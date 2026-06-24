@@ -60,8 +60,10 @@ fan-out, and WebRTC signaling relay. To understand message handling, read `Conne
 every site to handle it.
 
 **Channel modes** (`ChannelMode`): `MULTI_CHANNEL_PTT`, `GLOBAL_PTT` (channel name forced to `global`),
-`FULL_DUPLEX` (no floor). A channel's mode is fixed at creation; joining with a different mode is
-rejected. Floor state is an `AtomicReference<String>` on `Channel`; full-duplex bypasses it.
+`FULL_DUPLEX` (no floor). A channel's mode is set at creation and **adopted** by later joiners; only
+the **owner** (creator) may change it (`ChangeMode` → broadcast `ModeChanged`), and ownership transfers
+to another member if the owner leaves. Floor state is an `AtomicReference<String>` on `Channel`;
+full-duplex bypasses it.
 
 **Protocol.** `ClientMessage`/`ServerMessage` are sealed interfaces with nested records in
 `walkie-shared`, made polymorphic for Jackson 3 with `@JsonTypeInfo(use=NAME, property="type")` +

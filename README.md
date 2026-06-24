@@ -15,19 +15,29 @@ two reference clients, and three channel modes.
 ## Architecture
 
 ```
-                     ┌──────────────────────── walkie-server (Spring Boot 4.1) ────────────────────────┐
-  browser / java     │  /api/auth/login ── token ──► TokenAuthenticationFilter ──► Spring Security     │
-  clients            │                                                                                 │
-       │  WSS  ┌─────┤  /ws/audio  (BinaryWebSocket) ─► AudioRelayHandler  ─┐                          │
-       ├───────┴─────┤  /ws/signal (TextWebSocket)   ─► SignalingHandler   ─┤                          │
-       │             │                                                      ▼                          │
-       │             │   ConnectionService ── ChannelRegistry ── Channel ── FloorControlService        │
-       │             │   (pattern-matching dispatch, audio fan-out, PTT floor arbitration)             │
-       └─────────────┴─────────────────────────────────────────────────────────────────────────────────┘
+  browser / Java clients
+        │
+        │  POST /api/auth/login   → mint bearer token
+        │  POST /api/auth/logout  → revoke it
+        │  WSS  (token via Authorization header, or ?token= on the WebSocket handshake)
+        ▼
+  ┌─ walkie-server (Spring Boot 4.1) ───────────────────────────────────────────────────────────────┐
+  │                                                                                                 │
+  │  TokenAuthenticationFilter ─► Spring Security      (the token is the Authentication credential) │
+  │                                                                                                 │
+  │  /ws/audio   (binary) ─► AudioRelayHandler ┐                                                    │
+  │  /ws/signal  (text)   ─► SignalingHandler  ┴─► ConnectionService                                │
+  │                                                 ├─ ChannelRegistry ── Channel                   │
+  │                                                 ├─ FloorControlService (push-to-talk floor)     │
+  │                                                 └─ audio fan-out · WebRTC signaling relay       │
+  │                                                                                                 │
+  │  token eviction:  AuthService.revoke(token)  on  POST /api/auth/logout  AND  on WebSocket close │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────┘ 
 
-  Control plane: JSON text frames  (sealed ClientMessage / ServerMessage records, Jackson 3 polymorphic)
-  Media plane (relay): 48 kHz, 20 ms frames (mono, or stereo from the Java client) — Opus via WebCodecs (FEC) or PCM fallback,
-                       each frame prefixed with a 1-byte codec tag; fanned out server-side (codec-agnostic)
+  Control plane: JSON text frames (sealed ClientMessage / ServerMessage records, Jackson 3 polymorphic)
+  Media plane (relay):  48 kHz, 20 ms frames (mono, or stereo from the Java client) — Opus via WebCodecs
+                        (FEC) or PCM fallback, each frame prefixed with a 1-byte codec tag; fanned out
+                        server-side (codec-agnostic)
   Media plane (webrtc): Opus 48 kHz fullband, tuned (high bitrate + FEC), peer-to-peer
 ```
 
@@ -75,6 +85,12 @@ The server listens on `http://localhost:8080`. Open it in a browser to use the w
 2. Pick a transport, channel mode, and channel (optionally tick **High fidelity** to disable the mic
    noise-suppression/echo-cancellation DSP); click **Connect** and allow microphone access.
 3. **Push-to-talk** modes: hold the big button (or hold **Space**). **Full-duplex**: click to toggle your mic.
+4. **Disconnect** leaves the channel and logs out (revokes your token); closing the tab revokes it too.
+
+A channel's mode belongs to whoever **created** it: a later joiner adopts the existing mode (the server
+sends it), and only the creator can change it. When you own the channel the **Mode** selector stays
+enabled while connected — changing it switches the mode live for everyone (everyone's controls update);
+for non-owners it's disabled. If the owner leaves, ownership passes to another member.
 
 Open the page in two tabs (or two machines) to talk between them.
 
@@ -86,9 +102,10 @@ JAVA_OPTS= ./gradlew :walkie-client-java:run --args="\
 ```
 
 `--mode` accepts `ptt` (multi-channel PTT, default), `global` (single global PTT), or `duplex`
-(full-duplex); add the `--hifi` flag for the Opus music profile. At the prompt: `t` to talk/stop, `q` to
-quit, `h` for help. The Java client encodes Opus (48 kHz, FEC via Concentus — stereo when the audio
-device supports it, otherwise mono) and interoperates with
+(full-duplex) when *creating* a channel; joining an existing one adopts its mode. At the prompt: `t` to
+talk/stop, `m <ptt|global|duplex>` to change the mode (owner only), `q` to quit (which logs out and
+revokes the token), `h` for help. The Java client encodes Opus (48 kHz, FEC
+via Concentus — stereo when the audio device supports it, otherwise mono) and interoperates with
 relay-mode browser clients.
 
 ## Security
@@ -96,6 +113,9 @@ relay-mode browser clients.
 - **Token auth on every endpoint.** `POST /api/auth/login` mints a random, ephemeral bearer token
   (no secret is hard-coded or persisted). A `TokenAuthenticationFilter` validates the token (header or
   `?token=` for browser WebSocket handshakes) and the Spring Security chain enforces it on `/ws/**`.
+- **Token lifecycle.** `POST /api/auth/logout` revokes the presented token, and a token is also
+  evicted automatically when its WebSocket connection closes — so a disconnect ends the session and
+  the token can't be reused. (Tokens minted but never connected still have no TTL — a known gap.)
 - Stateless, CSRF-free token model; static client, health check and login are the only public routes.
 - Input is validated (usernames, channel-name pattern, audio-frame size caps). The browser renders
   member names with `textContent` to avoid markup injection.
