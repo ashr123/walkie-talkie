@@ -7,7 +7,6 @@ import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.floor.FloorControlService;
 import io.github.ashr123.walkietalkie.server.floor.FloorResult;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
-import io.github.ashr123.walkietalkie.server.support.AuthenticatedUser;
 import io.github.ashr123.walkietalkie.server.support.RequestContext;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
@@ -51,11 +50,12 @@ public class ConnectionService {
 		log.info("Connected: session={} user={} transport={}", session.id(), session.userId(), session.transport());
 	}
 
-	/// Handles one decoded control message, binding the authenticated identity into a scoped value for
-	/// the duration of the call (a Java 25 [ScopedValue], demonstrated in [RequestContext]).
+	/// Handles one decoded control message. The caller's identity is bound for the dynamic scope of the
+	/// call (a Java 25 [ScopedValue]) and surfaced on the log lines emitted while handling it (via the
+	/// MDC) — see [RequestContext#runAs]. The audio relay path ({@link #onAudio}) is deliberately not
+	/// scoped, to avoid per-frame MDC churn.
 	public void onMessage(ClientSession session, ClientMessage message) {
-		ScopedValue.where(RequestContext.CURRENT_USER, new AuthenticatedUser(session.userId()))
-				.run(() -> dispatch(session, message));
+		RequestContext.runAs(session.userId(), () -> dispatch(session, message));
 	}
 
 	private void dispatch(ClientSession session, ClientMessage message) {

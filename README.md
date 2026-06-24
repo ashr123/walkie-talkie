@@ -106,7 +106,7 @@ relay-mode browser clients.
 
 - **Virtual threads** for the servlet container and client I/O loops (`spring.threads.virtual.enabled`).
 - **Scoped Values** (JEP 506, finalized) to carry the authenticated identity for the scope of a
-  message — see `RequestContext`.
+  message and tag every log line emitted during it (mirrored into the SLF4J MDC) — see `RequestContext`.
 - **Sealed interfaces + records + pattern-matching `switch`** for the protocol and dispatch.
 - **Records as configuration properties**, text blocks, and `--release 25` throughout. No `var`.
 

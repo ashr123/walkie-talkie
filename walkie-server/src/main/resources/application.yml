@@ -26,3 +26,7 @@ management:
 logging:
   level:
     io.github.ashr123.walkietalkie: INFO
+  # Inject the RequestContext scoped value (mirrored into the MDC) onto every log line. Lines emitted
+  # outside a message scope (connection lifecycle, startup) show "system".
+  pattern:
+    level: "%5p [user=%X{user:-system}]"
