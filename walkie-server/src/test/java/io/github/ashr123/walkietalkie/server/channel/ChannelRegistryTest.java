@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.channel;
 
+import io.github.ashr123.option.None;
 import io.github.ashr123.walkietalkie.server.FakeClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -36,6 +37,6 @@ class ChannelRegistryTest {
 		assertEquals(1, registry.channelCount());
 		registry.leave("team", "a");
 		assertEquals(0, registry.channelCount());
-		assertTrue(registry.find("team").isEmpty());
+		assertInstanceOf(None.class, registry.find("team"));
 	}
 }

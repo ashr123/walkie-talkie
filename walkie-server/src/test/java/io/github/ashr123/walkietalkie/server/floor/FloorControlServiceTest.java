@@ -1,5 +1,7 @@
 package io.github.ashr123.walkietalkie.server.floor;
 
+import io.github.ashr123.option.None;
+import io.github.ashr123.option.Some;
 import io.github.ashr123.walkietalkie.server.FakeClientSession;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.session.Transport;
@@ -42,7 +44,7 @@ class FloorControlServiceTest {
 		assertInstanceOf(FloorResult.Granted.class, service.requestFloor(channel, alice));
 		assertTrue(service.releaseFloor(channel, alice));
 		assertInstanceOf(FloorResult.Granted.class, service.requestFloor(channel, bob));
-		assertEquals("bob", channel.floorHolder().orElseThrow());
+		assertEquals(new Some<>("bob"), channel.floorHolder());
 	}
 
 	@Test
@@ -66,6 +68,6 @@ class FloorControlServiceTest {
 		assertInstanceOf(FloorResult.Granted.class, service.requestFloor(channel, bob));
 		assertTrue(channel.holdsFloor("alice"));
 		assertTrue(channel.holdsFloor("bob"));
-		assertTrue(channel.floorHolder().isEmpty());
+		assertInstanceOf(None.class, channel.floorHolder());
 	}
 }

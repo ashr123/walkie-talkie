@@ -1,9 +1,9 @@
 package io.github.ashr123.walkietalkie.server.security;
 
+import io.github.ashr123.option.Option;
 import org.springframework.stereotype.Service;
 
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -23,8 +23,8 @@ public class AuthService {
 		return token;
 	}
 
-	public Optional<String> resolve(String token) {
-		return Optional.ofNullable(tokenToUser.get(token));
+	public Option<String> resolve(String token) {
+		return Option.of(tokenToUser.get(token));
 	}
 
 	public void revoke(String token) {

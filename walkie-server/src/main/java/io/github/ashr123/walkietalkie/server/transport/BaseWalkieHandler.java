@@ -41,10 +41,17 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 			closeUnauthenticated(session);
 			return;
 		}
-		WebSocketSession concurrent =
-				new ConcurrentWebSocketSessionDecorator(session, SEND_TIME_LIMIT_MS, SEND_BUFFER_LIMIT_BYTES);
 		ClientSession clientSession = new WebSocketClientSession(
-				concurrent, codec, transport, principal.getName(), principal.getName());
+				new ConcurrentWebSocketSessionDecorator(
+						session,
+						SEND_TIME_LIMIT_MS,
+						SEND_BUFFER_LIMIT_BYTES
+				),
+				codec,
+				transport,
+				principal.getName(),
+				principal.getName()
+		);
 		session.getAttributes().put(SESSION_KEY, clientSession);
 		connectionService.onConnect(clientSession);
 	}

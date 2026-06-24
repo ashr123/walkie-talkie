@@ -183,12 +183,13 @@ public final class WalkieClient {
 		short[] pcm = new short[frameSamples];
 		byte[] packet = new byte[MAX_PACKET_BYTES];
 		while (running.get()) {
-			if (!readFully(buffer)) {
-				continue; // line drained/closed; re-check running flag
+			// line drained/closed; re-check running flag
+			if (!readFully(buffer) ||
+					// keep the mic flowing but don't transmit
+					!transmitting.get()) {
+				continue;
 			}
-			if (!transmitting.get()) {
-				continue; // keep the mic flowing but don't transmit
-			}
+			// keep the mic flowing but don't transmit
 			ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(pcm);
 			try {
 				// frame size is samples *per channel*; pcm holds frameSamples interleaved shorts.

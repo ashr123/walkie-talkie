@@ -1,11 +1,11 @@
 package io.github.ashr123.walkietalkie.server.channel;
 
+import io.github.ashr123.option.Option;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /// Owns the set of live channels and handles atomic create/join/leave with empty-channel cleanup.
@@ -31,8 +31,8 @@ public class ChannelRegistry {
 		return channel;
 	}
 
-	public Optional<Channel> find(String name) {
-		return Optional.ofNullable(channels.get(name));
+	public Option<Channel> find(String name) {
+		return Option.of(channels.get(name));
 	}
 
 	/// Removes a member and drops the channel entirely once it becomes empty.

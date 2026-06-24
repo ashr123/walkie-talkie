@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.config;
 
+import io.github.ashr123.walkietalkie.server.security.AuthService;
 import io.github.ashr123.walkietalkie.server.security.TokenAuthenticationFilter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -18,14 +19,8 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @EnableWebSecurity
 public class SecurityConfig {
 
-	private final TokenAuthenticationFilter tokenAuthenticationFilter;
-
-	public SecurityConfig(TokenAuthenticationFilter tokenAuthenticationFilter) {
-		this.tokenAuthenticationFilter = tokenAuthenticationFilter;
-	}
-
 	@Bean
-	public SecurityFilterChain securityFilterChain(HttpSecurity http) {
+	public SecurityFilterChain securityFilterChain(HttpSecurity http, AuthService authService) {
 		return http
 				.csrf(AbstractHttpConfigurer::disable)
 				.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
@@ -37,7 +32,7 @@ public class SecurityConfig {
 						.requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
 						.requestMatchers("/ws/**").authenticated()
 						.anyRequest().authenticated())
-				.addFilterBefore(tokenAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+				.addFilterBefore(new TokenAuthenticationFilter(authService), UsernamePasswordAuthenticationFilter.class)
 				.httpBasic(AbstractHttpConfigurer::disable)
 				.formLogin(AbstractHttpConfigurer::disable)
 				.build();

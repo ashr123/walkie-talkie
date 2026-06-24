@@ -1,12 +1,12 @@
 package io.github.ashr123.walkietalkie.server.channel;
 
+import io.github.ashr123.option.Option;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -52,8 +52,8 @@ public final class Channel {
 		return members.size();
 	}
 
-	public Optional<ClientSession> member(String sessionId) {
-		return Optional.ofNullable(members.get(sessionId));
+	public Option<ClientSession> member(String sessionId) {
+		return Option.of(members.get(sessionId));
 	}
 
 	public List<MemberInfo> memberInfos() {
@@ -84,7 +84,7 @@ public final class Channel {
 		return mode == ChannelMode.FULL_DUPLEX || sessionId.equals(floorHolder.get());
 	}
 
-	public Optional<String> floorHolder() {
-		return Optional.ofNullable(floorHolder.get());
+	public Option<String> floorHolder() {
+		return Option.of(floorHolder.get());
 	}
 }

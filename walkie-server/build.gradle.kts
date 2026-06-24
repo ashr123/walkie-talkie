@@ -8,6 +8,8 @@ dependencies {
 
 	implementation(project(":walkie-shared"))
 
+	implementation("io.github.ashr123:option:1.3.1")
+
 	implementation("org.springframework.boot:spring-boot-starter-web")
 	implementation("org.springframework.boot:spring-boot-starter-websocket")
 	implementation("org.springframework.boot:spring-boot-starter-security")

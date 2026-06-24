@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
+import io.github.ashr123.option.Some;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelModeConflictException;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
@@ -103,7 +104,9 @@ public class ConnectionService {
 		ServerMessage.MemberJoined notice = new ServerMessage.MemberJoined(session.toMemberInfo());
 		channel.forEachOther(session.id(), other -> safeSend(other, notice));
 
-		channel.floorHolder().ifPresent(holder -> session.send(new ServerMessage.FloorTaken(holder)));
+		if (channel.floorHolder() instanceof Some(String holder)) {
+			session.send(new ServerMessage.FloorTaken(holder));
+		}
 
 		log.info("user={} joined channel={} mode={} as session={}",
 				session.userId(), channel.name(), channel.mode(), session.id());
@@ -114,7 +117,7 @@ public class ConnectionService {
 		if (channelName == null) {
 			return;
 		}
-		channelRegistry.find(channelName).ifPresent(channel -> {
+		if (channelRegistry.find(channelName) instanceof Some(Channel channel)) {
 			boolean wasHolding = channel.releaseFloor(session.id());
 			ServerMessage.MemberLeft left = new ServerMessage.MemberLeft(session.id());
 			channel.forEachOther(session.id(), other -> safeSend(other, left));
@@ -122,7 +125,7 @@ public class ConnectionService {
 				ServerMessage.FloorIdle idle = new ServerMessage.FloorIdle();
 				channel.forEachOther(session.id(), other -> safeSend(other, idle));
 			}
-		});
+		}
 		channelRegistry.leave(channelName, session.id());
 		session.leftChannel();
 	}
@@ -163,18 +166,17 @@ public class ConnectionService {
 	/// is dropped when the sender is not currently authorized to talk (push-to-talk floor not held) or
 	/// when it violates the configured size bounds.
 	public void onAudio(ClientSession session, byte[] audio) {
-		if (!session.supportsAudioRelay()) {
-			return;
-		}
-		if (audio.length == 0 || audio.length > properties.maxAudioFrameBytes()) {
+		if (!session.supportsAudioRelay() ||
+				audio.length == 0 ||
+				audio.length > properties.maxAudioFrameBytes()) {
 			return;
 		}
 		String channelName = session.channelName();
 		if (channelName == null) {
 			return;
 		}
-		Channel channel = channelRegistry.find(channelName).orElse(null);
-		if (channel == null || !channel.holdsFloor(session.id())) {
+		if (!(channelRegistry.find(channelName) instanceof Some(Channel channel))
+				|| !channel.holdsFloor(session.id())) {
 			return;
 		}
 		channel.forEachOther(session.id(), other -> {
@@ -198,10 +200,11 @@ public class ConnectionService {
 		if (channel == null) {
 			return;
 		}
-		channel.member(targetId).ifPresentOrElse(
-				target -> safeSend(target, message),
-				() -> session.send(new ServerMessage.ErrorMessage("unknown_target",
-						"No member '" + targetId + "' in this channel")));
+		if (channel.member(targetId) instanceof Some(ClientSession target))
+			safeSend(target, message);
+		else
+			session.send(new ServerMessage.ErrorMessage("unknown_target",
+					"No member '" + targetId + "' in this channel"));
 	}
 
 	private Channel requireChannel(ClientSession session) {
@@ -210,7 +213,9 @@ public class ConnectionService {
 			session.send(new ServerMessage.ErrorMessage("not_in_channel", "Join a channel first"));
 			return null;
 		}
-		return channelRegistry.find(name).orElse(null);
+		return channelRegistry.find(name) instanceof Some(Channel channel) ?
+				channel :
+				null;
 	}
 
 	private void safeSend(ClientSession session, ServerMessage message) {
