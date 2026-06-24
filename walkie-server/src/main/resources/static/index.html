@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta content="width=device-width, initial-scale=1.0" name="viewport">
+	<title>Walkie-Talkie</title>
+	<style>
+        :root {
+            --bg: #0f1419;
+            --panel: #1b232d;
+            --accent: #ff7a18;
+            --accent-2: #2ea3ff;
+            --text: #e7edf3;
+            --muted: #8aa0b3;
+            --ok: #3fb950;
+            --bad: #f85149;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.4;
+        }
+
+        header {
+            padding: 18px 24px;
+            border-bottom: 1px solid #28323d;
+        }
+
+        header h1 {
+            margin: 0;
+            font-size: 20px;
+        }
+
+        header p {
+            margin: 4px 0 0;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        main {
+            display: grid;
+            grid-template-columns: 340px 1fr;
+            gap: 20px;
+            padding: 20px 24px;
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid #28323d;
+            border-radius: 10px;
+            padding: 16px;
+        }
+
+        label {
+            display: block;
+            font-size: 12px;
+            color: var(--muted);
+            margin: 10px 0 4px;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid #33414f;
+            background: #0e151c;
+            color: var(--text);
+            font-size: 14px;
+        }
+
+        .row {
+            display: flex;
+            gap: 10px;
+        }
+
+        .row > div {
+            flex: 1;
+        }
+
+        button {
+            cursor: pointer;
+            border: none;
+            border-radius: 6px;
+            padding: 10px 14px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #0e151c;
+            background: var(--accent-2);
+        }
+
+        button.secondary {
+            background: #33414f;
+            color: var(--text);
+        }
+
+        button:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        #connectBtn {
+            width: 100%;
+            margin-top: 16px;
+        }
+
+        #talkBtn {
+            width: 100%;
+            padding: 28px;
+            font-size: 18px;
+            border-radius: 12px;
+            background: var(--accent);
+            color: #0e151c;
+            user-select: none;
+        }
+
+        #talkBtn.live {
+            background: var(--ok);
+            box-shadow: 0 0 0 4px rgba(63, 185, 80, .25);
+        }
+
+        #talkBtn.busy {
+            background: var(--bad);
+        }
+
+        .status {
+            font-size: 13px;
+            margin-top: 8px;
+        }
+
+        .dot {
+            display: inline-block;
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: var(--bad);
+            margin-right: 6px;
+        }
+
+        .dot.on {
+            background: var(--ok);
+        }
+
+        ul#members {
+            list-style: none;
+            padding: 0;
+            margin: 8px 0 0;
+        }
+
+        ul#members li {
+            padding: 6px 8px;
+            border-radius: 6px;
+            background: #0e151c;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+
+        ul#members li .self {
+            color: var(--accent);
+        }
+
+        #log {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px;
+            background: #0e151c;
+            border-radius: 8px;
+            padding: 12px;
+            height: 320px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            color: var(--muted);
+        }
+
+        h2 {
+            font-size: 14px;
+            margin: 0 0 4px;
+        }
+
+        .hint {
+            color: var(--muted);
+            font-size: 12px;
+            margin-top: 6px;
+        }
+	</style>
+</head>
+<body>
+<header>
+	<h1>📻 Walkie-Talkie</h1>
+	<p>Java 25 · Spring Boot 4.1 · live audio over WebSocket relay or WebRTC</p>
+</header>
+<main>
+	<section class="panel" id="setup">
+		<h2>Connect</h2>
+		<div class="row">
+			<div>
+				<label for="username">Username</label>
+				<input autocomplete="off" id="username" value="alice">
+			</div>
+			<div>
+				<label for="display">Display name</label>
+				<input autocomplete="off" id="display" value="Alice">
+			</div>
+		</div>
+		<label for="transport">Transport</label>
+		<select id="transport">
+			<option value="relay">WebSocket relay (server forwards audio)</option>
+			<option value="webrtc">WebRTC (peer-to-peer, server signals only)</option>
+		</select>
+		<label for="mode">Channel mode</label>
+		<select id="mode">
+			<option value="MULTI_CHANNEL_PTT">Multi-channel push-to-talk</option>
+			<option value="GLOBAL_PTT">Single global push-to-talk</option>
+			<option value="FULL_DUPLEX">Full-duplex conference</option>
+		</select>
+		<label for="channel">Channel</label>
+		<input autocomplete="off" id="channel" value="lobby">
+			<label style="display:flex; align-items:center; gap:8px; margin-top:10px;">
+				<input id="hifi" style="width:auto;" type="checkbox"> High fidelity (disable mic processing)
+			</label>
+		<button id="connectBtn">Connect</button>
+		<button class="secondary" disabled id="disconnectBtn" style="width:100%; margin-top:8px;">Disconnect</button>
+		<div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Disconnected</span></div>
+	</section>
+
+	<section style="display:flex; flex-direction:column; gap:20px;">
+		<div class="panel">
+			<h2>Talk</h2>
+			<button disabled id="talkBtn">Connect first</button>
+			<div class="hint" id="talkHint">Push-to-talk: hold the button (or hold Space). Full-duplex: click to toggle
+				your mic.
+			</div>
+		</div>
+		<div class="row" style="gap:20px;">
+			<div class="panel" style="flex:1;">
+				<h2>Members</h2>
+				<ul id="members"></ul>
+			</div>
+			<div class="panel" style="flex:2;">
+				<h2>Log</h2>
+				<div id="log"></div>
+			</div>
+		</div>
+	</section>
+</main>
+<script src="/assets/app.js" type="module"></script>
+</body>
+</html>
