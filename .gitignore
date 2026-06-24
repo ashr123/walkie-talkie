@@ -1,0 +1,127 @@
+# =============================================================================
+# Build output & Gradle
+# =============================================================================
+.gradle/
+build/
+**/build/
+out/
+bin/
+# Kotlin DSL build-script compilation cache (Gradle 8.4+)
+.kotlin/
+
+# Keep the Gradle wrapper itself tracked (it is part of the repo on purpose).
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# =============================================================================
+# Java / JVM
+# =============================================================================
+*.class
+# JVM crash & async-profiler dumps
+hs_err_pid*
+replay_pid*
+*.hprof
+# Package files are produced by the build (kept out via build/); never commit loose ones.
+*.war
+*.ear
+*.nar
+
+# =============================================================================
+# Logs & temp
+# =============================================================================
+*.log
+*.tmp
+*.bak
+*.swp
+
+# =============================================================================
+# Secrets & credentials  (Check Point policy: never commit these)
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets/
+**/application-local.yml
+**/application-secret*.yml
+
+# =============================================================================
+# IntelliJ IDEA / JetBrains
+# =============================================================================
+.idea/
+*.iml
+*.ipr
+*.iws
+# Gradle-managed JetBrains output
+.idea_modules/
+
+# =============================================================================
+# Eclipse
+# =============================================================================
+.project
+.classpath
+.settings/
+.metadata/
+.apt_generated/
+.factorypath
+.sts4-cache/
+
+# =============================================================================
+# NetBeans
+# =============================================================================
+nbproject/
+.nb-gradle/
+nbbuild/
+nbdist/
+
+# =============================================================================
+# VS Code
+# =============================================================================
+.vscode/
+*.code-workspace
+
+# =============================================================================
+# macOS
+# =============================================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# =============================================================================
+# Windows
+# =============================================================================
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+
+# =============================================================================
+# Linux
+# =============================================================================
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
