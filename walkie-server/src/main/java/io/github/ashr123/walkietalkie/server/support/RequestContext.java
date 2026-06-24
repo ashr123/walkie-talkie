@@ -20,10 +20,10 @@ public final class RequestContext {
 	private RequestContext() {
 	}
 
-	/// Runs {@code action} with {@code userId} bound as the current user: as a [ScopedValue] (the
+	/// Runs `action` with `userId` bound as the current user: as a [ScopedValue] (the
 	/// source of truth) and mirrored into the MDC, read back from the scoped value. On exit the MDC
 	/// key is restored to its previous value (not merely removed), so the MDC stays consistent with
-	/// the scoped value even if {@code runAs} is nested.
+	/// the scoped value even if `runAs` is nested.
 	public static void runAs(String userId, Runnable action) {
 		ScopedValue.where(CURRENT_USER, new AuthenticatedUser(userId)).run(() -> {
 			String previous = MDC.get(MDC_USER_KEY);
@@ -40,7 +40,7 @@ public final class RequestContext {
 		});
 	}
 
-	/// Returns the bound user id, or {@code "system"} when called outside a bound scope (for example
+	/// Returns the bound user id, or `"system"` when called outside a bound scope (for example
 	/// connection-lifecycle or other server-initiated logging that is not handling a client message).
 	public static String currentUserIdOrSystem() {
 		return CURRENT_USER.isBound() ? CURRENT_USER.get().userId() : "system";

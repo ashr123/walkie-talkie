@@ -6,7 +6,7 @@ import com.fasterxml.jackson.annotation.JsonTypeName;
 /**
  * Control-plane messages sent by a client to the server (as JSON text frames).
  *
- * <p>The live audio itself never travels as a {@code ClientMessage}: in WebSocket-relay mode
+ * <p>The live audio itself never travels as a `ClientMessage`: in WebSocket-relay mode
  * it is sent as raw binary frames, and in WebRTC mode it flows peer-to-peer. These messages
  * only carry coordination: joining/leaving, push-to-talk floor requests, and WebRTC signaling.
  *

@@ -12,7 +12,7 @@ public enum ChannelMode {
 	MULTI_CHANNEL_PTT,
 
 	/**
-	 * A single shared room (always named {@code "global"}); half-duplex push-to-talk.
+	 * A single shared room (always named `"global"`); half-duplex push-to-talk.
 	 */
 	GLOBAL_PTT,
 
