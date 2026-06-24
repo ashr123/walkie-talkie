@@ -19,8 +19,8 @@ two reference clients, and three channel modes.
   browser / java     │  /api/auth/login ── token ──► TokenAuthenticationFilter ──► Spring Security     │
   clients            │                                                                                 │
        │  WSS  ┌─────┤  /ws/audio  (BinaryWebSocket) ─► AudioRelayHandler  ─┐                          │
-       ├───────┤     │  /ws/signal (TextWebSocket)   ─► SignalingHandler   ─┤                          │
-       │       └─────┤                                                      ▼                          │
+       ├───────┴─────┤  /ws/signal (TextWebSocket)   ─► SignalingHandler   ─┤                          │
+       │             │                                                      ▼                          │
        │             │   ConnectionService ── ChannelRegistry ── Channel ── FloorControlService        │
        │             │   (pattern-matching dispatch, audio fan-out, PTT floor arbitration)             │
        └─────────────┴─────────────────────────────────────────────────────────────────────────────────┘
