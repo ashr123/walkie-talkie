@@ -1,0 +1,223 @@
+package io.github.ashr123.walkietalkie.server.transport;
+
+import io.github.ashr123.walkietalkie.server.channel.Channel;
+import io.github.ashr123.walkietalkie.server.channel.ChannelModeConflictException;
+import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
+import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
+import io.github.ashr123.walkietalkie.server.floor.FloorControlService;
+import io.github.ashr123.walkietalkie.server.floor.FloorResult;
+import io.github.ashr123.walkietalkie.server.session.ClientSession;
+import io.github.ashr123.walkietalkie.server.support.AuthenticatedUser;
+import io.github.ashr123.walkietalkie.server.support.RequestContext;
+import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
+import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.regex.Pattern;
+
+/// Transport-agnostic heart of the server. Both WebSocket handlers feed decoded control messages and
+/// raw audio frames here; this class owns membership, push-to-talk floor arbitration, audio fan-out
+/// and WebRTC signaling relay. It never touches a `WebSocketSession` directly, which keeps it
+/// unit-testable with fake [ClientSession] instances.
+@Service
+public class ConnectionService {
+
+	private static final Logger log = LoggerFactory.getLogger(ConnectionService.class);
+	private static final Pattern CHANNEL_NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+	private static final String GLOBAL_CHANNEL = "global";
+	private static final int MAX_DISPLAY_NAME = 40;
+
+	private final ChannelRegistry channelRegistry;
+	private final FloorControlService floorControl;
+	private final WalkieProperties properties;
+
+	public ConnectionService(ChannelRegistry channelRegistry,
+	                         FloorControlService floorControl,
+	                         WalkieProperties properties) {
+		this.channelRegistry = channelRegistry;
+		this.floorControl = floorControl;
+		this.properties = properties;
+	}
+
+	private static String sanitizeDisplayName(String raw) {
+		String cleaned = raw.strip().replaceAll("\\p{Cntrl}", "");
+		return cleaned.length() > MAX_DISPLAY_NAME ? cleaned.substring(0, MAX_DISPLAY_NAME) : cleaned;
+	}
+
+	public void onConnect(ClientSession session) {
+		log.info("Connected: session={} user={} transport={}", session.id(), session.userId(), session.transport());
+	}
+
+	/// Handles one decoded control message, binding the authenticated identity into a scoped value for
+	/// the duration of the call (a Java 25 [ScopedValue], demonstrated in [RequestContext]).
+	public void onMessage(ClientSession session, ClientMessage message) {
+		ScopedValue.where(RequestContext.CURRENT_USER, new AuthenticatedUser(session.userId()))
+				.run(() -> dispatch(session, message));
+	}
+
+	private void dispatch(ClientSession session, ClientMessage message) {
+		switch (message) {
+			case ClientMessage.Join join -> handleJoin(session, join);
+			case ClientMessage.Leave _ -> handleLeave(session);
+			case ClientMessage.RequestFloor _ -> handleRequestFloor(session);
+			case ClientMessage.ReleaseFloor _ -> handleReleaseFloor(session);
+			case ClientMessage.Offer offer ->
+					relaySignal(session, offer.target(), new ServerMessage.SignalOffer(session.id(), offer.sdp()));
+			case ClientMessage.Answer answer ->
+					relaySignal(session, answer.target(), new ServerMessage.SignalAnswer(session.id(), answer.sdp()));
+			case ClientMessage.IceCandidate ice -> relaySignal(session, ice.target(),
+					new ServerMessage.SignalIce(session.id(), ice.candidate(), ice.sdpMid(), ice.sdpMLineIndex()));
+		}
+	}
+
+	private void handleJoin(ClientSession session, ClientMessage.Join join) {
+		if (session.channelName() != null) {
+			handleLeave(session);
+		}
+
+		ChannelMode mode = join.mode();
+		String requested = mode == ChannelMode.GLOBAL_PTT ? GLOBAL_CHANNEL : join.channel();
+		if (requested == null || !CHANNEL_NAME.matcher(requested).matches()) {
+			session.send(new ServerMessage.ErrorMessage("invalid_channel",
+					"Channel name must match " + CHANNEL_NAME.pattern()));
+			return;
+		}
+		if (join.displayName() != null && !join.displayName().isBlank()) {
+			session.setDisplayName(sanitizeDisplayName(join.displayName()));
+		}
+
+		Channel channel;
+		try {
+			channel = channelRegistry.joinOrCreate(requested, mode, session);
+		} catch (ChannelModeConflictException e) {
+			session.send(new ServerMessage.ErrorMessage("channel_mode_conflict", e.getMessage()));
+			return;
+		}
+
+		session.joinedChannel(channel.name(), channel.mode());
+		session.send(new ServerMessage.Joined(session.id(), channel.name(), channel.mode(), channel.memberInfos()));
+
+		ServerMessage.MemberJoined notice = new ServerMessage.MemberJoined(session.toMemberInfo());
+		channel.forEachOther(session.id(), other -> safeSend(other, notice));
+
+		channel.floorHolder().ifPresent(holder -> session.send(new ServerMessage.FloorTaken(holder)));
+
+		log.info("user={} joined channel={} mode={} as session={}",
+				session.userId(), channel.name(), channel.mode(), session.id());
+	}
+
+	private void handleLeave(ClientSession session) {
+		String channelName = session.channelName();
+		if (channelName == null) {
+			return;
+		}
+		channelRegistry.find(channelName).ifPresent(channel -> {
+			boolean wasHolding = channel.releaseFloor(session.id());
+			ServerMessage.MemberLeft left = new ServerMessage.MemberLeft(session.id());
+			channel.forEachOther(session.id(), other -> safeSend(other, left));
+			if (wasHolding) {
+				ServerMessage.FloorIdle idle = new ServerMessage.FloorIdle();
+				channel.forEachOther(session.id(), other -> safeSend(other, idle));
+			}
+		});
+		channelRegistry.leave(channelName, session.id());
+		session.leftChannel();
+	}
+
+	private void handleRequestFloor(ClientSession session) {
+		Channel channel = requireChannel(session);
+		if (channel == null) {
+			return;
+		}
+		if (channel.mode() == ChannelMode.FULL_DUPLEX) {
+			session.send(new ServerMessage.FloorGranted());
+			return;
+		}
+		FloorResult result = floorControl.requestFloor(channel, session);
+		switch (result) {
+			case FloorResult.Granted _ -> {
+				session.send(new ServerMessage.FloorGranted());
+				ServerMessage.FloorTaken taken = new ServerMessage.FloorTaken(session.id());
+				channel.forEachOther(session.id(), other -> safeSend(other, taken));
+			}
+			case FloorResult.Denied denied ->
+					session.send(new ServerMessage.FloorDenied(denied.currentHolderId(), "floor_busy"));
+		}
+	}
+
+	private void handleReleaseFloor(ClientSession session) {
+		Channel channel = requireChannel(session);
+		if (channel == null || channel.mode() == ChannelMode.FULL_DUPLEX) {
+			return;
+		}
+		if (floorControl.releaseFloor(channel, session)) {
+			ServerMessage.FloorIdle idle = new ServerMessage.FloorIdle();
+			channel.forEachOther(session.id(), other -> safeSend(other, idle));
+		}
+	}
+
+	/// Relays a raw audio frame to the other relay-capable members of the sender's channel. The frame
+	/// is dropped when the sender is not currently authorized to talk (push-to-talk floor not held) or
+	/// when it violates the configured size bounds.
+	public void onAudio(ClientSession session, byte[] audio) {
+		if (!session.supportsAudioRelay()) {
+			return;
+		}
+		if (audio.length == 0 || audio.length > properties.maxAudioFrameBytes()) {
+			return;
+		}
+		String channelName = session.channelName();
+		if (channelName == null) {
+			return;
+		}
+		Channel channel = channelRegistry.find(channelName).orElse(null);
+		if (channel == null || !channel.holdsFloor(session.id())) {
+			return;
+		}
+		channel.forEachOther(session.id(), other -> {
+			if (other.supportsAudioRelay()) {
+				try {
+					other.sendAudio(audio);
+				} catch (RuntimeException e) {
+					log.debug("Audio relay to {} failed: {}", other.id(), e.getMessage());
+				}
+			}
+		});
+	}
+
+	public void onClose(ClientSession session) {
+		handleLeave(session);
+		log.info("Disconnected: session={} user={}", session.id(), session.userId());
+	}
+
+	private void relaySignal(ClientSession session, String targetId, ServerMessage message) {
+		Channel channel = requireChannel(session);
+		if (channel == null) {
+			return;
+		}
+		channel.member(targetId).ifPresentOrElse(
+				target -> safeSend(target, message),
+				() -> session.send(new ServerMessage.ErrorMessage("unknown_target",
+						"No member '" + targetId + "' in this channel")));
+	}
+
+	private Channel requireChannel(ClientSession session) {
+		String name = session.channelName();
+		if (name == null) {
+			session.send(new ServerMessage.ErrorMessage("not_in_channel", "Join a channel first"));
+			return null;
+		}
+		return channelRegistry.find(name).orElse(null);
+	}
+
+	private void safeSend(ClientSession session, ServerMessage message) {
+		try {
+			session.send(message);
+		} catch (RuntimeException e) {
+			log.debug("Control send to {} failed: {}", session.id(), e.getMessage());
+		}
+	}
+}

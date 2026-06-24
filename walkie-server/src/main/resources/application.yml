@@ -1,0 +1,28 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: walkie-talkie-server
+  # Java 25 virtual threads handle the servlet container and WebSocket work, so each connection
+  # costs a few KB instead of a full platform thread.
+  threads:
+    virtual:
+      enabled: true
+
+walkie:
+  # Permissive for local development. Restrict to your known client origins in production.
+  allowed-origins:
+    - "*"
+  max-audio-frame-bytes: 8192
+  max-text-message-bytes: 65536
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+logging:
+  level:
+    io.github.ashr123.walkietalkie: INFO
