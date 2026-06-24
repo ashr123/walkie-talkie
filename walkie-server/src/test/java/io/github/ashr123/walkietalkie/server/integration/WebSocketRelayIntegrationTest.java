@@ -2,6 +2,7 @@ package io.github.ashr123.walkietalkie.server.integration;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.LoginResponse;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.Test;
@@ -17,6 +18,7 @@ import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -82,6 +84,26 @@ class WebSocketRelayIntegrationTest {
 		}
 	}
 
+	@Test
+	void aMalformedTokenIsRejectedAtTheBoundaryNotAsAServerError() throws Exception {
+		// The refactor's central safety claim lives at the inbound boundary (TokenAuthenticationFilter ->
+		// AuthService.resolve): a token that is not a well-formed UUID must be treated as unauthenticated,
+		// never escape UUID.fromString as a 500. Drive a protected endpoint with a garbage bearer token and
+		// require it to behave exactly like presenting no token at all.
+		int missing = protectedEndpointStatus(null);
+		int malformed = protectedEndpointStatus("Bearer not-a-uuid");
+		assertNotEquals(500, malformed, "a malformed token must not surface as a server error");
+		assertEquals(missing, malformed, "a malformed token must be rejected exactly like a missing one");
+	}
+
+	private int protectedEndpointStatus(String authorization) throws Exception {
+		HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/ws/audio")).GET();
+		if (authorization != null) {
+			builder.header("Authorization", authorization);
+		}
+		return httpClient.send(builder.build(), HttpResponse.BodyHandlers.discarding()).statusCode();
+	}
+
 	private String login(String username) throws Exception {
 		String body = jsonMapper.writeValueAsString(Map.of("username", username));
 		HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/auth/login"))
@@ -90,12 +112,15 @@ class WebSocketRelayIntegrationTest {
 				.build();
 		HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 		assertEquals(200, response.statusCode());
-		return jsonMapper.readValue(response.body(), LoginResponse.class).token();
+		return jsonMapper.readValue(response.body(), LoginResponse.class).token().toString();
 	}
 
 	private WebSocketSession connect(StandardWebSocketClient client, CollectingHandler handler, String token)
 			throws Exception {
-		URI uri = URI.create("ws://localhost:" + port + "/ws/audio?token=" + token);
+		// Encode the token exactly as the real clients do (WalkieClient uses URLEncoder, the browser uses
+		// encodeURIComponent), so the test exercises the same opaque-token boundary and survives a future
+		// token format that is not URL-safe.
+		URI uri = URI.create("ws://localhost:" + port + "/ws/audio?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8));
 		return client.execute(handler, null, uri).get(5, TimeUnit.SECONDS);
 	}
 
@@ -113,9 +138,6 @@ class WebSocketRelayIntegrationTest {
 			}
 		}
 		throw new AssertionError("Timed out waiting for " + type.getSimpleName());
-	}
-
-	private record LoginResponse(String userId, String token) {
 	}
 
 	/// Collects inbound control messages and audio frames into queues for the test to assert on.

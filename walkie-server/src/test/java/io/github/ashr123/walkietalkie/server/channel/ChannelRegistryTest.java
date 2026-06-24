@@ -25,10 +25,13 @@ class ChannelRegistryTest {
 	}
 
 	@Test
-	void rejectsJoiningWithADifferentMode() {
-		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, session("a"));
-		assertThrows(ChannelModeConflictException.class,
-				() -> registry.joinOrCreate("team", ChannelMode.FULL_DUPLEX, session("b")));
+	void adoptsExistingModeAndOwnerOnJoin() {
+		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, session("a"));
+		Channel joined = registry.joinOrCreate("team", ChannelMode.FULL_DUPLEX, session("b"));
+		assertSame(created, joined);
+		assertEquals(ChannelMode.MULTI_CHANNEL_PTT, joined.mode(), "the channel keeps its original mode");
+		assertEquals("a", joined.ownerId(), "the creator stays the owner");
+		assertEquals(2, joined.size());
 	}
 
 	@Test

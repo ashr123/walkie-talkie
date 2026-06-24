@@ -1,7 +1,7 @@
 package io.github.ashr123.walkietalkie.shared.protocol;
 
-/// The conversation semantics of a channel. Fixed at the moment the channel is created;
-/// later joiners must use the same mode.
+/// The conversation semantics of a channel. Set when the channel is created and adopted by later
+/// joiners; only the channel's owner (its creator) may change it afterwards.
 public enum ChannelMode {
 
 	/// Named rooms; half-duplex push-to-talk with server-arbitrated floor control.

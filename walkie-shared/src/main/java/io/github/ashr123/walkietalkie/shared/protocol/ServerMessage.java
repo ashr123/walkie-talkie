@@ -9,9 +9,10 @@ import java.util.List;
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "type")
 public sealed interface ServerMessage {
 
-	/// Acknowledges a successful join and snapshots the current channel membership.
+	/// Acknowledges a successful join and snapshots the current channel mode, owner and membership.
+	/// When joining an existing channel, `mode` is the channel's actual mode (the joiner adopts it).
 	@JsonTypeName("joined")
-	record Joined(String selfId, String channel, ChannelMode mode, List<MemberInfo> members)
+	record Joined(String selfId, String channel, ChannelMode mode, String ownerId, List<MemberInfo> members)
 			implements ServerMessage {
 	}
 
@@ -43,6 +44,18 @@ public sealed interface ServerMessage {
 	/// The floor is now free.
 	@JsonTypeName("floorIdle")
 	record FloorIdle() implements ServerMessage {
+	}
+
+	/// The channel's owner changed its mode; clients adopt it, reset their talk state and re-render
+	/// their controls.
+	@JsonTypeName("modeChanged")
+	record ModeChanged(ChannelMode mode) implements ServerMessage {
+	}
+
+	/// The channel's owner changed (e.g. the previous owner disconnected); the named member may now
+	/// change the mode.
+	@JsonTypeName("ownerChanged")
+	record OwnerChanged(String ownerId) implements ServerMessage {
 	}
 
 	/// WebRTC: an SDP offer relayed from another member.

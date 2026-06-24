@@ -1,6 +1,7 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
+import io.github.ashr123.walkietalkie.server.security.AuthService;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.server.session.WebSocketClientSession;
@@ -8,6 +9,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.jspecify.annotations.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
@@ -26,11 +28,13 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 	protected final ConnectionService connectionService;
 	protected final MessageCodec codec;
 	private final Logger log = LoggerFactory.getLogger(getClass());
+	private final AuthService authService;
 	private final Transport transport;
 
-	protected BaseWalkieHandler(ConnectionService connectionService, MessageCodec codec, Transport transport) {
+	protected BaseWalkieHandler(ConnectionService connectionService, MessageCodec codec, AuthService authService, Transport transport) {
 		this.connectionService = connectionService;
 		this.codec = codec;
+		this.authService = authService;
 		this.transport = transport;
 	}
 
@@ -76,6 +80,11 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 		if (clientSession != null) {
 			connectionService.onClose(clientSession);
 		}
+		// Evict the bearer token that authenticated this connection (the filter stored it as the
+		// authentication credentials), so a disconnect ends the session: the token can no longer open
+		// a new connection or call the API.
+		if (session.getPrincipal() instanceof Authentication auth && auth.getCredentials() instanceof String token)
+			authService.revoke(token);
 	}
 
 	@Override

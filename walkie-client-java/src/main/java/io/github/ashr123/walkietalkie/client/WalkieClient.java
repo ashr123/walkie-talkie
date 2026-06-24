@@ -2,6 +2,7 @@ package io.github.ashr123.walkietalkie.client;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.LoginResponse;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import io.github.jaredmdobson.concentus.*;
@@ -21,6 +22,7 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -67,14 +69,19 @@ public final class WalkieClient {
 	private TargetDataLine mic;
 	private SourceDataLine speaker;
 	private WebSocket webSocket;
+	private volatile String token;
+	private volatile String selfId = "";
+	private volatile String ownerId;
+	private volatile ChannelMode currentMode;
 
 	public WalkieClient(ClientOptions options) {
 		this.options = options;
+		this.currentMode = options.mode();
 	}
 
 	public void run() throws Exception {
 		System.out.println("Logging in as '" + options.user() + "' at " + options.server() + " ...");
-		String token = login();
+		token = login();
 		negotiateAudioFormat();
 		setupCodec();
 		openAudio();
@@ -105,7 +112,29 @@ public final class WalkieClient {
 		if (response.statusCode() != 200) {
 			throw new IOException("Login failed: HTTP " + response.statusCode() + " " + response.body());
 		}
-		return jsonMapper.readValue(response.body(), LoginResult.class).token();
+		// The token is an opaque string in headers/query params; the wire record types it as a UUID.
+		return jsonMapper.readValue(response.body(), LoginResponse.class).token().toString();
+	}
+
+	/// Best-effort token revocation on a graceful quit. An abrupt disconnect is still covered by the
+	/// server evicting the token when the WebSocket closes.
+	private void logout() {
+		if (token == null) {
+			return;
+		}
+		try {
+			httpClient.send(
+					HttpRequest.newBuilder(URI.create(options.server() + "/api/auth/logout"))
+							.header("Authorization", "Bearer " + token)
+							.POST(HttpRequest.BodyPublishers.noBody())
+							.build(),
+					HttpResponse.BodyHandlers.discarding()
+			);
+		} catch (IOException _) {
+			// best-effort
+		} catch (InterruptedException _) {
+			Thread.currentThread().interrupt();
+		}
 	}
 
 	// --- Audio format + codec ---------------------------------------------------------------------
@@ -123,10 +152,13 @@ public final class WalkieClient {
 	}
 
 	private void setupCodec() throws OpusException {
-		OpusApplication application = options.highFidelity()
-				? OpusApplication.OPUS_APPLICATION_AUDIO
-				: OpusApplication.OPUS_APPLICATION_VOIP;
-		encoder = new OpusEncoder((int) SAMPLE_RATE, channels, application);
+		encoder = new OpusEncoder(
+				(int) SAMPLE_RATE,
+				channels,
+				options.highFidelity()
+						? OpusApplication.OPUS_APPLICATION_AUDIO
+						: OpusApplication.OPUS_APPLICATION_VOIP
+		);
 		encoder.setBitrate(channels == 2 ? STEREO_BITRATE : MONO_BITRATE);
 		encoder.setComplexity(10);
 		encoder.setUseInbandFEC(true);
@@ -149,10 +181,11 @@ public final class WalkieClient {
 	private void senderLoop() {
 		try {
 			while (running.get()) {
-				switch (sendQueue.take()) {
-					case Outbound.Text text -> webSocket.sendText(text.json(), true).join();
-					case Outbound.Binary binary -> webSocket.sendBinary(ByteBuffer.wrap(binary.data()), true).join();
-				}
+				(switch (sendQueue.take()) {
+					case Outbound.Text(String json) -> webSocket.sendText(json, true);
+					case Outbound.Binary(byte[] data) -> webSocket.sendBinary(ByteBuffer.wrap(data), true);
+				})
+						.join();
 			}
 		} catch (InterruptedException _) {
 			Thread.currentThread().interrupt();
@@ -272,32 +305,51 @@ public final class WalkieClient {
 
 	private void handleServerMessage(String json) {
 		switch (jsonMapper.readValue(json, ServerMessage.class)) {
-			case ServerMessage.Joined joined -> {
-				System.out.println("[joined] channel=" + joined.channel() + " mode=" + joined.mode()
-						+ " members=" + joined.members().size());
-				System.out.println(joined.mode() == ChannelMode.FULL_DUPLEX
-						? "Full-duplex: type 't' to start/stop your mic."
-						: "Push-to-talk: type 't' to grab/release the floor.");
+			case ServerMessage.Joined(String selfId, String channel, ChannelMode mode, String ownerId, List<MemberInfo> members) -> {
+				this.selfId = selfId;
+				this.ownerId = ownerId;
+				this.currentMode = mode;
+				System.out.println("[joined] channel=" + channel + " mode=" + mode + " members=" + members.size()
+						+ (selfId.equals(ownerId) ? " (you own this channel)" : "") + System.lineSeparator()
+						+ modeHint(mode));
 			}
-			case ServerMessage.MemberJoined event -> System.out.println("[+] " + describe(event.member()));
-			case ServerMessage.MemberLeft event -> System.out.println("[-] member " + event.memberId());
+			case ServerMessage.MemberJoined(MemberInfo member) -> System.out.println("[+] " + describe(member));
+			case ServerMessage.MemberLeft(String memberId) -> System.out.println("[-] member " + memberId);
 			case ServerMessage.FloorGranted _ -> {
 				transmitting.set(true);
 				System.out.println("[floor granted] talking — type 't' to stop");
 			}
-			case ServerMessage.FloorDenied denied ->
-					System.out.println("[floor busy] currently held by " + denied.currentHolderId());
-			case ServerMessage.FloorTaken taken -> System.out.println("[talking] " + taken.holderId());
+			case ServerMessage.FloorDenied(String currentHolderId, _) ->
+					System.out.println("[floor busy] currently held by " + currentHolderId);
+			case ServerMessage.FloorTaken(String holderId) -> System.out.println("[talking] " + holderId);
 			case ServerMessage.FloorIdle _ -> System.out.println("[floor free]");
+			case ServerMessage.ModeChanged(ChannelMode mode) -> {
+				currentMode = mode;
+				transmitting.set(false);
+				System.out.println("[mode changed] now " + mode + System.lineSeparator()
+						+ modeHint(mode));
+			}
+			case ServerMessage.OwnerChanged(String ownerId) -> {
+				this.ownerId = ownerId;
+				System.out.println(selfId.equals(ownerId)
+						? "[owner] you are now the owner — 'm <ptt|global|duplex>' to change the mode"
+						: "[owner] channel owner is now " + ownerId);
+			}
 			case ServerMessage.SignalOffer _, ServerMessage.SignalAnswer _,
 			     ServerMessage.SignalIce _ -> { /* WebRTC: not used by the relay client */ }
-			case ServerMessage.ErrorMessage error ->
-					System.out.println("[error] " + error.code() + ": " + error.message());
+			case ServerMessage.ErrorMessage(String code, String message) ->
+					System.out.println("[error] " + code + ": " + message);
 		}
 	}
 
 	private String describe(MemberInfo member) {
 		return member.displayName() + " (" + member.id() + ")";
+	}
+
+	private static String modeHint(ChannelMode mode) {
+		return mode == ChannelMode.FULL_DUPLEX
+				? "Full-duplex: type 't' to start/stop your mic."
+				: "Push-to-talk: type 't' to grab/release the floor.";
 	}
 
 	// --- Console control --------------------------------------------------------------------------
@@ -307,12 +359,14 @@ public final class WalkieClient {
 		try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
 			String line;
 			while (running.get() && (line = reader.readLine()) != null) {
-				switch (line.strip().toLowerCase(Locale.ROOT)) {
+				String[] parts = line.strip().split("\\s+", 2);
+				switch (parts[0].toLowerCase(Locale.ROOT)) {
 					case "t", "talk" -> toggleTalk();
+					case "m", "mode" -> changeMode(parts.length > 1 ? parts[1] : "");
 					case "q", "quit", "exit" -> running.set(false);
 					case "h", "help" -> printHelp();
 					case "" -> { /* ignore blank lines */ }
-					default -> System.out.println("Commands: 't' talk/stop, 'q' quit, 'h' help.");
+					default -> System.out.println("Commands: 't' talk/stop, 'm <ptt|global|duplex>' mode, 'q' quit, 'h' help.");
 				}
 			}
 		} catch (IOException _) {
@@ -323,11 +377,11 @@ public final class WalkieClient {
 	private void toggleTalk() {
 		if (transmitting.get()) {
 			transmitting.set(false);
-			if (options.mode() != ChannelMode.FULL_DUPLEX) {
+			if (currentMode != ChannelMode.FULL_DUPLEX) {
 				enqueue(new ClientMessage.ReleaseFloor());
 			}
 			System.out.println("[stopped]");
-		} else if (options.mode() == ChannelMode.FULL_DUPLEX) {
+		} else if (currentMode == ChannelMode.FULL_DUPLEX) {
 			transmitting.set(true);
 			System.out.println("[talking]");
 		} else {
@@ -336,11 +390,26 @@ public final class WalkieClient {
 		}
 	}
 
+	/// Asks the server to change the channel mode. Gated locally to the owner (the server enforces it
+	/// too); the resulting [ServerMessage.ModeChanged] is what actually updates everyone's controls.
+	private void changeMode(String arg) {
+		if (!selfId.equals(ownerId)) {
+			System.out.println("[denied] only the channel owner can change the mode");
+			return;
+		}
+		switch (arg.toLowerCase(Locale.ROOT)) {
+			case "ptt", "multi" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
+			case "global" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.GLOBAL_PTT));
+			case "duplex", "full" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
+			default -> System.out.println("Usage: m <ptt|global|duplex>");
+		}
+	}
+
 	private void printHelp() {
 		System.out.println("""
-				------------------------------------------------------------
-				 Commands:  t = talk/stop   q = quit   h = help
-				------------------------------------------------------------""");
+				-------------------------------------------------------------------------------
+				 Commands:  t = talk/stop   m <ptt|global|duplex> = mode   q = quit   h = help
+				-------------------------------------------------------------------------------""");
 	}
 
 	// --- helpers ----------------------------------------------------------------------------------
@@ -355,6 +424,7 @@ public final class WalkieClient {
 
 	private void shutdown() {
 		running.set(false);
+		logout();
 		if (webSocket != null) {
 			webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "bye");
 		}
@@ -376,9 +446,6 @@ public final class WalkieClient {
 
 		record Binary(byte[] data) implements Outbound {
 		}
-	}
-
-	private record LoginResult(String userId, String token) {
 	}
 
 	private final class ClientListener implements WebSocket.Listener {

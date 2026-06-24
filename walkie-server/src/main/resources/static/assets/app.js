@@ -25,6 +25,7 @@ const state = {
     mode: 'MULTI_CHANNEL_PTT',
     hifi: false,
     selfId: null,
+    ownerId: null,
     audioContext: null,
     captureNode: null,
     playbackNode: null,
@@ -110,9 +111,22 @@ async function connect() {
 }
 
 function disconnect() {
+    logout();
     if (state.ws) {
         sendCtrl({type: 'leave'});
         state.ws.close();
+    }
+}
+
+// Graceful logout: revoke the token server-side. (An unexpected disconnect is still covered by the
+// server evicting the token when the WebSocket closes.) `keepalive` lets it finish during page unload.
+function logout() {
+    if (state.token) {
+        fetch('/api/auth/logout', {
+            method: 'POST',
+            headers: {Authorization: 'Bearer ' + state.token},
+            keepalive: true,
+        }).catch(() => { /* best-effort */ });
     }
 }
 
@@ -155,6 +169,12 @@ function onWsMessage(ev) {
         case 'floorIdle':
             log('Floor is free');
             break;
+        case 'modeChanged':
+            onModeChanged(msg.mode);
+            break;
+        case 'ownerChanged':
+            onOwnerChanged(msg.ownerId);
+            break;
         case 'signalOffer':
             onOffer(msg.from, msg.sdp);
             break;
@@ -174,11 +194,15 @@ function onWsMessage(ev) {
 
 function onJoined(msg) {
     state.selfId = msg.selfId;
+    state.ownerId = msg.ownerId;
     state.mode = msg.mode;
     state.members.clear();
     msg.members.forEach(addMember);
     renderMembers();
     log(`Joined "${msg.channel}" (${msg.mode}) with ${msg.members.length} member(s)`);
+    log(state.selfId === state.ownerId
+        ? 'You own this channel — use the Mode selector to change it for everyone.'
+        : 'Owner: ' + (state.members.get(state.ownerId) || state.ownerId));
 
     if (state.transport === 'webrtc') {
         msg.members
@@ -194,6 +218,39 @@ function onJoined(msg) {
     }
     enableTalkButton(true);
     updateTalkButton();
+    updateModeControl();
+}
+
+function onModeChanged(mode) {
+    state.mode = mode;
+    state.transmitting = false;
+    enableLocalTracks(false);
+    if (mode === 'FULL_DUPLEX') {
+        beginTransmit(); // full-duplex: the mic goes live immediately
+    }
+    updateTalkButton();
+    updateModeControl();
+    log('Mode changed to ' + mode);
+}
+
+function onOwnerChanged(ownerId) {
+    state.ownerId = ownerId;
+    updateModeControl();
+    log(state.selfId === ownerId
+        ? 'You are now the channel owner — you can change the mode.'
+        : 'Channel owner is now ' + (state.members.get(ownerId) || ownerId));
+}
+
+// Reflects the live mode in the selector and lets only the owner change it while connected; when
+// disconnected the selector is just the initial-mode chooser for the next Connect.
+function updateModeControl() {
+    const select = $('mode');
+    if (isOpen()) {
+        select.value = state.mode;
+        select.disabled = state.selfId !== state.ownerId;
+    } else {
+        select.disabled = false;
+    }
 }
 
 // --- talk control ---------------------------------------------------------------------------------
@@ -549,12 +606,15 @@ function cleanup() {
     state.captureNode = null;
     state.playbackNode = null;
     state.ws = null;
+    state.token = null;
+    state.ownerId = null;
     enableTalkButton(false);
     $('talkBtn').textContent = 'Connect first';
     $('talkBtn').classList.remove('live');
     $('connectBtn').disabled = false;
     $('disconnectBtn').disabled = true;
     setStatus(false, 'Disconnected');
+    updateModeControl();
 }
 
 function closeCodec(codec) {
@@ -573,6 +633,20 @@ window.addEventListener('DOMContentLoaded', () => {
     $('connectBtn').addEventListener('click', connect);
     $('disconnectBtn').addEventListener('click', disconnect);
 
+    // While connected, only the owner can change the mode (the selector is disabled for others); this
+    // sends ChangeMode and the server's ModeChanged broadcast updates everyone. Pre-connect it just
+    // picks the initial mode for the next Connect.
+    $('mode').addEventListener('change', () => {
+        if (!isOpen()) {
+            return; // pre-connect: just choosing the initial mode for the next Connect
+        }
+        if (state.selfId === state.ownerId) {
+            sendCtrl({type: 'changeMode', mode: $('mode').value});
+        } else {
+            $('mode').value = state.mode; // non-owner can't change it live — snap back
+        }
+    });
+
     const talk = $('talkBtn');
     talk.addEventListener('mousedown', pressTalk);
     talk.addEventListener('mouseup', releaseTalk);
@@ -590,13 +664,13 @@ window.addEventListener('DOMContentLoaded', () => {
 
     // Hold Space as a push-to-talk key.
     window.addEventListener('keydown', (e) => {
-        if (e.code === 'Space' && !e.repeat && !talk.disabled && document.activeElement.tagName !== 'INPUT') {
+        if (e.code === 'Space' && !e.repeat && !talk.disabled && state.mode !== 'FULL_DUPLEX' && document.activeElement.tagName !== 'INPUT') {
             e.preventDefault();
             pressTalk();
         }
     });
     window.addEventListener('keyup', (e) => {
-        if (e.code === 'Space' && !talk.disabled && document.activeElement.tagName !== 'INPUT') {
+        if (e.code === 'Space' && !talk.disabled && state.mode !== 'FULL_DUPLEX' && document.activeElement.tagName !== 'INPUT') {
             e.preventDefault();
             releaseTalk();
         }

@@ -2,7 +2,6 @@ package io.github.ashr123.walkietalkie.server.transport;
 
 import io.github.ashr123.option.Some;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
-import io.github.ashr123.walkietalkie.server.channel.ChannelModeConflictException;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.floor.FloorControlService;
@@ -65,12 +64,13 @@ public class ConnectionService {
 			case ClientMessage.Leave _ -> handleLeave(session);
 			case ClientMessage.RequestFloor _ -> handleRequestFloor(session);
 			case ClientMessage.ReleaseFloor _ -> handleReleaseFloor(session);
-			case ClientMessage.Offer offer ->
-					relaySignal(session, offer.target(), new ServerMessage.SignalOffer(session.id(), offer.sdp()));
-			case ClientMessage.Answer answer ->
-					relaySignal(session, answer.target(), new ServerMessage.SignalAnswer(session.id(), answer.sdp()));
-			case ClientMessage.IceCandidate ice -> relaySignal(session, ice.target(),
-					new ServerMessage.SignalIce(session.id(), ice.candidate(), ice.sdpMid(), ice.sdpMLineIndex()));
+			case ClientMessage.ChangeMode(ChannelMode mode) -> handleChangeMode(session, mode);
+			case ClientMessage.Offer(String target, String sdp) ->
+					relaySignal(session, target, new ServerMessage.SignalOffer(session.id(), sdp));
+			case ClientMessage.Answer(String target, String sdp) ->
+					relaySignal(session, target, new ServerMessage.SignalAnswer(session.id(), sdp));
+			case ClientMessage.IceCandidate(String target, String candidate, String sdpMid, Integer sdpMLineIndex) ->
+					relaySignal(session, target, new ServerMessage.SignalIce(session.id(), candidate, sdpMid, sdpMLineIndex));
 		}
 	}
 
@@ -90,16 +90,11 @@ public class ConnectionService {
 			session.setDisplayName(sanitizeDisplayName(join.displayName()));
 		}
 
-		Channel channel;
-		try {
-			channel = channelRegistry.joinOrCreate(requested, mode, session);
-		} catch (ChannelModeConflictException e) {
-			session.send(new ServerMessage.ErrorMessage("channel_mode_conflict", e.getMessage()));
-			return;
-		}
+		Channel channel = channelRegistry.joinOrCreate(requested, mode, session);
 
 		session.joinedChannel(channel.name(), channel.mode());
-		session.send(new ServerMessage.Joined(session.id(), channel.name(), channel.mode(), channel.memberInfos()));
+		session.send(new ServerMessage.Joined(
+				session.id(), channel.name(), channel.mode(), channel.ownerId(), channel.memberInfos()));
 
 		ServerMessage.MemberJoined notice = new ServerMessage.MemberJoined(session.toMemberInfo());
 		channel.forEachOther(session.id(), other -> safeSend(other, notice));
@@ -126,7 +121,12 @@ public class ConnectionService {
 				channel.forEachOther(session.id(), other -> safeSend(other, idle));
 			}
 		}
-		channelRegistry.leave(channelName, session.id());
+		// Removal and ownership re-election are atomic in the registry; announce a new owner (if one was
+		// elected) to the members that remain after the leaver is gone.
+		if (channelRegistry.leave(channelName, session.id()) instanceof Some(String newOwner)
+				&& channelRegistry.find(channelName) instanceof Some(Channel channel)) {
+			channel.forEachOther(session.id(), other -> safeSend(other, new ServerMessage.OwnerChanged(newOwner)));
+		}
 		session.leftChannel();
 	}
 
@@ -139,15 +139,14 @@ public class ConnectionService {
 			session.send(new ServerMessage.FloorGranted());
 			return;
 		}
-		FloorResult result = floorControl.requestFloor(channel, session);
-		switch (result) {
+		switch (floorControl.requestFloor(channel, session)) {
 			case FloorResult.Granted _ -> {
 				session.send(new ServerMessage.FloorGranted());
 				ServerMessage.FloorTaken taken = new ServerMessage.FloorTaken(session.id());
 				channel.forEachOther(session.id(), other -> safeSend(other, taken));
 			}
-			case FloorResult.Denied denied ->
-					session.send(new ServerMessage.FloorDenied(denied.currentHolderId(), "floor_busy"));
+			case FloorResult.Denied(String currentHolderId) ->
+					session.send(new ServerMessage.FloorDenied(currentHolderId, "floor_busy"));
 		}
 	}
 
@@ -160,6 +159,39 @@ public class ConnectionService {
 			ServerMessage.FloorIdle idle = new ServerMessage.FloorIdle();
 			channel.forEachOther(session.id(), other -> safeSend(other, idle));
 		}
+	}
+
+	/// Changes the current channel's mode, but only for its owner. Clears the floor and broadcasts the
+	/// new mode to every member so their controls update; a non-owner gets a `not_owner` error.
+	private void handleChangeMode(ClientSession session, ChannelMode mode) {
+		Channel channel = requireChannel(session);
+		if (channel == null) {
+			return;
+		}
+		if (!session.id().equals(channel.ownerId())) {
+			session.send(new ServerMessage.ErrorMessage("not_owner", "Only the channel owner can change the mode"));
+			return;
+		}
+		if (mode == ChannelMode.GLOBAL_PTT && !channel.name().equals(GLOBAL_CHANNEL)) {
+			session.send(new ServerMessage.ErrorMessage("invalid_mode", "Global PTT applies only to the 'global' channel"));
+			return;
+		}
+		if (channel.mode() == mode) {
+			return;
+		}
+		channel.setMode(mode);
+		channel.clearFloor();
+		// Broadcast to everyone (incl. the owner): the new mode and a floor reset, so any 'talking'
+		// indicator is superseded and a fresh push-to-talk floor is available.
+		ServerMessage.ModeChanged modeChanged = new ServerMessage.ModeChanged(mode);
+		ServerMessage.FloorIdle floorIdle = new ServerMessage.FloorIdle();
+		session.send(modeChanged);
+		session.send(floorIdle);
+		channel.forEachOther(session.id(), other -> {
+			safeSend(other, modeChanged);
+			safeSend(other, floorIdle);
+		});
+		log.info("user={} changed channel={} mode to {}", session.userId(), channel.name(), mode);
 	}
 
 	/// Relays a raw audio frame to the other relay-capable members of the sender's channel. The frame

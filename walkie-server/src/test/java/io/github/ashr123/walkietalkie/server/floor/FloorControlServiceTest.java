@@ -20,7 +20,7 @@ class FloorControlServiceTest {
 
 	@Test
 	void grantsFloorToFirstRequesterAndDeniesSecond() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice");
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 		channel.add(alice);
@@ -37,7 +37,7 @@ class FloorControlServiceTest {
 
 	@Test
 	void releaseLetsTheNextSpeakerIn() {
-		Channel channel = new Channel("c", ChannelMode.GLOBAL_PTT);
+		Channel channel = new Channel("c", ChannelMode.GLOBAL_PTT, "alice");
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 
@@ -49,7 +49,7 @@ class FloorControlServiceTest {
 
 	@Test
 	void releaseByNonHolderIsRejected() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice");
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 
@@ -60,7 +60,7 @@ class FloorControlServiceTest {
 
 	@Test
 	void fullDuplexGrantsEveryoneAndTracksNoHolder() {
-		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX);
+		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "alice");
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 

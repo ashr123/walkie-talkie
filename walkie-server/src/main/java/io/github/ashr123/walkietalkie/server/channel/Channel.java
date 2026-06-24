@@ -11,20 +11,25 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
-/// A single conversation room. Membership and the talk floor are tracked with concurrent primitives
-/// so that connections handled on different (virtual) threads can join, leave and transmit safely.
+/// A single conversation room. Membership, the talk floor, the mode and the owner are tracked with
+/// concurrent primitives so that connections handled on different (virtual) threads can join, leave,
+/// transmit and re-configure safely. The `mode` and `ownerId` are mutable: the owner may change the
+/// mode, and ownership transfers to another member when the owner leaves.
 public final class Channel {
 
 	private final String name;
-	private final ChannelMode mode;
 	private final Map<String, ClientSession> members = new ConcurrentHashMap<>();
 
 	/// The session id currently holding the floor, or `null` when the floor is free.
 	private final AtomicReference<String> floorHolder = new AtomicReference<>();
 
-	public Channel(String name, ChannelMode mode) {
+	private volatile ChannelMode mode;
+	private volatile String ownerId;
+
+	public Channel(String name, ChannelMode mode, String ownerId) {
 		this.name = name;
 		this.mode = mode;
+		this.ownerId = ownerId;
 	}
 
 	public String name() {
@@ -33,6 +38,18 @@ public final class Channel {
 
 	public ChannelMode mode() {
 		return mode;
+	}
+
+	public void setMode(ChannelMode mode) {
+		this.mode = mode;
+	}
+
+	public String ownerId() {
+		return ownerId;
+	}
+
+	public void setOwner(String ownerId) {
+		this.ownerId = ownerId;
 	}
 
 	public void add(ClientSession session) {
@@ -56,6 +73,12 @@ public final class Channel {
 		return Option.of(members.get(sessionId));
 	}
 
+	/// Any current member, used to elect a new owner after the previous one leaves;
+	/// [io.github.ashr123.option.None] when the channel has no members.
+	public Option<String> anyMember() {
+		return Option.of(members.keySet().stream().findAny());
+	}
+
 	public List<MemberInfo> memberInfos() {
 		return members.values().stream().map(ClientSession::toMemberInfo).toList();
 	}
@@ -77,6 +100,11 @@ public final class Channel {
 	/// Releases the floor if held by `sessionId`; returns whether a release actually happened.
 	public boolean releaseFloor(String sessionId) {
 		return mode != ChannelMode.FULL_DUPLEX && floorHolder.compareAndSet(sessionId, null);
+	}
+
+	/// Unconditionally frees the floor (used when the mode changes).
+	public void clearFloor() {
+		floorHolder.set(null);
 	}
 
 	/// Whether `sessionId` may currently transmit (always true in full-duplex mode).

@@ -34,6 +34,11 @@ public sealed interface ClientMessage {
 	record ReleaseFloor() implements ClientMessage {
 	}
 
+	/// Ask the server to change the current channel's mode. Honored only for the channel owner.
+	@JsonTypeName("changeMode")
+	record ChangeMode(ChannelMode mode) implements ClientMessage {
+	}
+
 	/// WebRTC: an SDP offer aimed at another member, relayed by the server.
 	@JsonTypeName("offer")
 	record Offer(String target, String sdp) implements ClientMessage {
