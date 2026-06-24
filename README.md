@@ -124,4 +124,3 @@ default build stays preview-free.
   independently-decoded Opus stream. The relay never mixes audio server-side.
 - Channels and tokens are **in-memory** (single instance). Horizontal scaling would need a shared
   bus/registry.
-```
