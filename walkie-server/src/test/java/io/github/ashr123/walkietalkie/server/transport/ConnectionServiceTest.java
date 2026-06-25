@@ -255,6 +255,30 @@ class ConnectionServiceTest {
 		assertTrue(s.sent.isEmpty(), "leaving with no channel sends nothing — no error, no broadcast");
 	}
 
+	@Test
+	void audioForAChannelThatNoLongerExistsIsDroppedWithoutException() {
+		FakeClientSession s = session("orphan");
+		s.joinedChannel("ghost");   // a channel that was already dropped from the registry (a leave-during-send race)
+		assertDoesNotThrow(() -> service.onAudio(s, new byte[]{1, 2, 3}));
+	}
+
+	@Test
+	void leavingAChannelThatNoLongerExistsIsASilentNoOp() {
+		FakeClientSession s = session("orphan");
+		s.joinedChannel("ghost");
+		assertDoesNotThrow(() -> service.onMessage(s, new ClientMessage.Leave()));
+		assertNull(channel("ghost"), "no channel is resurrected");
+		assertTrue(s.sent.isEmpty(), "a vanished-channel leave broadcasts nothing");
+	}
+
+	@Test
+	void aFloorRequestForAChannelThatNoLongerExistsIsIgnored() {
+		FakeClientSession s = session("orphan");
+		s.joinedChannel("ghost");
+		service.onMessage(s, new ClientMessage.RequestFloor());
+		assertTrue(s.sent.isEmpty(), "a vanished channel yields no grant and no error");
+	}
+
 	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a
 	/// single failing recipient and still delivers to the others.
 	private static final class ThrowingSession implements ClientSession {

@@ -9,6 +9,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 class FloorControlServiceTest {
 
@@ -69,5 +70,19 @@ class FloorControlServiceTest {
 		assertTrue(channel.holdsFloor("alice"));
 		assertTrue(channel.holdsFloor("bob"));
 		assertInstanceOf(None.class, channel.floorHolder());
+	}
+
+	@Test
+	void deniesWithoutAHolderWhenAcquireFailsButTheFloorReadsAsFree() {
+		// The release-between-acquire-and-read race: tryAcquireFloor fails, yet the floor already reads empty,
+		// so the denial can't name a holder. Forced here with a mocked channel since it can't occur single-threaded.
+		Channel channel = mock(Channel.class);
+		when(channel.mode()).thenReturn(ChannelMode.MULTI_CHANNEL_PTT);
+		when(channel.tryAcquireFloor(any())).thenReturn(false);
+		when(channel.floorHolder()).thenReturn(None.instance());
+
+		FloorResult.Denied denied = assertInstanceOf(FloorResult.Denied.class,
+				service.requestFloor(channel, session("alice")));
+		assertNull(denied.currentHolderId(), "the denial carries no holder when the floor read back empty");
 	}
 }
