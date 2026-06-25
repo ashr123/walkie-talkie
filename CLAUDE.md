@@ -120,9 +120,17 @@ against `[A-Za-z0-9_.-]{1,32}` (else `invalid_display_name`); clients append a s
 members share one. The token's short TTL is the only bound on replay (no revocation list — the accepted
 trade-off of going store-free); serve over WSS and keep `walkie.allowed-origins` tight in production.
 
-**Concurrency.** Virtual threads are enabled (`spring.threads.virtual.enabled`). Outbound WS sends are
-wrapped in `ConcurrentWebSocketSessionDecorator` so fan-out from multiple threads is safe. In the Java
-client the Opus encoder/decoder are confined to the capture/playback threads respectively.
+**Concurrency.** Virtual threads are enabled (`spring.threads.virtual.enabled`). Each
+`WebSocketClientSession` owns an **asynchronous outbound mailbox** drained by exactly one dedicated virtual
+thread: `send`/`sendAudio` encode on the caller thread, then hand the frame off without blocking — so a slow
+recipient backs up only its own queue (never the fan-out caller `Channel.forEachOther` or other recipients),
+and the single consumer keeps each recipient's frames in submission order (required by the stateful Opus
+decode). Audio and control are split: audio is bounded and **dropped** on overflow (lossy, real-time), while
+control (floor/mode/owner/membership) is delivered reliably and drained ahead of audio — a client too far
+behind even for control is disconnected to force a clean reconnect/re-sync. The wrapping
+`ConcurrentWebSocketSessionDecorator` is kept only as the socket-layer backstop (its send-time / buffer
+limit aborts a wedged in-flight write). In the Java client the Opus encoder/decoder are confined to the
+capture/playback threads respectively.
 
 ## Testing notes
 

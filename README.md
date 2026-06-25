@@ -198,6 +198,11 @@ default build stays preview-free.
   talker holds the floor; switching speakers may briefly glitch the decoder as the stream changes. For
   *simultaneous* multi-talker audio, use the **WebRTC** transport, where each peer is its own
   independently-decoded Opus stream. The relay never mixes audio server-side.
+- **Backpressure is handled per recipient.** Each connection has its own outbound queue drained by a
+  dedicated virtual thread, so one slow or backpressured client never blocks delivery to the others. A slow
+  recipient's **audio** is dropped frame-by-frame (real-time, lossy); its **control** messages
+  (floor/mode/owner/membership) are never dropped — a client so far behind it can't even receive those is
+  disconnected and re-syncs via the `Joined` snapshot on reconnect.
 - Channels and tokens are **in-memory** (single instance). Horizontal scaling would need a shared
   bus/registry.
 - **End-to-end encryption uses one shared passphrase per channel** (a pre-shared key, no key exchange):
