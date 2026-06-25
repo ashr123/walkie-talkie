@@ -50,19 +50,31 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 	@Option(names = "--hifi", description = "Use the Opus music profile instead of the voice profile.")
 	private boolean highFidelity;
 
+	@Option(names = "--input",
+			description = "Capture from the input device whose name contains this text (default: the system default). See --list-inputs.")
+	private String input;
+
+	@Option(names = "--list-inputs", description = "List available audio input devices and exit.")
+	private boolean listInputs;
+
 	static void main(String... args) {
 		System.exit(new CommandLine(new WalkieClientLauncher()).execute(args));
 	}
 
 	@Override
 	public Integer call() throws Exception {
+		if (listInputs) {
+			WalkieClient.listInputDevices();
+			return 0;
+		}
 		new WalkieClient(new ClientOptions(
 				server,
 				user,
 				channel,
 				mode,
 				display == null || display.isBlank() ? user : display,
-				highFidelity
+				highFidelity,
+				input
 		))
 				.run();
 		return 0;

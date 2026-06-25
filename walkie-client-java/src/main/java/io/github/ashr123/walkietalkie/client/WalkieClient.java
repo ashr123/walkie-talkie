@@ -22,11 +22,14 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -50,6 +53,8 @@ public final class WalkieClient {
 	private static final int STEREO_BITRATE = 128_000;
 	private static final byte CODEC_OPUS = 1;
 	private static final byte CODEC_PCM = 2;
+	private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(
+			"yyyy-MM-dd HH:mm:ss,SSS", Locale.getDefault(Locale.Category.FORMAT));
 
 	private final ClientOptions options;
 	private final JsonMapper jsonMapper = JsonMapper.builder().build();
@@ -59,6 +64,7 @@ public final class WalkieClient {
 	private final AtomicBoolean transmitting = new AtomicBoolean(false);
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
 	private final BlockingQueue<byte[]> playbackQueue = new LinkedBlockingQueue<>();
+	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
 
 	private int channels;          // 1 or 2, negotiated against the audio device
 	private int frameSamples;      // SAMPLES_PER_CHANNEL * channels (interleaved)
@@ -67,6 +73,7 @@ public final class WalkieClient {
 	private OpusEncoder encoder;   // confined to the capture thread
 	private OpusDecoder decoder;   // confined to the playback thread
 	private TargetDataLine mic;
+	private Mixer.Info inputMixerInfo;  // resolved capture device (null = system default)
 	private SourceDataLine speaker;
 	private WebSocket webSocket;
 	private volatile String token;
@@ -139,16 +146,42 @@ public final class WalkieClient {
 
 	// --- Audio format + codec ---------------------------------------------------------------------
 
-	/// Picks stereo when both the capture and playback devices support a 48 kHz stereo line, else mono.
+	/// Resolves the input device (`--input`, or the system default) and picks stereo only when THAT mic
+	/// and the playback device both support a 48 kHz stereo line — otherwise mono. Negotiating against the
+	/// chosen device (not "any device on the system") avoids selecting stereo for a mono mic.
 	private void negotiateAudioFormat() {
+		inputMixerInfo = resolveInputMixer();
 		AudioFormat stereo = new AudioFormat(SAMPLE_RATE, 16, 2, true, false);
 		boolean stereoSupported =
-				AudioSystem.isLineSupported(new DataLine.Info(TargetDataLine.class, stereo))
+				lineSupported(inputMixerInfo, new DataLine.Info(TargetDataLine.class, stereo))
 						&& AudioSystem.isLineSupported(new DataLine.Info(SourceDataLine.class, stereo));
 		channels = stereoSupported ? 2 : 1;
 		format = new AudioFormat(SAMPLE_RATE, 16, channels, true, false);
 		frameSamples = SAMPLES_PER_CHANNEL * channels;
 		pcmFrameBytes = frameSamples * 2;
+	}
+
+	/// Finds the input mixer whose name contains [ClientOptions#inputDevice] and has a capture line, or
+	/// `null` (system default) when unset or unmatched.
+	private Mixer.Info resolveInputMixer() {
+		String wanted = options.inputDevice();
+		if (wanted == null || wanted.isBlank()) {
+			return null;
+		}
+		for (Mixer.Info info : AudioSystem.getMixerInfo()) {
+			if (info.getName().toLowerCase(Locale.ROOT).contains(wanted.toLowerCase(Locale.ROOT))
+					&& AudioSystem.getMixer(info).getTargetLineInfo().length > 0) {
+				return info;
+			}
+		}
+		System.out.println("No input device matching '" + wanted + "'; using the system default.");
+		return null;
+	}
+
+	private static boolean lineSupported(Mixer.Info mixerInfo, DataLine.Info lineInfo) {
+		return mixerInfo == null
+				? AudioSystem.isLineSupported(lineInfo)
+				: AudioSystem.getMixer(mixerInfo).isLineSupported(lineInfo);
 	}
 
 	private void setupCodec() throws OpusException {
@@ -203,12 +236,32 @@ public final class WalkieClient {
 			throw new LineUnavailableException(
 					"48 kHz " + channels + "-channel PCM is not supported by the default audio device");
 		}
-		mic = (TargetDataLine) AudioSystem.getLine(micInfo);
+		mic = openMic(micInfo);
 		mic.open(format);
 		mic.start();
 		speaker = (SourceDataLine) AudioSystem.getLine(speakerInfo);
 		speaker.open(format);
 		speaker.start();
+	}
+
+	/// Opens the capture line of the input device resolved during negotiation, or the system default when
+	/// none was matched. The line uses the negotiated [#format], which already matches the device.
+	private TargetDataLine openMic(DataLine.Info micInfo) throws LineUnavailableException {
+		if (inputMixerInfo == null) {
+			return (TargetDataLine) AudioSystem.getLine(micInfo);
+		}
+		System.out.println("Capturing from input device: " + inputMixerInfo.getName());
+		return (TargetDataLine) AudioSystem.getMixer(inputMixerInfo).getLine(micInfo);
+	}
+
+	/// Lists the audio mixers that expose a capture line, for use with `--input`.
+	static void listInputDevices() {
+		System.out.println("Available input devices (match with --input \"<name>\"):");
+		for (Mixer.Info info : AudioSystem.getMixerInfo()) {
+			if (AudioSystem.getMixer(info).getTargetLineInfo().length > 0) {
+				System.out.println("  - " + info.getName());
+			}
+		}
 	}
 
 	private void captureLoop() {
@@ -309,41 +362,60 @@ public final class WalkieClient {
 				this.selfId = selfId;
 				this.ownerId = ownerId;
 				this.currentMode = mode;
-				System.out.println("[joined] channel=" + channel + " mode=" + mode + " members=" + members.size()
+				memberNames.clear();
+				members.forEach(member -> memberNames.put(member.id(), member.displayName()));
+				log("[joined] channel=" + channel + " mode=" + mode + " members=" + members.size()
 						+ (selfId.equals(ownerId) ? " (you own this channel)" : "") + System.lineSeparator()
 						+ modeHint(mode));
 			}
-			case ServerMessage.MemberJoined(MemberInfo member) -> System.out.println("[+] " + describe(member));
-			case ServerMessage.MemberLeft(String memberId) -> System.out.println("[-] member " + memberId);
+			case ServerMessage.MemberJoined(MemberInfo member) -> announceJoin(member);
+			case ServerMessage.MemberLeft(String memberId) -> announceLeave(memberId);
 			case ServerMessage.FloorGranted _ -> {
 				transmitting.set(true);
-				System.out.println("[floor granted] talking — type 't' to stop");
+				log("[floor granted] talking — type 't' to stop");
 			}
 			case ServerMessage.FloorDenied(String currentHolderId, _) ->
-					System.out.println("[floor busy] currently held by " + currentHolderId);
-			case ServerMessage.FloorTaken(String holderId) -> System.out.println("[talking] " + holderId);
-			case ServerMessage.FloorIdle _ -> System.out.println("[floor free]");
+					log("[floor busy] currently held by " + name(currentHolderId));
+			case ServerMessage.FloorTaken(String holderId) -> log("[talking] " + name(holderId));
+			case ServerMessage.FloorIdle _ -> log("[floor free]");
 			case ServerMessage.ModeChanged(ChannelMode mode) -> {
 				currentMode = mode;
 				transmitting.set(false);
-				System.out.println("[mode changed] now " + mode + System.lineSeparator()
+				log("[mode changed] now " + mode + System.lineSeparator()
 						+ modeHint(mode));
 			}
 			case ServerMessage.OwnerChanged(String ownerId) -> {
 				this.ownerId = ownerId;
-				System.out.println(selfId.equals(ownerId)
+				log(selfId.equals(ownerId)
 						? "[owner] you are now the owner — 'm <ptt|global|duplex>' to change the mode"
-						: "[owner] channel owner is now " + ownerId);
+						: "[owner] channel owner is now " + name(ownerId));
 			}
 			case ServerMessage.SignalOffer _, ServerMessage.SignalAnswer _,
 			     ServerMessage.SignalIce _ -> { /* WebRTC: not used by the relay client */ }
 			case ServerMessage.ErrorMessage(String code, String message) ->
-					System.out.println("[error] " + code + ": " + message);
+					log("[error] " + code + ": " + message);
 		}
 	}
 
-	private String describe(MemberInfo member) {
-		return member.displayName() + " (" + member.id() + ")";
+	/// Resolves a member's display name from its session id, falling back to the raw id if unknown.
+	private String name(String id) {
+		String display = memberNames.get(id);
+		return display == null ? id : display;
+	}
+
+	private void announceJoin(MemberInfo member) {
+		memberNames.put(member.id(), member.displayName());
+		log("[+] " + member.displayName());
+	}
+
+	private void announceLeave(String memberId) {
+		log("[-] " + name(memberId));
+		memberNames.remove(memberId);
+	}
+
+	/// Prints a status line prefixed with the local timestamp (`yyyy-MM-dd HH:mm:ss,SSS`).
+	private static void log(String message) {
+		System.out.println(LocalDateTime.now().format(DATE_TIME_FORMATTER) + " " + message);
 	}
 
 	private static String modeHint(ChannelMode mode) {
@@ -380,13 +452,13 @@ public final class WalkieClient {
 			if (currentMode != ChannelMode.FULL_DUPLEX) {
 				enqueue(new ClientMessage.ReleaseFloor());
 			}
-			System.out.println("[stopped]");
+			log("[stopped]");
 		} else if (currentMode == ChannelMode.FULL_DUPLEX) {
 			transmitting.set(true);
-			System.out.println("[talking]");
+			log("[talking]");
 		} else {
 			enqueue(new ClientMessage.RequestFloor());
-			System.out.println("[requesting floor...]");
+			log("[requesting floor...]");
 		}
 	}
 
@@ -394,7 +466,7 @@ public final class WalkieClient {
 	/// too); the resulting [ServerMessage.ModeChanged] is what actually updates everyone's controls.
 	private void changeMode(String arg) {
 		if (!selfId.equals(ownerId)) {
-			System.out.println("[denied] only the channel owner can change the mode");
+			log("[denied] only the channel owner can change the mode");
 			return;
 		}
 		switch (arg.toLowerCase(Locale.ROOT)) {
@@ -440,6 +512,18 @@ public final class WalkieClient {
 		System.out.println("Goodbye.");
 	}
 
+	/// Reacts to the WebSocket dropping. A user-initiated quit has already flipped `running` to false and
+	/// is tearing down on the main thread, so this is a no-op for that path. Any other close means the
+	/// server went away while we were still live — and because the console loop is parked in a
+	/// non-interruptible `System.in` read, it can never observe the flag, so we stop the process here
+	/// instead of hanging until the next keypress. `getAndSet` makes this fire exactly once.
+	private void onConnectionLost() {
+		if (running.getAndSet(false)) {
+			log("Server connection lost — exiting.");
+			System.exit(0);
+		}
+	}
+
 	private sealed interface Outbound {
 		record Text(String json) implements Outbound {
 		}
@@ -455,7 +539,7 @@ public final class WalkieClient {
 
 		@Override
 		public void onOpen(WebSocket webSocket) {
-			System.out.println("[connected]");
+			log("[connected]");
 			sendJoin();
 			webSocket.request(1);
 		}
@@ -469,7 +553,7 @@ public final class WalkieClient {
 				try {
 					handleServerMessage(json);
 				} catch (RuntimeException e) {
-					System.out.println("[warn] could not handle message: " + e.getMessage());
+					log("[warn] could not handle message: " + e.getMessage());
 				}
 			}
 			webSocket.request(1);
@@ -491,15 +575,15 @@ public final class WalkieClient {
 
 		@Override
 		public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
-			System.out.println("[closed " + statusCode + (reason.isBlank() ? "" : " " + reason) + "]");
-			running.set(false);
+			log("[closed " + statusCode + (reason.isBlank() ? "" : " " + reason) + "]");
+			onConnectionLost();
 			return null;
 		}
 
 		@Override
 		public void onError(WebSocket webSocket, Throwable error) {
-			System.out.println("[error] " + error.getMessage());
-			running.set(false);
+			log("[error] " + error.getMessage());
+			onConnectionLost();
 		}
 	}
 }

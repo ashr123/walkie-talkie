@@ -10,11 +10,13 @@ import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 /// @param mode         conversation mode
 /// @param display      display name shown to other members
 /// @param highFidelity encode with the Opus music profile (vs. the voice profile) for richer audio
+/// @param inputDevice  capture from the mixer whose name contains this text; null uses the system default
 public record ClientOptions(String server,
                             String user,
                             String channel,
                             ChannelMode mode,
                             String display,
-                            boolean highFidelity
+                            boolean highFidelity,
+                            String inputDevice
 ) {
 }
