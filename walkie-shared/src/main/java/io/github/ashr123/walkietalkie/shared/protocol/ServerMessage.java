@@ -33,7 +33,7 @@ public sealed interface ServerMessage {
 
 	/// Your floor request was refused because someone else is holding it.
 	@JsonTypeName("floorDenied")
-	record FloorDenied(String currentHolderId, String reason) implements ServerMessage {
+	record FloorDenied(String currentHolderId) implements ServerMessage {
 	}
 
 	/// Another member took the floor and is now talking.

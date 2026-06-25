@@ -149,7 +149,7 @@ public class ConnectionService {
 				channel.forEachOther(session.id(), other -> safeSend(other, taken));
 			}
 			case FloorResult.Denied(String currentHolderId) ->
-					session.send(new ServerMessage.FloorDenied(currentHolderId, "floor_busy"));
+					session.send(new ServerMessage.FloorDenied(currentHolderId));
 		}
 	}
 

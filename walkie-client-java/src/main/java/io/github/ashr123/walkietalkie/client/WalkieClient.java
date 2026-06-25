@@ -186,7 +186,7 @@ public final class WalkieClient implements AutoCloseable {
 				audio.setTransmitting(true);
 				log("[floor granted] talking — type 't' to stop");
 			}
-			case ServerMessage.FloorDenied(String currentHolderId, _) ->
+			case ServerMessage.FloorDenied(String currentHolderId) ->
 					log("[floor busy] currently held by " + name(currentHolderId));
 			case ServerMessage.FloorTaken(String holderId) -> log("[talking] " + name(holderId));
 			case ServerMessage.FloorIdle _ -> log("[floor free]");
