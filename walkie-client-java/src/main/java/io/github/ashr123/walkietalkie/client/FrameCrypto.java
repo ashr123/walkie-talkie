@@ -111,8 +111,8 @@ final class FrameCrypto {
 		if (frame[0] != SCHEME) {
 			throw new GeneralSecurityException("not an end-to-end-encrypted frame (unencrypted peer or wrong scheme)");
 		}
-		Cipher cipher = cipher(Cipher.DECRYPT_MODE, Arrays.copyOfRange(frame, 1, 1 + IV_BYTES));
-		return cipher.doFinal(frame, 1 + IV_BYTES, frame.length - 1 - IV_BYTES);
+		return cipher(Cipher.DECRYPT_MODE, Arrays.copyOfRange(frame, 1, 1 + IV_BYTES))
+				.doFinal(frame, 1 + IV_BYTES, frame.length - 1 - IV_BYTES);
 	}
 
 	/// Deterministic encryption with a caller-supplied IV, returning just the raw GCM output (ciphertext+tag,
