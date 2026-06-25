@@ -25,7 +25,7 @@ JAVA_OPTS= ./gradlew :walkie-server:bootRun       # run the server on http://loc
 java -jar walkie-server/build/libs/walkie-server-0.1.0.jar   # or run the built boot jar
 
 # Java desktop client (relay transport). --mode: ptt|global|duplex ; --hifi flag for the music profile; --help for all options
-JAVA_OPTS= ./gradlew :walkie-client-java:run --args="--server http://localhost:8080 --user alice --channel team1 --mode ptt"
+JAVA_OPTS= ./gradlew :walkie-client-java:run --args="--server http://localhost:8080 --display alice --channel team1 --mode ptt"
 
 # Tests
 JAVA_OPTS= ./gradlew :walkie-server:test                                            # one module

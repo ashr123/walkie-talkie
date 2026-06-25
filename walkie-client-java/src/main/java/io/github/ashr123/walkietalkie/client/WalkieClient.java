@@ -1,8 +1,10 @@
 package io.github.ashr123.walkietalkie.client;
 
 import io.github.ashr123.walkietalkie.shared.protocol.*;
+import io.github.jaredmdobson.concentus.OpusException;
 import tools.jackson.databind.json.JsonMapper;
 
+import javax.sound.sampled.LineUnavailableException;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -36,35 +38,51 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// encrypts captured frames before sending them and decrypts received frames before handing them back to
 /// the engine for playback. All loops run on Java 25 virtual threads.
 ///
-/// It is [AutoCloseable]: [#run] does the work and blocks on the console; the caller closes the client
+/// It is [AutoCloseable]: [#WalkieClient] does the work and blocks on the console; the caller closes the client
 /// (ideally via try-with-resources) to tear the session down.
 public final class WalkieClient implements AutoCloseable {
 
 	private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(
 			"yyyy-MM-dd HH:mm:ss,SSS", Locale.getDefault(Locale.Category.FORMAT));
+	// Stateless, thread-safe infrastructure with no per-connection input — shared by every client instance.
+	private static final JsonMapper jsonMapper = JsonMapper.builder().build();
+	private static final HttpClient httpClient = HttpClient.newHttpClient();
 
 	private final ClientOptions options;
-	private final JsonMapper jsonMapper = JsonMapper.builder().build();
-	private final HttpClient httpClient = HttpClient.newHttpClient();
 
 	private final AtomicBoolean running = new AtomicBoolean(true);
 	private final AtomicBoolean closed = new AtomicBoolean(false);   // guards close() so it is idempotent
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
 	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
 	private final AudioEngine audio;
+	private final WebSocket webSocket;
+	private final FrameCrypto crypto;          // AES-256-GCM E2EE, or null when no passphrase; set before the loops start
 
-	private WebSocket webSocket;
-	private volatile String token;
 	private volatile String selfId = "";
 	private volatile String ownerId;
 	private volatile ChannelMode currentMode;
-	private FrameCrypto crypto;          // AES-256-GCM E2EE, or null when no passphrase; set before the loops start
 	private volatile boolean warnedDecrypt; // listener thread only today, but volatile so the warn-once intent survives a threading refactor
 
-	public WalkieClient(ClientOptions options) {
+	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
 		this.options = options;
 		this.currentMode = options.mode();
 		this.audio = new AudioEngine(options, this::sendAudioFrame);
+		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
+		String token = login();
+		crypto = setupCrypto();
+		audio.start();
+		System.out.println("Audio: " + audio.description()
+				+ (crypto == null ? "" : ", end-to-end encrypted (AES-256-GCM)"));
+
+		webSocket = connect(token);
+		// Start the sender only after webSocket is assigned, so this final field is safely published to the
+		// sender thread (Thread.start() happens-after the write). The final-field freeze can't be relied on
+		// here because `this` escapes during construction. A join queued by onOpen during connect is sent
+		// once the sender drains the queue.
+		Thread.ofVirtual().name("ptt-sender").start(this::senderLoop);
+
+		// Blocks until the user quits or stdin closes; the caller then closes us (try-with-resources).
+		consoleLoop();
 	}
 
 	/// Lists the audio mixers that expose a capture line, for use with `--input`.
@@ -81,21 +99,6 @@ public final class WalkieClient implements AutoCloseable {
 		return mode == ChannelMode.FULL_DUPLEX
 				? "Full-duplex: type 't' to start/stop your mic."
 				: "Push-to-talk: type 't' to grab/release the floor.";
-	}
-
-	public void run() throws Exception {
-		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
-		token = login();
-		crypto = setupCrypto();
-		audio.start();
-		System.out.println("Audio: " + audio.description()
-				+ (crypto != null ? ", end-to-end encrypted (AES-256-GCM)" : ""));
-
-		Thread.ofVirtual().name("ptt-sender").start(this::senderLoop);
-		connect(token);
-
-		// Blocks until the user quits or stdin closes; the caller then closes us (try-with-resources).
-		consoleLoop();
 	}
 
 	// --- HTTP login + WebSocket -------------------------------------------------------------------
@@ -127,13 +130,11 @@ public final class WalkieClient implements AutoCloseable {
 		);
 	}
 
-	private void connect(String token) {
-		webSocket = httpClient.newWebSocketBuilder()
-				.buildAsync(
-						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8)),
-						new ClientListener()
-				)
-				.join();
+	private static void printHelp() {
+		System.out.println("""
+				--------------------------------------------------------------------------------------------------
+				 Commands:  t = talk/stop   m <ptt|global|duplex> = mode   f = hi-fi on/off   q = quit   h = help
+				--------------------------------------------------------------------------------------------------""");
 	}
 
 	private void senderLoop() {
@@ -298,11 +299,13 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	private void printHelp() {
-		System.out.println("""
-				--------------------------------------------------------------------------------------------------
-				 Commands:  t = talk/stop   m <ptt|global|duplex> = mode   f = hi-fi on/off   q = quit   h = help
-				--------------------------------------------------------------------------------------------------""");
+	private WebSocket connect(String token) {
+		return httpClient.newWebSocketBuilder()
+				.buildAsync(
+						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8)),
+						new ClientListener()
+				)
+				.join();
 	}
 
 	// --- helpers ----------------------------------------------------------------------------------
