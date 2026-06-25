@@ -304,9 +304,9 @@ public final class WalkieClient {
 	/// Opens the capture line of the resolved input device (already logged in [#resolveInputMixer]), or the
 	/// raw system default when none was resolved. The line uses the negotiated [#format].
 	private TargetDataLine openMic(DataLine.Info micInfo) throws LineUnavailableException {
-		return inputMixerInfo != null
-				? (TargetDataLine) AudioSystem.getMixer(inputMixerInfo).getLine(micInfo)
-				: (TargetDataLine) AudioSystem.getLine(micInfo);
+		return (TargetDataLine) (inputMixerInfo != null
+				? AudioSystem.getMixer(inputMixerInfo).getLine(micInfo)
+				: AudioSystem.getLine(micInfo));
 	}
 
 	private void captureLoop() {
