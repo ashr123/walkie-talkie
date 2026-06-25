@@ -10,8 +10,6 @@ public interface ClientSession {
 
 	String id();
 
-	String userId();
-
 	Transport transport();
 
 	String displayName();

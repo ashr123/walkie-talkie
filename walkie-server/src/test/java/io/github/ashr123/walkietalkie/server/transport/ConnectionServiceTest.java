@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /// Drives [ConnectionService] with fake sessions to verify channel ownership, mode adoption and the
 /// owner-only mode-change broadcast.
@@ -22,7 +23,7 @@ class ConnectionServiceTest {
 
 	private final ChannelRegistry channelRegistry = new ChannelRegistry();
 	private final ConnectionService service = new ConnectionService(
-			channelRegistry, new FloorControlService(), new WalkieProperties(List.of("*"), 8192, 65536));
+			channelRegistry, new FloorControlService(), new WalkieProperties(List.of("*"), 8192, 65536, null));
 
 	private static FakeClientSession session(String id) {
 		return new FakeClientSession(id, Transport.AUDIO_RELAY, id);
@@ -38,7 +39,7 @@ class ConnectionServiceTest {
 
 	private FakeClientSession join(String id, String channelName, ChannelMode mode) {
 		FakeClientSession session = session(id);
-		service.onMessage(session, new ClientMessage.Join(channelName, mode, id));
+		service.onMessage(session, new ClientMessage.Join(channelName, mode, id, null));
 		return session;
 	}
 
@@ -95,6 +96,25 @@ class ConnectionServiceTest {
 
 		assertEquals("bob", firstOf(bob, ServerMessage.OwnerChanged.class).ownerId());
 		assertEquals("bob", channel("team").ownerId());
+	}
+
+	@Test
+	void aJoinWithAnInvalidDisplayNameIsRejected() {
+		FakeClientSession session = session("sess-1");
+		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "has spaces", null));
+
+		assertEquals("invalid_display_name", firstOf(session, ServerMessage.ErrorMessage.class).code());
+		assertNull(channel("team"), "the channel is not created when the join is rejected");
+	}
+
+	@Test
+	void aJoinWithAMismatchedKeyCheckIsRejected() {
+		join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);   // creator establishes keyCheck = null (unencrypted)
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-X"));
+
+		assertEquals("passphrase_mismatch", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(1, channel("team").size(), "the mismatched joiner is not added");
 	}
 
 	@Test

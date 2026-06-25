@@ -1,59 +1,118 @@
 package io.github.ashr123.walkietalkie.server.security;
 
-import io.github.ashr123.option.None;
-import io.github.ashr123.option.Option;
-import io.github.ashr123.option.Some;
+import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
+import javax.crypto.KeyGenerator;
+import javax.crypto.Mac;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Base64;
 
-/// Minimal, in-memory token store for the demo. A successful login mints a random, ephemeral bearer
-/// token — a [UUID] — mapped to a username; no secret is ever hard-coded or persisted.
+/// Stateless bearer auth for the demo: there is **no token store**. A login mints a self-contained,
+/// HMAC-signed token; the [TokenAuthenticationFilter] verifies the signature (and expiry) at the
+/// WebSocket handshake without any server-side lookup. Because nothing is stored, there is nothing to
+/// revoke — closing the WebSocket ends the session, and a leaked token is only usable until it expires.
 ///
-/// The token is a `UUID` *internally* — the store's key and [#issueToken]'s return type — but is an
-/// **opaque string** everywhere outside this class: on the wire it travels as a JSON string and comes
-/// back in an `Authorization: Bearer` header or `?token=` query parameter, which are string-native.
-/// [#resolve] and [#revoke] therefore accept the raw presented value and parse it here, at the trust
-/// boundary, so a malformed token is rejected cleanly (yields [None] / a no-op) instead of crashing the
-/// request.
+/// Token layout: `base64url(payload) + "." + base64url(HMAC-SHA512(key, payload))`, where
+/// `payload = nonce(8 random bytes) ‖ expiryEpochMillis(8 bytes, big-endian)`. The token is opaque to
+/// clients — they just echo it back as `Authorization: Bearer` or `?token=`.
 ///
-/// In production this would be replaced by validation against a real identity provider (e.g. OIDC/JWT).
-/// The read path ([#resolve]), and so the [TokenAuthenticationFilter] wiring, would carry over unchanged.
-/// Revocation ([#revoke] — used by logout and on disconnect) is a property of *this* in-memory store,
-/// though: a stateless JWT is not revoked by forgetting a map entry, so that path would then need an
-/// explicit denylist/expiry strategy.
+/// In production the signing key comes from configuration (see [WalkieProperties#authSigningKey()]); this
+/// would be replaced by validation against a real identity provider (OIDC/JWT) — the filter wiring stays.
 @Service
 public class AuthService {
 
-	private final Map<UUID, String> tokenToUser = new ConcurrentHashMap<>();
+	private static final Logger log = LoggerFactory.getLogger(AuthService.class);
 
-	public UUID issueToken(String username) {
-		UUID token = UUID.randomUUID();
-		tokenToUser.put(token, username);
-		return token;
+	private static final String HMAC_ALGORITHM = "HmacSHA512";
+	private static final int HMAC_KEY_BITS = 512;          // HMAC-SHA512 key strength (matches the 512-bit hash output)
+	private static final int NONCE_BYTES = 8;              // random per token: unguessable and unique even within one millisecond
+	private static final int EXPIRY_BYTES = Long.BYTES;    // 8-byte big-endian epoch-millis expiry
+	private static final int PAYLOAD_BYTES = NONCE_BYTES + EXPIRY_BYTES;
+	/// The token only has to survive from `/login` to the WebSocket upgrade — it is never re-checked on
+	/// the live socket — so a short lifetime bounds replay of a leaked token without cutting active calls.
+	private static final Duration TOKEN_TTL = Duration.ofSeconds(60);
+
+	private static final Base64.Encoder B64_ENCODER = Base64.getUrlEncoder().withoutPadding();
+	private static final Base64.Decoder B64_DECODER = Base64.getUrlDecoder();
+
+	private final SecretKey key;
+	private final SecureRandom random = new SecureRandom();
+
+	public AuthService(WalkieProperties properties) {
+		this.key = resolveKey(properties.authSigningKey());
 	}
 
-	/// Resolves the user behind a presented token. The value arrives as the raw header/query string, so
-	/// anything that is not a well-formed [UUID] (or is unknown/revoked) yields [None] rather than an error.
-	public Option<String> resolve(String token) {
-		return parse(token)
-				.map(tokenToUser::get);
-	}
-
-	public void revoke(String token) {
-		if (parse(token) instanceof Some(UUID id))
-			tokenToUser.remove(id);
-	}
-
-	/// Parses a presented token into a [UUID], or [None] when it is not a well-formed one. [UUID#fromString]
-	/// throws on malformed input, which at this trust boundary must become a clean rejection, not a 500.
-	private static Option<UUID> parse(String token) {
+	private static SecretKey resolveKey(String configured) {
+		if (configured != null && !configured.isBlank()) {
+			return new SecretKeySpec(configured.getBytes(StandardCharsets.UTF_8), HMAC_ALGORITHM);
+		}
 		try {
-			return Option.of(UUID.fromString(token));
-		} catch (IllegalArgumentException _) {
-			return None.instance();
+			KeyGenerator generator = KeyGenerator.getInstance(HMAC_ALGORITHM);
+			generator.init(HMAC_KEY_BITS);
+			log.warn("No walkie.auth-signing-key configured; generated a random HMAC key for this process. "
+					+ "Tokens will not survive a restart or work across instances — set WALKIE_AUTH_SIGNING_KEY in production.");
+			return generator.generateKey();
+		} catch (GeneralSecurityException e) {
+			throw new IllegalStateException(HMAC_ALGORITHM + " unavailable", e);
+		}
+	}
+
+	/// Mints a fresh signed token valid for [#TOKEN_TTL]. No state is kept.
+	public String issueToken() {
+		byte[] payload = ByteBuffer.allocate(PAYLOAD_BYTES)
+				.put(nonce())
+				.putLong(Instant.now().plus(TOKEN_TTL).toEpochMilli())
+				.array();
+		return B64_ENCODER.encodeToString(payload) + "." + B64_ENCODER.encodeToString(mac(payload));
+	}
+
+	/// True when `token` is a well-formed, correctly-signed and unexpired token minted by this server.
+	/// Verification is purely cryptographic — no lookup — and the MAC comparison is constant-time.
+	public boolean verify(String token) {
+		if (token == null) {
+			return false;
+		}
+		int dot = token.indexOf('.');
+		if (dot < 0) {
+			return false;
+		}
+		try {
+			byte[] payload = B64_DECODER.decode(token.substring(0, dot));
+			byte[] presentedMac = B64_DECODER.decode(token.substring(dot + 1));
+			if (payload.length != PAYLOAD_BYTES || !MessageDigest.isEqual(mac(payload), presentedMac)) {
+				return false;
+			}
+			Instant expiry = Instant.ofEpochMilli(ByteBuffer.wrap(payload, NONCE_BYTES, EXPIRY_BYTES).getLong());
+			return Instant.now().isBefore(expiry);
+		} catch (IllegalArgumentException _) {   // malformed base64url
+			return false;
+		}
+	}
+
+	private byte[] nonce() {
+		byte[] nonce = new byte[NONCE_BYTES];
+		random.nextBytes(nonce);
+		return nonce;
+	}
+
+	private byte[] mac(byte[] payload) {
+		try {
+			Mac hmac = Mac.getInstance(HMAC_ALGORITHM);
+			hmac.init(key);
+			return hmac.doFinal(payload);
+		} catch (GeneralSecurityException e) {
+			throw new IllegalStateException("HMAC computation failed", e);
 		}
 	}
 }

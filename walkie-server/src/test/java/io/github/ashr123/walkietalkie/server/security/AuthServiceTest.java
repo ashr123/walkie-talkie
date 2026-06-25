@@ -1,33 +1,67 @@
 package io.github.ashr123.walkietalkie.server.security;
 
-import io.github.ashr123.option.None;
-import io.github.ashr123.option.Some;
+import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import org.junit.jupiter.api.Test;
 
-import java.util.UUID;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/// Pins the stateless signed-token contract: a freshly issued token verifies, while tampered, expired,
+/// foreign-key and malformed tokens are rejected. (Security-critical — these are the only checks standing
+/// between a request and the protected WebSocket endpoints, since there is no token store to fall back on.)
 class AuthServiceTest {
 
-	private final AuthService authService = new AuthService();
+	private static final String SIGNING_KEY = "test-signing-key-which-is-plenty-long";
+	private final AuthService authService = new AuthService(props(SIGNING_KEY));
 
-	@Test
-	void issuedTokenResolvesUntilRevoked() {
-		UUID token = authService.issueToken("alice");
-		// The token round-trips through a string, exactly as it does over HTTP.
-		assertEquals(new Some<>("alice"), authService.resolve(token.toString()), "a freshly issued token resolves to its user");
-
-		authService.revoke(token.toString());
-		assertInstanceOf(None.class, authService.resolve(token.toString()), "a revoked token no longer resolves");
+	private static WalkieProperties props(String signingKey) {
+		return new WalkieProperties(List.of("*"), 8192, 65536, signingKey);
 	}
 
 	@Test
-	void aMalformedTokenIsRejectedCleanly() {
-		// A value that is not a well-formed UUID must not blow up the parse: it resolves to None and a
-		// revoke of it is a harmless no-op (the trust boundary turns bad input into a clean rejection).
-		assertInstanceOf(None.class, authService.resolve("not-a-uuid"), "garbage never resolves");
-		authService.revoke("not-a-uuid");
+	void acceptsAFreshlyIssuedToken() {
+		assertTrue(authService.verify(authService.issueToken()), "a token we just minted must verify");
+	}
+
+	@Test
+	void rejectsATamperedToken() {
+		char[] chars = authService.issueToken().toCharArray();
+		chars[0] = chars[0] == 'A' ? 'B' : 'A';   // perturb the payload segment -> the signature no longer matches
+		assertFalse(authService.verify(new String(chars)), "a modified token must not verify");
+	}
+
+	@Test
+	void rejectsAnExpiredToken() throws Exception {
+		// Hand-craft a correctly-signed token (same key/format) whose expiry is in the past.
+		byte[] payload = ByteBuffer.allocate(16)
+				.putLong(0x0102030405060708L)                  // nonce (8 bytes)
+				.putLong(System.currentTimeMillis() - 1_000)   // expiry: one second ago
+				.array();
+		Mac mac = Mac.getInstance("HmacSHA512");
+		mac.init(new SecretKeySpec(SIGNING_KEY.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
+		Base64.Encoder b64 = Base64.getUrlEncoder().withoutPadding();
+		String expired = b64.encodeToString(payload) + "." + b64.encodeToString(mac.doFinal(payload));
+		assertFalse(authService.verify(expired), "an expired but correctly-signed token must not verify");
+	}
+
+	@Test
+	void rejectsATokenSignedWithADifferentKey() {
+		String foreign = new AuthService(props("a-completely-different-signing-key")).issueToken();
+		assertFalse(authService.verify(foreign), "a token signed with another key must not verify");
+	}
+
+	@Test
+	void rejectsMalformedInput() {
+		assertFalse(authService.verify("not-a-token"), "no dot separator");
+		assertFalse(authService.verify("@@@.@@@"), "not valid base64url");
+		assertFalse(authService.verify(""), "empty");
+		assertFalse(authService.verify(null), "null");
 	}
 }

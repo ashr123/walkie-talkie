@@ -197,15 +197,10 @@
 <main>
 	<section class="panel" id="setup">
 		<h2>Connect</h2>
-		<div class="row">
-			<div>
-				<label for="username">Username</label>
-				<input autocomplete="off" id="username" value="alice">
-			</div>
-			<div>
-				<label for="display">Display name</label>
-				<input autocomplete="off" id="display" value="Alice">
-			</div>
+		<label for="display">Display name</label>
+		<input autocomplete="off" id="display" placeholder="1-32 chars of A-Z a-z 0-9 _ . -" value="Alice">
+		<div class="hint">Shown to others. Your identity in a channel is a per-connection id; if two people
+			share a display name, each is shown with a short <code>#id</code> to tell them apart.
 		</div>
 		<label for="transport">Transport</label>
 		<select id="transport">
@@ -223,6 +218,8 @@
 			<label style="display:flex; align-items:center; gap:8px; margin-top:10px;">
 				<input id="hifi" style="width:auto;" type="checkbox"> High fidelity (disable mic processing)
 			</label>
+		<label for="passphrase">Encryption passphrase (optional, relay)</label>
+		<input autocomplete="off" id="passphrase" placeholder="shared secret — leave blank for none" type="password">
 		<button id="connectBtn">Connect</button>
 		<button class="secondary" disabled id="disconnectBtn" style="width:100%; margin-top:8px;">Disconnect</button>
 		<div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Disconnected</span></div>

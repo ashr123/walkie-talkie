@@ -1,7 +1,6 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
-import io.github.ashr123.walkietalkie.server.security.AuthService;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import org.jspecify.annotations.NonNull;
@@ -16,8 +15,8 @@ import java.nio.ByteBuffer;
 @Component
 public class AudioRelayHandler extends BaseWalkieHandler {
 
-	public AudioRelayHandler(ConnectionService connectionService, MessageCodec codec, AuthService authService) {
-		super(connectionService, codec, authService, Transport.AUDIO_RELAY);
+	public AudioRelayHandler(ConnectionService connectionService, MessageCodec codec) {
+		super(connectionService, codec, Transport.AUDIO_RELAY);
 	}
 
 	@Override

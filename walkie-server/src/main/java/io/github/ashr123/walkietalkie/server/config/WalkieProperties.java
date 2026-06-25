@@ -10,11 +10,16 @@ import java.util.List;
 ///                            development, but should be restricted to known hosts in production
 /// @param maxAudioFrameBytes  largest inbound audio frame accepted on the relay transport
 /// @param maxTextMessageBytes largest control/signaling text frame accepted
+/// @param authSigningKey      HMAC-SHA512 key used to sign/verify bearer tokens, bound from
+///                            `walkie.auth-signing-key` (env `WALKIE_AUTH_SIGNING_KEY`). Blank/absent means
+///                            a random key is generated per process (dev only — tokens then don't survive a
+///                            restart or span instances). Never hardcode a real key.
 @ConfigurationProperties(prefix = "walkie")
 public record WalkieProperties(
 		List<String> allowedOrigins,
 		int maxAudioFrameBytes,
-		int maxTextMessageBytes) {
+		int maxTextMessageBytes,
+		String authSigningKey) {
 
 	public WalkieProperties {
 		if (allowedOrigins == null || allowedOrigins.isEmpty()) {

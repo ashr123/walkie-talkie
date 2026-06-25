@@ -7,6 +7,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -16,16 +17,22 @@ public class ChannelRegistry {
 
 	private final Map<String, Channel> channels = new ConcurrentHashMap<>();
 
-	/// Returns the named channel, creating it (owned by `session`, with `mode`) when absent, then adds
-	/// `session`. An existing channel keeps its own mode and owner — the joiner adopts them, so the
-	/// requested `mode` only matters when this call creates the channel. The membership add happens
-	/// inside the atomic map update, so it cannot race with a concurrent [#leave] dropping the channel.
-	public Channel joinOrCreate(String name, ChannelMode mode, ClientSession session) {
-		return channels.compute(name, (key, existing) -> {
-			Channel channel = existing != null ? existing : new Channel(key, mode, session.id());
-			channel.add(session);
-			return channel;
+	/// Returns the named channel after adding `session`, creating it (owned by `session`, with `mode` and the
+	/// joiner's `keyCheck`) when absent. An existing channel keeps its own mode and owner — the joiner adopts
+	/// them — but the joiner's `keyCheck` must **match** the channel's, or the join is refused: the member is
+	/// not added and this returns `null` (the caller reports a passphrase mismatch). The whole check-and-add
+	/// happens inside the atomic map update, so it cannot race with a concurrent create or [#leave].
+	public Channel joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session) {
+		AtomicReference<Channel> joined = new AtomicReference<>();
+		channels.compute(name, (key, existing) -> {
+			Channel channel = existing != null ? existing : new Channel(key, mode, session.id(), keyCheck);
+			if (Objects.equals(channel.keyCheck(), keyCheck)) {
+				channel.add(session);
+				joined.set(channel);
+			}
+			return channel;   // keep the channel even on a key-check mismatch (don't drop it)
 		});
+		return joined.get();   // null when the joiner's key-check didn't match the channel's
 	}
 
 	public Option<Channel> find(String name) {

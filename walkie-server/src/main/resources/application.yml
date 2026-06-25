@@ -29,4 +29,4 @@ logging:
   # Inject the RequestContext scoped value (mirrored into the MDC) onto every log line. Lines emitted
   # outside a message scope (connection lifecycle, startup) show "system".
   pattern:
-    level: "%5p [user=%X{user:-system}]"
+    level: "%5p [session=%X{session:-system}]"

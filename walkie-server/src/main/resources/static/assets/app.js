@@ -8,7 +8,8 @@
 // 1-byte codec tag so receivers can decode whatever the sender used. The WebRTC path uses the
 // browser's native Opus, tuned up via SDP + sender bitrate.
 
-const $ = (id) => document.getElementById(id);
+// Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
+const byId = (id) => document.getElementById(id);
 const STUN = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
 
 const SAMPLE_RATE = 48000;
@@ -17,7 +18,10 @@ const MONO_BITRATE = 64000;      // fullband voice, high quality
 const STEREO_BITRATE = 128000;   // stereo needs ~2x for equivalent quality
 const CODEC_OPUS = 1;
 const CODEC_PCM = 2;
+const E2EE_SCHEME = 0xe2;        // wire marker for an encrypted frame: [scheme][IV(12)][ciphertext+tag]; kept outside the codec-tag set {1,2} so a plaintext receiver drops it cleanly
+const E2EE_AAD = Uint8Array.of(E2EE_SCHEME);   // the scheme byte, authenticated (GCM additionalData) but not encrypted, so the envelope is covered by the tag
 const OPUS_SUPPORTED = (typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined');
+const DISPLAY_NAME = /^[A-Za-z0-9_.-]{1,32}$/;   // must match the server's display-name validation
 
 const state = {
     token: null,
@@ -40,20 +44,26 @@ const state = {
     decodeTs: 0,
     warnedNoOpus: false,
     warnedChannels: false,
+    cryptoKey: null,        // AES-256-GCM key for relay E2EE, or null when no passphrase
+    keyCheck: null,         // key-check value sent in the join so the server can reject a mismatched passphrase
+    txChain: null,          // serializes async frame encryption so it can't reorder the Opus stream
+    rxChain: null,          // serializes async frame decryption likewise
+    warnedDecrypt: false,
+    warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
     peers: new Map(),     // remoteId -> RTCPeerConnection
     members: new Map(),   // id -> displayName
 };
 
 function log(message) {
-    const el = $('log');
+    const el = byId('log');
     const time = new Date().toLocaleTimeString();
     el.textContent += `[${time}] ${message}\n`;
     el.scrollTop = el.scrollHeight;
 }
 
 function setStatus(connected, text) {
-    $('statusDot').classList.toggle('on', connected);
-    $('statusText').textContent = text;
+    byId('statusDot').classList.toggle('on', connected);
+    byId('statusText').textContent = text;
 }
 
 function isOpen() {
@@ -63,31 +73,57 @@ function isOpen() {
 // --- connection -----------------------------------------------------------------------------------
 
 async function connect() {
-    state.transport = $('transport').value;
-    state.mode = $('mode').value;
-    state.hifi = $('hifi').checked;
-    const username = $('username').value.trim() || 'guest';
-    const display = $('display').value.trim() || username;
-    const channel = $('channel').value.trim() || 'lobby';
+    state.transport = byId('transport').value;
+    state.mode = byId('mode').value;
+    state.hifi = byId('hifi').checked;
+    const display = byId('display').value.trim();
+    const channel = byId('channel').value.trim() || 'lobby';
+    const passphrase = byId('passphrase').value;   // read once; used only on the relay path (E2EE)
+
+    if (!DISPLAY_NAME.test(display)) {
+        log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
+        return;
+    }
+
+    // crypto.subtle is only exposed in a secure context (HTTPS or localhost). A second device reaching
+    // this server over http://<LAN-IP> has no crypto.subtle, so catch that here — before we acquire the
+    // mic — and explain it, rather than throwing a cryptic TypeError mid-connect.
+    if (state.transport === 'relay' && passphrase
+        && !(window.isSecureContext && window.crypto && crypto.subtle)) {
+        log('End-to-end encryption needs a secure context (HTTPS or localhost). '
+            + 'Clear the passphrase to connect without it, or serve the page over HTTPS.');
+        return;
+    }
 
     try {
-        const res = await fetch('/api/auth/login', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({username}),
-        });
+        // Login takes no input: it just mints a signed, short-lived token. Identity in a channel is the
+        // server-assigned session id; the display name is sent with the join below.
+        const res = await fetch('/api/auth/login', {method: 'POST'});
         if (!res.ok) {
             log('Login failed: HTTP ' + res.status);
             return;
         }
         const auth = await res.json();
         state.token = auth.token;
-        log('Logged in as ' + auth.userId);
+        log('Authenticated as ' + display);
 
         await setupAudio();
         log(state.transport === 'relay'
             ? `Relay codec: ${OPUS_SUPPORTED ? 'Opus 48 kHz + FEC' : 'PCM 48 kHz (no WebCodecs)'}`
             : 'WebRTC: Opus 48 kHz (tuned)');
+
+        // End-to-end encryption applies to the relay path only (WebRTC media is already peer-to-peer).
+        const derived = (state.transport === 'relay' && passphrase)
+            ? await deriveKey(passphrase, state.mode === 'GLOBAL_PTT' ? 'global' : channel)
+            : null;
+        state.cryptoKey = derived ? derived.key : null;
+        state.keyCheck = derived ? derived.keyCheck : null;
+        state.txChain = Promise.resolve();
+        state.rxChain = Promise.resolve();
+        state.warnedDecrypt = false;
+        if (state.transport === 'relay') {
+            log(state.cryptoKey ? 'End-to-end encryption: ON (AES-256-GCM)' : 'End-to-end encryption: off');
+        }
 
         const path = state.transport === 'webrtc' ? '/ws/signal' : '/ws/audio';
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -98,10 +134,10 @@ async function connect() {
 
         ws.onopen = () => {
             log('WebSocket open (' + state.transport + ')');
-            sendCtrl({type: 'join', channel, mode: state.mode, displayName: display});
+            sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck});
             setStatus(true, 'Connected — ' + state.transport);
-            $('connectBtn').disabled = true;
-            $('disconnectBtn').disabled = false;
+            byId('connectBtn').disabled = true;
+            byId('disconnectBtn').disabled = false;
         };
         ws.onmessage = onWsMessage;
         ws.onclose = (ev) => {
@@ -111,26 +147,18 @@ async function connect() {
         ws.onerror = () => log('WebSocket error');
     } catch (err) {
         log('Connect error: ' + err.message);
+        if (!state.ws) {
+            cleanup();  // tear down any mic / AudioContext acquired before the socket existed
+        }
     }
 }
 
 function disconnect() {
-    logout();
+    // Closing the socket ends the session — the bearer token is stateless and self-expiring, so there is
+    // nothing to log out server-side.
     if (state.ws) {
         sendCtrl({type: 'leave'});
         state.ws.close();
-    }
-}
-
-// Graceful logout: revoke the token server-side. (An unexpected disconnect is still covered by the
-// server evicting the token when the WebSocket closes.) `keepalive` lets it finish during page unload.
-function logout() {
-    if (state.token) {
-        fetch('/api/auth/logout', {
-            method: 'POST',
-            headers: {Authorization: 'Bearer ' + state.token},
-            keepalive: true,
-        }).catch(() => { /* best-effort */ });
     }
 }
 
@@ -190,6 +218,10 @@ function onWsMessage(ev) {
             break;
         case 'error':
             log('Server error [' + msg.code + ']: ' + msg.message);
+            if (msg.code === 'passphrase_mismatch') {
+                log('Disconnecting — this channel needs a different passphrase.');
+                disconnect();
+            }
             break;
         default:
             log('Unknown message: ' + msg.type);
@@ -248,7 +280,7 @@ function onOwnerChanged(ownerId) {
 // Reflects the live mode in the selector and lets only the owner change it while connected; when
 // disconnected the selector is just the initial-mode chooser for the next Connect.
 function updateModeControl() {
-    const select = $('mode');
+    const select = byId('mode');
     if (isOpen()) {
         select.value = state.mode;
         select.disabled = state.selfId !== state.ownerId;
@@ -428,10 +460,94 @@ function sendTagged(tag, payloadBytes) {
     const out = new Uint8Array(payloadBytes.length + 1);
     out[0] = tag;
     out.set(payloadBytes, 1);
-    state.ws.send(out.buffer);
+    if (!state.cryptoKey) {
+        state.ws.send(out.buffer);
+        return;
+    }
+    // Serialize encryption so async WebCrypto can't reorder the stateful Opus stream.
+    state.txChain = state.txChain
+        .then(() => encryptFrame(out))
+        .then((enc) => {
+            if (isOpen()) {
+                state.ws.send(enc.buffer);
+            }
+        })
+        .catch((err) => log('Encrypt error: ' + err.message));
 }
 
+// --- end-to-end encryption (relay path) -----------------------------------------------------------
+
+// Derive the per-channel material from the shared passphrase. Must match the Java client and FrameCryptoTest
+// exactly: PBKDF2-HMAC-SHA256, 600000 iterations, salt "walkie-talkie:e2ee:" + channel. A single 384-bit
+// derivation gives the AES-256-GCM key (first 32 bytes) plus a 16-byte key-check value (next 16) sent in the
+// join so the server can reject a mismatched passphrase. PBKDF2's first block is length-independent, so the
+// AES key is identical to a 256-bit derivation — the known-answer test still holds. Returns {key, keyCheck}.
+async function deriveKey(passphrase, effectiveChannel) {
+    const enc = new TextEncoder();
+    const base = await crypto.subtle.importKey('raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveBits']);
+    const bits = new Uint8Array(await crypto.subtle.deriveBits(
+        {
+            name: 'PBKDF2',
+            salt: enc.encode('walkie-talkie:e2ee:' + effectiveChannel),
+            iterations: 600000,
+            hash: 'SHA-256'
+        },
+        base, 384));
+    const key = await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['encrypt', 'decrypt']);
+    const keyCheck = [...bits.slice(32, 48)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    return {key, keyCheck};
+}
+
+// Wraps a plaintext frame as scheme(1) ‖ IV(12) ‖ ciphertext+tag(16). The scheme byte lets a receiver
+// distinguish an encrypted frame from a plaintext peer's [codec tag][payload] (which starts with 1 or 2).
+async function encryptFrame(plaintext) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({
+        name: 'AES-GCM',
+        iv,
+        tagLength: 128,
+        additionalData: E2EE_AAD
+    }, state.cryptoKey, plaintext));
+    const out = new Uint8Array(1 + iv.length + ct.length);
+    out[0] = E2EE_SCHEME;
+    out.set(iv, 1);
+    out.set(ct, 1 + iv.length);
+    return out;
+}
+
+// Recovers the plaintext frame from scheme ‖ IV ‖ ciphertext+tag; rejects on a missing scheme byte (a
+// plaintext peer in an encrypted channel) or a bad tag (tampered / wrong passphrase) — never decoding ciphertext as audio.
+function decryptFrame(frame) {
+    if (frame.length < 29 || frame[0] !== E2EE_SCHEME) {  // 1 scheme + 12 IV + 16 tag minimum
+        return Promise.reject(new Error('not an end-to-end-encrypted frame'));
+    }
+    return crypto.subtle.decrypt({
+        name: 'AES-GCM',
+        iv: frame.subarray(1, 13),
+        tagLength: 128,
+        additionalData: E2EE_AAD
+    }, state.cryptoKey, frame.subarray(13));
+}
+
+// Decrypts (when E2EE is on) before decoding. Decryption is serialized through a promise chain so async
+// WebCrypto can't hand frames to the stateful Opus decoder out of order.
 function handleAudioFrame(arrayBuffer) {
+    if (!state.cryptoKey) {
+        processFrame(arrayBuffer);
+        return;
+    }
+    state.rxChain = state.rxChain
+        .then(() => decryptFrame(new Uint8Array(arrayBuffer)))
+        .then((plaintext) => processFrame(plaintext))
+        .catch(() => {
+            if (!state.warnedDecrypt) {
+                state.warnedDecrypt = true;
+                log('Could not decrypt audio — confirm everyone is using the same passphrase, channel, and mode.');
+            }
+        });
+}
+
+function processFrame(arrayBuffer) {
     if (arrayBuffer.byteLength < 2) {
         return;
     }
@@ -465,6 +581,10 @@ function handleAudioFrame(arrayBuffer) {
             f32[i] = view.getInt16(i * 2, true) / 0x8000;
         }
         enqueuePlayback(f32, count, 1);
+    } else if (tag === E2EE_SCHEME && !state.warnedEncryptedNoKey) {
+        // Encrypted frames arriving while we have no passphrase: drop cleanly and explain (don't decode noise).
+        state.warnedEncryptedNoKey = true;
+        log('Received end-to-end-encrypted audio but no passphrase is set — set the matching passphrase to hear it.');
     }
 }
 
@@ -640,29 +760,38 @@ function removeMember(id) {
 }
 
 function renderMembers() {
-    const ul = $('members');
+    const ul = byId('members');
     ul.replaceChildren();
+    // When two members share a display name, disambiguate each with a short session-id prefix (the real
+    // identity); the full id is shown on hover.
+    const counts = new Map();
+    state.members.forEach((name) => counts.set(name, (counts.get(name) || 0) + 1));
     state.members.forEach((name, id) => {
+        const duplicated = counts.get(name) > 1;
+        const label = duplicated ? `${name} (#${id.slice(0, 8)})` : name;
         const li = document.createElement('li');
+        if (duplicated) {
+            li.title = id;
+        }
         if (id === state.selfId) {
             const span = document.createElement('span');
             span.className = 'self';
             // textContent (not innerHTML) so a crafted display name can't inject markup.
-            span.textContent = name + ' (you)';
+            span.textContent = label + ' (you)';
             li.appendChild(span);
         } else {
-            li.textContent = name;
+            li.textContent = label;
         }
         ul.appendChild(li);
     });
 }
 
 function enableTalkButton(enabled) {
-    $('talkBtn').disabled = !enabled;
+    byId('talkBtn').disabled = !enabled;
 }
 
 function updateTalkButton() {
-    const btn = $('talkBtn');
+    const btn = byId('talkBtn');
     btn.classList.toggle('live', state.transmitting);
     if (state.mode === 'FULL_DUPLEX') {
         btn.textContent = state.transmitting ? 'Mic ON (click to mute)' : 'Mic OFF (click to talk)';
@@ -686,6 +815,10 @@ function cleanup() {
     state.decoderChannels = null;
     state.warnedNoOpus = false;
     state.warnedChannels = false;
+    state.cryptoKey = null;
+    state.keyCheck = null;
+    state.warnedDecrypt = false;
+    state.warnedEncryptedNoKey = false;
     if (state.micStream) {
         state.micStream.getTracks().forEach((t) => t.stop());
         state.micStream = null;
@@ -700,11 +833,11 @@ function cleanup() {
     state.token = null;
     state.ownerId = null;
     enableTalkButton(false);
-    const talkBtn = $('talkBtn');
+    const talkBtn = byId('talkBtn');
     talkBtn.textContent = 'Connect first';
     talkBtn.classList.remove('live');
-    $('connectBtn').disabled = false;
-    $('disconnectBtn').disabled = true;
+    byId('connectBtn').disabled = false;
+    byId('disconnectBtn').disabled = true;
     setStatus(false, 'Disconnected');
     updateModeControl();
 }
@@ -722,13 +855,13 @@ function closeCodec(codec) {
 // --- wiring ---------------------------------------------------------------------------------------
 
 window.addEventListener('DOMContentLoaded', () => {
-    $('connectBtn').addEventListener('click', connect);
-    $('disconnectBtn').addEventListener('click', disconnect);
+    byId('connectBtn').addEventListener('click', connect);
+    byId('disconnectBtn').addEventListener('click', disconnect);
 
     // While connected, only the owner can change the mode (the selector is disabled for others); this
     // sends ChangeMode and the server's ModeChanged broadcast updates everyone. Pre-connect it just
     // picks the initial mode for the next Connect.
-    const modeSelect = $('mode');
+    const modeSelect = byId('mode');
     modeSelect.addEventListener('change', () => {
         if (!isOpen()) {
             return; // pre-connect: just choosing the initial mode for the next Connect
@@ -740,7 +873,25 @@ window.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    const talk = $('talkBtn');
+    // High fidelity toggles the mic DSP (echo cancellation / noise suppression / auto-gain) live: applied
+    // to the running mic track immediately via applyConstraints, no reconnect. (The channel layout —
+    // mono/stereo — is negotiated once at connect and is not changed by the live toggle.)
+    byId('hifi').addEventListener('change', async () => {
+        state.hifi = byId('hifi').checked;
+        if (!state.micStream) {
+            return; // pre-connect: just picks the initial setting for the next Connect
+        }
+        const dsp = !state.hifi;
+        try {
+            await Promise.all(state.micStream.getAudioTracks().map((t) =>
+                t.applyConstraints({echoCancellation: dsp, noiseSuppression: dsp, autoGainControl: dsp})));
+            log('Mic processing ' + (dsp ? 'on (clean speech)' : 'off (hi-fi)'));
+        } catch (err) {
+            log('Could not change mic processing live (reconnect to apply): ' + err.message);
+        }
+    });
+
+    const talk = byId('talkBtn');
     talk.addEventListener('mousedown', pressTalk);
     talk.addEventListener('mouseup', releaseTalk);
     talk.addEventListener('mouseleave', () => {

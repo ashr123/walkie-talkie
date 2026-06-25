@@ -21,22 +21,18 @@ public final class WebSocketClientSession implements ClientSession {
 	private final WebSocketSession session;
 	private final MessageCodec codec;
 	private final Transport transport;
-	private final String userId;
 
-	private volatile String displayName;
+	// Set when the client joins a channel (from the validated Join.displayName); "" until then.
+	private volatile String displayName = "";
 	private volatile String channelName;
 	private volatile ChannelMode channelMode;
 
 	public WebSocketClientSession(WebSocketSession session,
 	                              MessageCodec codec,
-	                              Transport transport,
-	                              String userId,
-	                              String displayName) {
+	                              Transport transport) {
 		this.session = session;
 		this.codec = codec;
 		this.transport = transport;
-		this.userId = userId;
-		this.displayName = displayName;
 	}
 
 	private static String truncateReason(String reason) {
@@ -47,11 +43,6 @@ public final class WebSocketClientSession implements ClientSession {
 	@Override
 	public String id() {
 		return session.getId();
-	}
-
-	@Override
-	public String userId() {
-		return userId;
 	}
 
 	@Override

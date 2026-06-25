@@ -14,9 +14,14 @@ import com.fasterxml.jackson.annotation.JsonTypeName;
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "type")
 public sealed interface ClientMessage {
 
-	/// Join (or create) a channel. For [ChannelMode#GLOBAL_PTT] the channel name is \_.
+	/// Join (or create) a channel. For [ChannelMode#GLOBAL_PTT] the channel name is forced to `global`.
+	///
+	/// `keyCheck` is a short value derived from the end-to-end-encryption passphrase (see the clients'
+	/// key derivation), or `null` when the member is unencrypted. The server compares it against the
+	/// channel's established value to reject a member whose passphrase doesn't match — without ever
+	/// learning the passphrase itself. It is *not* the key and cannot decrypt anything.
 	@JsonTypeName("join")
-	record Join(String channel, ChannelMode mode, String displayName) implements ClientMessage {
+	record Join(String channel, ChannelMode mode, String displayName, String keyCheck) implements ClientMessage {
 	}
 
 	/// Leave the current channel without closing the connection.

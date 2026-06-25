@@ -16,15 +16,19 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import java.io.IOException;
 
 /// Authentication middleware. Reads a bearer token from the `Authorization` header or, for browser
-/// WebSocket handshakes that cannot set custom headers, from a `token` query parameter. A valid token
-/// populates the [SecurityContextHolder] with the user id as the principal and the token itself as the
-/// credentials — so a closing connection can evict exactly that token — and the security filter chain
-/// then enforces authentication on the protected endpoints.
+/// WebSocket handshakes that cannot set custom headers, from a `token` query parameter, and verifies its
+/// signature and expiry via [AuthService] (no server-side lookup). A valid token authenticates the request
+/// with a fixed principal — the participant's real identity is the per-connection WebSocket session id,
+/// not anything carried here — so the security filter chain admits the protected endpoints.
 ///
 /// Intentionally not a Spring `@`[Component]: it is constructed directly in [SecurityConfig] so it is
 /// registered only within the security filter chain, avoiding the duplicate servlet-level
 /// registration Spring Boot performs for `OncePerRequestFilter` beans.
 public class TokenAuthenticationFilter extends OncePerRequestFilter {
+
+	/// Constant principal name. Identity in a channel is the WebSocket session id, so the principal needs
+	/// no per-user value — and the token must never be it (a credential would then leak into logs).
+	private static final String PRINCIPAL = "ws-client";
 
 	private final AuthService authService;
 
@@ -37,11 +41,11 @@ public class TokenAuthenticationFilter extends OncePerRequestFilter {
 			throws ServletException, IOException {
 		if (SecurityContextHolder.getContext().getAuthentication() == null
 				&& BearerTokens.extract(request.getHeader("Authorization"), request.getParameter("token")) instanceof Some(String token)
-				&& authService.resolve(token) instanceof Some(String userId)) {
+				&& authService.verify(token)) {
 			SecurityContextHolder.getContext()
 					.setAuthentication(new UsernamePasswordAuthenticationToken(
-							userId,
-							token,
+							PRINCIPAL,
+							null,
 							AuthorityUtils.createAuthorityList("ROLE_USER")
 					));
 		}

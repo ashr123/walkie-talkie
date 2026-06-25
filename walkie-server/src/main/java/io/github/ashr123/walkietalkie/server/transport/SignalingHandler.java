@@ -1,7 +1,6 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
-import io.github.ashr123.walkietalkie.server.security.AuthService;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import org.springframework.stereotype.Component;
 
@@ -11,7 +10,7 @@ import org.springframework.stereotype.Component;
 @Component
 public class SignalingHandler extends BaseWalkieHandler {
 
-	public SignalingHandler(ConnectionService connectionService, MessageCodec codec, AuthService authService) {
-		super(connectionService, codec, authService, Transport.SIGNALING);
+	public SignalingHandler(ConnectionService connectionService, MessageCodec codec) {
+		super(connectionService, codec, Transport.SIGNALING);
 	}
 }

@@ -11,33 +11,35 @@ two reference clients, and three channel modes.
 | **Transport**    | **WebSocket relay** — the server forwards raw audio frames between members · **WebRTC** — the server relays signaling only, audio flows peer-to-peer |
 | **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared room) · **Full-duplex** (everyone talks at once)                       |
 | **Clients**      | A zero-install **browser** client · a **Java 25 desktop** client                                                                                     |
+| **Encryption**   | Optional **end-to-end encryption** on the relay path (AES-256-GCM from a shared passphrase) · WebRTC media is already end-to-end (peer-to-peer)      |
 
 ## Architecture
 
 ```
   browser / Java clients
         │
-        │  POST /api/auth/login   → mint bearer token
-        │  POST /api/auth/logout  → revoke it
+        │  POST /api/auth/login   → mint a signed bearer token (no input)
         │  WSS  (token via Authorization header, or ?token= on the WebSocket handshake)
         ▼
-  ┌─ walkie-server (Spring Boot 4.1) ───────────────────────────────────────────────────────────────┐
-  │                                                                                                 │
-  │  TokenAuthenticationFilter ─► Spring Security      (the token is the Authentication credential) │
-  │                                                                                                 │
-  │  /ws/audio   (binary) ─► AudioRelayHandler ┐                                                    │
-  │  /ws/signal  (text)   ─► SignalingHandler  ┴─► ConnectionService                                │
-  │                                                 ├─ ChannelRegistry ── Channel                   │
-  │                                                 ├─ FloorControlService (push-to-talk floor)     │
-  │                                                 └─ audio fan-out · WebRTC signaling relay       │
-  │                                                                                                 │
-  │  token eviction:  AuthService.revoke(token)  on  POST /api/auth/logout  AND  on WebSocket close │
-  └─────────────────────────────────────────────────────────────────────────────────────────────────┘ 
+  ┌─ walkie-server (Spring Boot 4.1) ────────────────────────────────────────────────────────────────┐
+  │                                                                                                  │
+  │  TokenAuthenticationFilter ─► Spring Security      (the token is the Authentication credential)  │
+  │                                                                                                  │
+  │  /ws/audio   (binary) ─► AudioRelayHandler ┐                                                     │
+  │  /ws/signal  (text)   ─► SignalingHandler  ┴─► ConnectionService                                 │
+  │                                                 ├─ ChannelRegistry ── Channel                    │
+  │                                                 ├─ FloorControlService (push-to-talk floor)      │
+  │                                                 └─ audio fan-out · WebRTC signaling relay        │
+  │                                                                                                  │
+  │  stateless signed token, verified at the handshake (no store); a session ends when its WS closes │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────┘ 
 
   Control plane: JSON text frames (sealed ClientMessage / ServerMessage records, Jackson 3 polymorphic)
   Media plane (relay):  48 kHz, 20 ms frames (mono, or stereo from the Java client) — Opus via WebCodecs
-                        (FEC) or PCM fallback, each frame prefixed with a 1-byte codec tag; fanned out
-                        server-side (codec-agnostic)
+                        (FEC) or PCM fallback, each frame prefixed with a 1-byte codec tag. The server
+                        fans frames out opaquely (codec-agnostic, never inspecting the payload); clients
+                        may additionally end-to-end encrypt each frame (AES-256-GCM from a shared
+                        passphrase) before sending — the server relays the ciphertext blindly, no key
   Media plane (webrtc): Opus 48 kHz fullband, tuned (high bitrate + FEC), peer-to-peer
 ```
 
@@ -79,13 +81,33 @@ java -jar walkie-server/build/libs/walkie-server-0.1.0.jar
 
 The server listens on `http://localhost:8080`. Open it in a browser to use the web client.
 
+#### Signing key (real / multi-instance deployment)
+
+The bearer token is signed with **HMAC-SHA512**. With no key configured, the server generates a random key
+at startup — fine for a single local instance, but tokens then won't survive a restart or validate across
+instances (you'll see a `WARN` saying so). For a real or horizontally-scaled deployment, give **every
+instance the same key** via `WALKIE_AUTH_SIGNING_KEY` (or the `walkie.auth-signing-key` property). Generate
+a strong random key (≥ 64 bytes, to match the 512-bit MAC) and keep it out of source control:
+
+```bash
+# generate a key (store it in your secrets manager, not in the repo)
+openssl rand -base64 64
+
+# run with it (every instance uses the same value)
+WALKIE_AUTH_SIGNING_KEY="$(openssl rand -base64 64)" java -jar walkie-server/build/libs/walkie-server-0.1.0.jar
+```
+
 ### Browser client
 
 1. Open <http://localhost:8080>.
 2. Pick a transport, channel mode, and channel (optionally tick **High fidelity** to disable the mic
-   noise-suppression/echo-cancellation DSP); click **Connect** and allow microphone access.
+   noise-suppression/echo-cancellation DSP — this can be toggled **live** while connected and applies
+   immediately). To encrypt audio **end-to-end**, set the same **Encryption
+   passphrase** as everyone else in the channel (relay transport only; needs HTTPS or `localhost`).
+   Click **Connect** and allow microphone access.
 3. **Push-to-talk** modes: hold the big button (or hold **Space**). **Full-duplex**: click to toggle your mic.
-4. **Disconnect** leaves the channel and logs out (revokes your token); closing the tab revokes it too.
+4. **Disconnect** (or closing the tab) closes the WebSocket, which ends your session — the signed token is
+   stateless and self-expiring, so there's nothing to revoke.
 
 A channel's mode belongs to whoever **created** it: a later joiner adopts the existing mode (the server
 sends it), and only the creator can change it. When you own the channel the **Mode** selector stays
@@ -96,31 +118,65 @@ Open the page in two tabs (or two machines) to talk between them.
 
 ### Java desktop client
 
+A console client over the WebSocket-relay transport. Run it with the Gradle `run` task, passing CLI flags
+through `--args`:
+
 ```bash
 JAVA_OPTS= ./gradlew :walkie-client-java:run --args="\
-  --server http://localhost:8080 --user alice --channel team1 --mode ptt --display Alice"
+  --server http://localhost:8080 --channel team1 --mode ptt --display Alice"
 ```
 
-`--mode` accepts `ptt` (multi-channel PTT, default), `global` (single global PTT), or `duplex`
-(full-duplex) when *creating* a channel; joining an existing one adopts its mode. At the prompt: `t` to
-talk/stop, `m <ptt|global|duplex>` to change the mode (owner only), `q` to quit (which logs out and
-revokes the token), `h` for help. The Java client encodes Opus (48 kHz, FEC
-via Concentus — stereo when the audio device supports it, otherwise mono) and interoperates with
-relay-mode browser clients.
+All flags are optional (run with `--args="--help"` for the full list):
+
+| Flag                         | Default                 | Purpose                                                                                                                                                                                    |
+|------------------------------|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--server <url>`             | `http://localhost:8080` | Base HTTP URL of the server.                                                                                                                                                               |
+| `--channel <name>`           | `lobby`                 | Channel to join (ignored for global mode).                                                                                                                                                 |
+| `--mode ptt\|global\|duplex` | `ptt`                   | Conversation mode **when creating** a channel; a later joiner adopts the channel's existing mode.                                                                                          |
+| `--display <name>`           | `guest`                 | Name shown to others — **1–32 chars of `[A-Za-z0-9_.-]`, no spaces** (the server rejects anything else).                                                                                   |
+| `--hifi`                     | off                     | Start in the Opus **music** profile (vs. voice); toggle live with `f` at the prompt.                                                                                                       |
+| `--input <substr>`           | system default          | Capture from the input device whose name contains `<substr>`.                                                                                                                              |
+| `--list-inputs`              | —                       | Print the available input devices and exit.                                                                                                                                                |
+| `--key <passphrase>`         | `$WALKIE_KEY`           | **End-to-end encrypt** the audio (AES-256-GCM). Everyone in the channel — including browser peers — must use the same passphrase on the same channel/mode; a mismatch is rejected at join. |
+
+> Tip: run once with `--list-inputs` to see capture-device names, then pass a distinctive substring to
+> `--input` (e.g. `--input "USB"`).
+
+**Interactive commands** (type at the prompt): `t` talk/stop · `m <ptt|global|duplex>` change the mode
+(owner only) · `f` toggle hi-fi (music/voice) live · `q` quit (closes the socket, ending the session) · `h`
+help.
+
+The client encodes Opus at 48 kHz with in-band FEC (Concentus) — stereo when the audio device supports it,
+otherwise mono — and interoperates with relay-mode browser clients.
 
 ## Security
 
-- **Token auth on every endpoint.** `POST /api/auth/login` mints a random, ephemeral bearer token
-  (no secret is hard-coded or persisted). A `TokenAuthenticationFilter` validates the token (header or
-  `?token=` for browser WebSocket handshakes) and the Spring Security chain enforces it on `/ws/**`.
-- **Token lifecycle.** `POST /api/auth/logout` revokes the presented token, and a token is also
-  evicted automatically when its WebSocket connection closes — so a disconnect ends the session and
-  the token can't be reused. (Tokens minted but never connected still have no TTL — a known gap.)
+- **Stateless signed-token auth.** `POST /api/auth/login` takes **no input** and mints a self-contained,
+  **HMAC-SHA512-signed** bearer token; `TokenAuthenticationFilter` verifies its signature and expiry
+  cryptographically — **no server-side store** — and the Spring Security chain enforces it on `/ws/**`. The
+  signing key comes from `walkie.auth-signing-key` / `WALKIE_AUTH_SIGNING_KEY` (random per-process fallback
+  for dev; never hard-coded — see [Run the server](#run-the-server) for generating one).
+- **Session lifecycle = the WebSocket.** There is no `/logout` and no token store to evict: the token is
+  short-lived and self-expiring, so a session ends simply when its socket closes. That short TTL is the only
+  bound on replay of a leaked token — the accepted trade-off of being store-free.
+- **Identity is the per-connection session id**, not a username: it keys channel membership, the floor,
+  ownership and routing. The display name is a separate, validated label (`[A-Za-z0-9_.-]{1,32}`), and
+  duplicate display names are disambiguated for the user with a short `#id` prefix.
+- **Optional end-to-end encryption (relay path).** With a shared passphrase, audio frames are encrypted
+  with **AES-256-GCM** before they leave the client and decrypted only by other holders of the passphrase —
+  the server relays ciphertext opaquely and never holds the key. The key is derived with
+  **PBKDF2-HMAC-SHA256** (600 000 iterations, salted per channel); the browser (WebCrypto) and Java client
+  (`javax.crypto`) derive byte-identical keys, pinned by a cross-platform known-answer test. The same
+  derivation also yields a **key-check value** the client sends at join, letting the server **reject a
+  member whose passphrase doesn't match** the channel's (`passphrase_mismatch`) — without ever seeing the
+  passphrase or the key. Browser E2EE needs a secure context (HTTPS or `localhost`). This is confidentiality
+  between participants on top of transport security, not a replacement for serving over WSS/HTTPS.
 - Stateless, CSRF-free token model; static client, health check and login are the only public routes.
-- Input is validated (usernames, channel-name pattern, audio-frame size caps). The browser renders
+- Input is validated (display-name + channel-name patterns, audio-frame size caps). The browser renders
   member names with `textContent` to avoid markup injection.
-- **For production:** serve over WSS/HTTPS (TLS 1.2+), restrict `walkie.allowed-origins`, and replace
-  the in-memory `AuthService` with real IdP/JWT validation — the filter wiring stays the same.
+- **For production:** serve over WSS/HTTPS (TLS 1.2+), restrict `walkie.allowed-origins`, set
+  `WALKIE_AUTH_SIGNING_KEY`, and swap the signed-token mint/verify for real IdP/JWT validation — the filter
+  wiring stays the same.
 
 ## Java 25 features used
 
@@ -144,3 +200,9 @@ default build stays preview-free.
   independently-decoded Opus stream. The relay never mixes audio server-side.
 - Channels and tokens are **in-memory** (single instance). Horizontal scaling would need a shared
   bus/registry.
+- **End-to-end encryption uses one shared passphrase per channel** (a pre-shared key, no key exchange):
+  no forward secrecy, no per-sender keys, and frame *metadata* (who is transmitting, when, and frame
+  sizes) stays visible to the server. A channel is **uniformly** encrypted or plaintext: a joiner whose
+  passphrase doesn't match the channel's is **rejected at join** (`passphrase_mismatch`) via a key-check
+  value the server compares without ever learning the passphrase. It covers the **relay** transport;
+  WebRTC media is already end-to-end via DTLS-SRTP.

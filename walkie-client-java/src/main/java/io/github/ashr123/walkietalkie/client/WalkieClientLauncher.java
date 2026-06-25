@@ -16,7 +16,7 @@ import java.util.concurrent.Callable;
 ///
 /// ```shell
 /// ./gradlew :walkie-client-java:run --args="--server http://localhost:8080 \
-///     --user alice --channel team1 --mode ptt --display Alice --hifi"
+///     --channel team1 --mode ptt --display Alice --hifi"
 /// ```
 ///
 /// Run with `--help` for the full option list.
@@ -32,10 +32,6 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 			description = "Base HTTP URL of the server (default: ${DEFAULT-VALUE}).")
 	private String server;
 
-	@Option(names = "--user", defaultValue = "guest",
-			description = "Username used to obtain a bearer token (default: ${DEFAULT-VALUE}).")
-	private String user;
-
 	@Option(names = "--channel", defaultValue = "lobby",
 			description = "Channel to join; ignored for global mode (default: ${DEFAULT-VALUE}).")
 	private String channel;
@@ -44,7 +40,8 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 			description = "Conversation mode: ptt | global | duplex (default: ${DEFAULT-VALUE}).")
 	private ChannelMode mode;
 
-	@Option(names = "--display", description = "Display name shown to others (default: the username).")
+	@Option(names = "--display", defaultValue = "guest",
+			description = "Display name shown to others; 1-32 chars of [A-Za-z0-9_.-] (default: ${DEFAULT-VALUE}).")
 	private String display;
 
 	@Option(names = "--hifi", description = "Use the Opus music profile instead of the voice profile.")
@@ -56,6 +53,11 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 
 	@Option(names = "--list-inputs", description = "List available audio input devices and exit.")
 	private boolean listInputs;
+
+	@Option(names = "--key", defaultValue = "${env:WALKIE_KEY:-}",
+			description = "Passphrase for end-to-end audio encryption (AES-256-GCM). Every participant in a "
+					+ "channel must use the same one. Defaults to the WALKIE_KEY env var; omit to disable.")
+	private String key;
 
 	static void main(String... args) {
 		System.exit(new CommandLine(new WalkieClientLauncher()).execute(args));
@@ -69,12 +71,12 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 		}
 		new WalkieClient(new ClientOptions(
 				server,
-				user,
 				channel,
 				mode,
-				display == null || display.isBlank() ? user : display,
+				display,
 				highFidelity,
-				input
+				input,
+				key
 		))
 				.run();
 		return 0;

@@ -26,14 +26,24 @@ public final class Channel {
 	private volatile ChannelMode mode;
 	private volatile String ownerId;
 
-	public Channel(String name, ChannelMode mode, String ownerId) {
+	/// The key-check value every member must present to join (a short value derived from the E2EE
+	/// passphrase, or `null` for an unencrypted channel), set by the creator. The server compares it to
+	/// reject a mismatched passphrase; it is not the key and reveals nothing usable about it.
+	private final String keyCheck;
+
+	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck) {
 		this.name = name;
 		this.mode = mode;
 		this.ownerId = ownerId;
+		this.keyCheck = keyCheck;
 	}
 
 	public String name() {
 		return name;
+	}
+
+	public String keyCheck() {
+		return keyCheck;
 	}
 
 	public ChannelMode mode() {

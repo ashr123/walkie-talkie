@@ -31,11 +31,6 @@ public final class FakeClientSession implements ClientSession {
 	}
 
 	@Override
-	public String userId() {
-		return id;
-	}
-
-	@Override
 	public Transport transport() {
 		return transport;
 	}

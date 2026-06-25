@@ -1,10 +1,6 @@
 package io.github.ashr123.walkietalkie.client;
 
-import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
-import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
-import io.github.ashr123.walkietalkie.shared.protocol.LoginResponse;
-import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
-import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.*;
 import io.github.jaredmdobson.concentus.*;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -22,16 +18,13 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CompletionStage;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /// Console walkie-talkie client. Uses the WebSocket-relay transport (the only one available to a
@@ -65,7 +58,8 @@ public final class WalkieClient {
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
 	private final BlockingQueue<byte[]> playbackQueue = new LinkedBlockingQueue<>();
 	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
-
+	/// Toggled live from the console ('f'); read by the capture thread, which rebuilds the encoder when it changes.
+	private final AtomicBoolean highFidelity;
 	private int channels;          // 1 or 2, negotiated against the audio device
 	private int frameSamples;      // SAMPLES_PER_CHANNEL * channels (interleaved)
 	private int pcmFrameBytes;     // frameSamples * 2
@@ -80,20 +74,72 @@ public final class WalkieClient {
 	private volatile String selfId = "";
 	private volatile String ownerId;
 	private volatile ChannelMode currentMode;
+	private FrameCrypto crypto;          // AES-256-GCM E2EE, or null when no passphrase; set before the loops start
+	private volatile boolean warnedDecrypt; // listener thread only today, but volatile so the warn-once intent survives a threading refactor
 
 	public WalkieClient(ClientOptions options) {
 		this.options = options;
 		this.currentMode = options.mode();
+		this.highFidelity = new AtomicBoolean(options.highFidelity());
+	}
+
+	private static boolean lineSupported(Mixer.Info mixerInfo, DataLine.Info lineInfo) {
+		return mixerInfo == null
+				? AudioSystem.isLineSupported(lineInfo)
+				: AudioSystem.getMixer(mixerInfo).isLineSupported(lineInfo);
+	}
+
+	// --- HTTP login -------------------------------------------------------------------------------
+
+	/// Lists the audio mixers that expose a capture line, for use with `--input`.
+	static void listInputDevices() {
+		System.out.println("Available input devices (match with --input \"<name>\"):");
+		for (Mixer.Info info : AudioSystem.getMixerInfo()) {
+			if (AudioSystem.getMixer(info).getTargetLineInfo().length > 0) {
+				System.out.println("  - " + info.getName());
+			}
+		}
+	}
+
+	// --- Audio format + codec ---------------------------------------------------------------------
+
+	/// Prints a status line prefixed with the local timestamp (`yyyy-MM-dd HH:mm:ss,SSS`).
+	private static void log(String message) {
+		System.out.println(LocalDateTime.now().format(DATE_TIME_FORMATTER) + " " + message);
+	}
+
+	private static String modeHint(ChannelMode mode) {
+		return mode == ChannelMode.FULL_DUPLEX
+				? "Full-duplex: type 't' to start/stop your mic."
+				: "Push-to-talk: type 't' to grab/release the floor.";
+	}
+
+	/// Names the mixer [AudioSystem#getLine] would use for the default capture line — the configured default
+	/// mixer when it supports `info`, otherwise the first mixer that does (mirroring `getLine`'s own order) —
+	/// purely so the chosen default device can be shown in the log.
+	private static Mixer.Info defaultCaptureMixer(DataLine.Info info) {
+		Mixer defaultMixer = AudioSystem.getMixer(null);
+		if (defaultMixer.isLineSupported(info)) {
+			return defaultMixer.getMixerInfo();
+		}
+		for (Mixer.Info candidate : AudioSystem.getMixerInfo()) {
+			if (AudioSystem.getMixer(candidate).isLineSupported(info)) {
+				return candidate;
+			}
+		}
+		return null;
 	}
 
 	public void run() throws Exception {
-		System.out.println("Logging in as '" + options.user() + "' at " + options.server() + " ...");
+		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
 		token = login();
 		negotiateAudioFormat();
 		setupCodec();
 		openAudio();
+		crypto = setupCrypto();
 		System.out.println("Audio: Opus 48 kHz + FEC, " + (channels == 2 ? "stereo" : "mono")
-				+ " (" + (options.highFidelity() ? "music" : "voice") + " profile)");
+				+ " (" + (highFidelity.get() ? "music" : "voice") + " profile)"
+				+ (crypto != null ? ", end-to-end encrypted (AES-256-GCM)" : ""));
 
 		Thread.ofVirtual().name("ptt-sender").start(this::senderLoop);
 		Thread.ofVirtual().name("ptt-playback").start(this::playbackLoop);
@@ -107,44 +153,6 @@ public final class WalkieClient {
 			shutdown();
 		}
 	}
-
-	// --- HTTP login -------------------------------------------------------------------------------
-
-	private String login() throws IOException, InterruptedException {
-		HttpRequest request = HttpRequest.newBuilder(URI.create(options.server() + "/api/auth/login"))
-				.header("Content-Type", "application/json")
-				.POST(HttpRequest.BodyPublishers.ofString(jsonMapper.writeValueAsString(Map.of("username", options.user()))))
-				.build();
-		HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-		if (response.statusCode() != 200) {
-			throw new IOException("Login failed: HTTP " + response.statusCode() + " " + response.body());
-		}
-		// The token is an opaque string in headers/query params; the wire record types it as a UUID.
-		return jsonMapper.readValue(response.body(), LoginResponse.class).token().toString();
-	}
-
-	/// Best-effort token revocation on a graceful quit. An abrupt disconnect is still covered by the
-	/// server evicting the token when the WebSocket closes.
-	private void logout() {
-		if (token == null) {
-			return;
-		}
-		try {
-			httpClient.send(
-					HttpRequest.newBuilder(URI.create(options.server() + "/api/auth/logout"))
-							.header("Authorization", "Bearer " + token)
-							.POST(HttpRequest.BodyPublishers.noBody())
-							.build(),
-					HttpResponse.BodyHandlers.discarding()
-			);
-		} catch (IOException _) {
-			// best-effort
-		} catch (InterruptedException _) {
-			Thread.currentThread().interrupt();
-		}
-	}
-
-	// --- Audio format + codec ---------------------------------------------------------------------
 
 	/// Resolves the input device (`--input`, or the system default) and picks stereo only when THAT mic
 	/// and the playback device both support a 48 kHz stereo line — otherwise mono. Negotiating against the
@@ -161,7 +169,21 @@ public final class WalkieClient {
 		pcmFrameBytes = frameSamples * 2;
 	}
 
-	/// Finds the input mixer whose name contains [ClientOptions#inputDevice] and has a capture line, or
+	private String login() throws IOException, InterruptedException {
+		// Login takes no input: it just mints a signed, short-lived token. The token is an opaque string.
+		HttpRequest request = HttpRequest.newBuilder(URI.create(options.server() + "/api/auth/login"))
+				.POST(HttpRequest.BodyPublishers.noBody())
+				.build();
+		HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+		if (response.statusCode() != 200) {
+			throw new IOException("Login failed: HTTP " + response.statusCode() + " " + response.body());
+		}
+		return jsonMapper.readValue(response.body(), LoginResponse.class).token();
+	}
+
+	// --- WebSocket --------------------------------------------------------------------------------
+
+	/// Finds the input mixer whose name contains [ClientOptions#inputDevice()] and has a capture line, or
 	/// `null` (system default) when unset or unmatched.
 	private Mixer.Info resolveInputMixer() {
 		String wanted = options.inputDevice();
@@ -178,29 +200,25 @@ public final class WalkieClient {
 		return null;
 	}
 
-	private static boolean lineSupported(Mixer.Info mixerInfo, DataLine.Info lineInfo) {
-		return mixerInfo == null
-				? AudioSystem.isLineSupported(lineInfo)
-				: AudioSystem.getMixer(mixerInfo).isLineSupported(lineInfo);
+	/// Builds the AES-256-GCM frame cipher from `--key` (or the WALKIE_KEY env var), or null to disable
+	/// E2EE. Salted with the effective channel (the server forces "global" for global mode), so every
+	/// client in the channel derives the same key.
+	private FrameCrypto setupCrypto() throws GeneralSecurityException {
+		String passphrase = options.key();
+		return passphrase == null || passphrase.isBlank()
+				? null
+				: FrameCrypto.fromPassphrase(
+				passphrase,
+				options.mode() == ChannelMode.GLOBAL_PTT ? "global" : options.channel()
+		);
 	}
+
+	// --- Audio ------------------------------------------------------------------------------------
 
 	private void setupCodec() throws OpusException {
-		encoder = new OpusEncoder(
-				(int) SAMPLE_RATE,
-				channels,
-				options.highFidelity()
-						? OpusApplication.OPUS_APPLICATION_AUDIO
-						: OpusApplication.OPUS_APPLICATION_VOIP
-		);
-		encoder.setBitrate(channels == 2 ? STEREO_BITRATE : MONO_BITRATE);
-		encoder.setComplexity(10);
-		encoder.setUseInbandFEC(true);
-		encoder.setPacketLossPercent(10);
-		encoder.setSignalType(options.highFidelity() ? OpusSignal.OPUS_SIGNAL_MUSIC : OpusSignal.OPUS_SIGNAL_VOICE);
+		configureEncoder();
 		decoder = new OpusDecoder((int) SAMPLE_RATE, channels);
 	}
-
-	// --- WebSocket --------------------------------------------------------------------------------
 
 	private void connect(String token) {
 		webSocket = httpClient.newWebSocketBuilder()
@@ -227,8 +245,6 @@ public final class WalkieClient {
 		}
 	}
 
-	// --- Audio ------------------------------------------------------------------------------------
-
 	private void openAudio() throws LineUnavailableException {
 		DataLine.Info micInfo = new DataLine.Info(TargetDataLine.class, format);
 		DataLine.Info speakerInfo = new DataLine.Info(SourceDataLine.class, format);
@@ -244,30 +260,43 @@ public final class WalkieClient {
 		speaker.start();
 	}
 
-	/// Opens the capture line of the input device resolved during negotiation, or the system default when
-	/// none was matched. The line uses the negotiated [#format], which already matches the device.
-	private TargetDataLine openMic(DataLine.Info micInfo) throws LineUnavailableException {
-		if (inputMixerInfo == null) {
-			return (TargetDataLine) AudioSystem.getLine(micInfo);
-		}
-		System.out.println("Capturing from input device: " + inputMixerInfo.getName());
-		return (TargetDataLine) AudioSystem.getMixer(inputMixerInfo).getLine(micInfo);
+	/// (Re)builds the Opus encoder for the current [#highFidelity] setting — music profile (full-band audio)
+	/// when on, voice profile (VoIP) when off. Called once at startup and again by the capture thread when
+	/// the setting is toggled live, so it is only ever touched from that one thread (the encoder is confined
+	/// to it). The Opus *application* mode is fixed at construction, so a live switch rebuilds the encoder.
+	private void configureEncoder() throws OpusException {
+		boolean hifi = highFidelity.get();
+		encoder = new OpusEncoder(
+				(int) SAMPLE_RATE,
+				channels,
+				hifi ? OpusApplication.OPUS_APPLICATION_AUDIO : OpusApplication.OPUS_APPLICATION_VOIP
+		);
+		encoder.setBitrate(channels == 2 ? STEREO_BITRATE : MONO_BITRATE);
+		encoder.setComplexity(10);
+		encoder.setUseInbandFEC(true);
+		encoder.setPacketLossPercent(10);
+		encoder.setSignalType(hifi ? OpusSignal.OPUS_SIGNAL_MUSIC : OpusSignal.OPUS_SIGNAL_VOICE);
 	}
 
-	/// Lists the audio mixers that expose a capture line, for use with `--input`.
-	static void listInputDevices() {
-		System.out.println("Available input devices (match with --input \"<name>\"):");
-		for (Mixer.Info info : AudioSystem.getMixerInfo()) {
-			if (AudioSystem.getMixer(info).getTargetLineInfo().length > 0) {
-				System.out.println("  - " + info.getName());
-			}
+	/// Opens the capture line of the input device resolved during negotiation, or the system default when
+	/// none was matched. Either way it logs the device actually opened — so a silent/wrong default device
+	/// is visible rather than mysterious. The line uses the negotiated [#format], which matches the device.
+	private TargetDataLine openMic(DataLine.Info micInfo) throws LineUnavailableException {
+		if (inputMixerInfo != null) {
+			System.out.println("Capturing from input device: " + inputMixerInfo.getName() + " (matched --input)");
+			return (TargetDataLine) AudioSystem.getMixer(inputMixerInfo).getLine(micInfo);
 		}
+		Mixer.Info dflt = defaultCaptureMixer(micInfo);
+		System.out.println("Capturing from input device: " + (dflt == null ? "(unidentified)" : dflt.getName())
+				+ " — system default. If you hear nothing, pass --input (see --list-inputs) to pick your mic.");
+		return (TargetDataLine) AudioSystem.getLine(micInfo);
 	}
 
 	private void captureLoop() {
 		byte[] buffer = new byte[pcmFrameBytes];
 		short[] pcm = new short[frameSamples];
 		byte[] packet = new byte[MAX_PACKET_BYTES];
+		boolean appliedHifi = highFidelity.get();
 		while (running.get()) {
 			// line drained/closed; re-check running flag
 			if (!readFully(buffer) ||
@@ -275,7 +304,15 @@ public final class WalkieClient {
 					!transmitting.get()) {
 				continue;
 			}
-			// keep the mic flowing but don't transmit
+			// Apply a live hi-fi toggle: rebuild the encoder (music vs voice profile) when it changed.
+			if (highFidelity.get() != appliedHifi) {
+				try {
+					configureEncoder();
+					appliedHifi = highFidelity.get();
+				} catch (OpusException _) {
+					// keep the existing encoder if the rebuild fails
+				}
+			}
 			ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(pcm);
 			try {
 				// frame size is samples *per channel*; pcm holds frameSamples interleaved shorts.
@@ -283,8 +320,8 @@ public final class WalkieClient {
 				byte[] frame = new byte[len + 1];
 				frame[0] = CODEC_OPUS;
 				System.arraycopy(packet, 0, frame, 1, len);
-				sendQueue.offer(new Outbound.Binary(frame));
-			} catch (OpusException _) {
+				sendQueue.offer(new Outbound.Binary(crypto == null ? frame : crypto.encrypt(frame)));
+			} catch (OpusException | GeneralSecurityException _) {
 				// drop this frame; keep going
 			}
 		}
@@ -301,6 +338,8 @@ public final class WalkieClient {
 		}
 		return read == buffer.length;
 	}
+
+	// --- Server messages --------------------------------------------------------------------------
 
 	private void playbackLoop() {
 		short[] pcm = new short[frameSamples];
@@ -354,11 +393,11 @@ public final class WalkieClient {
 		speaker.write(stereo, 0, stereo.length);
 	}
 
-	// --- Server messages --------------------------------------------------------------------------
-
 	private void handleServerMessage(String json) {
 		switch (jsonMapper.readValue(json, ServerMessage.class)) {
-			case ServerMessage.Joined(String selfId, String channel, ChannelMode mode, String ownerId, List<MemberInfo> members) -> {
+			case ServerMessage.Joined(
+					String selfId, String channel, ChannelMode mode, String ownerId, List<MemberInfo> members
+			) -> {
 				this.selfId = selfId;
 				this.ownerId = ownerId;
 				this.currentMode = mode;
@@ -392,36 +431,38 @@ public final class WalkieClient {
 			}
 			case ServerMessage.SignalOffer _, ServerMessage.SignalAnswer _,
 			     ServerMessage.SignalIce _ -> { /* WebRTC: not used by the relay client */ }
-			case ServerMessage.ErrorMessage(String code, String message) ->
-					log("[error] " + code + ": " + message);
+			case ServerMessage.ErrorMessage(String code, String message) -> {
+				log("[error] " + code + ": " + message);
+				// A passphrase mismatch is fatal: the channel requires a different --key, so there's nothing
+				// to do but disconnect. getAndSet(false) makes this fire once (mirrors onConnectionLost).
+				if ("passphrase_mismatch".equals(code) && running.getAndSet(false)) {
+					log("Disconnecting — this channel needs a different --key.");
+					System.exit(0);
+				}
+			}
 		}
 	}
 
-	/// Resolves a member's display name from its session id, falling back to the raw id if unknown.
+	/// Resolves a member's display name from its session id, falling back to the raw id if unknown. When
+	/// more than one member shares that display name, a short session-id prefix is appended so the two are
+	/// distinguishable — the session id is the real identity.
 	private String name(String id) {
 		String display = memberNames.get(id);
-		return display == null ? id : display;
+		if (display == null) {
+			return id;
+		}
+		long sharing = memberNames.values().stream().filter(display::equals).count();
+		return sharing > 1 ? display + " (#" + id.substring(0, Math.min(8, id.length())) + ")" : display;
 	}
 
 	private void announceJoin(MemberInfo member) {
 		memberNames.put(member.id(), member.displayName());
-		log("[+] " + member.displayName());
+		log("[+] " + name(member.id()));
 	}
 
 	private void announceLeave(String memberId) {
 		log("[-] " + name(memberId));
 		memberNames.remove(memberId);
-	}
-
-	/// Prints a status line prefixed with the local timestamp (`yyyy-MM-dd HH:mm:ss,SSS`).
-	private static void log(String message) {
-		System.out.println(LocalDateTime.now().format(DATE_TIME_FORMATTER) + " " + message);
-	}
-
-	private static String modeHint(ChannelMode mode) {
-		return mode == ChannelMode.FULL_DUPLEX
-				? "Full-duplex: type 't' to start/stop your mic."
-				: "Push-to-talk: type 't' to grab/release the floor.";
 	}
 
 	// --- Console control --------------------------------------------------------------------------
@@ -435,10 +476,12 @@ public final class WalkieClient {
 				switch (parts[0].toLowerCase(Locale.ROOT)) {
 					case "t", "talk" -> toggleTalk();
 					case "m", "mode" -> changeMode(parts.length > 1 ? parts[1] : "");
+					case "f", "fidelity" -> toggleFidelity();
 					case "q", "quit", "exit" -> running.set(false);
 					case "h", "help" -> printHelp();
 					case "" -> { /* ignore blank lines */ }
-					default -> System.out.println("Commands: 't' talk/stop, 'm <ptt|global|duplex>' mode, 'q' quit, 'h' help.");
+					default ->
+							System.out.println("Commands: 't' talk/stop, 'm <ptt|global|duplex>' mode, 'f' hi-fi, 'q' quit, 'h' help.");
 				}
 			}
 		} catch (IOException _) {
@@ -462,6 +505,14 @@ public final class WalkieClient {
 		}
 	}
 
+	/// Flips the hi-fi (Opus music vs voice) profile live. The capture thread rebuilds the encoder on its
+	/// next transmitted frame, so the change applies without reconnecting.
+	private void toggleFidelity() {
+		boolean hifi = !highFidelity.get();
+		highFidelity.set(hifi);
+		log("[hi-fi " + (hifi ? "on — music profile" : "off — voice profile") + "] (applies on the next transmitted frame)");
+	}
+
 	/// Asks the server to change the channel mode. Gated locally to the owner (the server enforces it
 	/// too); the resulting [ServerMessage.ModeChanged] is what actually updates everyone's controls.
 	private void changeMode(String arg) {
@@ -479,9 +530,9 @@ public final class WalkieClient {
 
 	private void printHelp() {
 		System.out.println("""
-				-------------------------------------------------------------------------------
-				 Commands:  t = talk/stop   m <ptt|global|duplex> = mode   q = quit   h = help
-				-------------------------------------------------------------------------------""");
+				--------------------------------------------------------------------------------------------------
+				 Commands:  t = talk/stop   m <ptt|global|duplex> = mode   f = hi-fi on/off   q = quit   h = help
+				--------------------------------------------------------------------------------------------------""");
 	}
 
 	// --- helpers ----------------------------------------------------------------------------------
@@ -491,12 +542,14 @@ public final class WalkieClient {
 	}
 
 	private void sendJoin() {
-		enqueue(new ClientMessage.Join(options.channel(), options.mode(), options.display()));
+		enqueue(new ClientMessage.Join(options.channel(), options.mode(), options.display(),
+				crypto == null ? null : crypto.keyCheck()));
 	}
 
 	private void shutdown() {
 		running.set(false);
-		logout();
+		// Closing the WebSocket ends the session — the bearer token is stateless and self-expiring, so
+		// there is nothing to revoke server-side.
 		if (webSocket != null) {
 			webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "bye");
 		}
@@ -566,8 +619,20 @@ public final class WalkieClient {
 			data.get(chunk);
 			binaryBuffer.writeBytes(chunk);
 			if (last) {
-				playbackQueue.offer(binaryBuffer.toByteArray());
+				byte[] frame = binaryBuffer.toByteArray();
 				binaryBuffer.reset();
+				if (crypto == null) {
+					playbackQueue.offer(frame);
+				} else {
+					try {
+						playbackQueue.offer(crypto.decrypt(frame));
+					} catch (GeneralSecurityException _) {
+						if (!warnedDecrypt) {
+							warnedDecrypt = true;
+							log("[warn] could not decrypt audio — confirm everyone uses the same --key, --channel, and --mode");
+						}
+					}
+				}
 			}
 			webSocket.request(1);
 			return null;

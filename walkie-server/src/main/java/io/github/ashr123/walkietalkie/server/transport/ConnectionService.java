@@ -26,8 +26,8 @@ public class ConnectionService {
 
 	private static final Logger log = LoggerFactory.getLogger(ConnectionService.class);
 	private static final Pattern CHANNEL_NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+	private static final Pattern DISPLAY_NAME = Pattern.compile("[A-Za-z0-9_.-]{1,32}");
 	private static final String GLOBAL_CHANNEL = "global";
-	private static final int MAX_DISPLAY_NAME = 40;
 
 	private final ChannelRegistry channelRegistry;
 	private final FloorControlService floorControl;
@@ -41,13 +41,8 @@ public class ConnectionService {
 		this.properties = properties;
 	}
 
-	private static String sanitizeDisplayName(String raw) {
-		String cleaned = raw.strip().replaceAll("\\p{Cntrl}", "");
-		return cleaned.length() > MAX_DISPLAY_NAME ? cleaned.substring(0, MAX_DISPLAY_NAME) : cleaned;
-	}
-
 	public void onConnect(ClientSession session) {
-		log.info("Connected: session={} user={} transport={}", session.id(), session.userId(), session.transport());
+		log.info("Connected: session={} transport={}", session.id(), session.transport());
 	}
 
 	/// Handles one decoded control message. The caller's identity is bound for the dynamic scope of the
@@ -55,7 +50,7 @@ public class ConnectionService {
 	/// MDC) — see [RequestContext#runAs]. The audio relay path ({@link #onAudio}) is deliberately not
 	/// scoped, to avoid per-frame MDC churn.
 	public void onMessage(ClientSession session, ClientMessage message) {
-		RequestContext.runAs(session.userId(), () -> dispatch(session, message));
+		RequestContext.runAs(session.id(), () -> dispatch(session, message));
 	}
 
 	private void dispatch(ClientSession session, ClientMessage message) {
@@ -86,11 +81,19 @@ public class ConnectionService {
 					"Channel name must match " + CHANNEL_NAME.pattern()));
 			return;
 		}
-		if (join.displayName() != null && !join.displayName().isBlank()) {
-			session.setDisplayName(sanitizeDisplayName(join.displayName()));
+		if (join.displayName() == null || !DISPLAY_NAME.matcher(join.displayName()).matches()) {
+			session.send(new ServerMessage.ErrorMessage("invalid_display_name",
+					"Display name must match " + DISPLAY_NAME.pattern()));
+			return;
 		}
+		session.setDisplayName(join.displayName());
 
-		Channel channel = channelRegistry.joinOrCreate(requested, mode, session);
+		Channel channel = channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session);
+		if (channel == null) {
+			session.send(new ServerMessage.ErrorMessage("passphrase_mismatch",
+					"This channel is using a different encryption passphrase (or none) — you can't join it."));
+			return;
+		}
 
 		session.joinedChannel(channel.name(), channel.mode());
 		session.send(new ServerMessage.Joined(
@@ -103,8 +106,8 @@ public class ConnectionService {
 			session.send(new ServerMessage.FloorTaken(holder));
 		}
 
-		log.info("user={} joined channel={} mode={} as session={}",
-				session.userId(), channel.name(), channel.mode(), session.id());
+		log.info("session={} ({}) joined channel={} mode={}",
+				session.id(), session.displayName(), channel.name(), channel.mode());
 	}
 
 	private void handleLeave(ClientSession session) {
@@ -191,7 +194,7 @@ public class ConnectionService {
 			safeSend(other, modeChanged);
 			safeSend(other, floorIdle);
 		});
-		log.info("user={} changed channel={} mode to {}", session.userId(), channel.name(), mode);
+		log.info("session={} changed channel={} mode to {}", session.id(), channel.name(), mode);
 	}
 
 	/// Relays a raw audio frame to the other relay-capable members of the sender's channel. The frame
@@ -224,7 +227,7 @@ public class ConnectionService {
 
 	public void onClose(ClientSession session) {
 		handleLeave(session);
-		log.info("Disconnected: session={} user={}", session.id(), session.userId());
+		log.info("Disconnected: session={}", session.id());
 	}
 
 	private void relaySignal(ClientSession session, String targetId, ServerMessage message) {

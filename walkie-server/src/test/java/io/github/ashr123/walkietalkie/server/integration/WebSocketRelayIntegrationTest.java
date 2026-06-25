@@ -24,7 +24,6 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -42,8 +41,8 @@ class WebSocketRelayIntegrationTest {
 
 	@Test
 	void pushToTalkFloorGrantAndAudioFanOut() throws Exception {
-		String tokenA = login("alice");
-		String tokenB = login("bob");
+		String tokenA = login();
+		String tokenB = login();
 
 		StandardWebSocketClient client = new StandardWebSocketClient();
 		CollectingHandler handlerA = new CollectingHandler();
@@ -53,11 +52,11 @@ class WebSocketRelayIntegrationTest {
 		WebSocketSession sessionB = connect(client, handlerB, tokenB);
 
 		try {
-			send(sessionA, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Alice"));
+			send(sessionA, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.Joined joinedA = awaitType(handlerA.messages, ServerMessage.Joined.class);
 			assertEquals("team", joinedA.channel());
 
-			send(sessionB, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Bob"));
+			send(sessionB, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
 			awaitType(handlerB.messages, ServerMessage.Joined.class);
 
 			// Alice's queue should see Bob arrive.
@@ -86,12 +85,11 @@ class WebSocketRelayIntegrationTest {
 
 	@Test
 	void aMalformedTokenIsRejectedAtTheBoundaryNotAsAServerError() throws Exception {
-		// The refactor's central safety claim lives at the inbound boundary (TokenAuthenticationFilter ->
-		// AuthService.resolve): a token that is not a well-formed UUID must be treated as unauthenticated,
-		// never escape UUID.fromString as a 500. Drive a protected endpoint with a garbage bearer token and
-		// require it to behave exactly like presenting no token at all.
+		// A token that is not a valid signed token (here: garbage) must be treated as unauthenticated at the
+		// inbound boundary (TokenAuthenticationFilter -> AuthService.verify), never surface as a 500. Drive a
+		// protected endpoint with a garbage bearer token and require it to behave exactly like no token.
 		int missing = protectedEndpointStatus(null);
-		int malformed = protectedEndpointStatus("Bearer not-a-uuid");
+		int malformed = protectedEndpointStatus("Bearer not-a-token");
 		assertNotEquals(500, malformed, "a malformed token must not surface as a server error");
 		assertEquals(missing, malformed, "a malformed token must be rejected exactly like a missing one");
 	}
@@ -104,15 +102,13 @@ class WebSocketRelayIntegrationTest {
 		return httpClient.send(builder.build(), HttpResponse.BodyHandlers.discarding()).statusCode();
 	}
 
-	private String login(String username) throws Exception {
-		String body = jsonMapper.writeValueAsString(Map.of("username", username));
+	private String login() throws Exception {
 		HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/auth/login"))
-				.header("Content-Type", "application/json")
-				.POST(HttpRequest.BodyPublishers.ofString(body))
+				.POST(HttpRequest.BodyPublishers.noBody())
 				.build();
 		HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 		assertEquals(200, response.statusCode());
-		return jsonMapper.readValue(response.body(), LoginResponse.class).token().toString();
+		return jsonMapper.readValue(response.body(), LoginResponse.class).token();
 	}
 
 	private WebSocketSession connect(StandardWebSocketClient client, CollectingHandler handler, String token)
