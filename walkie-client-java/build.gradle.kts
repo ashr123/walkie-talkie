@@ -26,3 +26,10 @@ dependencies {
 application {
     mainClass.set("io.github.ashr123.walkietalkie.client.WalkieClientLauncher")
 }
+
+// Gradle's `run` task does not attach the terminal's stdin to the forked JVM by default, so the
+// interactive console would read EOF immediately and quit ("Goodbye."). Forward stdin so the
+// `t` / `m` / `q` prompt commands work when launched via `:walkie-client-java:run`.
+tasks.named<JavaExec>("run") {
+    standardInput = System.`in`
+}
