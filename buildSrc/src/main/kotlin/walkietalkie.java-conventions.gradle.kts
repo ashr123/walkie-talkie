@@ -1,3 +1,5 @@
+import org.gradle.testing.jacoco.tasks.JacocoReport
+
 // Shared Java build conventions for every module in this build.
 // Modules apply it with: plugins { id("walkietalkie.java-conventions") }
 // This replaces the old subprojects {}/apply(plugin = ...) cross-configuration, which Gradle
@@ -5,6 +7,7 @@
 
 plugins {
 	java
+	jacoco
 }
 
 group = "io.github.ashr123"
@@ -25,6 +28,22 @@ tasks.withType<JavaCompile>().configureEach {
 	options.encoding = "UTF-8"
 }
 
+// Use the explicitly-typed task API (named<Test>/named<JacocoReport>) rather than Gradle's generated
+// type-safe accessors (tasks.test / tasks.jacocoTestReport). The accessors live in a hash-named package
+// (gradle.kotlin.dsl.accessors._<hash>) that IntelliJ can't resolve without a brittle, plugin-set-specific
+// import; the typed form below resolves from real Gradle types in both the IDE and the Gradle build.
 tasks.withType<Test>().configureEach {
 	useJUnitPlatform()
+	// Run the coverage report automatically after the tests, so `./gradlew test` (or build) always
+	// refreshes build/reports/jacoco/test for that module.
+	finalizedBy(tasks.named("jacocoTestReport"))
+}
+
+tasks.named<JacocoReport>("jacocoTestReport") {
+	dependsOn(tasks.named("test"))
+	reports {
+		xml.required.set(true)
+		csv.required.set(true)
+		html.required.set(true)
+	}
 }

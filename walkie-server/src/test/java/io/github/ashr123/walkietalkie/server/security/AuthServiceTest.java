@@ -64,4 +64,19 @@ class AuthServiceTest {
 		assertFalse(authService.verify(""), "empty");
 		assertFalse(authService.verify(null), "null");
 	}
+
+	@Test
+	void rejectsACorrectlyEncodedButWrongLengthPayload() {
+		// "QQ" is valid base64url (one decoded byte), so this clears the dot + base64 checks but fails the
+		// fixed payload-length guard before any MAC work is done.
+		assertFalse(authService.verify("QQ.QQ"), "a payload of the wrong length must not verify");
+	}
+
+	@Test
+	void generatesARandomPerProcessKeyWhenNoneIsConfiguredSoTokensStillRoundTrip() {
+		AuthService noKey = new AuthService(props(null));
+		assertTrue(noKey.verify(noKey.issueToken()), "a process-random key still signs and verifies");
+		AuthService blankKey = new AuthService(props("   "));
+		assertTrue(blankKey.verify(blankKey.issueToken()), "a blank key takes the same random-fallback path");
+	}
 }

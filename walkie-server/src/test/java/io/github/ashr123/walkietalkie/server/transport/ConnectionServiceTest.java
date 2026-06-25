@@ -6,6 +6,7 @@ import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.floor.FloorControlService;
+import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
@@ -14,8 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.*;
 
 /// Drives [ConnectionService] with fake sessions to verify channel ownership, mode adoption and the
 /// owner-only mode-change broadcast.
@@ -126,5 +126,196 @@ class ConnectionServiceTest {
 
 		assertEquals("invalid_mode", firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals(ChannelMode.MULTI_CHANNEL_PTT, channel("team").mode(), "the mode is unchanged");
+	}
+
+	// --- additional branch coverage: validation edges and audio-relay rules that are awkward to reach over
+	// --- a real socket (the WebSocket container caps the wire frame, so onAudio's own size guard, the
+	// --- signaling-transport skip, and the per-recipient failure isolation are exercised directly here).
+
+	private static FakeClientSession signaling(String id) {
+		return new FakeClientSession(id, Transport.SIGNALING, id);
+	}
+
+	@Test
+	void aJoinWithANullChannelNameIsRejectedAsInvalidChannel() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		assertEquals("invalid_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void aJoinWithAnEmptyChannelNameIsRejectedAsInvalidChannel() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join("", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		assertEquals("invalid_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void aJoinWithAnOverlongChannelNameIsRejectedAsInvalidChannel() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join("x".repeat(65), ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		assertEquals("invalid_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void channelNameValidationHappensBeforeDisplayNameValidation() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join("bad name", ChannelMode.MULTI_CHANNEL_PTT, "also bad!!", null));
+		assertEquals("invalid_channel", firstOf(s, ServerMessage.ErrorMessage.class).code(),
+				"the channel name is validated before the display name");
+	}
+
+	@Test
+	void aJoinWithANullDisplayNameIsRejectedAsInvalidDisplayName() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, null));
+		assertEquals("invalid_display_name", firstOf(s, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void aJoinWithAnOverlongDisplayNameIsRejected() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "x".repeat(33), null));
+		assertEquals("invalid_display_name", firstOf(s, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void globalPttWithANullChannelNameStillJoinsTheGlobalChannel() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.GLOBAL_PTT, "alice", null));
+		assertEquals("global", firstOf(s, ServerMessage.Joined.class).channel(),
+				"GLOBAL_PTT forces the name to 'global' before the null-channel check");
+	}
+
+	@Test
+	void emptyAndOversizedAudioFramesAreDroppedAndAFrameAtTheLimitIsRelayed() {
+		FakeClientSession alice = join("alice", "fd", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "fd", ChannelMode.FULL_DUPLEX);
+
+		service.onAudio(alice, new byte[0]);          // empty -> dropped
+		service.onAudio(alice, new byte[8193]);       // over the 8192 limit -> dropped
+		assertEquals(0, bob.audio.size(), "empty and oversized frames are dropped");
+
+		service.onAudio(alice, new byte[8192]);       // exactly at the limit -> relayed
+		assertEquals(1, bob.audio.size());
+		assertEquals(8192, bob.audio.getFirst().length);
+	}
+
+	@Test
+	void audioFromASignalingSenderIsDroppedAndSignalingMembersAreSkipped() {
+		FakeClientSession alice = join("alice", "room", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "room", ChannelMode.FULL_DUPLEX);
+		FakeClientSession carol = signaling("carol");
+		service.onMessage(carol, new ClientMessage.Join("room", ChannelMode.FULL_DUPLEX, "carol", null));
+
+		byte[] frame = {1, 2, 3};
+		service.onAudio(alice, frame);
+		assertEquals(1, bob.audio.size(), "an audio-relay member receives the frame");
+		assertEquals(0, carol.audio.size(), "a signaling member is skipped");
+
+		service.onAudio(carol, frame);   // a signaling sender cannot relay audio
+		assertEquals(1, bob.audio.size(), "audio from a signaling sender is dropped");
+	}
+
+	@Test
+	void audioWithNoChannelIsDroppedWithoutException() {
+		FakeClientSession s = session("never-joined");
+		assertDoesNotThrow(() -> service.onAudio(s, new byte[]{1, 2, 3}));
+	}
+
+	@Test
+	void aRelayFailureToOneRecipientDoesNotBlockOthers() {
+		FakeClientSession alice = join("alice", "relayfail", ChannelMode.FULL_DUPLEX);
+		FakeClientSession good = join("good", "relayfail", ChannelMode.FULL_DUPLEX);
+		ThrowingSession bad = new ThrowingSession("bad");
+		service.onMessage(bad, new ClientMessage.Join("relayfail", ChannelMode.FULL_DUPLEX, "bad", null));
+
+		byte[] frame = {4, 5, 6};
+		assertDoesNotThrow(() -> service.onAudio(alice, frame));
+		assertEquals(1, good.audio.size(), "the healthy recipient still receives despite a failing peer");
+		assertArrayEquals(frame, good.audio.getFirst());
+	}
+
+	@Test
+	void releaseFloorInFullDuplexIsANoOp() {
+		FakeClientSession alice = join("alice", "fd-rel", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "fd-rel", ChannelMode.FULL_DUPLEX);
+		alice.sent.clear();
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.ReleaseFloor());
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorIdle.class::isInstance),
+				"a full-duplex release broadcasts nothing");
+	}
+
+	@Test
+	void leavingWhenNeverInAChannelIsASilentNoOp() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Leave());
+		assertTrue(s.sent.isEmpty(), "leaving with no channel sends nothing — no error, no broadcast");
+	}
+
+	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a
+	/// single failing recipient and still delivers to the others.
+	private static final class ThrowingSession implements ClientSession {
+
+		private final String id;
+		private String displayName;
+		private String channelName;
+
+		private ThrowingSession(String id) {
+			this.id = id;
+			this.displayName = id;
+		}
+
+		@Override
+		public String id() {
+			return id;
+		}
+
+		@Override
+		public Transport transport() {
+			return Transport.AUDIO_RELAY;
+		}
+
+		@Override
+		public String displayName() {
+			return displayName;
+		}
+
+		@Override
+		public void setDisplayName(String displayName) {
+			this.displayName = displayName;
+		}
+
+		@Override
+		public String channelName() {
+			return channelName;
+		}
+
+		@Override
+		public void joinedChannel(String channel) {
+			this.channelName = channel;
+		}
+
+		@Override
+		public void leftChannel() {
+			this.channelName = null;
+		}
+
+		@Override
+		public boolean supportsAudioRelay() {
+			return true;
+		}
+
+		@Override
+		public void send(ServerMessage message) {
+			// control frames are irrelevant to this fake
+		}
+
+		@Override
+		public void sendAudio(byte[] audio) {
+			throw new RuntimeException("simulated send failure");
+		}
 	}
 }
