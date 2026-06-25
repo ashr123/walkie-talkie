@@ -21,7 +21,10 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /// Console walkie-talkie client over the WebSocket-relay transport (the only one available to a pure-Java
@@ -32,7 +35,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// Microphone capture, Opus (de)coding and speaker playback all live in [AudioEngine]; this class only
 /// encrypts captured frames before sending them and decrypts received frames before handing them back to
 /// the engine for playback. All loops run on Java 25 virtual threads.
-public final class WalkieClient {
+///
+/// It is [AutoCloseable]: [#run] does the work and blocks on the console; the caller closes the client
+/// (ideally via try-with-resources) to tear the session down.
+public final class WalkieClient implements AutoCloseable {
 
 	private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(
 			"yyyy-MM-dd HH:mm:ss,SSS", Locale.getDefault(Locale.Category.FORMAT));
@@ -42,6 +48,7 @@ public final class WalkieClient {
 	private final HttpClient httpClient = HttpClient.newHttpClient();
 
 	private final AtomicBoolean running = new AtomicBoolean(true);
+	private final AtomicBoolean closed = new AtomicBoolean(false);   // guards close() so it is idempotent
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
 	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
 	private final AudioEngine audio;
@@ -87,11 +94,8 @@ public final class WalkieClient {
 		Thread.ofVirtual().name("ptt-sender").start(this::senderLoop);
 		connect(token);
 
-		try {
-			consoleLoop();
-		} finally {
-			shutdown();
-		}
+		// Blocks until the user quits or stdin closes; the caller then closes us (try-with-resources).
+		consoleLoop();
 	}
 
 	// --- HTTP login + WebSocket -------------------------------------------------------------------
@@ -316,7 +320,14 @@ public final class WalkieClient {
 		));
 	}
 
-	private void shutdown() {
+	/// Tears the session down: stops the loops, closes the WebSocket, and closes the [AudioEngine].
+	/// Idempotent, so it is safe in a try-with-resources block (the launcher's) — note some paths exit the
+	/// process directly via [#onConnectionLost] and so never reach here.
+	@Override
+	public void close() {
+		if (!closed.compareAndSet(false, true)) {
+			return;
+		}
 		running.set(false);
 		// Closing the WebSocket ends the session — the bearer token is stateless and self-expiring, so
 		// there is nothing to revoke server-side.

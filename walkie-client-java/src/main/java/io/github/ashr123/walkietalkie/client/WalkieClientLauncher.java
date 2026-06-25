@@ -69,7 +69,7 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 			WalkieClient.listInputDevices();
 			return 0;
 		}
-		new WalkieClient(new ClientOptions(
+		try (WalkieClient client = new WalkieClient(new ClientOptions(
 				server,
 				channel,
 				mode,
@@ -77,8 +77,9 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 				highFidelity,
 				input,
 				key
-		))
-				.run();
+		))) {
+			client.run();
+		}
 		return 0;
 	}
 
