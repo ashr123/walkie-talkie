@@ -203,14 +203,9 @@ public class ConnectionService {
 	public void onAudio(ClientSession session, byte[] audio) {
 		if (!session.supportsAudioRelay() ||
 				audio.length == 0 ||
-				audio.length > properties.maxAudioFrameBytes()) {
-			return;
-		}
-		String channelName = session.channelName();
-		if (channelName == null) {
-			return;
-		}
-		if (!(channelRegistry.find(channelName) instanceof Some(Channel channel))
+				audio.length > properties.maxAudioFrameBytes()
+				|| session.channelName() == null
+				|| !(channelRegistry.find(session.channelName()) instanceof Some(Channel channel))
 				|| !channel.holdsFloor(session.id())) {
 			return;
 		}
