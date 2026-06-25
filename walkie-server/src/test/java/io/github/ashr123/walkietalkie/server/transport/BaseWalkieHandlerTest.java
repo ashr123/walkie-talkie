@@ -1,6 +1,7 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
+import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.CloseStatus;
@@ -9,6 +10,7 @@ import org.springframework.web.socket.WebSocketSession;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.mockito.Mockito.*;
@@ -75,7 +77,22 @@ class BaseWalkieHandlerTest {
 	void aTransportErrorIsLoggedAndSwallowed() {
 		WebSocketSession session = mock(WebSocketSession.class);
 		when(session.getId()).thenReturn("sess-1");
+		when(session.getAttributes()).thenReturn(new HashMap<>());   // no bound session -> nothing to close
 
 		assertDoesNotThrow(() -> handler.handleTransportError(session, new RuntimeException("boom")));
+	}
+
+	@Test
+	void aTransportErrorClosesTheBoundSessionsOutboundPump() {
+		ClientSession bound = mock(ClientSession.class);
+		WebSocketSession session = mock(WebSocketSession.class);
+		when(session.getId()).thenReturn("sess-2");
+		Map<String, Object> attributes = new HashMap<>();
+		attributes.put(BaseWalkieHandler.SESSION_KEY, bound);
+		when(session.getAttributes()).thenReturn(attributes);
+
+		handler.handleTransportError(session, new RuntimeException("boom"));
+
+		verify(bound).close();   // the pump is torn down so a transport error before close can't leak it
 	}
 }

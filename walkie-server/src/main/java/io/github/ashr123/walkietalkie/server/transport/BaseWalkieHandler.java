@@ -41,7 +41,7 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 			closeUnauthenticated(session);
 			return;
 		}
-		ClientSession clientSession = new WebSocketClientSession(
+		WebSocketClientSession clientSession = new WebSocketClientSession(
 				new ConcurrentWebSocketSessionDecorator(
 						session,
 						SEND_TIME_LIMIT_MS,
@@ -51,6 +51,9 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 				transport
 		);
 		session.getAttributes().put(SESSION_KEY, clientSession);
+		// Start the outbound pump only after the session is registered, so afterConnectionClosed can always
+		// find and close it (no construct-before-register leak window).
+		clientSession.start();
 		connectionService.onConnect(clientSession);
 	}
 
@@ -72,7 +75,11 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 	public void afterConnectionClosed(@NonNull WebSocketSession session, @NonNull CloseStatus status) {
 		ClientSession clientSession = lookup(session);
 		if (clientSession != null) {
-			connectionService.onClose(clientSession);
+			try {
+				connectionService.onClose(clientSession);
+			} finally {
+				clientSession.close();   // tear down the outbound pump even if onClose throws
+			}
 		}
 		// The bearer token is stateless and self-expiring, so there is nothing to revoke here: closing the
 		// WebSocket already ends the session (membership is dropped in onClose).
@@ -81,6 +88,11 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 	@Override
 	public void handleTransportError(WebSocketSession session, Throwable exception) {
 		log.debug("Transport error on session {}: {}", session.getId(), exception.toString());
+		// A transport error may precede afterConnectionClosed; close the pump now (idempotent) so it can't leak.
+		ClientSession clientSession = lookup(session);
+		if (clientSession != null) {
+			clientSession.close();
+		}
 	}
 
 	protected ClientSession lookup(WebSocketSession session) {

@@ -30,6 +30,11 @@ public interface ClientSession {
 	/// Sends a raw audio frame as a binary frame.
 	void sendAudio(byte[] audio);
 
+	/// Releases per-session outbound resources (the async send pump) on disconnect. A no-op for in-memory
+	/// fakes, which send synchronously.
+	default void close() {
+	}
+
 	default MemberInfo toMemberInfo() {
 		return new MemberInfo(id(), displayName());
 	}
