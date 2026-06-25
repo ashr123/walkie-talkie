@@ -13,7 +13,8 @@ const STUN = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
 
 const SAMPLE_RATE = 48000;
 const FRAME_US = 20000;          // 20 ms frame, in microseconds
-const TARGET_BITRATE = 64000;    // fullband voice, high quality
+const MONO_BITRATE = 64000;      // fullband voice, high quality
+const STEREO_BITRATE = 128000;   // stereo needs ~2x for equivalent quality
 const CODEC_OPUS = 1;
 const CODEC_PCM = 2;
 const OPUS_SUPPORTED = (typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined');
@@ -30,12 +31,15 @@ const state = {
     captureNode: null,
     playbackNode: null,
     micStream: null,
+    channels: 1,            // negotiated in setupAudio: 2 if the mic provides stereo, else 1
     transmitting: false,
     opusEncoder: null,
     opusDecoder: null,
+    decoderChannels: null,  // channel count the decoder is configured for, matched to the sender's stream
     captureTs: 0,
     decodeTs: 0,
     warnedNoOpus: false,
+    warnedChannels: false,
     peers: new Map(),     // remoteId -> RTCPeerConnection
     members: new Map(),   // id -> displayName
 };
@@ -176,13 +180,13 @@ function onWsMessage(ev) {
             onOwnerChanged(msg.ownerId);
             break;
         case 'signalOffer':
-            onOffer(msg.from, msg.sdp);
+            onOffer(msg.from, msg.sdp).catch((err) => log('Offer error: ' + err.message));
             break;
         case 'signalAnswer':
-            onAnswer(msg.from, msg.sdp);
+            onAnswer(msg.from, msg.sdp).catch((err) => log('Answer error: ' + err.message));
             break;
         case 'signalIce':
-            onIce(msg.from, msg.candidate, msg.sdpMid, msg.sdpMLineIndex);
+            onIce(msg.from, msg.candidate, msg.sdpMid, msg.sdpMLineIndex).catch((err) => log('ICE error: ' + err.message));
             break;
         case 'error':
             log('Server error [' + msg.code + ']: ' + msg.message);
@@ -207,7 +211,7 @@ function onJoined(msg) {
     if (state.transport === 'webrtc') {
         msg.members
             .filter((m) => m.id !== state.selfId)
-            .forEach((m) => offerTo(m.id));
+            .forEach((m) => offerTo(m.id).catch((err) => log('Offer error: ' + err.message)));
     }
 
     if (state.mode === 'FULL_DUPLEX') {
@@ -305,8 +309,11 @@ function enableLocalTracks(on) {
 
 function captureConstraints() {
     // Hi-fi disables the voice DSP for faithful capture; otherwise keep it for clean speech.
+    // Real stereo needs the voice DSP off (it downmixes to mono) AND a stereo input device, so only
+    // request 2 channels in hi-fi mode — the default voice path stays unambiguously mono (no fake 128k
+    // "stereo" from an upmixed mono mic).
     return state.hifi
-        ? {channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false}
+        ? {channelCount: 2, echoCancellation: false, noiseSuppression: false, autoGainControl: false}
         : {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true};
 }
 
@@ -314,17 +321,47 @@ async function setupAudio() {
     const ctx = new AudioContext({sampleRate: SAMPLE_RATE});
     await ctx.audioWorklet.addModule('/assets/audio-worklet.js');
     state.audioContext = ctx;
+    // setupAudio() runs after awaits (login), so the synchronous user-gesture window is gone and Chrome
+    // creates the context "suspended" under its autoplay policy. Resume it — the Connect click left a
+    // sticky user activation — otherwise the capture/playback worklets never run, so there is no audio
+    // in either direction even though control messages (floor, "talking") keep flowing.
+    if (ctx.state === 'suspended') {
+        await ctx.resume();
+    }
 
-    const playback = new AudioWorkletNode(ctx, 'playback-processor');
+    // Acquire the mic first so we can negotiate the real channel count before building the nodes.
+    // Stereo only when the device actually reports 2 channels AND WebCodecs Opus is available — the raw
+    // PCM fallback stays mono.
+    state.micStream = await navigator.mediaDevices.getUserMedia({audio: captureConstraints()});
+    const micSettings = state.micStream.getAudioTracks()[0].getSettings();
+    state.channels = (OPUS_SUPPORTED && micSettings.channelCount === 2) ? 2 : 1;
+    log('Audio ready — context ' + ctx.state + ' @ ' + ctx.sampleRate + ' Hz, '
+        + (state.channels === 2 ? 'stereo' : 'mono') + ', transport ' + state.transport);
+
+    // A pure source: no inputs, one output of the negotiated channel count. Without outputChannelCount
+    // the (default) unconnected input can make Chrome hand process() a zero-channel output — outputs[0][0]
+    // is then undefined, process() throws, and Chrome stops calling it (permanent silence).
+    const playback = new AudioWorkletNode(ctx, 'playback-processor', {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [state.channels],
+        processorOptions: {channels: state.channels},
+    });
     playback.connect(ctx.destination);
     state.playbackNode = playback;
-
-    state.micStream = await navigator.mediaDevices.getUserMedia({audio: captureConstraints()});
 
     if (state.transport === 'relay') {
         setupRelayCodec();
         const source = ctx.createMediaStreamSource(state.micStream);
-        const capture = new AudioWorkletNode(ctx, 'capture-processor');
+        // 'explicit' + 'speakers' so the worklet always gets exactly `channels` channels; if the source
+        // turns out mono, 'speakers' duplicates it into both (no hard-left/dead-right) rather than
+        // padding the second channel with silence the way 'discrete' would.
+        const capture = new AudioWorkletNode(ctx, 'capture-processor', {
+            channelCount: state.channels,
+            channelCountMode: 'explicit',
+            channelInterpretation: 'speakers',
+            processorOptions: {channels: state.channels},
+        });
         source.connect(capture);
         capture.port.onmessage = (e) => onCapturedFrame(e.data);
         state.captureNode = capture;
@@ -342,15 +379,17 @@ function setupRelayCodec() {
     state.opusEncoder.configure({
         codec: 'opus',
         sampleRate: SAMPLE_RATE,
-        numberOfChannels: 1,
-        bitrate: TARGET_BITRATE,
+        numberOfChannels: state.channels,
+        bitrate: state.channels === 2 ? STEREO_BITRATE : MONO_BITRATE,
         opus: {format: 'opus', frameDuration: FRAME_US, complexity: 10, useinbandfec: true, packetlossperc: 10},
     });
     state.opusDecoder = new AudioDecoder({
         output: (audioData) => playbackDecoded(audioData),
         error: (e) => log('Opus decoder error: ' + e.message),
     });
-    state.opusDecoder.configure({codec: 'opus', sampleRate: SAMPLE_RATE, numberOfChannels: 1});
+    // The decoder is configured lazily in handleAudioFrame to match the SENDER's channel count (read from
+    // the Opus TOC byte), not ours: WebCodecs' Opus decoder yields silence if its configured channel count
+    // differs from the stream's, so a stereo sender must be decoded as stereo even on a mono listener.
 }
 
 function onCapturedFrame(pcmBuffer) {
@@ -361,10 +400,10 @@ function onCapturedFrame(pcmBuffer) {
     if (state.opusEncoder) {
         const int16 = new Int16Array(pcmBuffer);
         const audioData = new AudioData({
-            format: 's16',
+            format: 's16',                                  // interleaved
             sampleRate: SAMPLE_RATE,
-            numberOfFrames: int16.length,
-            numberOfChannels: 1,
+            numberOfFrames: int16.length / state.channels,  // frames are counted per channel
+            numberOfChannels: state.channels,
             timestamp: state.captureTs,
             data: int16,
         });
@@ -398,8 +437,18 @@ function handleAudioFrame(arrayBuffer) {
     }
     const tag = new Uint8Array(arrayBuffer, 0, 1)[0];
     if (tag === CODEC_OPUS) {
-        if (state.opusDecoder && state.opusDecoder.state === 'configured') {
+        if (state.opusDecoder) {
             const payload = new Uint8Array(arrayBuffer, 1);
+            // The Opus TOC byte's stereo flag (0x04) gives the stream's channel count, which may differ
+            // from ours (e.g. a stereo Concentus/Java sender into a mono browser). Configure the decoder
+            // to match the stream — otherwise WebCodecs decodes to silence — and reconfigure if it changes
+            // (one talker at a time, so this is rare). playbackDecoded adapts the result to our output.
+            const streamChannels = (payload[0] & 0x04) ? 2 : 1;
+            if (state.decoderChannels !== streamChannels) {
+                state.opusDecoder.configure({codec: 'opus', sampleRate: SAMPLE_RATE, numberOfChannels: streamChannels});
+                state.decoderChannels = streamChannels;
+                state.decodeTs = 0;
+            }
             const chunk = new EncodedAudioChunk({type: 'key', timestamp: state.decodeTs, duration: FRAME_US, data: payload});
             state.decodeTs += FRAME_US;
             state.opusDecoder.decode(chunk);
@@ -408,23 +457,64 @@ function handleAudioFrame(arrayBuffer) {
             log('Received Opus audio but this browser cannot decode it (no WebCodecs).');
         }
     } else if (tag === CODEC_PCM) {
-        // Raw Int16 LE starting at byte offset 1 (odd offset -> read with a DataView).
+        // Raw Int16 LE, mono (the PCM fallback is always mono), starting at byte offset 1.
         const view = new DataView(arrayBuffer, 1);
         const count = (arrayBuffer.byteLength - 1) >> 1;
         const f32 = new Float32Array(count);
         for (let i = 0; i < count; i++) {
             f32[i] = view.getInt16(i * 2, true) / 0x8000;
         }
-        state.playbackNode.port.postMessage(f32.buffer, [f32.buffer]);
+        enqueuePlayback(f32, count, 1);
     }
 }
 
 function playbackDecoded(audioData) {
-    const count = audioData.numberOfFrames;
-    const f32 = new Float32Array(count);
-    audioData.copyTo(f32, {planeIndex: 0, format: 'f32-planar'});
+    const frames = audioData.numberOfFrames;
+    // The decoder is configured to match the stream (see handleAudioFrame), so numberOfChannels is the
+    // stream's count. Copy each channel plane as f32-planar and interleave manually — the reliably
+    // supported WebCodecs path; interleaved-'f32' copyTo can mis-extract a multi-channel AudioData.
+    const srcChannels = audioData.numberOfChannels;
+    const interleaved = new Float32Array(frames * srcChannels);
+    const plane = new Float32Array(frames);
+    for (let c = 0; c < srcChannels; c++) {
+        audioData.copyTo(plane, {planeIndex: c, format: 'f32-planar'});
+        for (let i = 0; i < frames; i++) {
+            interleaved[i * srcChannels + c] = plane[i];
+        }
+    }
     audioData.close();
-    state.playbackNode.port.postMessage(f32.buffer, [f32.buffer]);
+    enqueuePlayback(interleaved, frames, srcChannels);
+}
+
+// Adapt an interleaved Float32 buffer (srcChannels) to the device's output channel count and queue it
+// for the playback worklet — so a mono sender plays on a stereo listener (and vice versa) regardless of
+// how the Opus decoder reports channels. Mirrors the Java client's "decode to my own channel count".
+// Takes ownership of `src`: the underlying buffer is transferred (detached) once queued.
+function enqueuePlayback(src, frames, srcChannels) {
+    const out = state.channels;
+    let interleaved;
+    if (srcChannels === out) {
+        interleaved = src;
+    } else if (srcChannels === 1 && out === 2) {
+        interleaved = new Float32Array(frames * 2);
+        for (let i = 0; i < frames; i++) {
+            interleaved[i * 2] = src[i];
+            interleaved[i * 2 + 1] = src[i];
+        }
+    } else if (srcChannels === 2 && out === 1) {
+        interleaved = new Float32Array(frames);
+        for (let i = 0; i < frames; i++) {
+            interleaved[i] = 0.5 * (src[i * 2] + src[i * 2 + 1]);
+        }
+    } else {
+        // Unexpected channel count (not 1 or 2) — drop rather than mis-stride the worklet de-interleave.
+        if (!state.warnedChannels) {
+            state.warnedChannels = true;
+            log('Dropping audio with unexpected channel count: ' + srcChannels);
+        }
+        return;
+    }
+    state.playbackNode.port.postMessage(interleaved.buffer, [interleaved.buffer]);
 }
 
 // --- WebRTC mesh ----------------------------------------------------------------------------------
@@ -453,7 +543,7 @@ async function offerTo(remoteId) {
     const offer = await pc.createOffer();
     await pc.setLocalDescription({type: offer.type, sdp: tuneOpusSdp(offer.sdp)});
     sendCtrl({type: 'offer', target: remoteId, sdp: pc.localDescription.sdp});
-    setSenderBitrate(pc, TARGET_BITRATE);
+    setSenderBitrate(pc, MONO_BITRATE);
 }
 
 async function onOffer(from, sdp) {
@@ -462,7 +552,7 @@ async function onOffer(from, sdp) {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription({type: answer.type, sdp: tuneOpusSdp(answer.sdp)});
     sendCtrl({type: 'answer', target: from, sdp: pc.localDescription.sdp});
-    setSenderBitrate(pc, TARGET_BITRATE);
+    setSenderBitrate(pc, MONO_BITRATE);
 }
 
 async function onAnswer(from, sdp) {
@@ -475,11 +565,7 @@ async function onAnswer(from, sdp) {
 async function onIce(from, candidate, sdpMid, sdpMLineIndex) {
     const pc = state.peers.get(from);
     if (pc && candidate) {
-        try {
-            await pc.addIceCandidate({candidate, sdpMid, sdpMLineIndex});
-        } catch (err) {
-            log('ICE error: ' + err.message);
-        }
+        await pc.addIceCandidate({candidate, sdpMid, sdpMLineIndex}); // rejection logged by the caller
     }
 }
 
@@ -524,6 +610,9 @@ function attachRemoteAudio(remoteId, stream) {
         document.body.appendChild(el);
     }
     el.srcObject = stream;
+    // autoplay should start it, but call play() explicitly so a blocked autoplay surfaces a hint
+    // instead of failing silently.
+    el.play().catch((e) => log('Browser blocked audio autoplay (click the page to enable): ' + e.message));
 }
 
 function closePeer(remoteId) {
@@ -594,7 +683,9 @@ function cleanup() {
     state.opusDecoder = null;
     state.captureTs = 0;
     state.decodeTs = 0;
+    state.decoderChannels = null;
     state.warnedNoOpus = false;
+    state.warnedChannels = false;
     if (state.micStream) {
         state.micStream.getTracks().forEach((t) => t.stop());
         state.micStream = null;
@@ -609,8 +700,9 @@ function cleanup() {
     state.token = null;
     state.ownerId = null;
     enableTalkButton(false);
-    $('talkBtn').textContent = 'Connect first';
-    $('talkBtn').classList.remove('live');
+    const talkBtn = $('talkBtn');
+    talkBtn.textContent = 'Connect first';
+    talkBtn.classList.remove('live');
     $('connectBtn').disabled = false;
     $('disconnectBtn').disabled = true;
     setStatus(false, 'Disconnected');
@@ -636,14 +728,15 @@ window.addEventListener('DOMContentLoaded', () => {
     // While connected, only the owner can change the mode (the selector is disabled for others); this
     // sends ChangeMode and the server's ModeChanged broadcast updates everyone. Pre-connect it just
     // picks the initial mode for the next Connect.
-    $('mode').addEventListener('change', () => {
+    const modeSelect = $('mode');
+    modeSelect.addEventListener('change', () => {
         if (!isOpen()) {
             return; // pre-connect: just choosing the initial mode for the next Connect
         }
         if (state.selfId === state.ownerId) {
-            sendCtrl({type: 'changeMode', mode: $('mode').value});
+            sendCtrl({type: 'changeMode', mode: modeSelect.value});
         } else {
-            $('mode').value = state.mode; // non-owner can't change it live — snap back
+            modeSelect.value = state.mode; // non-owner can't change it live — snap back
         }
     });
 
