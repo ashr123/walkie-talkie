@@ -2,6 +2,7 @@ package io.github.ashr123.walkietalkie.client;
 
 import io.github.ashr123.walkietalkie.shared.protocol.*;
 import io.github.jaredmdobson.concentus.OpusException;
+import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.json.JsonMapper;
 
 import javax.sound.sampled.LineUnavailableException;
@@ -45,7 +46,7 @@ public final class WalkieClient implements AutoCloseable {
 	private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(
 			"yyyy-MM-dd HH:mm:ss,SSS", Locale.getDefault(Locale.Category.FORMAT));
 	// Stateless, thread-safe infrastructure with no per-connection input — shared by every client instance.
-	private static final JsonMapper jsonMapper = JsonMapper.builder().build();
+	private static final ObjectMapper JSON_MAPPER = JsonMapper.builder().build();
 	private static final HttpClient httpClient = HttpClient.newHttpClient();
 
 	private final ClientOptions options;
@@ -103,6 +104,13 @@ public final class WalkieClient implements AutoCloseable {
 
 	// --- HTTP login + WebSocket -------------------------------------------------------------------
 
+	private static void printHelp() {
+		System.out.println("""
+				--------------------------------------------------------------------------------------------------
+				 Commands:  t = talk/stop   m <ptt|global|duplex> = mode   f = hi-fi on/off   q = quit   h = help
+				--------------------------------------------------------------------------------------------------""");
+	}
+
 	private String login() throws IOException, InterruptedException {
 		// Login takes no input: it just mints a signed, short-lived token. The token is an opaque string.
 		HttpResponse<String> response = httpClient.send(
@@ -114,7 +122,7 @@ public final class WalkieClient implements AutoCloseable {
 		if (response.statusCode() != 200) {
 			throw new IOException("Login failed: HTTP " + response.statusCode() + " " + response.body());
 		}
-		return jsonMapper.readValue(response.body(), LoginResponse.class).token();
+		return JSON_MAPPER.readValue(response.body(), LoginResponse.class).token();
 	}
 
 	/// Builds the AES-256-GCM frame cipher from `--key` (or the WALKIE_KEY env var), or null to disable
@@ -128,13 +136,6 @@ public final class WalkieClient implements AutoCloseable {
 				passphrase,
 				options.mode() == ChannelMode.GLOBAL_PTT ? "global" : options.channel()
 		);
-	}
-
-	private static void printHelp() {
-		System.out.println("""
-				--------------------------------------------------------------------------------------------------
-				 Commands:  t = talk/stop   m <ptt|global|duplex> = mode   f = hi-fi on/off   q = quit   h = help
-				--------------------------------------------------------------------------------------------------""");
 	}
 
 	private void senderLoop() {
@@ -166,7 +167,7 @@ public final class WalkieClient implements AutoCloseable {
 	// --- Server messages --------------------------------------------------------------------------
 
 	private void handleServerMessage(String json) {
-		switch (jsonMapper.readValue(json, ServerMessage.class)) {
+		switch (JSON_MAPPER.readValue(json, ServerMessage.class)) {
 			case ServerMessage.Joined(
 					String selfId, String channel, ChannelMode mode, String ownerId, List<MemberInfo> members
 			) -> {
@@ -311,7 +312,7 @@ public final class WalkieClient implements AutoCloseable {
 	// --- helpers ----------------------------------------------------------------------------------
 
 	private void enqueue(ClientMessage message) {
-		sendQueue.offer(new Outbound.Text(jsonMapper.writeValueAsString(message)));
+		sendQueue.offer(new Outbound.Text(JSON_MAPPER.writeValueAsString(message)));
 	}
 
 	private void sendJoin() {
