@@ -48,6 +48,12 @@ public final class WalkieClient {
 	private static final byte CODEC_PCM = 2;
 	private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(
 			"yyyy-MM-dd HH:mm:ss,SSS", Locale.getDefault(Locale.Category.FORMAT));
+	/// Marker substrings of well-known virtual / loopback audio drivers that present as capture devices but
+	/// usually carry no microphone signal (they capture silence unless an app routes through them). The
+	/// no-`--input` auto-selection skips these so it lands on a real mic instead of, e.g., ZoomAudioDevice.
+	private static final List<String> VIRTUAL_DEVICE_MARKERS = List.of(
+			"zoomaudiodevice", "blackhole", "soundflower", "loopback", "vb-cable", "vb-audio",
+			"aggregate", "multi-output", "teams audio", "krisp", "ndi", "obs virtual", "background music");
 
 	private final ClientOptions options;
 	private final JsonMapper jsonMapper = JsonMapper.builder().build();
@@ -114,22 +120,6 @@ public final class WalkieClient {
 				: "Push-to-talk: type 't' to grab/release the floor.";
 	}
 
-	/// Names the mixer [AudioSystem#getLine] would use for the default capture line — the configured default
-	/// mixer when it supports `info`, otherwise the first mixer that does (mirroring `getLine`'s own order) —
-	/// purely so the chosen default device can be shown in the log.
-	private static Mixer.Info defaultCaptureMixer(DataLine.Info info) {
-		Mixer defaultMixer = AudioSystem.getMixer(null);
-		if (defaultMixer.isLineSupported(info)) {
-			return defaultMixer.getMixerInfo();
-		}
-		for (Mixer.Info candidate : AudioSystem.getMixerInfo()) {
-			if (AudioSystem.getMixer(candidate).isLineSupported(info)) {
-				return candidate;
-			}
-		}
-		return null;
-	}
-
 	public void run() throws Exception {
 		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
 		token = login();
@@ -183,20 +173,53 @@ public final class WalkieClient {
 
 	// --- WebSocket --------------------------------------------------------------------------------
 
-	/// Finds the input mixer whose name contains [ClientOptions#inputDevice()] and has a capture line, or
-	/// `null` (system default) when unset or unmatched.
+	/// Whether `name` looks like a virtual/loopback audio driver (see [#VIRTUAL_DEVICE_MARKERS]) rather than a
+	/// real microphone, so the no-`--input` auto-selection can skip it.
+	private static boolean isVirtualDevice(String name) {
+		return VIRTUAL_DEVICE_MARKERS.parallelStream().unordered()
+				.anyMatch(name.toLowerCase(Locale.ROOT)::contains);
+	}
+
+	/// Resolves the capture device, logging the choice and why. With `--input`, returns the first
+	/// capture-capable mixer whose name contains it. Without `--input` (or when it doesn't match), auto-selects
+	/// the first *real* mic — skipping known virtual/loopback drivers (ZoomAudioDevice, BlackHole, aggregates,
+	/// …) that the JVM might otherwise default to and that capture silence — preferring one that reports 48 kHz
+	/// support. Returns `null` only when nothing suitable is found, letting [AudioSystem#getLine] pick the raw default.
 	private Mixer.Info resolveInputMixer() {
 		String wanted = options.inputDevice();
-		if (wanted == null || wanted.isBlank()) {
-			return null;
-		}
+		boolean wantSpecific = wanted != null && !wanted.isBlank();
+		DataLine.Info captureLine = new DataLine.Info(TargetDataLine.class, new AudioFormat(SAMPLE_RATE, 16, 1, true, false));
+
+		Mixer.Info firstReal48k = null;   // non-virtual mic reporting 48 kHz capture support — preferred
+		Mixer.Info firstRealAny = null;   // any non-virtual mic — fallback if none confirm 48 kHz
 		for (Mixer.Info info : AudioSystem.getMixerInfo()) {
-			if (info.getName().toLowerCase(Locale.ROOT).contains(wanted.toLowerCase(Locale.ROOT))
-					&& AudioSystem.getMixer(info).getTargetLineInfo().length > 0) {
+			Mixer mixer = AudioSystem.getMixer(info);
+			if (mixer.getTargetLineInfo().length == 0) {
+				continue;   // not a capture device
+			}
+			if (wantSpecific && info.getName().toLowerCase(Locale.ROOT).contains(wanted.toLowerCase(Locale.ROOT))) {
+				System.out.println("Capturing from input device: " + info.getName() + " (matched --input \"" + wanted + "\")");
 				return info;
 			}
+			if (!isVirtualDevice(info.getName())) {
+				if (firstRealAny == null) {
+					firstRealAny = info;
+				}
+				if (firstReal48k == null && mixer.isLineSupported(captureLine)) {
+					firstReal48k = info;
+				}
+			}
 		}
-		System.out.println("No input device matching '" + wanted + "'; using the system default.");
+		if (wantSpecific) {
+			System.out.println("No input device matching '" + wanted + "'; auto-selecting a real mic instead.");
+		}
+		Mixer.Info auto = firstReal48k != null ? firstReal48k : firstRealAny;
+		if (auto != null) {
+			System.out.println("Capturing from input device: " + auto.getName()
+					+ " (auto-selected, skipping virtual devices — pass --input to override, --list-inputs to see all)");
+			return auto;
+		}
+		System.out.println("No real capture device identified; using the system default (may be silent — see --list-inputs).");
 		return null;
 	}
 
@@ -278,18 +301,12 @@ public final class WalkieClient {
 		encoder.setSignalType(hifi ? OpusSignal.OPUS_SIGNAL_MUSIC : OpusSignal.OPUS_SIGNAL_VOICE);
 	}
 
-	/// Opens the capture line of the input device resolved during negotiation, or the system default when
-	/// none was matched. Either way it logs the device actually opened — so a silent/wrong default device
-	/// is visible rather than mysterious. The line uses the negotiated [#format], which matches the device.
+	/// Opens the capture line of the resolved input device (already logged in [#resolveInputMixer]), or the
+	/// raw system default when none was resolved. The line uses the negotiated [#format].
 	private TargetDataLine openMic(DataLine.Info micInfo) throws LineUnavailableException {
-		if (inputMixerInfo != null) {
-			System.out.println("Capturing from input device: " + inputMixerInfo.getName() + " (matched --input)");
-			return (TargetDataLine) AudioSystem.getMixer(inputMixerInfo).getLine(micInfo);
-		}
-		Mixer.Info dflt = defaultCaptureMixer(micInfo);
-		System.out.println("Capturing from input device: " + (dflt == null ? "(unidentified)" : dflt.getName())
-				+ " — system default. If you hear nothing, pass --input (see --list-inputs) to pick your mic.");
-		return (TargetDataLine) AudioSystem.getLine(micInfo);
+		return inputMixerInfo != null
+				? (TargetDataLine) AudioSystem.getMixer(inputMixerInfo).getLine(micInfo)
+				: (TargetDataLine) AudioSystem.getLine(micInfo);
 	}
 
 	private void captureLoop() {

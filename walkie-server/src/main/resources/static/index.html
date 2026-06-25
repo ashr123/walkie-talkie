@@ -120,13 +120,11 @@
             user-select: none;
         }
 
+        /* .live is added/removed at runtime by app.js (classList), so it never appears in the static HTML. */
+        /*noinspection CssUnusedSymbol*/
         #talkBtn.live {
             background: var(--ok);
             box-shadow: 0 0 0 4px rgba(63, 185, 80, .25);
-        }
-
-        #talkBtn.busy {
-            background: var(--bad);
         }
 
         .status {
@@ -161,6 +159,8 @@
             font-size: 13px;
         }
 
+        /* .self is added at runtime by app.js (the "you" marker on your own roster entry). */
+        /*noinspection CssUnusedSymbol*/
         ul#members li .self {
             color: var(--accent);
         }
