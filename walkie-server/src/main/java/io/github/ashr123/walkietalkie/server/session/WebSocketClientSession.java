@@ -1,10 +1,8 @@
 package io.github.ashr123.walkietalkie.server.session;
 
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
-import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.springframework.web.socket.BinaryMessage;
-import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
@@ -25,7 +23,6 @@ public final class WebSocketClientSession implements ClientSession {
 	// Set when the client joins a channel (from the validated Join.displayName); "" until then.
 	private volatile String displayName = "";
 	private volatile String channelName;
-	private volatile ChannelMode channelMode;
 
 	public WebSocketClientSession(WebSocketSession session,
 	                              MessageCodec codec,
@@ -33,11 +30,6 @@ public final class WebSocketClientSession implements ClientSession {
 		this.session = session;
 		this.codec = codec;
 		this.transport = transport;
-	}
-
-	private static String truncateReason(String reason) {
-		// Close-frame reason phrases are limited to 123 UTF-8 bytes by the protocol.
-		return reason.length() > 100 ? reason.substring(0, 100) : reason;
 	}
 
 	@Override
@@ -66,20 +58,13 @@ public final class WebSocketClientSession implements ClientSession {
 	}
 
 	@Override
-	public ChannelMode channelMode() {
-		return channelMode;
-	}
-
-	@Override
-	public void joinedChannel(String channel, ChannelMode mode) {
+	public void joinedChannel(String channel) {
 		this.channelName = channel;
-		this.channelMode = mode;
 	}
 
 	@Override
 	public void leftChannel() {
 		this.channelName = null;
-		this.channelMode = null;
 	}
 
 	@Override
@@ -102,15 +87,6 @@ public final class WebSocketClientSession implements ClientSession {
 			session.sendMessage(new BinaryMessage(ByteBuffer.wrap(audio)));
 		} catch (IOException e) {
 			throw new UncheckedIOException("Failed to send audio to " + id(), e);
-		}
-	}
-
-	@Override
-	public void close(String reason) {
-		try {
-			session.close(CloseStatus.NORMAL.withReason(truncateReason(reason)));
-		} catch (IOException _) {
-			// best-effort close
 		}
 	}
 }

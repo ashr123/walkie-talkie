@@ -559,8 +559,12 @@ public final class WalkieClient {
 	}
 
 	private void sendJoin() {
-		enqueue(new ClientMessage.Join(options.channel(), options.mode(), options.display(),
-				crypto == null ? null : crypto.keyCheck()));
+		enqueue(new ClientMessage.Join(
+				options.channel(),
+				options.mode(),
+				options.display(),
+				crypto == null ? null : crypto.keyCheck()
+		));
 	}
 
 	private void shutdown() {

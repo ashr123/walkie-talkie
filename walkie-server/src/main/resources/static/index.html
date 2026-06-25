@@ -141,6 +141,8 @@
             margin-right: 6px;
         }
 
+        /* .on is toggled at runtime by app.js (connected status dot); not present in the static HTML. */
+        /*noinspection CssUnusedSymbol*/
         .dot.on {
             background: var(--ok);
         }
@@ -171,7 +173,8 @@
             background: #0e151c;
             border-radius: 8px;
             padding: 12px;
-            height: 320px;
+            flex: 1; /* fill the Log panel so its bottom aligns with the Connect panel */
+            min-height: 140px;
             overflow-y: auto;
             white-space: pre-wrap;
             color: var(--muted);
@@ -233,12 +236,12 @@
 				your mic.
 			</div>
 		</div>
-		<div class="row" style="gap:20px;">
+		<div class="row" style="gap:20px; flex:1; min-height:0;">
 			<div class="panel" style="flex:1;">
 				<h2>Members</h2>
 				<ul id="members"></ul>
 			</div>
-			<div class="panel" style="flex:2;">
+			<div class="panel" style="flex:2; display:flex; flex-direction:column;">
 				<h2>Log</h2>
 				<div id="log"></div>
 			</div>

@@ -494,7 +494,7 @@ async function deriveKey(passphrase, effectiveChannel) {
         },
         base, 384));
     const key = await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['encrypt', 'decrypt']);
-    const keyCheck = [...bits.slice(32, 48)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    const keyCheck = [...bits.slice(32, 48)].map((b) => Number(b).toString(16).padStart(2, '0')).join('');
     return {key, keyCheck};
 }
 

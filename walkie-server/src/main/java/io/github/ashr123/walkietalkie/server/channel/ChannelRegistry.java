@@ -25,7 +25,7 @@ public class ChannelRegistry {
 	public Channel joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session) {
 		AtomicReference<Channel> joined = new AtomicReference<>();
 		channels.compute(name, (key, existing) -> {
-			Channel channel = existing != null ? existing : new Channel(key, mode, session.id(), keyCheck);
+			Channel channel = existing == null ? new Channel(key, mode, session.id(), keyCheck) : existing;
 			if (Objects.equals(channel.keyCheck(), keyCheck)) {
 				channel.add(session);
 				joined.set(channel);
@@ -44,7 +44,7 @@ public class ChannelRegistry {
 	/// announce it); otherwise [io.github.ashr123.option.None].
 	public Option<String> leave(String name, String sessionId) {
 		AtomicReference<String> newOwner = new AtomicReference<>();
-		channels.computeIfPresent(name, (key, channel) -> {
+		channels.computeIfPresent(name, (_, channel) -> {
 			boolean wasOwner = sessionId.equals(channel.ownerId());
 			channel.remove(sessionId);
 			if (channel.isEmpty()) {

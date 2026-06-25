@@ -2,7 +2,6 @@ package io.github.ashr123.walkietalkie.server;
 
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
-import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 
 import java.util.List;
@@ -17,7 +16,6 @@ public final class FakeClientSession implements ClientSession {
 	private final Transport transport;
 	private String displayName;
 	private String channelName;
-	private ChannelMode channelMode;
 
 	public FakeClientSession(String id, Transport transport, String displayName) {
 		this.id = id;
@@ -51,20 +49,13 @@ public final class FakeClientSession implements ClientSession {
 	}
 
 	@Override
-	public ChannelMode channelMode() {
-		return channelMode;
-	}
-
-	@Override
-	public void joinedChannel(String channel, ChannelMode mode) {
+	public void joinedChannel(String channel) {
 		this.channelName = channel;
-		this.channelMode = mode;
 	}
 
 	@Override
 	public void leftChannel() {
 		this.channelName = null;
-		this.channelMode = null;
 	}
 
 	@Override
@@ -80,10 +71,5 @@ public final class FakeClientSession implements ClientSession {
 	@Override
 	public void sendAudio(byte[] audioFrame) {
 		audio.add(audioFrame);
-	}
-
-	@Override
-	public void close(String reason) {
-		// no-op
 	}
 }

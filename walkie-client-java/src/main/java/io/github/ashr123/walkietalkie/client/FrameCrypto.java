@@ -58,7 +58,8 @@ final class FrameCrypto {
 		byte[] secret = pbkdf2(passphrase, effectiveChannel, KEY_BITS + KCV_BITS);
 		return new FrameCrypto(
 				new SecretKeySpec(secret, 0, KEY_BITS / Byte.SIZE, "AES"),
-				HexFormat.of().formatHex(secret, KEY_BITS / Byte.SIZE, (KEY_BITS + KCV_BITS) / Byte.SIZE));
+				HexFormat.of().formatHex(secret, KEY_BITS / Byte.SIZE, (KEY_BITS + KCV_BITS) / Byte.SIZE)
+		);
 	}
 
 	/// The 256-bit AES key bytes — only for the cross-platform known-answer test (it is the first `KEY_BITS`

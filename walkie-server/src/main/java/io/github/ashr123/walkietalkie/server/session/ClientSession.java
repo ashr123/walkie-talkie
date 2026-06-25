@@ -1,6 +1,5 @@
 package io.github.ashr123.walkietalkie.server.session;
 
-import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 
@@ -19,10 +18,7 @@ public interface ClientSession {
 	/// The channel currently joined, or `null` if not in a channel.
 	String channelName();
 
-	/// The mode of the channel currently joined, or `null` if not in a channel.
-	ChannelMode channelMode();
-
-	void joinedChannel(String channel, ChannelMode mode);
+	void joinedChannel(String channel);
 
 	void leftChannel();
 
@@ -33,8 +29,6 @@ public interface ClientSession {
 
 	/// Sends a raw audio frame as a binary frame.
 	void sendAudio(byte[] audio);
-
-	void close(String reason);
 
 	default MemberInfo toMemberInfo() {
 		return new MemberInfo(id(), displayName());

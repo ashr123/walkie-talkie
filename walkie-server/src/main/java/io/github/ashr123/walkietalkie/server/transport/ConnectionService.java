@@ -95,7 +95,7 @@ public class ConnectionService {
 			return;
 		}
 
-		session.joinedChannel(channel.name(), channel.mode());
+		session.joinedChannel(channel.name());
 		session.send(new ServerMessage.Joined(
 				session.id(), channel.name(), channel.mode(), channel.ownerId(), channel.memberInfos()));
 

@@ -89,12 +89,8 @@ public class AuthService {
 		}
 		try {
 			byte[] payload = B64_DECODER.decode(token.substring(0, dot));
-			byte[] presentedMac = B64_DECODER.decode(token.substring(dot + 1));
-			if (payload.length != PAYLOAD_BYTES || !MessageDigest.isEqual(mac(payload), presentedMac)) {
-				return false;
-			}
-			Instant expiry = Instant.ofEpochMilli(ByteBuffer.wrap(payload, NONCE_BYTES, EXPIRY_BYTES).getLong());
-			return Instant.now().isBefore(expiry);
+			return payload.length == PAYLOAD_BYTES && MessageDigest.isEqual(mac(payload), B64_DECODER.decode(token.substring(dot + 1)))
+					&& Instant.now().isBefore(Instant.ofEpochMilli(ByteBuffer.wrap(payload, NONCE_BYTES, EXPIRY_BYTES).getLong()));
 		} catch (IllegalArgumentException _) {   // malformed base64url
 			return false;
 		}
