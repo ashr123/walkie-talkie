@@ -48,6 +48,21 @@ class RelayFramingIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
+	void aLegacyJoinThatOmitsRelayFramingIsAccepted() throws Exception {
+		// Exactly what an un-upgraded browser sends: a join with no relayFraming field. It must deserialize
+		// cleanly (treated as legacy framing), not fail with bad_message.
+		CollectingHandler a = new CollectingHandler();
+		WebSocketSession sa = connect(AUDIO, a, login());
+		try {
+			sendRaw(sa, """
+					{"type":"join","channel":"lobby","mode":"FULL_DUPLEX","displayName":"Alice","keyCheck":null}""");
+			assertEquals("lobby", awaitType(a.messages, ServerMessage.Joined.class).channel());
+		} finally {
+			sa.close(CloseStatus.NORMAL);
+		}
+	}
+
+	@Test
 	void aLegacyRecipientReceivesUnprefixedAudio() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();

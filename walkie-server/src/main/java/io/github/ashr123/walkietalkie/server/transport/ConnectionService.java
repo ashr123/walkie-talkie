@@ -88,7 +88,7 @@ public class ConnectionService {
 			return;
 		}
 		session.setDisplayName(join.displayName());
-		session.setRelayFraming(join.relayFraming());
+		session.setRelayFraming(join.relayFraming() == null ? 0 : join.relayFraming());   // absent = legacy
 
 		Channel channel = channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session);
 		if (channel == null) {
