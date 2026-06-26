@@ -17,6 +17,9 @@ import java.util.function.Consumer;
 /// mode, and ownership transfers to another member when the owner leaves.
 public final class Channel {
 
+	/// Usable stream indices are 0..254; 255 (0xFF) is reserved as a future "extended id" escape.
+	private static final int STREAM_INDEX_RANGE = 255;
+
 	private final String name;
 	private final Map<String, ClientSession> members = new ConcurrentHashMap<>();
 
@@ -30,6 +33,15 @@ public final class Channel {
 	/// passphrase, or `null` for an unencrypted channel), set by the creator. The server compares it to
 	/// reject a mismatched passphrase; it is not the key and reveals nothing usable about it.
 	private final String keyCheck;
+
+	/// Per-channel stream-index allocator: maps each member's session id to a uint8 routing index (0..254).
+	/// The server prefixes this index onto a member's relayed audio so multi-stream receivers can demultiplex
+	/// talkers. A monotonic rotating cursor that skips live indices avoids reusing a just-freed index until it
+	/// has cycled the whole range — quarantining recycled indices so a new talker can't inherit a departed
+	/// member's still-in-flight frames. Allocation/free are synchronized; reads go through the concurrent map.
+	private final Map<String, Integer> streamIndices = new ConcurrentHashMap<>();
+	private final boolean[] indexInUse = new boolean[STREAM_INDEX_RANGE];
+	private int rotation = 0;
 
 	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck) {
 		this.name = name;
@@ -64,11 +76,13 @@ public final class Channel {
 
 	public void add(ClientSession session) {
 		members.put(session.id(), session);
+		assignStreamIndex(session.id());
 	}
 
 	public void remove(String sessionId) {
 		members.remove(sessionId);
 		floorHolder.compareAndSet(sessionId, null);
+		freeStreamIndex(sessionId);
 	}
 
 	public boolean isEmpty() {
@@ -89,8 +103,39 @@ public final class Channel {
 		return Option.of(members.keySet().stream().findAny());
 	}
 
+	/// The stream index assigned to `sessionId`, or 0 if unknown (defensive; an active member always has one).
+	public int streamIndexOf(String sessionId) {
+		Integer index = streamIndices.get(sessionId);
+		return index == null ? 0 : index;
+	}
+
+	private synchronized void assignStreamIndex(String sessionId) {
+		if (streamIndices.containsKey(sessionId)) {
+			return;
+		}
+		for (int probe = 0; probe < STREAM_INDEX_RANGE; probe++) {
+			int candidate = rotation;
+			rotation = (rotation + 1) % STREAM_INDEX_RANGE;
+			if (!indexInUse[candidate]) {
+				indexInUse[candidate] = true;
+				streamIndices.put(sessionId, candidate);
+				return;
+			}
+		}
+		streamIndices.put(sessionId, 0);   // >254 concurrent members (far above any real channel) — tolerate a collision
+	}
+
+	private synchronized void freeStreamIndex(String sessionId) {
+		Integer index = streamIndices.remove(sessionId);
+		if (index != null) {
+			indexInUse[index] = false;
+		}
+	}
+
 	public List<MemberInfo> memberInfos() {
-		return members.values().stream().map(ClientSession::toMemberInfo).toList();
+		return members.values().stream()
+				.map(session -> new MemberInfo(session.id(), session.displayName(), streamIndexOf(session.id())))
+				.toList();
 	}
 
 	/// Applies an action to every member except the one with `excludeSessionId`.

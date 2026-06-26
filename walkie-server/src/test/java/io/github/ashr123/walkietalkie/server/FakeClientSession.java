@@ -16,6 +16,7 @@ public final class FakeClientSession implements ClientSession {
 	private final Transport transport;
 	private String displayName;
 	private String channelName;
+	private int relayFraming;
 
 	public FakeClientSession(String id, Transport transport, String displayName) {
 		this.id = id;
@@ -61,6 +62,16 @@ public final class FakeClientSession implements ClientSession {
 	@Override
 	public boolean supportsAudioRelay() {
 		return transport == Transport.AUDIO_RELAY;
+	}
+
+	@Override
+	public int relayFraming() {
+		return relayFraming;
+	}
+
+	@Override
+	public void setRelayFraming(int relayFraming) {
+		this.relayFraming = relayFraming;
 	}
 
 	@Override

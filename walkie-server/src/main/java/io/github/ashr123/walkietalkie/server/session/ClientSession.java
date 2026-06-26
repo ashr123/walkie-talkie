@@ -1,6 +1,5 @@
 package io.github.ashr123.walkietalkie.server.session;
 
-import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 
 /// A connected participant, abstracted away from the underlying WebSocket so that the channel and
@@ -24,6 +23,12 @@ public interface ClientSession {
 
 	boolean supportsAudioRelay();
 
+	/// The relay-audio framing version this connection advertised at join: 0 = legacy (un-prefixed), 1 =
+	/// SID-prefixed multi-stream. The server frames each recipient's outbound audio accordingly.
+	int relayFraming();
+
+	void setRelayFraming(int relayFraming);
+
 	/// Sends a control/signaling message as a JSON text frame.
 	void send(ServerMessage message);
 
@@ -33,9 +38,5 @@ public interface ClientSession {
 	/// Releases per-session outbound resources (the async send pump) on disconnect. A no-op for in-memory
 	/// fakes, which send synchronously.
 	default void close() {
-	}
-
-	default MemberInfo toMemberInfo() {
-		return new MemberInfo(id(), displayName());
 	}
 }

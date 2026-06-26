@@ -21,7 +21,12 @@ public sealed interface ClientMessage {
 	/// channel's established value to reject a member whose passphrase doesn't match — without ever
 	/// learning the passphrase itself. It is *not* the key and cannot decrypt anything.
 	@JsonTypeName("join")
-	record Join(String channel, ChannelMode mode, String displayName, String keyCheck) implements ClientMessage {
+	record Join(String channel, ChannelMode mode, String displayName, String keyCheck, int relayFraming) implements ClientMessage {
+		/// Legacy relay-audio framing (un-prefixed) for callers that don't advertise a relay-framing version.
+		/// `relayFraming`: 0 = legacy un-prefixed frames; 1 = the SID-prefixed multi-stream framing.
+		public Join(String channel, ChannelMode mode, String displayName, String keyCheck) {
+			this(channel, mode, displayName, keyCheck, 0);
+		}
 	}
 
 	/// Leave the current channel without closing the connection.

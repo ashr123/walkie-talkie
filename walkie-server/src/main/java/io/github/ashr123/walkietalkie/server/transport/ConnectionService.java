@@ -10,6 +10,7 @@ import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.support.RequestContext;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -87,6 +88,7 @@ public class ConnectionService {
 			return;
 		}
 		session.setDisplayName(join.displayName());
+		session.setRelayFraming(join.relayFraming());
 
 		Channel channel = channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session);
 		if (channel == null) {
@@ -99,7 +101,8 @@ public class ConnectionService {
 		session.send(new ServerMessage.Joined(
 				session.id(), channel.name(), channel.mode(), channel.ownerId(), channel.memberInfos()));
 
-		ServerMessage.MemberJoined notice = new ServerMessage.MemberJoined(session.toMemberInfo());
+		ServerMessage.MemberJoined notice = new ServerMessage.MemberJoined(
+				new MemberInfo(session.id(), session.displayName(), channel.streamIndexOf(session.id())));
 		channel.forEachOther(session.id(), other -> safeSend(other, notice));
 
 		if (channel.floorHolder() instanceof Some(String holder)) {
@@ -209,15 +212,28 @@ public class ConnectionService {
 				|| !channel.holdsFloor(session.id())) {
 			return;
 		}
+		// Tag the fan-out with the sender's per-channel stream index so multi-stream (relayFraming=1) receivers
+		// can demultiplex talkers; a legacy (relayFraming=0) receiver gets the un-prefixed frame unchanged.
+		byte[] prefixed = prefixedFrame(channel.streamIndexOf(session.id()), audio);
 		channel.forEachOther(session.id(), other -> {
 			if (other.supportsAudioRelay()) {
 				try {
-					other.sendAudio(audio);
+					other.sendAudio(other.relayFraming() >= 1 ? prefixed : audio);
 				} catch (RuntimeException e) {
 					log.debug("Audio relay to {} failed: {}", other.id(), e.getMessage());
 				}
 			}
 		});
+	}
+
+	/// Prepends the 1-byte stream index to a relayed audio frame: `[sid][body]`. The body (plaintext
+	/// `[tag][payload]` or the E2EE `[scheme][IV][ct]` envelope) is copied verbatim — the server never
+	/// inspects it, and the index sits outside any encryption.
+	private static byte[] prefixedFrame(int streamIndex, byte[] body) {
+		byte[] out = new byte[body.length + 1];
+		out[0] = (byte) streamIndex;
+		System.arraycopy(body, 0, out, 1, body.length);
+		return out;
 	}
 
 	public void onClose(ClientSession session) {

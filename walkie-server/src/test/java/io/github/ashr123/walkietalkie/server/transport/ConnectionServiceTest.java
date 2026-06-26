@@ -13,6 +13,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -279,6 +280,58 @@ class ConnectionServiceTest {
 		assertTrue(s.sent.isEmpty(), "a vanished channel yields no grant and no error");
 	}
 
+	@Test
+	void audioToAV1RecipientIsPrefixedWithTheSendersStreamIndex() {
+		FakeClientSession alice = join("alice", "fd-sid", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join("fd-sid", ChannelMode.FULL_DUPLEX, "bob", null, 1));   // relayFraming = 1
+
+		byte[] frame = {1, 2, 3};
+		service.onAudio(alice, frame);
+
+		byte[] received = bob.audio.getFirst();
+		int aliceSid = channel("fd-sid").streamIndexOf("alice");
+		assertEquals(aliceSid, received[0] & 0xFF, "the frame is prefixed with the sender's stream index");
+		assertArrayEquals(frame, Arrays.copyOfRange(received, 1, received.length), "the body is the original frame");
+	}
+
+	@Test
+	void audioToALegacyRecipientIsNotPrefixed() {
+		FakeClientSession alice = join("alice", "fd-legacy", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "fd-legacy", ChannelMode.FULL_DUPLEX);   // 4-arg join -> relayFraming 0
+
+		byte[] frame = {1, 2, 3};
+		service.onAudio(alice, frame);
+
+		assertArrayEquals(frame, bob.audio.getFirst(), "a legacy recipient gets the un-prefixed frame");
+	}
+
+	@Test
+	void membersGetDistinctStreamIndicesAnnouncedInJoinedAndMemberJoined() {
+		FakeClientSession alice = join("alice", "sid-roster", ChannelMode.MULTI_CHANNEL_PTT);
+		int aliceSid = channel("sid-roster").streamIndexOf("alice");
+		assertEquals(aliceSid, firstOf(alice, ServerMessage.Joined.class).members().getFirst().streamId());
+
+		FakeClientSession bob = join("bob", "sid-roster", ChannelMode.MULTI_CHANNEL_PTT);
+		int bobSid = channel("sid-roster").streamIndexOf("bob");
+		assertNotEquals(aliceSid, bobSid, "members get distinct stream indices");
+		assertEquals(bobSid, firstOf(alice, ServerMessage.MemberJoined.class).member().streamId(),
+				"existing members learn the newcomer's index via MemberJoined");
+	}
+
+	@Test
+	void aFreedStreamIndexIsNotImmediatelyReused() {
+		FakeClientSession alice = join("alice", "sid-reuse", ChannelMode.MULTI_CHANNEL_PTT);
+		join("bob", "sid-reuse", ChannelMode.MULTI_CHANNEL_PTT);   // keeps the channel alive when Alice leaves
+		int aliceSid = channel("sid-reuse").streamIndexOf("alice");
+
+		service.onClose(alice);
+		join("carol", "sid-reuse", ChannelMode.MULTI_CHANNEL_PTT);
+
+		assertNotEquals(aliceSid, channel("sid-reuse").streamIndexOf("carol"),
+				"a freed index is quarantined by the rotating allocator, not immediately reused");
+	}
+
 	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a
 	/// single failing recipient and still delivers to the others.
 	private static final class ThrowingSession implements ClientSession {
@@ -330,6 +383,16 @@ class ConnectionServiceTest {
 		@Override
 		public boolean supportsAudioRelay() {
 			return true;
+		}
+
+		@Override
+		public int relayFraming() {
+			return 0;
+		}
+
+		@Override
+		public void setRelayFraming(int relayFraming) {
+			// not exercised by this fake
 		}
 
 		@Override

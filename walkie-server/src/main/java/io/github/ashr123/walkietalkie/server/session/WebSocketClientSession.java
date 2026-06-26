@@ -63,6 +63,7 @@ public final class WebSocketClientSession implements ClientSession {
 	// Set when the client joins a channel (from the validated Join.displayName); "" until then.
 	private volatile String displayName = "";
 	private volatile String channelName;
+	private volatile int relayFraming = 0;   // 0 = legacy un-prefixed audio, 1 = SID-prefixed multi-stream
 
 	public WebSocketClientSession(WebSocketSession session,
 	                              MessageCodec codec,
@@ -135,6 +136,16 @@ public final class WebSocketClientSession implements ClientSession {
 	@Override
 	public boolean supportsAudioRelay() {
 		return transport == Transport.AUDIO_RELAY;
+	}
+
+	@Override
+	public int relayFraming() {
+		return relayFraming;
+	}
+
+	@Override
+	public void setRelayFraming(int relayFraming) {
+		this.relayFraming = relayFraming;
 	}
 
 	@Override
