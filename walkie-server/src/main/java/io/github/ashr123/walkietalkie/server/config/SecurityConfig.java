@@ -12,6 +12,8 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
+import java.security.SecureRandom;
+
 /// Stateless, token-based security. Static client assets, health checks and the login endpoint are
 /// public; the WebSocket endpoints and everything else require a valid bearer token, applied by
 /// [TokenAuthenticationFilter].
@@ -36,5 +38,13 @@ public class SecurityConfig {
 				.httpBasic(AbstractHttpConfigurer::disable)
 				.formLogin(AbstractHttpConfigurer::disable)
 				.build();
+	}
+
+	/// A single shared, thread-safe CSPRNG for the app's security infrastructure — token nonces in
+	/// [AuthService] and the dev-TLS keystore password in [TlsConfiguration]. (Spring Boot does not
+	/// auto-configure a `SecureRandom` bean, so we define one.)
+	@Bean
+	public SecureRandom secureRandom() {
+		return new SecureRandom();
 	}
 }

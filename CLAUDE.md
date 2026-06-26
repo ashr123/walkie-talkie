@@ -21,11 +21,11 @@ so only Gradle needs the prefix. Use the bundled wrapper (`./gradlew`, Gradle 9.
 
 ```bash
 JAVA_OPTS= ./gradlew build                       # compile all modules + run all tests
-JAVA_OPTS= ./gradlew :walkie-server:bootRun       # run the server on http://localhost:8080
+JAVA_OPTS= ./gradlew :walkie-server:bootRun       # HTTPS on https://localhost:8443 by default (auto self-signed cert); walkie.tls.enabled=false -> http://localhost:8080
 java -jar walkie-server/build/libs/walkie-server-0.1.0.jar   # or run the built boot jar
 
 # Java desktop client (relay transport). --mode: ptt|global|duplex ; --hifi flag for the music profile; --help for all options
-JAVA_OPTS= ./gradlew :walkie-client-java:run --args="--server http://localhost:8080 --display alice --channel team1 --mode ptt"
+JAVA_OPTS= ./gradlew :walkie-client-java:run --args="--server https://localhost:8443 --display alice --channel team1 --mode ptt"
 
 # Tests
 JAVA_OPTS= ./gradlew :walkie-server:test                                            # one module
@@ -100,7 +100,7 @@ independently-decoded stream) and tunes Opus via SDP munging + sender `maxBitrat
 **Relay end-to-end encryption (optional).** When a shared passphrase is set (browser passphrase field,
 or `--key` / `WALKIE_KEY` on the Java client), the sender encrypts the *whole* `[codec tag][payload]`
 plaintext and the wire frame becomes `[scheme 0xE2][IV(12)][AES-256-GCM ciphertext+tag(16)]`. A single
-`PBKDF2-HMAC-SHA256(passphrase, "walkie-talkie:e2ee:"+effectiveChannel, 600 000)` run derives **384 bits**:
+`PBKDF2-HMAC-SHA512(passphrase, "walkie-talkie:e2ee:"+effectiveChannel, 600 000)` run derives **384 bits**:
 the first 256 are the AES key, the next 128 are a **key-check value** the client sends in its `Join`. PBKDF2's
 first output block is length-independent, so the AES key is byte-identical to a 256-bit derivation — the
 known-answer test still holds. The key is derived identically by both clients; the server never sees it and
@@ -132,6 +132,16 @@ carry. The **display name** is the only human label: the client sends it in `Joi
 against `[A-Za-z0-9_.-]{1,32}` (else `invalid_display_name`); clients append a short `#<id-prefix>` when two
 members share one. The token's short TTL is the only bound on replay (no revocation list — the accepted
 trade-off of going store-free); serve over WSS and keep `walkie.allowed-origins` tight in production.
+**Transport TLS is ON by default** (`TlsConfiguration`, a `WebServerFactoryCustomizer` gated by
+`walkie.tls.enabled`, default true): the server serves HTTPS/WSS on 8443, auto-generating a self-signed
+localhost cert into `~/.walkie-talkie/` when no `WALKIE_TLS_KEYSTORE` is supplied (via the JDK's `keytool`
+with a fixed arg list — no user input). The Java client auto-trusts that dev cert on localhost (reading the
+exported `dev-cert.pem`) or a `--tls-truststore`, with verification **never** disabled (`TlsTrust`). Set
+`walkie.tls.enabled=false` to serve plain HTTP — the integration tests do this (`src/test/resources/
+application.properties`), and it's the mode for a TLS-terminating reverse proxy (see `deploy/`). WSS encrypts
+*everything* on the wire — control **and** the binary audio frames — whereas the optional passphrase E2EE is
+application-layer and covers only the audio *payload* (control is never passphrase-encrypted, since the
+server must read and act on it).
 
 **Concurrency.** Virtual threads are enabled (`spring.threads.virtual.enabled`). Each
 `WebSocketClientSession` owns an **asynchronous outbound mailbox** drained by exactly one dedicated virtual

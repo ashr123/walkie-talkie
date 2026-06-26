@@ -15,7 +15,7 @@ import java.util.concurrent.Callable;
 /// Example:
 ///
 /// ```shell
-/// ./gradlew :walkie-client-java:run --args="--server http://localhost:8080 \
+/// ./gradlew :walkie-client-java:run --args="--server https://localhost:8443 \
 ///     --channel team1 --mode ptt --display Alice --hifi"
 /// ```
 ///
@@ -28,8 +28,8 @@ import java.util.concurrent.Callable;
 )
 public final class WalkieClientLauncher implements Callable<Integer> {
 
-	@Option(names = "--server", defaultValue = "http://localhost:8080",
-			description = "Base HTTP URL of the server (default: ${DEFAULT-VALUE}).")
+	@Option(names = "--server", defaultValue = "https://localhost:8443",
+			description = "Base URL of the server (default: ${DEFAULT-VALUE}). Use http://... for a server run with walkie.tls.enabled=false.")
 	private String server;
 
 	@Option(names = "--channel", defaultValue = "lobby",
@@ -59,6 +59,11 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 					+ "channel must use the same one. Defaults to the WALKIE_KEY env var; omit to disable.")
 	private String key;
 
+	@Option(names = "--tls-truststore",
+			description = "Path to a PEM certificate to additionally trust for TLS. The system CAs are always "
+					+ "trusted, and on localhost the server's auto-generated dev cert is trusted automatically.")
+	private String tlsTruststore;
+
 	static void main(String... args) {
 		System.exit(new CommandLine(new WalkieClientLauncher()).execute(args));
 	}
@@ -76,7 +81,8 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 				display,
 				highFidelity,
 				input,
-				key
+				key,
+				tlsTruststore
 		))) {
 		}
 		return 0;

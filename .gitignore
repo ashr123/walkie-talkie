@@ -125,3 +125,12 @@ $RECYCLE.BIN/
 .directory
 .Trash-*
 .nfs*
+
+# =============================================================================
+# TLS / secrets — never commit private keys, certs, or keystores (org policy)
+# =============================================================================
+*.p12
+*.jks
+*.pem
+*.key
+dev-keystore.p12

@@ -1,0 +1,15 @@
+# Production TLS termination for the walkie-talkie server using Caddy, with AUTOMATIC HTTPS
+# (Caddy obtains and renews a Let's Encrypt certificate for you).
+#
+#   1. Point walkie.example.com at this host (DNS A/AAAA), with ports 80 and 443 reachable.
+#   2. Replace walkie.example.com below with your domain.
+#   3. Run the app on plain HTTP for this proxy — set walkie.tls.enabled=false (serves :8080) — then:
+#      caddy run --config deploy/Caddyfile
+#
+# reverse_proxy forwards WebSocket upgrades (/ws/audio, /ws/signal) transparently, so audio + control travel
+# inside TLS end-to-end between the browser and Caddy. Tighten walkie.allowed-origins to https://your-domain
+# in production (see application.yml) so the origin check (anti-CSWSH) only accepts your real site.
+
+walkie.example.com {
+	reverse_proxy localhost:8080
+}

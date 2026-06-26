@@ -7,6 +7,7 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.List;
 
@@ -19,7 +20,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AuthServiceTest {
 
 	private static final String SIGNING_KEY = "test-signing-key-which-is-plenty-long";
-	private final AuthService authService = new AuthService(props(SIGNING_KEY));
+	private static final SecureRandom RANDOM = new SecureRandom();
+	private final AuthService authService = auth(SIGNING_KEY);
+
+	private static AuthService auth(String signingKey) {
+		return new AuthService(props(signingKey), RANDOM);
+	}
 
 	private static WalkieProperties props(String signingKey) {
 		return new WalkieProperties(List.of("*"), 8192, 65536, signingKey);
@@ -53,7 +59,7 @@ class AuthServiceTest {
 
 	@Test
 	void rejectsATokenSignedWithADifferentKey() {
-		String foreign = new AuthService(props("a-completely-different-signing-key")).issueToken();
+		String foreign = auth("a-completely-different-signing-key").issueToken();
 		assertFalse(authService.verify(foreign), "a token signed with another key must not verify");
 	}
 
@@ -74,9 +80,9 @@ class AuthServiceTest {
 
 	@Test
 	void generatesARandomPerProcessKeyWhenNoneIsConfiguredSoTokensStillRoundTrip() {
-		AuthService noKey = new AuthService(props(null));
+		AuthService noKey = auth(null);
 		assertTrue(noKey.verify(noKey.issueToken()), "a process-random key still signs and verifies");
-		AuthService blankKey = new AuthService(props("   "));
+		AuthService blankKey = auth("   ");
 		assertTrue(blankKey.verify(blankKey.issueToken()), "a blank key takes the same random-fallback path");
 	}
 }

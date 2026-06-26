@@ -77,12 +77,23 @@ public class ConnectionService {
 	}
 
 	private void handleJoin(ClientSession session, ClientMessage.Join join) {
+		ChannelMode mode = join.mode();
+		String requested = mode == ChannelMode.GLOBAL_PTT ? GLOBAL_CHANNEL : join.channel();
+
+		// Connect guard: a duplicate Join for the channel this session is already in is idempotent — re-send
+		// the current snapshot so the client re-syncs, but do NOT churn membership (no leave/rejoin, no
+		// MemberLeft + MemberJoined flicker for the other members). A Join for a different channel still switches.
+		if (requested != null && requested.equals(session.channelName())
+				&& channelRegistry.find(requested) instanceof Some(Channel current)) {
+			session.send(new ServerMessage.Joined(
+					session.id(), current.name(), current.mode(), current.ownerId(), current.memberInfos()));
+			return;
+		}
+
 		if (session.channelName() != null) {
 			handleLeave(session);
 		}
 
-		ChannelMode mode = join.mode();
-		String requested = mode == ChannelMode.GLOBAL_PTT ? GLOBAL_CHANNEL : join.channel();
 		if (requested == null || !CHANNEL_NAME.matcher(requested).matches()) {
 			session.send(new ServerMessage.ErrorMessage("invalid_channel",
 					"Channel name must match " + CHANNEL_NAME.pattern()));

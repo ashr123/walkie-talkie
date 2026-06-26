@@ -14,7 +14,7 @@ import java.util.HexFormat;
 
 /// End-to-end encryption for relay audio frames (AES-256-GCM).
 ///
-/// The key is derived from a shared passphrase with PBKDF2-HMAC-SHA-256 (600 000 iterations), salted with
+/// The key is derived from a shared passphrase with PBKDF2-HMAC-SHA-512 (600 000 iterations), salted with
 /// the effective channel name, so every client in a channel derives the same key and the server — which
 /// relays frames opaquely — never sees it. Each frame is `scheme(1) ‖ IV(12) ‖ AES-256-GCM(key, IV, plaintext)`:
 /// the leading scheme byte (`0xE2`, kept outside the codec-tag set so it never collides with a plaintext
@@ -32,9 +32,9 @@ final class FrameCrypto {
 	private static final byte SCHEME = (byte) 0xE2;              // wire marker: frame is scheme(1) ‖ IV ‖ ct+tag; kept outside the codec-tag set {1,2}
 	private static final byte[] AAD = {SCHEME};                 // the scheme byte is authenticated (GCM AAD) but not encrypted, binding the envelope to the tag
 	// PBKDF2 work factor: a deliberate slowdown so a low-entropy passphrase is expensive to brute-force
-	// offline. It's the cost knob every password KDF has, not an arbitrary value — 600k is the current
-	// OWASP guidance for PBKDF2-HMAC-SHA256. It must match the browser's WebCrypto iteration count
-	// exactly — it's part of the cross-platform key-derivation contract.
+	// offline. It's the cost knob every password KDF has, not an arbitrary value — 600k comfortably exceeds
+	// OWASP's PBKDF2-HMAC-SHA512 floor (210k). It must match the browser's WebCrypto iteration count exactly —
+	// it's part of the cross-platform key-derivation contract.
 	private static final int PBKDF2_ITERATIONS = 600_000;
 	private static final int KEY_BITS = 256;
 	private static final int KCV_BITS = 128;          // 16-byte key-check value, derived alongside the AES key
@@ -76,7 +76,7 @@ final class FrameCrypto {
 				bits
 		);
 		try {
-			return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+			return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA512").generateSecret(spec).getEncoded();
 		} finally {
 			spec.clearPassword();
 		}

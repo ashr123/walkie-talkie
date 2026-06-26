@@ -1,0 +1,10 @@
+{
+  "properties": [
+    {
+      "name": "walkie.tls.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Whether the server serves HTTPS/WSS (transport TLS). On by default; set to false to serve plain HTTP (e.g. behind a TLS-terminating reverse proxy). Consumed by TlsConfiguration via @ConditionalOnProperty.",
+      "defaultValue": true
+    }
+  ]
+}

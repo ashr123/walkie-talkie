@@ -1,0 +1,38 @@
+# Production TLS termination for the walkie-talkie server using nginx.
+# Point ssl_certificate / ssl_certificate_key at your CA-issued cert (e.g. from certbot/Let's Encrypt),
+# replace walkie.example.com, and run the app on plain HTTP behind this proxy by setting
+# walkie.tls.enabled=false (it then serves :8080; TLS is on by default otherwise).
+#
+# The Upgrade / Connection headers are REQUIRED — without them the WebSocket endpoints (/ws/audio,
+# /ws/signal) fail to upgrade and no audio/control flows.
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name walkie.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/walkie.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/walkie.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;   # TLS 1.2+ only
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket upgrade (required for /ws/audio and /ws/signal)
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;   # keep long-lived audio sockets open
+    }
+}
+
+# Optional: redirect plain HTTP to HTTPS.
+server {
+    listen 80;
+    server_name walkie.example.com;
+    return 301 https://$host$request_uri;
+}

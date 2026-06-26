@@ -47,10 +47,11 @@ public class AuthService {
 	private static final Base64.Decoder B64_DECODER = Base64.getUrlDecoder();
 
 	private final SecretKey key;
-	private final SecureRandom random = new SecureRandom();
+	private final SecureRandom random;
 
-	public AuthService(WalkieProperties properties) {
+	public AuthService(WalkieProperties properties, SecureRandom random) {
 		this.key = resolveKey(properties.authSigningKey());
+		this.random = random;
 	}
 
 	private static SecretKey resolveKey(String configured) {

@@ -40,6 +40,7 @@ const state = {
     micStream: null,
     channels: 1,            // negotiated in setupAudio: 2 if the mic provides stereo, else 1
     transmitting: false,
+    connecting: false,      // true while a connect() flow is in flight — guards against double-clicking Connect
     opusEncoder: null,
     captureTs: 0,
     warnedNoOpus: false,
@@ -78,6 +79,9 @@ function isOpen() {
 // --- connection -----------------------------------------------------------------------------------
 
 async function connect() {
+    if (state.connecting || isOpen()) {
+        return;   // a connect flow is already in progress (or we're connected) — ignore extra clicks
+    }
     state.transport = byId('transport').value;
     state.mode = byId('mode').value;
     state.hifi = byId('hifi').checked;
@@ -100,6 +104,10 @@ async function connect() {
         return;
     }
 
+    // Commit to a single connect flow: hold the button down for the whole async sequence (login -> mic -> WS),
+    // not just from ws.onopen, so rapid double-clicks can't kick off a second login / mic grab / socket.
+    state.connecting = true;
+    byId('connectBtn').disabled = true;
     try {
         // Login takes no input: it just mints a signed, short-lived token. Identity in a channel is the
         // server-assigned session id; the display name is sent with the join below.
@@ -137,6 +145,7 @@ async function connect() {
         state.ws = ws;
 
         ws.onopen = () => {
+            state.connecting = false;   // connect flow completed — now connected
             log('WebSocket open (' + state.transport + ')');
             sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck, relayFraming: RELAY_FRAMING});
             setStatus(true, 'Connected — ' + state.transport);
@@ -151,6 +160,7 @@ async function connect() {
         ws.onerror = () => log('WebSocket error');
     } catch (err) {
         log('Connect error: ' + err.message);
+        state.connecting = false;
         if (!state.ws) {
             cleanup();  // tear down any mic / AudioContext acquired before the socket existed
         }
@@ -503,7 +513,7 @@ function sendTagged(tag, payloadBytes) {
 // --- end-to-end encryption (relay path) -----------------------------------------------------------
 
 // Derive the per-channel material from the shared passphrase. Must match the Java client and FrameCryptoTest
-// exactly: PBKDF2-HMAC-SHA256, 600000 iterations, salt "walkie-talkie:e2ee:" + channel. A single 384-bit
+// exactly: PBKDF2-HMAC-SHA512, 600000 iterations, salt "walkie-talkie:e2ee:" + channel. A single 384-bit
 // derivation gives the AES-256-GCM key (first 32 bytes) plus a 16-byte key-check value (next 16) sent in the
 // join so the server can reject a mismatched passphrase. PBKDF2's first block is length-independent, so the
 // AES key is identical to a 256-bit derivation — the known-answer test still holds. Returns {key, keyCheck}.
@@ -515,7 +525,7 @@ async function deriveKey(passphrase, effectiveChannel) {
             name: 'PBKDF2',
             salt: enc.encode('walkie-talkie:e2ee:' + effectiveChannel),
             iterations: 600000,
-            hash: 'SHA-256'
+            hash: 'SHA-512'
         },
         base, 384));
     const key = await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['encrypt', 'decrypt']);
@@ -949,6 +959,7 @@ function cleanup() {
     state.members.clear();
     renderMembers();
     state.transmitting = false;
+    state.connecting = false;
     closeCodec(state.opusEncoder);
     state.opusEncoder = null;
     state.captureTs = 0;

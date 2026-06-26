@@ -45,12 +45,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class WalkieClient implements AutoCloseable {
 
 	private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(
-			"yyyy-MM-dd HH:mm:ss,SSS", Locale.getDefault(Locale.Category.FORMAT));
+			"yyyy-MM-dd HH:mm:ss,SSS",
+			Locale.getDefault(Locale.Category.FORMAT)
+	);
 	// Stateless, thread-safe infrastructure with no per-connection input — shared by every client instance.
 	private static final ObjectMapper JSON_MAPPER = JsonMapper.builder().build();
-	private static final HttpClient httpClient = HttpClient.newHttpClient();
 
 	private final ClientOptions options;
+	// Per-instance: its SSLContext trusts the system CAs plus (on localhost) the server's dev cert or a
+	// --tls-truststore, so HTTPS + WSS verify against the target server — verification is never disabled.
+	private final HttpClient httpClient;
 
 	private final AtomicBoolean running = new AtomicBoolean(true);
 	private final AtomicBoolean closed = new AtomicBoolean(false);   // guards close() so it is idempotent
@@ -67,6 +71,9 @@ public final class WalkieClient implements AutoCloseable {
 
 	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
 		this.options = options;
+		this.httpClient = HttpClient.newBuilder()
+				.sslContext(TlsTrust.forServer(options.server(), options.tlsTruststore()))
+				.build();
 		this.currentMode = options.mode();
 		this.audio = new AudioEngine(options, this::sendAudioFrame);
 		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");

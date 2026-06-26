@@ -79,7 +79,10 @@ JAVA_OPTS= ./gradlew :walkie-server:bootRun
 java -jar walkie-server/build/libs/walkie-server-0.1.0.jar
 ```
 
-The server listens on `http://localhost:8080`. Open it in a browser to use the web client.
+By default the server runs over **HTTPS on `https://localhost:8443`** with an auto-generated self-signed
+certificate (your browser shows a one-time warning) — see *Transport encryption (TLS / WSS)* below. To run
+plain HTTP on `http://localhost:8080` instead, set `walkie.tls.enabled=false`. Open the URL in a browser to
+use the web client.
 
 #### Signing key (real / multi-instance deployment)
 
@@ -97,9 +100,44 @@ openssl rand -base64 64
 WALKIE_AUTH_SIGNING_KEY="$(openssl rand -base64 64)" java -jar walkie-server/build/libs/walkie-server-0.1.0.jar
 ```
 
+### Transport encryption (TLS / WSS)
+
+**TLS is on by default**, so the whole connection is encrypted in transit — control messages, the binary
+audio frames, the HTTPS login, and the `?token=` on the WebSocket handshake. (The optional audio passphrase
+is a separate, end-to-end layer that protects only the audio *payload* between participants; it is **not** a
+substitute for transport TLS, and control messages are never passphrase-encrypted because the server has to
+read and act on them.)
+
+**Local dev (zero-config).** With no keystore configured, the server **auto-generates a self-signed localhost
+certificate at startup** (into `~/.walkie-talkie/`, regenerated each run) and serves `https://localhost:8443`.
+The browser shows a one-time "accept the certificate" warning. The **Java client auto-trusts** this dev cert
+on localhost (it reads the exported `~/.walkie-talkie/dev-cert.pem`), so it just works — and TLS verification
+is never disabled.
+
+**Your own / a stronger cert.** Point the server at a keystore via the environment (path + password are never
+hardcoded or committed):
+
+```bash
+export WALKIE_TLS_KEYSTORE_PASSWORD=…              # your keystore password
+scripts/gen-dev-cert.sh                            # optional: writes ./dev-keystore.p12 (RSA-4096) + ./dev-cert.pem
+WALKIE_TLS_KEYSTORE="file:$PWD/dev-keystore.p12" JAVA_OPTS= ./gradlew :walkie-server:bootRun
+# Java client against a custom cert:  --tls-truststore ./dev-cert.pem
+```
+
+**Turn TLS off** with `walkie.tls.enabled=false` — the server then serves plain `http://localhost:8080`. Use
+this for the production model below (a TLS-terminating reverse proxy on a trusted loopback).
+
+**Production — terminate TLS at a reverse proxy.** Run the app with `walkie.tls.enabled=false` (plain HTTP on
+loopback) behind a proxy. Ready-to-edit configs are in [`deploy/`](deploy/): a [`Caddyfile`](deploy/Caddyfile)
+(automatic HTTPS via Let's Encrypt) and an [`nginx.conf.example`](deploy/nginx.conf.example) (mind the
+`Upgrade`/`Connection` headers the WebSocket endpoints require). Tighten `walkie.allowed-origins` to your
+HTTPS origin so the handshake's origin check (anti-CSWSH) accepts only your real site. TLS 1.3 / 1.2 only
+throughout.
+
 ### Browser client
 
-1. Open <http://localhost:8080>.
+1. Open <https://localhost:8443> and accept the one-time self-signed-certificate warning (or
+   <http://localhost:8080> if you started the server with `walkie.tls.enabled=false`).
 2. Pick a transport, channel mode, and channel (optionally tick **High fidelity** to disable the mic
    noise-suppression/echo-cancellation DSP — this can be toggled **live** while connected and applies
    immediately). To encrypt audio **end-to-end**, set the same **Encryption
@@ -123,14 +161,14 @@ through `--args`:
 
 ```bash
 JAVA_OPTS= ./gradlew :walkie-client-java:run --args="\
-  --server http://localhost:8080 --channel team1 --mode ptt --display Alice"
+  --server https://localhost:8443 --channel team1 --mode ptt --display Alice"
 ```
 
 All flags are optional (run with `--args="--help"` for the full list):
 
 | Flag                         | Default                 | Purpose                                                                                                                                                                                    |
 |------------------------------|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--server <url>`             | `http://localhost:8080` | Base HTTP URL of the server.                                                                                                                                                               |
+| `--server <url>`             | `https://localhost:8443`| Base URL of the server (on localhost the dev cert is auto-trusted; use `http://…` for a server run with `walkie.tls.enabled=false`).                                                                                                                                                               |
 | `--channel <name>`           | `lobby`                 | Channel to join (ignored for global mode; the name `global` is reserved for global mode).                                                                                                                                                 |
 | `--mode ptt\|global\|duplex` | `ptt`                   | Conversation mode **when creating** a channel; a later joiner adopts the channel's existing mode.                                                                                          |
 | `--display <name>`           | `guest`                 | Name shown to others — **1–32 chars of `[A-Za-z0-9_.-]`, no spaces** (the server rejects anything else).                                                                                   |
@@ -138,6 +176,7 @@ All flags are optional (run with `--args="--help"` for the full list):
 | `--input <substr>`           | system default          | Capture from the input device whose name contains `<substr>`.                                                                                                                              |
 | `--list-inputs`              | —                       | Print the available input devices and exit.                                                                                                                                                |
 | `--key <passphrase>`         | `$WALKIE_KEY`           | **End-to-end encrypt** the audio (AES-256-GCM). Everyone in the channel — including browser peers — must use the same passphrase on the same channel/mode; a mismatch is rejected at join. Ignored in global mode — that room is the server's unencrypted broadcast channel. |
+| `--tls-truststore <pem>`     | —                       | Extra PEM certificate to trust for TLS, besides the system CAs and (on localhost) the server's auto-generated dev cert. Verification stays on. |
 
 > Tip: run once with `--list-inputs` to see capture-device names, then pass a distinctive substring to
 > `--input` (e.g. `--input "USB"`).
@@ -165,7 +204,7 @@ otherwise mono — and interoperates with relay-mode browser clients.
 - **Optional end-to-end encryption (relay path).** With a shared passphrase, audio frames are encrypted
   with **AES-256-GCM** before they leave the client and decrypted only by other holders of the passphrase —
   the server relays ciphertext opaquely and never holds the key. The key is derived with
-  **PBKDF2-HMAC-SHA256** (600 000 iterations, salted per channel); the browser (WebCrypto) and Java client
+  **PBKDF2-HMAC-SHA512** (600 000 iterations, salted per channel); the browser (WebCrypto) and Java client
   (`javax.crypto`) derive byte-identical keys, pinned by a cross-platform known-answer test. The same
   derivation also yields a **key-check value** the client sends at join, letting the server **reject a
   member whose passphrase doesn't match** the channel's (`passphrase_mismatch`) — without ever seeing the
@@ -174,7 +213,7 @@ otherwise mono — and interoperates with relay-mode browser clients.
 - Stateless, CSRF-free token model; static client, health check and login are the only public routes.
 - Input is validated (display-name + channel-name patterns, audio-frame size caps). The browser renders
   member names with `textContent` to avoid markup injection.
-- **For production:** serve over WSS/HTTPS (TLS 1.2+), restrict `walkie.allowed-origins`, set
+- **For production:** serve over WSS/HTTPS (TLS 1.2+) — see _Transport encryption (TLS / WSS)_ above and the `deploy/` proxy configs — restrict `walkie.allowed-origins`, set
   `WALKIE_AUTH_SIGNING_KEY`, and swap the signed-token mint/verify for real IdP/JWT validation — the filter
   wiring stays the same.
 

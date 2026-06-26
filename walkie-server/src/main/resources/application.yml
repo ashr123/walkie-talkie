@@ -1,4 +1,6 @@
 server:
+  # Transport TLS is ON by default (HTTPS/WSS on 8443) — see TlsConfiguration. This port is used only when
+  # TLS is turned off with walkie.tls.enabled=false (e.g. behind a TLS-terminating reverse proxy on loopback).
   port: 8080
 
 spring:

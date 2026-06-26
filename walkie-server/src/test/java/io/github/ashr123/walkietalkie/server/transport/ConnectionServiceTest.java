@@ -62,6 +62,35 @@ class ConnectionServiceTest {
 	}
 
 	@Test
+	void aDuplicateJoinToTheSameChannelIsIdempotentAndDoesNotChurnMembership() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		alice.sent.clear();
+		bob.sent.clear();
+
+		// Alice re-sends Join for the channel she is already in (a duplicate / retry).
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+
+		assertEquals("team", firstOf(alice, ServerMessage.Joined.class).channel(),
+				"a duplicate join re-sends the snapshot so the client re-syncs");
+		assertTrue(bob.sent.isEmpty(),
+				"the other members see no churn (no MemberLeft/MemberJoined) on a duplicate join");
+		assertEquals(2, channel("team").size(), "membership is unchanged");
+	}
+
+	@Test
+	void joiningADifferentChannelStillSwitches() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		alice.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+
+		assertEquals("other", firstOf(alice, ServerMessage.Joined.class).channel(), "joining a different channel switches");
+		assertNull(channel("team"), "the previous channel is left (and dropped once empty)");
+		assertEquals(1, channel("other").size());
+	}
+
+	@Test
 	void theOwnerCanChangeTheModeAndEveryoneIsNotified() {
 		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
