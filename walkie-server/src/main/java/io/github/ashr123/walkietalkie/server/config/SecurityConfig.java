@@ -25,7 +25,7 @@ public class SecurityConfig {
 				.csrf(AbstractHttpConfigurer::disable)
 				.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
 				.authorizeHttpRequests(auth -> auth
-						.requestMatchers("/", "/index.html", "/favicon.ico", "/assets/**").permitAll()
+						.requestMatchers("/", "/index.html", "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png", "/assets/**").permitAll()
 						// Permit the error dispatch so validation failures surface as 400, not 403.
 						.requestMatchers("/error").permitAll()
 						.requestMatchers("/actuator/health", "/actuator/info").permitAll()
