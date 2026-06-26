@@ -22,6 +22,9 @@ const E2EE_SCHEME = 0xe2;        // wire marker for an encrypted frame: [scheme]
 const E2EE_AAD = Uint8Array.of(E2EE_SCHEME);   // the scheme byte, authenticated (GCM additionalData) but not encrypted, so the envelope is covered by the tag
 const OPUS_SUPPORTED = (typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined');
 const DISPLAY_NAME = /^[A-Za-z0-9_.-]{1,32}$/;   // must match the server's display-name validation
+const RELAY_FRAMING = 1;         // advertised in the join: 1 = we parse the SID-prefixed multi-stream relay framing
+const MAX_ACTIVE_DECODERS = 8;   // cap on per-sender decoders we mix at once (O(N^2) fan-out guard); evict longest-silent
+const SILENCE_TTL_MS = 4000;     // close a per-sender lane after this much silence (survives speech gaps + jitter)
 
 const state = {
     token: null,
@@ -33,25 +36,26 @@ const state = {
     ownerId: null,
     audioContext: null,
     captureNode: null,
-    playbackNode: null,
     micStream: null,
     channels: 1,            // negotiated in setupAudio: 2 if the mic provides stereo, else 1
     transmitting: false,
     opusEncoder: null,
-    opusDecoder: null,
-    decoderChannels: null,  // channel count the decoder is configured for, matched to the sender's stream
     captureTs: 0,
-    decodeTs: 0,
     warnedNoOpus: false,
     warnedChannels: false,
     cryptoKey: null,        // AES-256-GCM key for relay E2EE, or null when no passphrase
     keyCheck: null,         // key-check value sent in the join so the server can reject a mismatched passphrase
-    txChain: null,          // serializes async frame encryption so it can't reorder the Opus stream
-    rxChain: null,          // serializes async frame decryption likewise
+    txChain: null,          // serializes async frame encryption (send side) so it can't reorder our Opus stream
     warnedDecrypt: false,
     warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
-    peers: new Map(),     // remoteId -> RTCPeerConnection
-    members: new Map(),   // id -> displayName
+    peers: new Map(),       // remoteId -> RTCPeerConnection (WebRTC)
+    members: new Map(),     // id -> displayName
+    // Relay full-duplex: one decode/playback "lane" per sender, keyed by the server-assigned stream index,
+    // mixed natively by ctx.destination. The maps relate stream indices to member ids for lifecycle/binding.
+    lanes: new Map(),        // stream id (uint8) -> {node, decoder, decoderChannels, decodeTs, rxChain, memberId, lastSeen}
+    streamOf: new Map(),     // member id -> stream id
+    memberOfStream: new Map(), // stream id -> member id
+    laneSweep: null,         // interval id for the silent-lane age-out sweep
 };
 
 function log(message) {
@@ -119,7 +123,6 @@ async function connect() {
         state.cryptoKey = derived ? derived.key : null;
         state.keyCheck = derived ? derived.keyCheck : null;
         state.txChain = Promise.resolve();
-        state.rxChain = Promise.resolve();
         state.warnedDecrypt = false;
         if (state.transport === 'relay') {
             log(state.cryptoKey ? 'End-to-end encryption: ON (AES-256-GCM)' : 'End-to-end encryption: off');
@@ -134,7 +137,7 @@ async function connect() {
 
         ws.onopen = () => {
             log('WebSocket open (' + state.transport + ')');
-            sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck});
+            sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck, relayFraming: RELAY_FRAMING});
             setStatus(true, 'Connected — ' + state.transport);
             byId('connectBtn').disabled = true;
             byId('disconnectBtn').disabled = false;
@@ -232,6 +235,11 @@ function onJoined(msg) {
     state.selfId = msg.selfId;
     state.ownerId = msg.ownerId;
     state.mode = msg.mode;
+    // A fresh snapshot (including our own reconnect) reassigns every stream index, so drop all decode lanes
+    // and rebuild the roster + stream-index maps from scratch.
+    closeAllLanes();
+    state.memberOfStream.clear();
+    state.streamOf.clear();
     state.members.clear();
     msg.members.forEach(addMember);
     renderMembers();
@@ -370,20 +378,11 @@ async function setupAudio() {
     log('Audio ready — context ' + ctx.state + ' @ ' + ctx.sampleRate + ' Hz, '
         + (state.channels === 2 ? 'stereo' : 'mono') + ', transport ' + state.transport);
 
-    // A pure source: no inputs, one output of the negotiated channel count. Without outputChannelCount
-    // the (default) unconnected input can make Chrome hand process() a zero-channel output — outputs[0][0]
-    // is then undefined, process() throws, and Chrome stops calling it (permanent silence).
-    const playback = new AudioWorkletNode(ctx, 'playback-processor', {
-        numberOfInputs: 0,
-        numberOfOutputs: 1,
-        outputChannelCount: [state.channels],
-        processorOptions: {channels: state.channels},
-    });
-    playback.connect(ctx.destination);
-    state.playbackNode = playback;
-
     if (state.transport === 'relay') {
         setupRelayCodec();
+        // One decode/playback lane PER sender is created lazily in getLane; ctx.destination mixes them all.
+        // Sweep idle lanes so a sender that has fallen silent has its decoder released.
+        state.laneSweep = setInterval(sweepLanes, 1000);
         const source = ctx.createMediaStreamSource(state.micStream);
         // 'explicit' + 'speakers' so the worklet always gets exactly `channels` channels; if the source
         // turns out mono, 'speakers' duplicates it into both (no hard-left/dead-right) rather than
@@ -415,13 +414,8 @@ function setupRelayCodec() {
         bitrate: state.channels === 2 ? STEREO_BITRATE : MONO_BITRATE,
         opus: {format: 'opus', frameDuration: FRAME_US, complexity: 10, useinbandfec: true, packetlossperc: 10},
     });
-    state.opusDecoder = new AudioDecoder({
-        output: (audioData) => playbackDecoded(audioData),
-        error: (e) => log('Opus decoder error: ' + e.message),
-    });
-    // The decoder is configured lazily in handleAudioFrame to match the SENDER's channel count (read from
-    // the Opus TOC byte), not ours: WebCodecs' Opus decoder yields silence if its configured channel count
-    // differs from the stream's, so a stereo sender must be decoded as stereo even on a mono listener.
+    // Decoders are created PER sender (lazily, in getLane): each remote stream needs its own stateful Opus
+    // decoder so simultaneous talkers don't garble, and ctx.destination mixes the per-sender playback nodes.
 }
 
 function onCapturedFrame(pcmBuffer) {
@@ -532,13 +526,25 @@ function decryptFrame(frame) {
 // Decrypts (when E2EE is on) before decoding. Decryption is serialized through a promise chain so async
 // WebCrypto can't hand frames to the stateful Opus decoder out of order.
 function handleAudioFrame(arrayBuffer) {
+    const bytes = new Uint8Array(arrayBuffer);
+    if (bytes.length < 2) {
+        return; // need at least [stream id][1 body byte]
+    }
+    // Demultiplex by the server-prepended stream index, then strip it unconditionally (before the E2EE
+    // branch) so the no-key path can't mistake the stream id for a codec tag.
+    const sid = bytes[0];
+    const body = bytes.subarray(1);
+    const lane = getLane(sid);
+    lane.lastSeen = performance.now();
     if (!state.cryptoKey) {
-        processFrame(arrayBuffer);
+        processFrame(lane, body);
         return;
     }
-    state.rxChain = state.rxChain
-        .then(() => decryptFrame(new Uint8Array(arrayBuffer)))
-        .then((plaintext) => processFrame(plaintext))
+    // Decryption is serialized PER sender (one stateful decoder per lane), so a slow decrypt for one sender
+    // can't reorder that sender's frames or head-of-line-block another.
+    lane.rxChain = lane.rxChain
+        .then(() => decryptFrame(body))
+        .then((plaintext) => processFrame(lane, new Uint8Array(plaintext)))
         .catch(() => {
             if (!state.warnedDecrypt) {
                 state.warnedDecrypt = true;
@@ -547,40 +553,39 @@ function handleAudioFrame(arrayBuffer) {
         });
 }
 
-function processFrame(arrayBuffer) {
-    if (arrayBuffer.byteLength < 2) {
+function processFrame(lane, body) {
+    if (body.length < 2) {
         return;
     }
-    const tag = new Uint8Array(arrayBuffer, 0, 1)[0];
+    const tag = body[0];
     if (tag === CODEC_OPUS) {
-        if (state.opusDecoder) {
-            const payload = new Uint8Array(arrayBuffer, 1);
-            // The Opus TOC byte's stereo flag (0x04) gives the stream's channel count, which may differ
-            // from ours (e.g. a stereo Concentus/Java sender into a mono browser). Configure the decoder
-            // to match the stream — otherwise WebCodecs decodes to silence — and reconfigure if it changes
-            // (one talker at a time, so this is rare). playbackDecoded adapts the result to our output.
+        if (lane.decoder) {
+            const payload = body.subarray(1);
+            // The Opus TOC byte's stereo flag (0x04) gives the stream's channel count, which may differ from
+            // ours (e.g. a stereo Concentus/Java sender into a mono browser). Configure THIS lane's decoder to
+            // match the stream — otherwise WebCodecs decodes to silence — and reconfigure if it changes.
             const streamChannels = (payload[0] & 0x04) ? 2 : 1;
-            if (state.decoderChannels !== streamChannels) {
-                state.opusDecoder.configure({codec: 'opus', sampleRate: SAMPLE_RATE, numberOfChannels: streamChannels});
-                state.decoderChannels = streamChannels;
-                state.decodeTs = 0;
+            if (lane.decoderChannels !== streamChannels) {
+                lane.decoder.configure({codec: 'opus', sampleRate: SAMPLE_RATE, numberOfChannels: streamChannels});
+                lane.decoderChannels = streamChannels;
+                lane.decodeTs = 0;
             }
-            const chunk = new EncodedAudioChunk({type: 'key', timestamp: state.decodeTs, duration: FRAME_US, data: payload});
-            state.decodeTs += FRAME_US;
-            state.opusDecoder.decode(chunk);
+            const chunk = new EncodedAudioChunk({type: 'key', timestamp: lane.decodeTs, duration: FRAME_US, data: payload});
+            lane.decodeTs += FRAME_US;
+            lane.decoder.decode(chunk);
         } else if (!state.warnedNoOpus) {
             state.warnedNoOpus = true;
             log('Received Opus audio but this browser cannot decode it (no WebCodecs).');
         }
     } else if (tag === CODEC_PCM) {
-        // Raw Int16 LE, mono (the PCM fallback is always mono), starting at byte offset 1.
-        const view = new DataView(arrayBuffer, 1);
-        const count = (arrayBuffer.byteLength - 1) >> 1;
+        // Raw Int16 LE, mono (the PCM fallback is always mono), starting at body offset 1.
+        const count = (body.length - 1) >> 1;
+        const view = new DataView(body.buffer, body.byteOffset + 1, body.length - 1);
         const f32 = new Float32Array(count);
         for (let i = 0; i < count; i++) {
             f32[i] = view.getInt16(i * 2, true) / 0x8000;
         }
-        enqueuePlayback(f32, count, 1);
+        enqueuePlayback(lane, f32, count, 1);
     } else if (tag === E2EE_SCHEME && !state.warnedEncryptedNoKey) {
         // Encrypted frames arriving while we have no passphrase: drop cleanly and explain (don't decode noise).
         state.warnedEncryptedNoKey = true;
@@ -588,11 +593,11 @@ function processFrame(arrayBuffer) {
     }
 }
 
-function playbackDecoded(audioData) {
+function playbackDecoded(lane, audioData) {
     const frames = audioData.numberOfFrames;
-    // The decoder is configured to match the stream (see handleAudioFrame), so numberOfChannels is the
-    // stream's count. Copy each channel plane as f32-planar and interleave manually — the reliably
-    // supported WebCodecs path; interleaved-'f32' copyTo can mis-extract a multi-channel AudioData.
+    // The lane's decoder is configured to match its stream (see processFrame), so numberOfChannels is the
+    // stream's count. Copy each channel plane as f32-planar and interleave manually — the reliably supported
+    // WebCodecs path; interleaved-'f32' copyTo can mis-extract a multi-channel AudioData.
     const srcChannels = audioData.numberOfChannels;
     const interleaved = new Float32Array(frames * srcChannels);
     const plane = new Float32Array(frames);
@@ -603,14 +608,14 @@ function playbackDecoded(audioData) {
         }
     }
     audioData.close();
-    enqueuePlayback(interleaved, frames, srcChannels);
+    enqueuePlayback(lane, interleaved, frames, srcChannels);
 }
 
-// Adapt an interleaved Float32 buffer (srcChannels) to the device's output channel count and queue it
-// for the playback worklet — so a mono sender plays on a stereo listener (and vice versa) regardless of
+// Adapt an interleaved Float32 buffer (srcChannels) to the device's output channel count and queue it on
+// this sender's playback node — so a mono sender plays on a stereo listener (and vice versa) regardless of
 // how the Opus decoder reports channels. Mirrors the Java client's "decode to my own channel count".
 // Takes ownership of `src`: the underlying buffer is transferred (detached) once queued.
-function enqueuePlayback(src, frames, srcChannels) {
+function enqueuePlayback(lane, src, frames, srcChannels) {
     const out = state.channels;
     let interleaved;
     if (srcChannels === out) {
@@ -634,7 +639,97 @@ function enqueuePlayback(src, frames, srcChannels) {
         }
         return;
     }
-    state.playbackNode.port.postMessage(interleaved.buffer, [interleaved.buffer]);
+    lane.node.port.postMessage(interleaved.buffer, [interleaved.buffer]);
+}
+
+// --- per-sender lanes (relay full-duplex) ---------------------------------------------------------
+
+// Returns the decode/playback lane for a stream index, creating it on first use. Each lane carries its own
+// stateful Opus decoder and its own Web Audio playback node (ctx.destination mixes all lanes natively), so
+// simultaneous talkers no longer collide in one decoder. If the index has been reassigned to a different
+// member, the stale lane is torn down and rebuilt with a fresh decoder.
+function getLane(sid) {
+    const expectedMember = state.memberOfStream.get(sid);
+    let lane = state.lanes.get(sid);
+    if (lane) {
+        if (expectedMember !== undefined && lane.memberId !== null && lane.memberId !== expectedMember) {
+            closeLane(sid);   // index reassigned to a new member -> fresh decoder, no stale Opus state
+            lane = undefined;
+        } else if (lane.memberId === null && expectedMember !== undefined) {
+            lane.memberId = expectedMember;   // late roster binding for a frame that arrived before MemberJoined
+        }
+    }
+    if (!lane) {
+        if (state.lanes.size >= MAX_ACTIVE_DECODERS) {
+            evictOldestLane();
+        }
+        lane = createLane(expectedMember === undefined ? null : expectedMember);
+        state.lanes.set(sid, lane);
+    }
+    return lane;
+}
+
+function createLane(memberId) {
+    // Same node invariants as the legacy single playback node: no inputs and an explicit output channel
+    // count, or Chrome can hand process() a zero-channel output and go permanently silent.
+    const node = new AudioWorkletNode(state.audioContext, 'playback-processor', {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [state.channels],
+        processorOptions: {channels: state.channels},
+    });
+    node.connect(state.audioContext.destination);
+    const lane = {node, decoder: null, decoderChannels: null, decodeTs: 0, rxChain: Promise.resolve(), memberId, lastSeen: performance.now()};
+    if (OPUS_SUPPORTED) {
+        lane.decoder = new AudioDecoder({
+            output: (audioData) => playbackDecoded(lane, audioData),
+            error: (e) => log('Opus decoder error: ' + e.message),
+        });
+    }
+    return lane;
+}
+
+function closeLane(sid) {
+    const lane = state.lanes.get(sid);
+    if (!lane) {
+        return;
+    }
+    state.lanes.delete(sid);
+    closeCodec(lane.decoder);
+    try {
+        lane.node.disconnect();
+    } catch (err) {
+        // already disconnected
+    }
+}
+
+function closeAllLanes() {
+    [...state.lanes.keys()].forEach(closeLane);
+}
+
+// Evicts the longest-silent lane to stay under MAX_ACTIVE_DECODERS (loudness isn't computable for an
+// un-decoded sender). A dropped sender simply isn't audible until a slot frees.
+function evictOldestLane() {
+    let oldestSid = null;
+    let oldest = Infinity;
+    state.lanes.forEach((lane, sid) => {
+        if (lane.lastSeen < oldest) {
+            oldest = lane.lastSeen;
+            oldestSid = sid;
+        }
+    });
+    if (oldestSid !== null) {
+        closeLane(oldestSid);
+    }
+}
+
+function sweepLanes() {
+    const now = performance.now();
+    state.lanes.forEach((lane, sid) => {
+        if (now - lane.lastSeen > SILENCE_TTL_MS) {
+            closeLane(sid);
+        }
+    });
 }
 
 // --- WebRTC mesh ----------------------------------------------------------------------------------
@@ -751,11 +846,21 @@ function closePeer(remoteId) {
 
 function addMember(member) {
     state.members.set(member.id, member.displayName);
+    if (member.streamId !== undefined && member.streamId !== null) {
+        state.streamOf.set(member.id, member.streamId);
+        state.memberOfStream.set(member.streamId, member.id);
+    }
     renderMembers();
 }
 
 function removeMember(id) {
     state.members.delete(id);
+    const sid = state.streamOf.get(id);
+    if (sid !== undefined) {
+        closeLane(sid);   // free the departed member's decoder immediately
+        state.memberOfStream.delete(sid);
+        state.streamOf.delete(id);
+    }
     renderMembers();
 }
 
@@ -803,16 +908,19 @@ function updateTalkButton() {
 function cleanup() {
     state.peers.forEach((_, id) => closePeer(id));
     state.peers.clear();
+    if (state.laneSweep) {
+        clearInterval(state.laneSweep);
+        state.laneSweep = null;
+    }
+    closeAllLanes();
+    state.memberOfStream.clear();
+    state.streamOf.clear();
     state.members.clear();
     renderMembers();
     state.transmitting = false;
     closeCodec(state.opusEncoder);
-    closeCodec(state.opusDecoder);
     state.opusEncoder = null;
-    state.opusDecoder = null;
     state.captureTs = 0;
-    state.decodeTs = 0;
-    state.decoderChannels = null;
     state.warnedNoOpus = false;
     state.warnedChannels = false;
     state.cryptoKey = null;
@@ -828,7 +936,6 @@ function cleanup() {
         state.audioContext = null;
     }
     state.captureNode = null;
-    state.playbackNode = null;
     state.ws = null;
     state.token = null;
     state.ownerId = null;
