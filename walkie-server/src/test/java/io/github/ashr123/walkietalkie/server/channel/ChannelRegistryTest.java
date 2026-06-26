@@ -44,6 +44,14 @@ class ChannelRegistryTest {
 	}
 
 	@Test
+	void theExplicitOwnerOverloadStampsTheGivenOwnerNotTheSession() {
+		Channel global = registry.joinOrCreate("global", ChannelMode.GLOBAL_PTT, null, session("a"), "server");
+		assertEquals("server", global.ownerId(), "the 5-arg form uses the explicit owner, not the joiner's id");
+		assertEquals(1, global.size());
+		assertNull(global.keyCheck());
+	}
+
+	@Test
 	void refusesAJoinerWhoseKeyCheckDoesNotMatch() {
 		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"));
 		assertNotNull(created, "the creator establishes the channel's key-check");

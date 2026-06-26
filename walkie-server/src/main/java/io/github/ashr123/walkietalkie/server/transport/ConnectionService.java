@@ -29,6 +29,12 @@ public class ConnectionService {
 	private static final Pattern CHANNEL_NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
 	private static final Pattern DISPLAY_NAME = Pattern.compile("[A-Za-z0-9_.-]{1,32}");
 	private static final String GLOBAL_CHANNEL = "global";
+	/// Owner id stamped on the server-managed "global" channel. It is deliberately NOT a session id — session
+	/// ids are Spring-generated UUID strings, so "server" can never collide — which means no real participant
+	/// is ever the owner: the global room's mode can't be changed or claimed by a user ([#handleChangeMode]'s
+	/// owner check always fails for it) and ownership never transfers when a member leaves. Clients recognize
+	/// this constant to label the room "server-managed".
+	private static final String GLOBAL_CHANNEL_OWNER = "server";
 
 	private final ChannelRegistry channelRegistry;
 	private final FloorControlService floorControl;
@@ -87,10 +93,26 @@ public class ConnectionService {
 					"Display name must match " + DISPLAY_NAME.pattern()));
 			return;
 		}
+		// The "global" channel is the server-managed broadcast room: reachable ONLY via global push-to-talk,
+		// and never end-to-end encrypted — so anyone can join it (there is no shared passphrase to know).
+		if (GLOBAL_CHANNEL.equals(requested) && mode != ChannelMode.GLOBAL_PTT) {
+			session.send(new ServerMessage.ErrorMessage("reserved_channel",
+					"'" + GLOBAL_CHANNEL + "' is reserved — use Single global push-to-talk to join it."));
+			return;
+		}
+		if (mode == ChannelMode.GLOBAL_PTT && join.keyCheck() != null) {
+			session.send(new ServerMessage.ErrorMessage("encryption_not_allowed",
+					"The global channel can't be end-to-end encrypted — clear the passphrase to join it."));
+			return;
+		}
 		session.setDisplayName(join.displayName());
 		session.setRelayFraming(join.relayFraming() == null ? 0 : join.relayFraming());   // absent = legacy
 
-		Channel channel = channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session);
+		// Global is server-owned (sentinel owner) and forced unencrypted (null key-check); every other channel
+		// is owned by its creator and adopts the joiner's key-check.
+		Channel channel = mode == ChannelMode.GLOBAL_PTT
+				? channelRegistry.joinOrCreate(requested, mode, null, session, GLOBAL_CHANNEL_OWNER)
+				: channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session);
 		if (channel == null) {
 			session.send(new ServerMessage.ErrorMessage("passphrase_mismatch",
 					"This channel is using a different encryption passphrase (or none) — you can't join it."));

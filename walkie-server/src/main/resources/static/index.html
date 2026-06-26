@@ -222,11 +222,13 @@
 		</select>
 		<label for="channel">Channel</label>
 		<input autocomplete="off" id="channel" value="lobby">
+		<div class="hint" hidden id="channelHint">Global push-to-talk uses one shared channel for everyone — the name is fixed to <code>global</code>.</div>
 			<label style="display:flex; align-items:center; gap:8px; margin-top:10px;">
 				<input id="hifi" style="width:auto;" type="checkbox"> High fidelity (disable mic processing)
 			</label>
 		<label for="passphrase">Encryption passphrase (optional, relay)</label>
 		<input autocomplete="off" id="passphrase" placeholder="shared secret — leave blank for none" type="password">
+		<div class="hint" hidden id="passphraseHint">The global channel is the server's unencrypted broadcast room — encryption isn't available there.</div>
 		<button id="connectBtn">Connect</button>
 		<button class="secondary" disabled id="disconnectBtn" style="width:100%; margin-top:8px;">Disconnect</button>
 		<div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Disconnected</span></div>

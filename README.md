@@ -9,7 +9,7 @@ two reference clients, and three channel modes.
 | Choice           | Options                                                                                                                                              |
 |------------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Transport**    | **WebSocket relay** — the server forwards raw audio frames between members · **WebRTC** — the server relays signaling only, audio flows peer-to-peer |
-| **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared room) · **Full-duplex** (everyone talks at once)                       |
+| **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared, server-managed, always-unencrypted room) · **Full-duplex** (everyone talks at once)                       |
 | **Clients**      | A zero-install **browser** client · a **Java 25 desktop** client                                                                                     |
 | **Encryption**   | Optional **end-to-end encryption** on the relay path (AES-256-GCM from a shared passphrase) · WebRTC media is already end-to-end (peer-to-peer)      |
 
@@ -131,13 +131,13 @@ All flags are optional (run with `--args="--help"` for the full list):
 | Flag                         | Default                 | Purpose                                                                                                                                                                                    |
 |------------------------------|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `--server <url>`             | `http://localhost:8080` | Base HTTP URL of the server.                                                                                                                                                               |
-| `--channel <name>`           | `lobby`                 | Channel to join (ignored for global mode).                                                                                                                                                 |
+| `--channel <name>`           | `lobby`                 | Channel to join (ignored for global mode; the name `global` is reserved for global mode).                                                                                                                                                 |
 | `--mode ptt\|global\|duplex` | `ptt`                   | Conversation mode **when creating** a channel; a later joiner adopts the channel's existing mode.                                                                                          |
 | `--display <name>`           | `guest`                 | Name shown to others — **1–32 chars of `[A-Za-z0-9_.-]`, no spaces** (the server rejects anything else).                                                                                   |
 | `--hifi`                     | off                     | Start in the Opus **music** profile (vs. voice); toggle live with `f` at the prompt.                                                                                                       |
 | `--input <substr>`           | system default          | Capture from the input device whose name contains `<substr>`.                                                                                                                              |
 | `--list-inputs`              | —                       | Print the available input devices and exit.                                                                                                                                                |
-| `--key <passphrase>`         | `$WALKIE_KEY`           | **End-to-end encrypt** the audio (AES-256-GCM). Everyone in the channel — including browser peers — must use the same passphrase on the same channel/mode; a mismatch is rejected at join. |
+| `--key <passphrase>`         | `$WALKIE_KEY`           | **End-to-end encrypt** the audio (AES-256-GCM). Everyone in the channel — including browser peers — must use the same passphrase on the same channel/mode; a mismatch is rejected at join. Ignored in global mode — that room is the server's unencrypted broadcast channel. |
 
 > Tip: run once with `--list-inputs` to see capture-device names, then pass a distinctive substring to
 > `--input` (e.g. `--input "USB"`).

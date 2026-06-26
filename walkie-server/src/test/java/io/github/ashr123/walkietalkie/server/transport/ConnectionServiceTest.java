@@ -188,6 +188,82 @@ class ConnectionServiceTest {
 				"GLOBAL_PTT forces the name to 'global' before the null-channel check");
 	}
 
+	// --- the server-managed "global" channel: reserved name, always unencrypted, owned by no participant ----
+
+	@Test
+	void joiningTheGlobalNameInMultiChannelModeIsReservedRejected() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		assertEquals("reserved_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertNull(channel("global"), "the global channel is not created by a reserved-name rejection");
+	}
+
+	@Test
+	void joiningTheGlobalNameInFullDuplexIsReservedRejected() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.FULL_DUPLEX, "alice", null));
+		assertEquals("reserved_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertNull(channel("global"));
+	}
+
+	@Test
+	void anEncryptedGlobalPttJoinIsRejected() {
+		FakeClientSession s = session("s1");
+		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.GLOBAL_PTT, "alice", "kcv-X"));
+		assertEquals("encryption_not_allowed", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertNull(channel("global"), "an encrypted join never creates the global channel");
+	}
+
+	@Test
+	void theGlobalChannelIsServerOwnedAndUnencrypted() {
+		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
+		assertEquals("server", firstOf(alice, ServerMessage.Joined.class).ownerId(),
+				"the global channel is owned by the server sentinel, not the joiner");
+		assertEquals("server", channel("global").ownerId());
+		assertNull(channel("global").keyCheck(), "the global channel is never encrypted");
+	}
+
+	@Test
+	void everyoneCanJoinTheGlobalChannelWithoutAPassphrase() {
+		join("alice", null, ChannelMode.GLOBAL_PTT);
+		FakeClientSession bob = join("bob", null, ChannelMode.GLOBAL_PTT);
+		assertEquals("global", firstOf(bob, ServerMessage.Joined.class).channel());
+		assertEquals(2, channel("global").size(), "both passphrase-less users are in the global channel");
+	}
+
+	@Test
+	void aGlobalMemberCannotChangeTheMode() {
+		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
+		alice.sent.clear();
+		service.onMessage(alice, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
+		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code(),
+				"no participant owns the server-managed global channel");
+		assertEquals(ChannelMode.GLOBAL_PTT, channel("global").mode(), "the global mode is fixed");
+	}
+
+	@Test
+	void globalOwnershipDoesNotTransferWhenAMemberLeaves() {
+		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
+		FakeClientSession bob = join("bob", null, ChannelMode.GLOBAL_PTT);
+		bob.sent.clear();
+
+		service.onClose(alice);   // a member leaving must not re-elect a user as owner of the global room
+
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.OwnerChanged.class::isInstance),
+				"the global channel stays server-owned; no ownership is re-elected on a leave");
+		assertEquals("server", channel("global").ownerId());
+	}
+
+	@Test
+	void theGlobalChannelIsRecreatedServerOwnedAfterEmptying() {
+		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
+		service.onClose(alice);
+		assertNull(channel("global"), "the global channel is dropped once empty");
+		FakeClientSession bob = join("bob", null, ChannelMode.GLOBAL_PTT);
+		assertEquals("server", firstOf(bob, ServerMessage.Joined.class).ownerId(),
+				"the recreated global channel is server-owned again");
+	}
+
 	@Test
 	void emptyAndOversizedAudioFramesAreDroppedAndAFrameAtTheLimitIsRelayed() {
 		FakeClientSession alice = join("alice", "fd", ChannelMode.FULL_DUPLEX);

@@ -131,12 +131,16 @@ public final class WalkieClient implements AutoCloseable {
 	/// client in the channel derives the same key.
 	private FrameCrypto setupCrypto() throws GeneralSecurityException {
 		String passphrase = options.key();
-		return passphrase == null || passphrase.isBlank()
-				? null
-				: FrameCrypto.fromPassphrase(
-				passphrase,
-				options.mode() == ChannelMode.GLOBAL_PTT ? "global" : options.channel()
-		);
+		if (passphrase == null || passphrase.isBlank()) {
+			return null;
+		}
+		if (options.mode() == ChannelMode.GLOBAL_PTT) {
+			// Global is the server-managed, always-unencrypted broadcast room — the server rejects an
+			// encrypted global join, so drop the key here (and warn) rather than fail the join.
+			log("[warn] global mode uses the server's unencrypted broadcast channel — ignoring --key");
+			return null;
+		}
+		return FrameCrypto.fromPassphrase(passphrase, options.channel());
 	}
 
 	private void senderLoop() {

@@ -63,7 +63,14 @@ every site to handle it.
 `FULL_DUPLEX` (no floor). A channel's mode is set at creation and **adopted** by later joiners; only
 the **owner** (creator) may change it (`ChangeMode` → broadcast `ModeChanged`), and ownership transfers
 to another member if the owner leaves. Floor state is an `AtomicReference<String>` on `Channel`;
-full-duplex bypasses it.
+full-duplex bypasses it. **The `global` channel is special and server-managed:** it is reachable *only*
+via `GLOBAL_PTT` (a `MULTI_CHANNEL_PTT`/`FULL_DUPLEX` join naming `global` is rejected with
+`reserved_channel`); it is **always unencrypted** (a `GLOBAL_PTT` join carrying a `keyCheck` is rejected
+with `encryption_not_allowed`, so anyone can join without knowing a passphrase); and it is created with a
+sentinel owner (`ConnectionService.GLOBAL_CHANNEL_OWNER = "server"`, never a session id) so **no
+participant owns it** — its mode can't be changed (`not_owner`) and ownership never transfers. It is
+dropped when empty and recreated server-owned + unencrypted on the next join; clients render its owner as
+"server-managed".
 
 **Protocol.** `ClientMessage`/`ServerMessage` are sealed interfaces with nested records in
 `walkie-shared`, made polymorphic for Jackson 3 with `@JsonTypeInfo(use=NAME, property="type")` +

@@ -92,19 +92,19 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
-	void switchingToGlobalPttIsAllowedInsideTheGlobalChannel() throws Exception {
+	void theGlobalChannelIsServerManagedAndItsModeCannotBeChanged() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		WebSocketSession sa = connect(AUDIO, a, login());
 		try {
 			send(sa, new ClientMessage.Join("anything", ChannelMode.GLOBAL_PTT, "Alice", null));
 			ServerMessage.Joined joined = awaitType(a.messages, ServerMessage.Joined.class);
 			assertEquals("global", joined.channel());
+			assertEquals("server", joined.ownerId(), "the global channel is server-owned, not owned by the joiner");
 
+			// No participant owns the server-managed global room, so its mode is fixed: a ChangeMode is
+			// rejected as not_owner rather than broadcasting a ModeChanged.
 			send(sa, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
-			assertEquals(ChannelMode.MULTI_CHANNEL_PTT, awaitType(a.messages, ServerMessage.ModeChanged.class).mode());
-			// Back to GLOBAL_PTT: permitted because this channel is named "global" (no invalid_mode).
-			send(sa, new ClientMessage.ChangeMode(ChannelMode.GLOBAL_PTT));
-			assertEquals(ChannelMode.GLOBAL_PTT, awaitType(a.messages, ServerMessage.ModeChanged.class).mode());
+			assertEquals("not_owner", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		} finally {
 			sa.close(CloseStatus.NORMAL);
 		}

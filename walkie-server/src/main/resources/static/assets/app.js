@@ -23,6 +23,7 @@ const E2EE_AAD = Uint8Array.of(E2EE_SCHEME);   // the scheme byte, authenticated
 const OPUS_SUPPORTED = (typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined');
 const DISPLAY_NAME = /^[A-Za-z0-9_.-]{1,32}$/;   // must match the server's display-name validation
 const RELAY_FRAMING = 1;         // advertised in the join: 1 = we parse the SID-prefixed multi-stream relay framing
+const SERVER_OWNER = 'server';   // ownerId the server stamps on the server-managed "global" room (matches ConnectionService.GLOBAL_CHANNEL_OWNER); no participant owns it
 const MAX_ACTIVE_DECODERS = 8;   // cap on per-sender decoders we mix at once (O(N^2) fan-out guard); evict longest-silent
 const SILENCE_TTL_MS = 4000;     // close a per-sender lane after this much silence (survives speech gaps + jitter)
 
@@ -244,9 +245,11 @@ function onJoined(msg) {
     msg.members.forEach(addMember);
     renderMembers();
     log(`Joined "${msg.channel}" (${msg.mode}) with ${msg.members.length} member(s)`);
-    log(state.selfId === state.ownerId
-        ? 'You own this channel — use the Mode selector to change it for everyone.'
-        : 'Owner: ' + (state.members.get(state.ownerId) || state.ownerId));
+    log(state.ownerId === SERVER_OWNER
+        ? 'Server-managed global room — everyone can talk (push-to-talk), no owner, no encryption.'
+        : state.selfId === state.ownerId
+            ? 'You own this channel — use the Mode selector to change it for everyone.'
+            : 'Owner: ' + (state.members.get(state.ownerId) || state.ownerId));
 
     if (state.transport === 'webrtc') {
         msg.members
@@ -263,6 +266,7 @@ function onJoined(msg) {
     enableTalkButton(true);
     updateTalkButton();
     updateModeControl();
+    updateGlobalModeLocks();
 }
 
 function onModeChanged(mode) {
@@ -274,6 +278,7 @@ function onModeChanged(mode) {
     }
     updateTalkButton();
     updateModeControl();
+    updateGlobalModeLocks();
     log('Mode changed to ' + mode);
 }
 
@@ -294,6 +299,32 @@ function updateModeControl() {
         select.disabled = state.selfId !== state.ownerId;
     } else {
         select.disabled = false;
+    }
+}
+
+// Locks the channel + passphrase inputs in GLOBAL_PTT mode. That mode joins the server-managed "global"
+// room, which forces the channel name to "global" and forbids end-to-end encryption (the server rejects an
+// encrypted global join), so both fields are misleading if editable. Each field's typed value is stashed and
+// restored when switching back. Driven by the live mode when connected, else the selector.
+function updateGlobalModeLocks() {
+    const global = (isOpen() ? state.mode : byId('mode').value) === 'GLOBAL_PTT';
+    lockInGlobalMode(byId('channel'), byId('channelHint'), 'global', global);
+    lockInGlobalMode(byId('passphrase'), byId('passphraseHint'), '', global);
+}
+
+// Disables `input` and shows `hint` while in global mode, swapping in `lockedValue` and stashing the user's
+// typed value in a data attribute so it is restored verbatim when the mode changes back.
+function lockInGlobalMode(input, hint, lockedValue, global) {
+    input.disabled = global;
+    hint.hidden = !global;
+    if (global) {
+        if (input.dataset.userValue === undefined) {
+            input.dataset.userValue = input.value;
+        }
+        input.value = lockedValue;
+    } else if (input.dataset.userValue !== undefined) {
+        input.value = input.dataset.userValue;
+        delete input.dataset.userValue;
     }
 }
 
@@ -947,6 +978,7 @@ function cleanup() {
     byId('disconnectBtn').disabled = true;
     setStatus(false, 'Disconnected');
     updateModeControl();
+    updateGlobalModeLocks();
 }
 
 function closeCodec(codec) {
@@ -970,6 +1002,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // picks the initial mode for the next Connect.
     const modeSelect = byId('mode');
     modeSelect.addEventListener('change', () => {
+        updateGlobalModeLocks(); // reflect the global-mode channel lock immediately (pre- and post-connect)
         if (!isOpen()) {
             return; // pre-connect: just choosing the initial mode for the next Connect
         }
@@ -977,8 +1010,10 @@ window.addEventListener('DOMContentLoaded', () => {
             sendCtrl({type: 'changeMode', mode: modeSelect.value});
         } else {
             modeSelect.value = state.mode; // non-owner can't change it live — snap back
+            updateGlobalModeLocks();        // re-sync the lock to the snapped-back mode
         }
     });
+    updateGlobalModeLocks(); // set the initial channel-input state to match the default mode
 
     // High fidelity toggles the mic DSP (echo cancellation / noise suppression / auto-gain) live: applied
     // to the running mic track immediately via applyConstraints, no reconnect. (The channel layout —

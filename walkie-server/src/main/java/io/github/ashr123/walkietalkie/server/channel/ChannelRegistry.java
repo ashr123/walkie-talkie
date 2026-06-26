@@ -23,9 +23,16 @@ public class ChannelRegistry {
 	/// not added and this returns `null` (the caller reports a passphrase mismatch). The whole check-and-add
 	/// happens inside the atomic map update, so it cannot race with a concurrent create or [#leave].
 	public Channel joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session) {
+		return joinOrCreate(name, mode, keyCheck, session, session.id());
+	}
+
+	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], but stamps a newly-created channel with
+	/// an explicit `ownerId` instead of the joiner's session id — used to give the server-managed "global"
+	/// channel a sentinel owner that no participant can match. An existing channel keeps its own owner.
+	public Channel joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId) {
 		AtomicReference<Channel> joined = new AtomicReference<>();
 		channels.compute(name, (key, existing) -> {
-			Channel channel = existing == null ? new Channel(key, mode, session.id(), keyCheck) : existing;
+			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck) : existing;
 			if (Objects.equals(channel.keyCheck(), keyCheck)) {
 				channel.add(session);
 				joined.set(channel);
