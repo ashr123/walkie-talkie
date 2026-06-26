@@ -194,10 +194,12 @@ default build stays preview-free.
 - **WebRTC is browser-to-browser.** There is no mature pure-Java WebRTC stack, so the Java desktop
   client uses the relay transport. WebRTC group calls here use a peer-to-peer **mesh** (fine for small
   PTT groups); a large conference would need an SFU.
-- **The relay decodes one Opus stream at a time.** Push-to-talk (the core mode) is ideal — a single
-  talker holds the floor; switching speakers may briefly glitch the decoder as the stream changes. For
-  *simultaneous* multi-talker audio, use the **WebRTC** transport, where each peer is its own
-  independently-decoded Opus stream. The relay never mixes audio server-side.
+- **The relay mixes on the client, not the server.** Simultaneous talkers (full-duplex) work on the relay
+  path: the server prefixes each fanned-out frame with the sender's 1-byte stream index, and the receiver
+  decodes every sender with its own Opus decoder and mixes locally — the server never mixes or even inspects
+  audio. The cost is per-receiver, not server-side: a receiver runs one decoder per active talker, capped
+  (longest-silent eviction) so a crowded channel can't fan out unboundedly. WebRTC remains an alternative —
+  each peer is its own independently-decoded stream, mixed by the browser.
 - **Backpressure is handled per recipient.** Each connection has its own outbound queue drained by a
   dedicated virtual thread, so one slow or backpressured client never blocks delivery to the others. A slow
   recipient's **audio** is dropped frame-by-frame (real-time, lossy); its **control** messages

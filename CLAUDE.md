@@ -79,10 +79,16 @@ emit their own configured channel count (down/upmixing as needed) — so the mon
 Java client interoperate. The **server never inspects the payload** — it relays frames opaquely and
 only enforces `walkie.max-audio-frame-bytes`. The browser encodes Opus via WebCodecs (mono; PCM
 fallback where WebCodecs is absent); the Java client uses Concentus (stereo when the device supports
-it, else mono). Opus decode is per-stream
-stateful, so the relay path is effectively **one-talker-at-a-time** (ideal for PTT); true simultaneous
-multi-talker is the WebRTC transport's job (each peer is an independently-decoded stream). The WebRTC
-path tunes Opus via SDP munging + sender `maxBitrate`.
+it, else mono). **Relay multi-stream framing (full-duplex).** Opus decode is per-stream stateful, so to
+carry simultaneous talkers the server fans each frame out prefixed with the sender's per-channel **1-byte
+stream index** (`[sid][body]`); a receiver demultiplexes by index, decodes each sender with its **own**
+decoder, and mixes locally (browser: one `AudioDecoder` + Web Audio node per sender into `ctx.destination`;
+Java: one Concentus decoder per sender summed into the speaker line). The prefix is negotiated **per
+recipient** via `Join.relayFraming` (`1` = SID-prefixed, `0`/absent = legacy un-prefixed), so upgraded and
+legacy clients coexist in one channel, and the server still **never inspects the body** (the index sits
+outside any E2EE envelope). Byte-exact framing, versioning and the receiver pipeline live in
+`docs/CLIENT_PROTOCOL.md`. WebRTC remains an alternative full-duplex transport (each peer an
+independently-decoded stream) and tunes Opus via SDP munging + sender `maxBitrate`.
 
 **Relay end-to-end encryption (optional).** When a shared passphrase is set (browser passphrase field,
 or `--key` / `WALKIE_KEY` on the Java client), the sender encrypts the *whole* `[codec tag][payload]`
