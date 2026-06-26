@@ -22,7 +22,6 @@ const E2EE_SCHEME = 0xe2;        // wire marker for an encrypted frame: [scheme]
 const E2EE_AAD = Uint8Array.of(E2EE_SCHEME);   // the scheme byte, authenticated (GCM additionalData) but not encrypted, so the envelope is covered by the tag
 const OPUS_SUPPORTED = (typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined');
 const DISPLAY_NAME = /^[A-Za-z0-9_.-]{1,32}$/;   // must match the server's display-name validation
-const RELAY_FRAMING = 1;         // advertised in the join: 1 = we parse the SID-prefixed multi-stream relay framing
 const SERVER_OWNER = 'server';   // ownerId the server stamps on the server-managed "global" room (matches ConnectionService.GLOBAL_CHANNEL_OWNER); no participant owns it
 const MAX_ACTIVE_DECODERS = 8;   // cap on per-sender decoders we mix at once (O(N^2) fan-out guard); evict longest-silent
 const SILENCE_TTL_MS = 4000;     // close a per-sender lane after this much silence (survives speech gaps + jitter)
@@ -147,7 +146,7 @@ async function connect() {
         ws.onopen = () => {
             state.connecting = false;   // connect flow completed — now connected
             log('WebSocket open (' + state.transport + ')');
-            sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck, relayFraming: RELAY_FRAMING});
+            sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck});
             setStatus(true, 'Connected — ' + state.transport);
             byId('connectBtn').disabled = true;
             byId('disconnectBtn').disabled = false;
@@ -711,7 +710,7 @@ function getLane(sid) {
 }
 
 function createLane(memberId) {
-    // Same node invariants as the legacy single playback node: no inputs and an explicit output channel
+    // Same node invariants as the original single playback node: no inputs and an explicit output channel
     // count, or Chrome can hand process() a zero-channel output and go permanently silent.
     const node = new AudioWorkletNode(state.audioContext, 'playback-processor', {
         numberOfInputs: 0,

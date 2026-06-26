@@ -23,12 +23,6 @@ public interface ClientSession {
 
 	boolean supportsAudioRelay();
 
-	/// The relay-audio framing version this connection advertised at join: 0 = legacy (un-prefixed), 1 =
-	/// SID-prefixed multi-stream. The server frames each recipient's outbound audio accordingly.
-	int relayFraming();
-
-	void setRelayFraming(int relayFraming);
-
 	/// Sends a control/signaling message as a JSON text frame.
 	void send(ServerMessage message);
 

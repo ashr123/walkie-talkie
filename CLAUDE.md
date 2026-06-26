@@ -93,10 +93,10 @@ it, else mono). **Relay multi-stream framing (full-duplex).** Opus decode is per
 carry simultaneous talkers the server fans each frame out prefixed with the sender's per-channel **1-byte
 stream index** (`[sid][body]`); a receiver demultiplexes by index, decodes each sender with its **own**
 decoder, and mixes locally (browser: one `AudioDecoder` + Web Audio node per sender into `ctx.destination`;
-Java: one Concentus decoder per sender summed into the speaker line). The prefix is negotiated **per
-recipient** via `Join.relayFraming` (`1` = SID-prefixed, `0`/absent = legacy un-prefixed), so upgraded and
-legacy clients coexist in one channel, and the server still **never inspects the body** (the index sits
-outside any E2EE envelope). Byte-exact framing, versioning and the receiver pipeline live in
+Java: one Concentus decoder per sender summed into the speaker line). The prefix is **unconditional**: the
+server prefixes **every** relayed frame and all clients demux it — there is no legacy un-prefixed path. The
+server still **never inspects the body** (the index sits outside any E2EE envelope). Byte-exact framing, versioning and
+the receiver pipeline live in
 `docs/CLIENT_PROTOCOL.md`. WebRTC remains an alternative full-duplex transport (each peer an
 independently-decoded stream) and tunes Opus via SDP munging + sender `maxBitrate`.
 

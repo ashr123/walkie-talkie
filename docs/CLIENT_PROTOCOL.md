@@ -8,10 +8,6 @@ receiver-side decode/mix pipeline.
 > **Audience:** anyone writing a new client (or maintaining the reference browser/Java clients). The two
 > reference clients live in `walkie-server/src/main/resources/static/` (browser) and `walkie-client-java/`
 > (desktop); cross-references below point at the authoritative code.
->
-> **Status:** the multi-stream relay framing described here (`relayFraming = 1`) is rolling out server-first —
-> the server enabler lands before the reference clients are updated to demux/mix. Legacy (`relayFraming = 0`)
-> clients keep working throughout.
 
 ---
 
@@ -28,7 +24,7 @@ The server change is just the routing tag; all the intelligence is in the receiv
 
 A conformant full-duplex-capable client must:
 1. authenticate and open the WebSocket (§2),
-2. speak the JSON control protocol (§3) and advertise `relayFraming = 1` in its `Join` (§14),
+2. speak the JSON control protocol (§3),
 3. parse the prefixed audio wire format (§5) and run the per-sender receiver pipeline (§8–§10),
 4. optionally implement end-to-end encryption (§7), byte-compatibly with the reference clients.
 
@@ -93,16 +89,16 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 
 ### Client → server
 
-| `type`         | Fields                                                              | Meaning                                         |
-|----------------|---------------------------------------------------------------------|-------------------------------------------------|
-| `join`         | `channel`, `mode`, `displayName`, `keyCheck`, **`relayFraming`**     | Join/create a channel (see §7 `keyCheck`, §14 `relayFraming`) |
-| `leave`        | —                                                                   | Leave the current channel (keep the socket)     |
-| `requestFloor` | —                                                                   | Ask for the talk floor (PTT modes)              |
-| `releaseFloor` | —                                                                   | Release the floor                               |
-| `changeMode`   | `mode`                                                              | Owner-only: change the channel mode             |
-| `offer`        | `target`, `sdp`                                                     | WebRTC (see §3a)                                |
-| `answer`       | `target`, `sdp`                                                     | WebRTC                                          |
-| `ice`          | `target`, `candidate`, `sdpMid`, `sdpMLineIndex`                    | WebRTC                                          |
+| `type`         | Fields                                           | Meaning                                       |
+|----------------|--------------------------------------------------|-----------------------------------------------|
+| `join`         | `channel`, `mode`, `displayName`, `keyCheck`     | Join/create a channel (see §7 for `keyCheck`) |
+| `leave`        | —                                                | Leave the current channel (keep the socket)   |
+| `requestFloor` | —                                                | Ask for the talk floor (PTT modes)            |
+| `releaseFloor` | —                                                | Release the floor                             |
+| `changeMode`   | `mode`                                           | Owner-only: change the channel mode           |
+| `offer`        | `target`, `sdp`                                  | WebRTC (see §3a)                              |
+| `answer`       | `target`, `sdp`                                  | WebRTC                                        |
+| `ice`          | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                        |
 
 ### Server → client
 
@@ -163,10 +159,9 @@ single-decoder limit).
 
 ### Direction matters
 
-- **Inbound** (client → server): **unprefixed** — exactly the legacy frame. The server learns the sender from
-  the connection, so a client never sends its own stream index.
-- **Outbound** (server → client): for a `relayFraming = 1` recipient, **every** binary frame gains a **1-byte
-  plaintext stream-index prefix** (a legacy `relayFraming = 0` recipient still receives the un-prefixed body — see §14).
+- **Inbound** (client → server): **no prefix** — a client never sends its own stream index; the server learns
+  the sender from the connection.
+- **Outbound** (server → client): **every** binary frame gains a **1-byte plaintext stream-index prefix**.
 
 ### Outbound layout
 
@@ -194,7 +189,7 @@ Worked examples (hex; `SID` values are real allocator indices, **not** ASCII):
 
 1. **Length guard:** if `frame.length < 2`, **drop** the whole frame (it cannot carry `[SID][≥1 body byte]`).
 2. **Demux:** `sid = frame[0] & 0xFF`; `body = frame[1..]`. The SID is always present and always plaintext.
-3. **Disambiguate the body by `body[0]`** — the *same* first-byte the legacy format branches on:
+3. **Disambiguate the body by `body[0]`** — the *same* first byte that tells a plaintext body from an encrypted one:
    - `0xE2` → **encrypted**; hand `body` to the decryptor (§7) unchanged.
    - `0x01` / `0x02` → **plaintext**; parse `[tag][payload]`.
    This is unambiguous because the codec-tag set `{0x01, 0x02}` is disjoint from the scheme byte `0xE2`. A
@@ -373,24 +368,16 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 
 ---
 
-## 14. Versioning & compatibility
+## 14. Wire format notes
 
-The SID prefix is a **breaking** relay-audio framing change (an un-upgraded client reading a prefixed frame —
-or vice-versa — decodes **noise**, since the binary channel has no in-band version header). It is
-**negotiated per connection on the control plane**:
+The outbound relay framing is **fixed**, not negotiated: the server prefixes the 1-byte stream index on
+**every** relayed binary frame, and every client demuxes it (§5). There is no capability flag and no
+un-prefixed mode — a client that doesn't strip the prefix will decode **noise**.
 
-- **`Join.relayFraming`** (`int`): a client's capability — `0` (or absent) = **legacy** un-prefixed framing;
-  `1` = it can parse **SID-prefixed** framing (this document). Advertise `1` from a full-duplex-capable
-  client.
-- The server records each connection's advertised framing and **frames its outbound audio per recipient**: a
-  `relayFraming = 1` recipient receives `[SID][body]`; a legacy recipient receives the un-prefixed `body`. So
-  mixed-version clients coexist in one channel with no rejection — each simply gets the framing it can parse.
-  (Senders are unaffected — inbound frames are never prefixed.)
-- **`MemberInfo.streamId`** (`int`, `0..254`) carries each member's stream index; legacy clients ignore it.
-
-**Rollout:** the server understands both framings, so clients upgrade independently and a legacy client keeps
-working (it just can't demux simultaneous talkers). The E2EE known-answer vectors (§7) are **not** part of
-this change — the encrypted body is byte-unchanged; only the relay framing is added, per recipient.
+- **`MemberInfo.streamId`** (`int`, `0..254`) carries each member's stream index, announced in `joined` /
+  `memberJoined` so a client can pre-bind a lane (and its display name) before the first frame arrives.
+- The E2EE known-answer vectors (§7) are independent of the framing — the encrypted **body** is byte-unchanged;
+  the stream-index prefix sits outside it (and outside the GCM envelope, §7).
 
 ---
 
@@ -409,8 +396,6 @@ A minimal full-duplex-capable client should pass:
       fresh `joined` discards all lanes (self-reconnect).
 - [ ] **Caps** — beyond `MAX_ACTIVE_DECODERS`, the longest-silent lane is evicted; per-lane jitter buffer
       drops oldest at its bound; lanes age out after `SILENCE_TTL_MS` and close immediately on `memberLeft`.
-- [ ] **Negotiation** — advertise `relayFraming = 1` in `Join`; a legacy peer (no/0 framing) keeps working
-      alongside (the server sends it un-prefixed audio).
 
 > Sample frame hexdumps and the canonical KAT inputs live in `walkie-client-java`'s `FrameCryptoTest` and the
 > reference clients (`app.js`, `AudioEngine.java`); use them as the authoritative reference implementation.

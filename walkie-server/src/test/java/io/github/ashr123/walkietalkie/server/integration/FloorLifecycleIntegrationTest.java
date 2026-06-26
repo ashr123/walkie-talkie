@@ -37,9 +37,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void aSecondRequesterIsDeniedWithTheCurrentHolderId() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			String[] ids = joinPair("deny", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -48,9 +47,6 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sb, new ClientMessage.RequestFloor());
 			ServerMessage.FloorDenied denied = awaitType(b.messages, ServerMessage.FloorDenied.class);
 			assertEquals(ids[0], denied.currentHolderId(), "the denial names the current holder");
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -58,9 +54,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void releaseByTheHolderBroadcastsFloorIdleAndLetsTheNextRequesterIn() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			String[] ids = joinPair("release", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -72,9 +67,6 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sb, new ClientMessage.RequestFloor());
 			awaitType(b.messages, ServerMessage.FloorGranted.class);
 			assertEquals(ids[1], awaitType(a.messages, ServerMessage.FloorTaken.class).holderId());
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -82,9 +74,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void releaseByANonHolderIsANoOp() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			joinPair("noop-release", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -92,9 +83,6 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 
 			send(sb, new ClientMessage.ReleaseFloor());   // Bob does not hold it
 			assertNotReceived(a.messages, ServerMessage.FloorIdle.class);
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -102,9 +90,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void fullDuplexAutoGrantsWithoutBroadcastingAndBothMembersMayRequest() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			joinPair("fd-floor", ChannelMode.FULL_DUPLEX, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -112,9 +99,6 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 
 			send(sb, new ClientMessage.RequestFloor());
 			awaitType(b.messages, ServerMessage.FloorGranted.class);
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -122,9 +106,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void globalPttGrantsTheFirstDeniesTheSecondThenFreesOnRelease() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			String[] ids = joinPair("ignored", ChannelMode.GLOBAL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -137,23 +120,17 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			awaitType(b.messages, ServerMessage.FloorIdle.class);
 			send(sb, new ClientMessage.RequestFloor());
 			awaitType(b.messages, ServerMessage.FloorGranted.class);
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
 	@Test
 	void requestingOrReleasingTheFloorWithoutAChannelIsNotInChannel() throws Exception {
 		CollectingHandler a = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login())) {
 			send(sa, new ClientMessage.RequestFloor());
 			assertEquals("not_in_channel", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 			send(sa, new ClientMessage.ReleaseFloor());
 			assertEquals("not_in_channel", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
-		} finally {
-			sa.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -161,9 +138,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void theHolderLeavingTheChannelFreesAndBroadcastsTheFloor() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			String[] ids = joinPair("holder-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -172,9 +148,6 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sa, new ClientMessage.Leave());
 			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
 			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class), "the leaver's floor is released");
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -183,8 +156,7 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
 		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sb = connect(AUDIO, b, login())) {
 			String[] ids = joinPair("holder-drop", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -193,8 +165,6 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			sa.close(CloseStatus.NORMAL);   // abrupt disconnect while holding
 			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
 			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class));
-		} finally {
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -202,9 +172,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void aNonHolderLeavingDoesNotBroadcastFloorIdle() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			String[] ids = joinPair("nonholder-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -213,9 +182,6 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sb, new ClientMessage.Leave());   // Bob is not the holder
 			assertEquals(ids[1], awaitType(a.messages, ServerMessage.MemberLeft.class).memberId());
 			assertNotReceived(a.messages, ServerMessage.FloorIdle.class);
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -223,9 +189,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void audioIsRelayedOnlyWhileTheSenderHoldsTheFloor() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			joinPair("audio-ptt", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 
 			// No floor held -> dropped.
@@ -238,14 +203,11 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			awaitType(b.messages, ServerMessage.FloorTaken.class);
 			byte[] held = frame("held");
 			sendBinary(sa, held);
-			assertArrayEquals(held, b.audio.poll(5, TimeUnit.SECONDS));
+			assertPrefixedBody(held, b.audio.poll(5, TimeUnit.SECONDS), "the holder's audio reaches Bob");
 
 			// Bob does not hold the floor -> his audio is dropped.
 			sendBinary(sb, frame("bob"));
 			assertNull(a.audio.poll(1, TimeUnit.SECONDS), "a non-holder's audio is dropped");
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -253,22 +215,18 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void fullDuplexFansOutBothWaysWithoutAFloorAndNeverEchoesTheSender() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			joinPair("audio-fd", ChannelMode.FULL_DUPLEX, sa, a, sb, b);
 
 			byte[] fromA = frame("fromA");
 			sendBinary(sa, fromA);
-			assertArrayEquals(fromA, b.audio.poll(5, TimeUnit.SECONDS), "full-duplex fans out without a floor");
+			assertPrefixedBody(fromA, b.audio.poll(5, TimeUnit.SECONDS), "full-duplex fans out without a floor");
 			assertNull(a.audio.poll(1, TimeUnit.SECONDS), "the sender never hears its own frame");
 
 			byte[] fromB = frame("fromB");
 			sendBinary(sb, fromB);
-			assertArrayEquals(fromB, a.audio.poll(5, TimeUnit.SECONDS), "the other direction works too");
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
+			assertPrefixedBody(fromB, a.audio.poll(5, TimeUnit.SECONDS), "the other direction works too");
 		}
 	}
 
@@ -276,9 +234,8 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	void globalPttFansOutTheHolderAudioAndDropsANonHolder() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			joinPair("ignored2", ChannelMode.GLOBAL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
@@ -286,13 +243,10 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 
 			byte[] held = frame("global");
 			sendBinary(sa, held);
-			assertArrayEquals(held, b.audio.poll(5, TimeUnit.SECONDS));
+			assertPrefixedBody(held, b.audio.poll(5, TimeUnit.SECONDS), "the holder's global-PTT audio reaches Bob");
 
 			sendBinary(sb, frame("bob-global"));
 			assertNull(a.audio.poll(1, TimeUnit.SECONDS), "a non-holder's audio is dropped in global PTT");
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 }

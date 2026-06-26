@@ -5,7 +5,6 @@ import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
-import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.WebSocketSession;
 
 import java.util.Set;
@@ -23,9 +22,8 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void joinedSnapshotIncludesAllExistingMembersAndAdoptsOwnerAndMode() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			send(sa, new ClientMessage.Join("snap", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
 
@@ -39,9 +37,6 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			assertEquals(2, joinedB.members().size());
 			assertTrue(ids.contains(joinedA.selfId()) && ids.contains(joinedB.selfId()),
 					"the snapshot lists both members including self");
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -49,9 +44,8 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void memberJoinedFanOutCarriesNewcomerInfoAndExcludesTheJoiner() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			send(sa, new ClientMessage.Join("fanout", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			awaitType(a.messages, ServerMessage.Joined.class);
 			send(sb, new ClientMessage.Join("fanout", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
@@ -63,9 +57,6 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 
 			// Bob is never told about his own arrival.
 			assertNotReceived(b.messages, ServerMessage.MemberJoined.class);
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -73,9 +64,8 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void displayNamesSurviveOverTheWireIncludingTheAllowedPunctuation() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			send(sa, new ClientMessage.Join("names", ChannelMode.MULTI_CHANNEL_PTT, "Al.ice-1_2", null));
 			awaitType(a.messages, ServerMessage.Joined.class);
 			send(sb, new ClientMessage.Join("names", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
@@ -84,9 +74,6 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			assertTrue(joinedB.members().stream().anyMatch(m -> m.displayName().equals("Al.ice-1_2")),
 					"the validated display name is preserved verbatim in the snapshot");
 			assertEquals("Bob", awaitType(a.messages, ServerMessage.MemberJoined.class).member().displayName());
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -94,9 +81,8 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void aNewcomerJoiningWhileTheFloorIsHeldReceivesFloorTaken() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			send(sa, new ClientMessage.Join("held", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
 			send(sa, new ClientMessage.RequestFloor());
@@ -106,9 +92,6 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			awaitType(b.messages, ServerMessage.Joined.class);
 			ServerMessage.FloorTaken taken = awaitType(b.messages, ServerMessage.FloorTaken.class);
 			assertEquals(joinedA.selfId(), taken.holderId(), "the newcomer learns who currently holds the floor");
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -116,9 +99,8 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void globalPttForcesTheChannelNameSoDifferentlyNamedJoinersShareOneChannel() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			send(sa, new ClientMessage.Join("alpha", ChannelMode.GLOBAL_PTT, "Alice", null));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
 			assertEquals("global", joinedA.channel(), "GLOBAL_PTT forces the channel name to 'global'");
@@ -129,39 +111,30 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 
 			// Despite the different requested names, both landed in the same channel, so Alice sees Bob.
 			assertEquals(joinedB.selfId(), awaitType(a.messages, ServerMessage.MemberJoined.class).member().id());
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 
 	@Test
 	void aJoinWithAnIllegalChannelNameIsRejectedAsInvalidChannel() throws Exception {
 		CollectingHandler a = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login())) {
 			send(sa, new ClientMessage.Join("bad name!", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.ErrorMessage error = awaitType(a.messages, ServerMessage.ErrorMessage.class);
 			assertEquals("invalid_channel", error.code());
 			assertNotReceived(a.messages, ServerMessage.Joined.class);
-		} finally {
-			sa.close(CloseStatus.NORMAL);
 		}
 	}
 
 	@Test
 	void aMalformedControlFrameYieldsABadMessageErrorAndKeepsTheConnection() throws Exception {
 		CollectingHandler a = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login())) {
 			sendRaw(sa, "{not valid json");
 			assertEquals("bad_message", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 
 			// The connection survives a bad frame: a subsequent valid join still works.
 			send(sa, new ClientMessage.Join("recover", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			assertNotNull(awaitType(a.messages, ServerMessage.Joined.class));
-		} finally {
-			sa.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -169,9 +142,8 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void membershipIsTransportAgnosticAcrossAudioAndSignalingClients() throws Exception {
 		CollectingHandler audioPeer = new CollectingHandler();
 		CollectingHandler signalPeer = new CollectingHandler();
-		WebSocketSession sAudio = connect(AUDIO, audioPeer, login());
-		WebSocketSession sSignal = connect(SIGNAL, signalPeer, login());
-		try {
+		try (WebSocketSession sAudio = connect(AUDIO, audioPeer, login());
+		     WebSocketSession sSignal = connect(SIGNAL, signalPeer, login())) {
 			send(sAudio, new ClientMessage.Join("mix", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.Joined joinedAudio = awaitType(audioPeer.messages, ServerMessage.Joined.class);
 
@@ -181,9 +153,6 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			// The signaling client joined the same channel and the audio client is notified of it.
 			assertTrue(joinedSignal.members().stream().anyMatch(m -> m.id().equals(joinedAudio.selfId())));
 			assertEquals(joinedSignal.selfId(), awaitType(audioPeer.messages, ServerMessage.MemberJoined.class).member().id());
-		} finally {
-			sAudio.close(CloseStatus.NORMAL);
-			sSignal.close(CloseStatus.NORMAL);
 		}
 	}
 
@@ -191,9 +160,8 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void reJoiningAnotherChannelLeavesTheOldOneAndReleasesAHeldFloor() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
-		WebSocketSession sa = connect(AUDIO, a, login());
-		WebSocketSession sb = connect(AUDIO, b, login());
-		try {
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			send(sa, new ClientMessage.Join("old", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
 			send(sb, new ClientMessage.Join("old", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
@@ -213,9 +181,6 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 
 			ServerMessage.Joined rejoined = awaitType(a.messages, ServerMessage.Joined.class);
 			assertEquals("new", rejoined.channel());
-		} finally {
-			sa.close(CloseStatus.NORMAL);
-			sb.close(CloseStatus.NORMAL);
 		}
 	}
 }

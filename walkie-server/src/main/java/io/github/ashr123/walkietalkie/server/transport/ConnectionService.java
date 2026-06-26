@@ -117,7 +117,6 @@ public class ConnectionService {
 			return;
 		}
 		session.setDisplayName(join.displayName());
-		session.setRelayFraming(join.relayFraming() == null ? 0 : join.relayFraming());   // absent = legacy
 
 		// Global is server-owned (sentinel owner) and forced unencrypted (null key-check); every other channel
 		// is owned by its creator and adopts the joiner's key-check.
@@ -245,13 +244,13 @@ public class ConnectionService {
 				|| !channel.holdsFloor(session.id())) {
 			return;
 		}
-		// Tag the fan-out with the sender's per-channel stream index so multi-stream (relayFraming=1) receivers
-		// can demultiplex talkers; a legacy (relayFraming=0) receiver gets the un-prefixed frame unchanged.
+		// Tag the fan-out with the sender's per-channel stream index so receivers can demultiplex talkers;
+		// every client decodes per sender and mixes locally (see docs/CLIENT_PROTOCOL.md §5).
 		byte[] prefixed = prefixedFrame(channel.streamIndexOf(session.id()), audio);
 		channel.forEachOther(session.id(), other -> {
 			if (other.supportsAudioRelay()) {
 				try {
-					other.sendAudio(other.relayFraming() >= 1 ? prefixed : audio);
+					other.sendAudio(prefixed);
 				} catch (RuntimeException e) {
 					log.debug("Audio relay to {} failed: {}", other.id(), e.getMessage());
 				}

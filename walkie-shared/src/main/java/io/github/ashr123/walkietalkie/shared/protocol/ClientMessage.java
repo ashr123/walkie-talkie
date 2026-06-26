@@ -21,14 +21,7 @@ public sealed interface ClientMessage {
 	/// channel's established value to reject a member whose passphrase doesn't match — without ever
 	/// learning the passphrase itself. It is *not* the key and cannot decrypt anything.
 	@JsonTypeName("join")
-	record Join(String channel, ChannelMode mode, String displayName, String keyCheck, Integer relayFraming) implements ClientMessage {
-		/// `relayFraming`: `0`/absent (`null`) = legacy un-prefixed relay frames; `1` = the SID-prefixed
-		/// multi-stream framing. It is a nullable `Integer` so a legacy client that omits the field entirely
-		/// deserializes cleanly (the server treats `null` as `0`). This convenience constructor is the legacy
-		/// (un-prefixed) form.
-		public Join(String channel, ChannelMode mode, String displayName, String keyCheck) {
-			this(channel, mode, displayName, keyCheck, 0);
-		}
+	record Join(String channel, ChannelMode mode, String displayName, String keyCheck) implements ClientMessage {
 	}
 
 	/// Leave the current channel without closing the connection.

@@ -4,7 +4,6 @@ import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
-import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.WebSocketSession;
 
 import java.nio.charset.StandardCharsets;
@@ -23,10 +22,8 @@ class WebSocketRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 
 		CollectingHandler handlerA = new CollectingHandler();
 		CollectingHandler handlerB = new CollectingHandler();
-		WebSocketSession sessionA = connect(AUDIO, handlerA, tokenA);
-		WebSocketSession sessionB = connect(AUDIO, handlerB, tokenB);
-
-		try {
+		try (WebSocketSession sessionA = connect(AUDIO, handlerA, tokenA);
+		     WebSocketSession sessionB = connect(AUDIO, handlerB, tokenB)) {
 			send(sessionA, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.Joined joinedA = awaitType(handlerA.messages, ServerMessage.Joined.class);
 			assertEquals("team", joinedA.channel());
@@ -43,18 +40,14 @@ class WebSocketRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 			ServerMessage.FloorTaken taken = awaitType(handlerB.messages, ServerMessage.FloorTaken.class);
 			assertEquals(joinedA.selfId(), taken.holderId());
 
-			// Alice transmits an audio frame; Bob receives the exact bytes.
+			// Alice transmits an audio frame; Bob receives it (body intact after the 1-byte stream-index prefix).
 			byte[] frame = "pcm-audio-frame".getBytes(StandardCharsets.UTF_8);
 			sendBinary(sessionA, frame);
-			byte[] received = handlerB.audio.poll(5, TimeUnit.SECONDS);
-			assertArrayEquals(frame, received);
+			assertPrefixedBody(frame, handlerB.audio.poll(5, TimeUnit.SECONDS), "Bob receives Alice's frame body");
 
 			// While Alice holds the floor, Bob is denied.
 			send(sessionB, new ClientMessage.RequestFloor());
 			assertNotNull(awaitType(handlerB.messages, ServerMessage.FloorDenied.class));
-		} finally {
-			sessionA.close(CloseStatus.NORMAL);
-			sessionB.close(CloseStatus.NORMAL);
 		}
 	}
 

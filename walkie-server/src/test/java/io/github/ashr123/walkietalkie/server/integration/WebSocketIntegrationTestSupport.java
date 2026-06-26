@@ -21,11 +21,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.*;
 
 /// Shared harness for the WebSocket integration tests. Boots the full application on a random port (the
 /// Spring test context is cached and reused across every subclass with this same configuration) and offers
@@ -115,6 +116,14 @@ abstract class WebSocketIntegrationTestSupport {
 				throw new AssertionError("Unexpectedly received " + type.getSimpleName());
 			}
 		}
+	}
+
+	/// Asserts a relayed audio frame carries `expected` as its body after the mandatory 1-byte stream-index
+	/// prefix the server prepends to every outbound relay frame. The prefix *value* (the sender's stream
+	/// index) is asserted in RelayFramingIntegrationTest; here we only check the body survives the round trip.
+	protected static void assertPrefixedBody(byte[] expected, byte[] received, String message) {
+		assertNotNull(received, message);
+		assertArrayEquals(expected, Arrays.copyOfRange(received, 1, received.length), message);
 	}
 
 	/// Collects inbound control messages and audio frames into queues for the test to assert on.

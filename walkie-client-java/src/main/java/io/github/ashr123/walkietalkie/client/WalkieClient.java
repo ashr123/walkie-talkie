@@ -19,6 +19,7 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
@@ -50,6 +51,10 @@ public final class WalkieClient implements AutoCloseable {
 	);
 	// Stateless, thread-safe infrastructure with no per-connection input — shared by every client instance.
 	private static final ObjectMapper JSON_MAPPER = JsonMapper.builder().build();
+	/// Upper bound on how long [#close] waits for the HttpClient — and the WebSocket close handshake riding on
+	/// it — to drain gracefully before forcing termination, so quitting can never hang on a slow or vanished
+	/// server. Two seconds is ample for a localhost/LAN close handshake while still feeling instant to a user.
+	private static final Duration HTTP_SHUTDOWN_GRACE = Duration.ofSeconds(2);
 
 	private final ClientOptions options;
 	// Per-instance: its SSLContext trusts the system CAs plus (on localhost) the server's dev cert or a
@@ -332,14 +337,14 @@ public final class WalkieClient implements AutoCloseable {
 				options.channel(),
 				options.mode(),
 				options.display(),
-				crypto == null ? null : crypto.keyCheck(),
-				1   // relayFraming=1: we strip the per-sender stream index and mix talkers locally (full-duplex)
+				crypto == null ? null : crypto.keyCheck()
 		));
 	}
 
-	/// Tears the session down: stops the loops, closes the WebSocket, and closes the [AudioEngine].
-	/// Idempotent, so it is safe in a try-with-resources block (the launcher's) — note some paths exit the
-	/// process directly via [#onConnectionLost] and so never reach here.
+	/// Tears the session down: stops the loops, closes the WebSocket, closes the [AudioEngine], and shuts the
+	/// HttpClient down (bounded, so it can't hang on a slow server). Idempotent, so it is safe in a
+	/// try-with-resources block (the launcher's) — note some paths exit the process directly via
+	/// [#onConnectionLost] and so never reach here.
 	@Override
 	public void close() {
 		if (!closed.compareAndSet(false, true)) {
@@ -352,6 +357,19 @@ public final class WalkieClient implements AutoCloseable {
 			webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "bye");
 		}
 		audio.close();
+		// HttpClient has been AutoCloseable since Java 21; shutting it down frees its selector/executor
+		// threads. Its close() blocks until in-flight operations (the WebSocket included) finish, so bound the
+		// wait: shut down gracefully, then force it if the close handshake doesn't drain in time — teardown
+		// must never hang on a slow or vanished server.
+		httpClient.shutdown();
+		try {
+			if (!httpClient.awaitTermination(HTTP_SHUTDOWN_GRACE)) {
+				httpClient.shutdownNow();
+			}
+		} catch (InterruptedException _) {
+			httpClient.shutdownNow();
+			Thread.currentThread().interrupt();
+		}
 		System.out.println("Goodbye.");
 	}
 

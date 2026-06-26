@@ -4,7 +4,6 @@ import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
-import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.WebSocketSession;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -73,13 +72,10 @@ class AuthBoundaryIntegrationTest extends WebSocketIntegrationTestSupport {
 	@Test
 	void aValidQueryTokenOpensAUsableAudioSession() throws Exception {
 		CollectingHandler handler = new CollectingHandler();
-		WebSocketSession session = connect(AUDIO, handler, login());
-		try {
+		try (WebSocketSession session = connect(AUDIO, handler, login())) {
 			send(session, new ClientMessage.Join("auth-usable", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.Joined joined = awaitType(handler.messages, ServerMessage.Joined.class);
 			assertEquals("auth-usable", joined.channel(), "the authenticated session can join and is fully usable");
-		} finally {
-			session.close(CloseStatus.NORMAL);
 		}
 	}
 

@@ -304,7 +304,7 @@ class ConnectionServiceTest {
 
 		service.onAudio(alice, new byte[8192]);       // exactly at the limit -> relayed
 		assertEquals(1, bob.audio.size());
-		assertEquals(8192, bob.audio.getFirst().length);
+		assertEquals(8192 + 1, bob.audio.getFirst().length, "the relayed frame is the body plus the 1-byte stream-index prefix");
 	}
 
 	@Test
@@ -339,7 +339,8 @@ class ConnectionServiceTest {
 		byte[] frame = {4, 5, 6};
 		assertDoesNotThrow(() -> service.onAudio(alice, frame));
 		assertEquals(1, good.audio.size(), "the healthy recipient still receives despite a failing peer");
-		assertArrayEquals(frame, good.audio.getFirst());
+		assertArrayEquals(frame, Arrays.copyOfRange(good.audio.getFirst(), 1, good.audio.getFirst().length),
+				"the delivered frame body is intact (after stripping the stream-index prefix)");
 	}
 
 	@Test
@@ -386,10 +387,9 @@ class ConnectionServiceTest {
 	}
 
 	@Test
-	void audioToAV1RecipientIsPrefixedWithTheSendersStreamIndex() {
+	void audioIsPrefixedWithTheSendersStreamIndex() {
 		FakeClientSession alice = join("alice", "fd-sid", ChannelMode.FULL_DUPLEX);
-		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join("fd-sid", ChannelMode.FULL_DUPLEX, "bob", null, 1));   // relayFraming = 1
+		FakeClientSession bob = join("bob", "fd-sid", ChannelMode.FULL_DUPLEX);
 
 		byte[] frame = {1, 2, 3};
 		service.onAudio(alice, frame);
@@ -398,17 +398,6 @@ class ConnectionServiceTest {
 		int aliceSid = channel("fd-sid").streamIndexOf("alice");
 		assertEquals(aliceSid, received[0] & 0xFF, "the frame is prefixed with the sender's stream index");
 		assertArrayEquals(frame, Arrays.copyOfRange(received, 1, received.length), "the body is the original frame");
-	}
-
-	@Test
-	void audioToALegacyRecipientIsNotPrefixed() {
-		FakeClientSession alice = join("alice", "fd-legacy", ChannelMode.FULL_DUPLEX);
-		FakeClientSession bob = join("bob", "fd-legacy", ChannelMode.FULL_DUPLEX);   // 4-arg join -> relayFraming 0
-
-		byte[] frame = {1, 2, 3};
-		service.onAudio(alice, frame);
-
-		assertArrayEquals(frame, bob.audio.getFirst(), "a legacy recipient gets the un-prefixed frame");
 	}
 
 	@Test
@@ -488,16 +477,6 @@ class ConnectionServiceTest {
 		@Override
 		public boolean supportsAudioRelay() {
 			return true;
-		}
-
-		@Override
-		public int relayFraming() {
-			return 0;
-		}
-
-		@Override
-		public void setRelayFraming(int relayFraming) {
-			// not exercised by this fake
 		}
 
 		@Override
