@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -320,7 +321,8 @@ public final class WalkieClient implements AutoCloseable {
 				options.channel(),
 				options.mode(),
 				options.display(),
-				crypto == null ? null : crypto.keyCheck()
+				crypto == null ? null : crypto.keyCheck(),
+				1   // relayFraming=1: we strip the per-sender stream index and mix talkers locally (full-duplex)
 		));
 	}
 
@@ -398,15 +400,21 @@ public final class WalkieClient implements AutoCloseable {
 			if (last) {
 				byte[] frame = binaryBuffer.toByteArray();
 				binaryBuffer.reset();
-				if (crypto == null) {
-					audio.play(frame);
-				} else {
-					try {
-						audio.play(crypto.decrypt(frame));
-					} catch (GeneralSecurityException _) {
-						if (!warnedDecrypt) {
-							warnedDecrypt = true;
-							log("[warn] could not decrypt audio — confirm everyone uses the same --key, --channel, and --mode");
+				// Demultiplex by the server-prepended stream index, then strip it (before the decrypt branch)
+				// so the body handed to the engine is the same [tag][payload] / E2EE envelope a sender produced.
+				if (frame.length >= 2) {
+					int sid = frame[0] & 0xFF;
+					byte[] body = Arrays.copyOfRange(frame, 1, frame.length);
+					if (crypto == null) {
+						audio.play(sid, body);
+					} else {
+						try {
+							audio.play(sid, crypto.decrypt(body));
+						} catch (GeneralSecurityException _) {
+							if (!warnedDecrypt) {
+								warnedDecrypt = true;
+								log("[warn] could not decrypt audio — confirm everyone uses the same --key, --channel, and --mode");
+							}
 						}
 					}
 				}

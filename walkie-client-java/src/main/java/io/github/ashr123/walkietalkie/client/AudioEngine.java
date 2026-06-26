@@ -15,11 +15,12 @@ import javax.sound.sampled.SourceDataLine;
 import javax.sound.sampled.TargetDataLine;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -42,6 +43,10 @@ final class AudioEngine implements AutoCloseable {
 	private static final int STEREO_BITRATE = 128_000;
 	private static final byte CODEC_OPUS = 1;
 	private static final byte CODEC_PCM = 2;
+	private static final int MAX_ACTIVE_LANES = 8;          // cap on simultaneous per-sender decoders we mix (O(N^2) fan-out guard)
+	private static final int LANE_JITTER_CAP = 50;          // ~1 s per lane; drop oldest on overflow (audio is loss-tolerant)
+	private static final int LANE_TARGET_DEPTH = 4;         // per-tick catch-up: drop stale frames so a backed-up lane re-aligns
+	private static final long SILENCE_TTL_NANOS = 4_000_000_000L;   // close a lane after ~4 s of silence (survives speech gaps)
 	/// Marker substrings of well-known virtual / loopback audio drivers that present as capture devices but
 	/// usually carry no microphone signal (they capture silence unless an app routes through them). The
 	/// no-`--input` auto-selection skips these so it lands on a real mic instead of, e.g., ZoomAudioDevice.
@@ -56,7 +61,9 @@ final class AudioEngine implements AutoCloseable {
 	private final AtomicBoolean transmitting = new AtomicBoolean(false);
 	/// Toggled live ('f' on the console); the capture thread rebuilds the encoder when it changes.
 	private final AtomicBoolean highFidelity;
-	private final BlockingQueue<byte[]> playbackQueue = new LinkedBlockingQueue<>();
+	/// Per-sender decode/playback lanes (relay full-duplex), keyed by the server-assigned stream index. The
+	/// playback thread mixes one 20 ms frame from each lane per tick; each lane owns its decoder + jitter buffer.
+	private final Map<Integer, Lane> lanes = new ConcurrentHashMap<>();
 
 	private int channels;          // 1 or 2, negotiated against the audio device
 	private int frameSamples;      // SAMPLES_PER_CHANNEL * channels (interleaved)
@@ -64,7 +71,6 @@ final class AudioEngine implements AutoCloseable {
 	private AudioFormat format;
 	private Mixer.Info inputMixerInfo;  // resolved capture device (null = system default)
 	private OpusEncoder encoder;   // confined to the capture thread
-	private OpusDecoder decoder;   // confined to the playback thread
 	private TargetDataLine mic;
 	private SourceDataLine speaker;
 
@@ -136,9 +142,15 @@ final class AudioEngine implements AutoCloseable {
 				+ " (" + (highFidelity.get() ? "music" : "voice") + " profile)";
 	}
 
-	/// Queues an already-decrypted `[codec tag][payload]` frame for decoding and playback.
-	void play(byte[] frame) {
-		playbackQueue.offer(frame);
+	/// Queues an already-decrypted `[codec tag][payload]` frame from the sender with stream index `sid` for
+	/// decoding and mixing. One lane (decoder + jitter buffer) per sender; the playback thread mixes them.
+	void play(int sid, byte[] body) {
+		if (body.length < 2) {
+			return;
+		}
+		Lane lane = lanes.computeIfAbsent(sid, _ -> new Lane());
+		lane.offer(body);
+		lane.lastSeen = System.nanoTime();
 	}
 
 	/// Whether captured audio is currently being emitted to the sink (mic is "live").
@@ -245,7 +257,7 @@ final class AudioEngine implements AutoCloseable {
 
 	private void setupCodec() throws OpusException {
 		configureEncoder();
-		decoder = new OpusDecoder((int) SAMPLE_RATE, channels);
+		// Decoders are created per sender, lazily, on the playback thread (see decodeFrame).
 	}
 
 	/// (Re)builds the Opus encoder for the current [#highFidelity] setting — music profile (full-band audio)
@@ -313,55 +325,116 @@ final class AudioEngine implements AutoCloseable {
 		return read == buffer.length;
 	}
 
+	/// The mixer. Each ~20 ms tick: pull one frame from every lane, decode it, and sum the lanes into one
+	/// buffer (clipping to the S16 range), then write that single 20 ms frame to the speaker. The **blocking
+	/// `speaker.write` is the clock** — it paces the loop to the device's real-time rate, so there is no
+	/// wall-clock sleep that could drift against the audio hardware. When no lane has a frame this tick a
+	/// silence frame is written, keeping the line fed so a live talker never starves on an underrun.
 	private void playbackLoop() {
-		short[] pcm = new short[frameSamples];
+		int[] mix = new int[frameSamples];
+		short[] decoded = new short[frameSamples];
 		byte[] out = new byte[pcmFrameBytes];
-		try {
-			while (running.get()) {
-				byte[] frame = playbackQueue.poll(200, TimeUnit.MILLISECONDS);
-				if (frame == null || frame.length < 2) {
+		while (running.get()) {
+			sweepLanes();
+			Arrays.fill(mix, 0);
+			for (Lane lane : lanes.values()) {
+				byte[] frame = lane.take();
+				if (frame == null) {
 					continue;
 				}
-				switch (frame[0]) {
-					case CODEC_PCM -> playPcmFallback(frame);
-					case CODEC_OPUS -> {
-						try {
-							int perChannel = decoder.decode(frame, 1, frame.length - 1, pcm, 0, SAMPLES_PER_CHANNEL, false);
-							int bytes = perChannel * channels * 2;
-							ByteBuffer.wrap(out, 0, bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(pcm, 0, perChannel * channels);
-							speaker.write(out, 0, bytes);
-						} catch (OpusException _) {
-							// drop undecodable packet
-						}
-					}
-					default -> {
-						// unknown codec tag; ignore
-					}
+				int count = Math.min(decodeFrame(lane, frame, decoded), frameSamples);
+				for (int i = 0; i < count; i++) {
+					mix[i] += decoded[i];
 				}
 			}
-		} catch (InterruptedException _) {
-			Thread.currentThread().interrupt();
+			for (int i = 0; i < frameSamples; i++) {
+				short clipped = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, mix[i]));
+				out[i * 2] = (byte) clipped;
+				out[i * 2 + 1] = (byte) (clipped >> 8);
+			}
+			speaker.write(out, 0, pcmFrameBytes);
 		}
 	}
 
-	/// Plays a raw-PCM fallback frame (sent only by a browser without WebCodecs, always mono 48 kHz).
-	/// On a stereo line each mono sample is duplicated into the left/right pair.
-	private void playPcmFallback(byte[] frame) {
-		int payloadBytes = frame.length - 1;
-		if (channels == 1) {
-			speaker.write(frame, 1, payloadBytes);
-			return;
+	/// Decodes one frame for a lane into `dest` (interleaved, device channel layout) and returns the valid
+	/// interleaved sample count: Opus via the lane's own decoder (created lazily, confined to this thread), or
+	/// the mono PCM fallback upmixed to the device layout. Returns 0 on an undecodable/unknown frame.
+	private int decodeFrame(Lane lane, byte[] body, short[] dest) {
+		return switch (body[0]) {
+			case CODEC_OPUS -> {
+				try {
+					if (lane.decoder == null) {
+						lane.decoder = new OpusDecoder((int) SAMPLE_RATE, channels);
+					}
+					int perChannel = lane.decoder.decode(body, 1, body.length - 1, dest, 0, SAMPLES_PER_CHANNEL, false);
+					yield perChannel * channels;
+				} catch (OpusException _) {
+					yield 0;   // drop undecodable packet
+				}
+			}
+			case CODEC_PCM -> {
+				// Raw mono S16LE (the PCM fallback is always mono); upmix to the device channel count.
+				int monoSamples = Math.min((body.length - 1) / 2, channels == 2 ? frameSamples / 2 : frameSamples);
+				ByteBuffer in = ByteBuffer.wrap(body, 1, body.length - 1).order(ByteOrder.LITTLE_ENDIAN);
+				if (channels == 1) {
+					for (int i = 0; i < monoSamples; i++) {
+						dest[i] = in.getShort();
+					}
+					yield monoSamples;
+				}
+				for (int i = 0; i < monoSamples; i++) {
+					short sample = in.getShort();
+					dest[i * 2] = sample;
+					dest[i * 2 + 1] = sample;
+				}
+				yield monoSamples * 2;
+			}
+			default -> 0;   // unknown codec tag
+		};
+	}
+
+	/// Closes lanes idle longer than [#SILENCE_TTL_NANOS], then evicts the longest-silent lanes while more
+	/// than [#MAX_ACTIVE_LANES] remain. Runs on the playback thread, so dropping a lane (and its decoder) is safe.
+	private void sweepLanes() {
+		long now = System.nanoTime();
+		lanes.values().removeIf(lane -> now - lane.lastSeen > SILENCE_TTL_NANOS);
+		while (lanes.size() > MAX_ACTIVE_LANES) {
+			Integer oldestSid = null;
+			long oldest = Long.MAX_VALUE;
+			for (Map.Entry<Integer, Lane> entry : lanes.entrySet()) {
+				if (entry.getValue().lastSeen < oldest) {
+					oldest = entry.getValue().lastSeen;
+					oldestSid = entry.getKey();
+				}
+			}
+			if (oldestSid == null) {
+				break;
+			}
+			lanes.remove(oldestSid);
 		}
-		int monoSamples = payloadBytes / 2;
-		byte[] stereo = new byte[monoSamples * 4];
-		for (int i = 0; i < monoSamples; i++) {
-			int src = 1 + i * 2;
-			int dst = i * 4;
-			stereo[dst] = frame[src];
-			stereo[dst + 1] = frame[src + 1];
-			stereo[dst + 2] = frame[src];
-			stereo[dst + 3] = frame[src + 1];
+	}
+
+	/// One sender's playback lane: a bounded jitter buffer of `[tag][payload]` frames plus its own stateful
+	/// Opus decoder (created and used only on the playback thread). `offer` is called from the WebSocket
+	/// listener thread and `take` from the playback thread, so the jitter buffer is synchronized.
+	private static final class Lane {
+
+		private final ArrayDeque<byte[]> jitter = new ArrayDeque<>();
+		private OpusDecoder decoder;        // created/used only on the playback thread
+		private volatile long lastSeen;     // System.nanoTime of the last frame offered (for age-out)
+
+		synchronized void offer(byte[] frame) {
+			jitter.addLast(frame);
+			while (jitter.size() > LANE_JITTER_CAP) {
+				jitter.removeFirst();   // drop oldest on overflow (audio is loss-tolerant)
+			}
 		}
-		speaker.write(stereo, 0, stereo.length);
+
+		synchronized byte[] take() {
+			while (jitter.size() > LANE_TARGET_DEPTH) {
+				jitter.removeFirst();   // catch up: discard stale frames so a backed-up lane re-aligns
+			}
+			return jitter.pollFirst();
+		}
 	}
 }
