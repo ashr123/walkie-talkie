@@ -54,6 +54,7 @@ class RelayFramingIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler a = new CollectingHandler();
 		WebSocketSession sa = connect(AUDIO, a, login());
 		try {
+			//language=JSON
 			sendRaw(sa, """
 					{"type":"join","channel":"lobby","mode":"FULL_DUPLEX","displayName":"Alice","keyCheck":null}""");
 			assertEquals("lobby", awaitType(a.messages, ServerMessage.Joined.class).channel());
