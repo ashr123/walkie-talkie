@@ -6,12 +6,12 @@ two reference clients, and three channel modes.
 
 ## What it does
 
-| Choice           | Options                                                                                                                                              |
-|------------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Transport**    | **WebSocket relay** — the server forwards raw audio frames between members · **WebRTC** — the server relays signaling only, audio flows peer-to-peer |
-| **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared, server-managed, always-unencrypted room) · **Full-duplex** (everyone talks at once)                       |
-| **Clients**      | A zero-install **browser** client · a **Java 25 desktop** client                                                                                     |
-| **Encryption**   | Optional **end-to-end encryption** on the relay path (AES-256-GCM from a shared passphrase) · WebRTC media is already end-to-end (peer-to-peer)      |
+| Choice           | Options                                                                                                                                                              |
+|------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Transport**    | **WebSocket relay** — the server forwards raw audio frames between members · **WebRTC** — the server relays signaling only, audio flows peer-to-peer                 |
+| **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared, server-managed, always-unencrypted room) · **Full-duplex** (everyone talks at once)   |
+| **Clients**      | A zero-install **browser** client · a **Java 25 desktop** client                                                                                                     |
+| **Encryption**   | Optional **end-to-end encryption** on the relay path (AES-256-GCM from a shared passphrase) · WebRTC media is already end-to-end encrypted (DTLS-SRTP, peer-to-peer) |
 
 ## Architecture
 
@@ -94,6 +94,7 @@ a strong random key (≥ 64 bytes, to match the 512-bit MAC) and keep it out of 
 
 ```bash
 # generate a key (store it in your secrets manager, not in the repo)
+# the base64 text itself becomes the key (~88 chars / well over 64 bytes of UTF-8, matching the 512-bit MAC)
 openssl rand -base64 64
 
 # run with it (every instance uses the same value)
@@ -109,7 +110,8 @@ substitute for transport TLS, and control messages are never passphrase-encrypte
 read and act on them.)
 
 **Local dev (zero-config).** With no keystore configured, the server **auto-generates a self-signed localhost
-certificate at startup** (into `~/.walkie-talkie/`, regenerated each run) and serves `https://localhost:8443`.
+certificate on first use** (into `~/.walkie-talkie/`) and **reuses it across restarts** (regenerating only if it
+is missing, expired, or the wrong key size), serving `https://localhost:8443`.
 The browser shows a one-time "accept the certificate" warning. The **Java client auto-trusts** this dev cert
 on localhost (it reads the exported `~/.walkie-talkie/dev-cert.pem`), so it just works — and TLS verification
 is never disabled.
@@ -119,7 +121,7 @@ hardcoded or committed):
 
 ```bash
 export WALKIE_TLS_KEYSTORE_PASSWORD=…              # your keystore password
-scripts/gen-dev-cert.sh                            # optional: writes ./dev-keystore.p12 (RSA-4096) + ./dev-cert.pem
+scripts/gen-dev-cert.sh                            # optional: writes ./dev-keystore.p12 (RSA-16384) + ./dev-cert.pem
 WALKIE_TLS_KEYSTORE="file:$PWD/dev-keystore.p12" JAVA_OPTS= ./gradlew :walkie-server:bootRun
 # Java client against a custom cert:  --tls-truststore ./dev-cert.pem
 ```
@@ -203,7 +205,9 @@ otherwise mono — and interoperates with relay-mode browser clients.
   duplicate display names are disambiguated for the user with a short `#id` prefix.
 - **Optional end-to-end encryption (relay path).** With a shared passphrase, audio frames are encrypted
   with **AES-256-GCM** before they leave the client and decrypted only by other holders of the passphrase —
-  the server relays ciphertext opaquely and never holds the key. The key is derived with
+  the server relays ciphertext opaquely and never holds the key. Because the key is **shared per channel**, this
+  proves a frame came from *some* passphrase-holder (confidentiality and integrity against the relay and
+  non-members) — **not which member sent it**: there is no per-sender authentication. The key is derived with
   **PBKDF2-HMAC-SHA512** (600 000 iterations, salted per channel); the browser (WebCrypto) and Java client
   (`javax.crypto`) derive byte-identical keys, pinned by a cross-platform known-answer test. The same
   derivation also yields a **key-check value** the client sends at join, letting the server **reject a
@@ -220,8 +224,9 @@ otherwise mono — and interoperates with relay-mode browser clients.
 ## Java 25 features used
 
 - **Virtual threads** for the servlet container and client I/O loops (`spring.threads.virtual.enabled`).
-- **Scoped Values** (JEP 506, finalized) to carry the authenticated identity for the scope of a
-  message and tag every log line emitted during it (mirrored into the SLF4J MDC) — see `RequestContext`.
+- **Scoped Values** (JEP 506, finalized) to carry the authenticated identity for the scope of a control
+  message and tag the log lines emitted during it (mirrored into the SLF4J MDC); the per-frame audio relay
+  path is intentionally left unscoped — see `RequestContext`.
 - **Sealed interfaces + records + pattern-matching `switch`** for the protocol and dispatch.
 - **Records as configuration properties**, text blocks, and `--release 25` throughout. No `var`.
 

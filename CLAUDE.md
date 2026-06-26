@@ -84,7 +84,10 @@ binary frame is `[1-byte codec tag][payload]`: tag `1` = Opus (48 kHz, 20 ms / 9
 frames), tag `2` = raw PCM S16LE 48 kHz. Channel count is carried inside the Opus stream, and decoders
 emit their own configured channel count (down/upmixing as needed) — so the mono browser and a stereo
 Java client interoperate. The **server never inspects the payload** — it relays frames opaquely and
-only enforces `walkie.max-audio-frame-bytes`. The browser encodes Opus via WebCodecs (mono; PCM
+only enforces `walkie.max-audio-frame-bytes` (plus the PTT-floor / membership gate). E2EE makes the *payload*
+opaque to an honest-but-curious relay; it does **not** constrain the relay as **router** — a malicious relay can
+still drop, reorder, duplicate or misroute frames, and the per-sender stream index it stamps is plaintext. The browser
+encodes Opus via WebCodecs (mono; PCM
 fallback where WebCodecs is absent); the Java client uses Concentus (stereo when the device supports
 it, else mono). **Relay multi-stream framing (full-duplex).** Opus decode is per-stream stateful, so to
 carry simultaneous talkers the server fans each frame out prefixed with the sender's per-channel **1-byte
@@ -113,7 +116,9 @@ whose key-check differs (`passphrase_mismatch`, in `ChannelRegistry.joinOrCreate
 brute-force-equivalent to the ciphertext it already relays). The leading scheme byte (kept out of the
 codec-tag set `{1,2}`) still lets a receiver tell an encrypted frame from a plaintext peer and drop it
 cleanly; it is **also passed as AES-GCM additional authenticated data (AAD)** (`Cipher.updateAAD` / WebCrypto
-`additionalData`), so the envelope is covered by the tag and a tampered/forged scheme byte fails decryption.
+`additionalData`), so the scheme byte is bound into the tag and a tampered/forged scheme byte fails decryption.
+(The server's stream-index prefix sits **outside** this GCM frame, so it is not authenticated; and because the
+channel key is shared, GCM integrity proves a frame came from *a* key-holder, not *which* member.)
 WebCrypto needs a secure context, so browser E2EE requires HTTPS or `localhost` (not
 `http://<LAN-IP>`). The relay path only; WebRTC media is already end-to-end (DTLS-SRTP, peer-to-peer). Async
 WebCrypto on the browser is serialized through `txChain`/`rxChain` so it can't reorder the stateful Opus stream.
@@ -126,12 +131,20 @@ and mints a self-contained **HMAC-SHA512-signed** token (`AuthService`, key from
 (`"ws-client"`). There is **no `/logout`**: the token is short-lived and self-expiring, so ending a session
 is just closing the WebSocket. `SecurityConfig` permits static assets, `/error`, health, and login, and
 authenticates everything else including `/ws/**` (keeping `/error` permitted makes validation failures
-surface as 400, not 403). **A participant's identity is the per-connection `WebSocketSession.getId()`** —
+surface as 400, not 403). **A participant's identity is the per-connection, server-assigned `WebSocketSession.getId()`
+** —
 it keys channel membership, the floor, ownership and routing, and it's what `Joined.selfId`/`MemberInfo.id`
-carry. The **display name** is the only human label: the client sends it in `Join`, the server validates it
+carry; clients can't choose or spoof it. (That authority holds only under the trusted-server model: a frame's
+sender is read from the server-stamped, plaintext stream index, which no cryptography binds — so attribution is
+as trustworthy as the relay.) The **display name** is the only human label: the client sends it in `Join`, the server
+validates it
 against `[A-Za-z0-9_.-]{1,32}` (else `invalid_display_name`); clients append a short `#<id-prefix>` when two
-members share one. The token's short TTL is the only bound on replay (no revocation list — the accepted
-trade-off of going store-free); serve over WSS and keep `walkie.allowed-origins` tight in production.
+members share one. The token's short TTL is the only bound on replay — the random nonce only makes each token
+unique/unguessable,
+it is **not** tracked, so a captured token is freely replayable to open new sockets within its ~60 s lifetime (no
+revocation list — the accepted trade-off of going store-free). Serve over WSS and keep `walkie.allowed-origins`
+tight in production: it **defaults to `*`** (wide open), and since CSRF is disabled the WS origin check is the
+relied-upon anti-CSWSH control, so it MUST be overridden.
 **Transport TLS is ON by default** (`TlsConfiguration`, a `WebServerFactoryCustomizer` gated by
 `walkie.tls.enabled`, default true): the server serves HTTPS/WSS on 8443, auto-generating a self-signed
 localhost cert into `~/.walkie-talkie/` when no `WALKIE_TLS_KEYSTORE` is supplied (via the JDK's `keytool`

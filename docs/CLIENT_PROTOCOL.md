@@ -41,14 +41,16 @@ WebRTC (§3a) is a separate transport for true peer-to-peer media and is indepen
 ### Login
 
 `POST /api/auth/login` — **no request body, no authentication required** (it is the only public application
-endpoint besides static assets, `/actuator/health`, and `/error`). It returns:
+endpoint besides static assets, `/actuator/health`, `/actuator/info`, and `/error`). It returns:
 
 ```json
 { "token": "<opaque signed bearer token>" }
 ```
 
 The token is a stateless, HMAC-SHA512-signed, short-lived (~60 s) credential; it is **opaque** to clients —
-do not parse it, just echo it back. There is **no `/logout`**: a session ends when its WebSocket closes.
+do not parse it, just echo it back. There is **no `/logout`** and no revocation list: the token authorizes only
+the handshake and is never re-validated on the live socket, so a session ends when its WebSocket closes — and a
+leaked token can open new sockets until it expires.
 
 ### WebSocket
 
@@ -86,7 +88,8 @@ selects the record; the remaining fields are its components.
 - `FULL_DUPLEX` — everyone may transmit at once (no floor).
 
 A channel's mode is fixed at creation and **adopted** by later joiners; only the **owner** (creator) may
-change it, and ownership transfers to another member if the owner leaves.
+change it, and ownership transfers to another member if the owner leaves. (Exception: the server-managed
+`global` channel has a sentinel owner — no participant can change its mode or become its owner.)
 
 ### Client → server
 
@@ -162,7 +165,8 @@ single-decoder limit).
 
 - **Inbound** (client → server): **unprefixed** — exactly the legacy frame. The server learns the sender from
   the connection, so a client never sends its own stream index.
-- **Outbound** (server → client): **every** binary frame gains a **1-byte plaintext stream-index prefix**.
+- **Outbound** (server → client): for a `relayFraming = 1` recipient, **every** binary frame gains a **1-byte
+  plaintext stream-index prefix** (a legacy `relayFraming = 0` recipient still receives the un-prefixed body — see §14).
 
 ### Outbound layout
 
@@ -221,9 +225,11 @@ Worked examples (hex; `SID` values are real allocator indices, **not** ASCII):
 When a shared passphrase is set, the sender encrypts the **whole** `[codec tag][payload]` plaintext and the
 body becomes `[0xE2][IV(12)][AES-256-GCM ciphertext+tag]`. Must be **byte-identical** across clients:
 
-- **Key derivation:** `PBKDF2-HMAC-SHA256(passphrase, salt, 600000)` → **384 bits**, where
+- **Key derivation:** `PBKDF2-HMAC-SHA512(passphrase, salt, 600000)` → **384 bits**, where
   `salt = "walkie-talkie:e2ee:" + effectiveChannel` (`effectiveChannel = "global"` in `GLOBAL_PTT`, else the
-  channel name). First **32 bytes** = AES-256 key; next **16 bytes** = **key-check value (KCV)**.
+  channel name). First **32 bytes** = AES-256 key; next **16 bytes** = **key-check value (KCV)**. (The `global`
+  branch is for byte-compatibility only — the server forces the `global` room to be unencrypted, rejecting a
+  `GLOBAL_PTT` join that carries a `keyCheck` with `encryption_not_allowed`, so E2EE never actually runs there.)
 - **Per frame:** AES-256-GCM, **12-byte random IV**, 128-bit tag. The scheme byte `0xE2` is passed as GCM
   **additional authenticated data (AAD)** — and AAD is **only** `{0xE2}`.
 - **Key-check:** send the hex KCV in `Join.keyCheck`. The server enforces a **uniform** channel (all members
@@ -233,21 +239,27 @@ body becomes `[0xE2][IV(12)][AES-256-GCM ciphertext+tag]`. Must be **byte-identi
 **Known-answer vectors** (pin these in your tests; passphrase/channel per `FrameCryptoTest`):
 
 ```
-AES key   : 2cd28ead697478bf2e0f7225a795406d055053873e56bd6a6bd8dcc30ec967ea
-key-check : a305570d2140e4933493d84916508daa
-ciphertext: 10ff6aa7a86d7962ccf168f8c801068e62d50ed4a3
+AES key   : 43321a28736472e94ff819ef9364476d5324b8fa550115409047f7da41fcbc06
+key-check : c9ea045aeadb2254fff7fa0efeb4d18a
+ciphertext: 64d66fb60c1fe48c515bb15362b5bcd63cca8d0a48
 ```
 
-> **Security note — the SID is NOT authenticated.** The stream-index prefix is plaintext, *outside* the
-> encrypted envelope, and is **not** in the AAD. Payload confidentiality and integrity are fully preserved
-> (the GCM tag still covers `{0xE2} ‖ ciphertext`), but a malicious/buggy **relay** can remap, duplicate, or
-> flip the SID byte per frame without breaking GCM — degrading routing (spraying one talker across phantom
-> lanes to defeat the active-speaker cap) or re-introducing decoder garble (collapsing two talkers onto one
-> SID). This is strictly within the existing trust boundary (the relay is trusted for *availability*, not
-> *confidentiality* — it can already drop/reorder/duplicate frames) and is no worse than that. It is called
-> out here so client authors don't assume the SID is trustworthy. (The SID can't be authenticated without a
-> new protocol step: encryption happens on the sender, which doesn't know its server-assigned index, and
-> binding server state into the AAD would break the cross-platform KAT.)
+> **Security note — the SID is NOT authenticated, by design.** It is plaintext, *outside* the encrypted
+> envelope, and not in the AAD. Relay E2EE's threat model is an **honest-but-curious relay**: payload
+> **confidentiality** (the relay can't hear the audio) and **integrity against any party without the channel
+> key** (it can't forge audio that decrypts — the GCM tag covers `{0xE2} ‖ ciphertext`) are preserved. The
+> channel key is *shared*, so GCM proves a frame came from *some* passphrase-holder — **not which member**;
+> there is **no per-sender authentication**. And it does **not** defend **routing authenticity or availability
+> against a *malicious* relay**, which can't be done cheaply: the relay *is* the router, so it can already
+> drop, reorder, duplicate, or misroute frames. A hostile relay remapping/flipping the SID (collapsing two
+> talkers onto one lane → decoder garble, or spraying one talker across phantom lanes) is therefore no worse
+> than its existing powers — and the phantom-lane case is already bounded by the active-speaker cap (§11). So
+> **treat the SID as an untrusted routing *hint*, never an authenticated sender identity.** Authenticating the
+> sender against a hostile relay is feasible but a deliberate non-goal here — and note the *real* obstacle:
+> under the shared channel key, merely carrying the sender id *inside* the encrypted body proves only that *a*
+> passphrase-holder wrote that id, not *which* member sent it (any key-holder can forge it). Genuine per-sender
+> authenticity needs **asymmetric per-member signing keys** (out of scope here) — not binding the SID into the
+> AAD (which would only *detect* relay tampering on encrypted channels while still losing the frame).
 
 ---
 
