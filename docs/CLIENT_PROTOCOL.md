@@ -109,8 +109,8 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `memberLeft`    | `memberId`                                                              | A participant left/disconnected                   |
 | `floorGranted`  | —                                                                       | You hold the floor; you may transmit              |
 | `floorDenied`   | `currentHolderId`                                                       | Floor request refused; names the current holder   |
-| `floorTaken`    | `holderId`                                                              | Another member took the floor (also sent on join) |
-| `floorIdle`     | —                                                                       | The floor is free                                 |
+| `floorTaken`    | `holderId`                                                              | Another member holds the floor (sent on join; also to a holder preempted by idle auto-release — §3b) |
+| `floorIdle`     | —                                                                       | The floor is free (also sent to a holder force-released by max-hold — §3b) |
 | `modeChanged`   | `mode`                                                                  | The channel mode changed; reset talk state        |
 | `ownerChanged`  | `ownerId`                                                               | New owner (e.g. previous owner left)              |
 | `signalOffer`   | `from`, `sdp`                                                           | WebRTC (see §3a)                                  |
@@ -137,6 +137,27 @@ single-decoder limit).
 - Reference client uses STUN `stun:stun.l.google.com:19302`, tunes Opus via SDP fmtp
   `maxaveragebitrate=64000;maxplaybackrate=48000;stereo=0;useinbandfec=1;usedtx=0`, and sets the sender
   `maxBitrate` to 64000.
+
+---
+
+## 3b. Push-to-talk floor lifecycle
+
+A holder normally keeps the floor until it sends `releaseFloor` (or disconnects). The server may also
+**revoke** it, so a client MUST treat the following as "you lost the floor" — stop transmitting and reset its
+talk control:
+
+- **`floorTaken` whose `holderId` is not your own, while you believed you held the floor** — you were
+  preempted by **idle auto-release**: you sent no audio for `walkie.floor-idle-release-seconds` (default 5)
+  *and* another member requested the floor. Idle is measured from frame *timing*, never content, so it works
+  on encrypted channels; it applies to **relay holders only** (the server has no activity signal for WebRTC
+  media, §3a).
+- **`floorIdle` while you held the floor** — you were force-released by the **max-hold** cap
+  (`walkie.floor-max-hold-seconds`, default 300, of continuous holding). Re-`requestFloor` to keep talking.
+
+Both timers `0`-disable. A normal active talker is **never** preempted: it transmits continuously while
+holding (the mic sends a frame every 20 ms, even through speech pauses), which refreshes the activity mark on
+every frame — so idle auto-release only catches a holder that genuinely went silent on the wire without
+releasing.
 
 ---
 
@@ -353,6 +374,11 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 - **Display name:** `[A-Za-z0-9_.-]{1,32}` (no spaces). **Channel name:** `[A-Za-z0-9_-]{1,64}`.
 - **Inbound audio frame:** ≤ `walkie.max-audio-frame-bytes` (default 8192) — enforced on the **un-prefixed**
   inbound frame, so the outbound +1 SID never trips it. **Text frame:** ≤ 65536 (default).
+- **Inbound audio frame rate:** ≤ `walkie.max-audio-frames-per-second` per sender (default 100; ~50 fps is
+  nominal). Excess frames are dropped **before** fan-out — a flood guard that counts frames without inspecting
+  them, so it works on encrypted channels. Always on (0/blank → default, never disabled).
+- **PTT floor timers:** idle auto-release after `walkie.floor-idle-release-seconds` (default 5; relay holders,
+  on contention) and force-release after `walkie.floor-max-hold-seconds` (default 300); each `0`-disables (§3b).
 - **Error codes** (`error.code`):
 
 | Code                  | Triggered by                                                          |

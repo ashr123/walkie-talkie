@@ -219,6 +219,17 @@ otherwise mono — and interoperates with relay-mode browser clients.
 - Stateless, CSRF-free token model; static client, health check and login are the only public routes.
 - Input is validated (display-name + channel-name patterns, audio-frame size caps). The browser renders
   member names with `textContent` to avoid markup injection.
+- **Per-sender flood guard.** Each sender's relayed audio is rate-limited with a token bucket
+  (`walkie.max-audio-frames-per-second`, default 100 ≈ 2× the ~50 fps nominal); frames over the rate are
+  dropped **before** fan-out, so one client can't amplify load across the channel (N recipients) or force
+  excess decode work. It counts frames without inspecting them, so it works on encrypted channels too — the
+  per-frame **size** cap is `walkie.max-audio-frame-bytes` (default 8 KiB).
+- **Push-to-talk floor anti-hogging.** A half-duplex channel's talk floor can't be held forever: a holder
+  that goes silent is reclaimed for a waiting requester after `walkie.floor-idle-release-seconds` (default 5;
+  measured from frame timing, so it works on encrypted channels), and any holder is force-released after
+  `walkie.floor-max-hold-seconds` (default 300) of continuous holding. Set either to `0` to disable. On a
+  server-initiated release the (ex-)holder is notified so its client stops transmitting. (Idle auto-release
+  applies to relay holders only — the server has no activity signal for peer-to-peer WebRTC media.)
 - **For production:** serve over WSS/HTTPS (TLS 1.2+) — see _Transport encryption (TLS / WSS)_ above and the
   `deploy/` proxy configs — and **override `walkie.allowed-origins`**: it **defaults to `*`** (wide open),
   and because CSRF is disabled this WebSocket origin check is the sole anti-CSWSH (cross-site WebSocket

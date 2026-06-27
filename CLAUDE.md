@@ -63,7 +63,13 @@ every site to handle it.
 `FULL_DUPLEX` (no floor). A channel's mode is set at creation and **adopted** by later joiners; only
 the **owner** (creator) may change it (`ChangeMode` → broadcast `ModeChanged`), and ownership transfers
 to another member if the owner leaves. Floor state is an `AtomicReference<String>` on `Channel`;
-full-duplex bypasses it. **The `global` channel is special and server-managed:** it is reachable *only*
+full-duplex bypasses it. **Floor anti-hogging** (PTT modes, in `ConnectionService`): a holder gone silent past
+`walkie.floor-idle-release-seconds` (default 5) is preempted when another member requests the floor (idle
+auto-release — `Channel.preemptFloorIfIdle`, relay holders only, keyed off frame *timing* not content), and
+any holder is force-released after `walkie.floor-max-hold-seconds` (default 300) of continuous holding
+(max-hold, CAS-gated in `onAudio`). Both `0`-disable; on a server-initiated release the (ex-)holder is told
+(`FloorTaken`/`FloorIdle`) so its client stops transmitting. Floor timing uses a `java.time.Clock` + `Instant`
+(injectable for tests). **The `global` channel is special and server-managed:** it is reachable *only*
 via `GLOBAL_PTT` (a `MULTI_CHANNEL_PTT`/`FULL_DUPLEX` join naming `global` is rejected with
 `reserved_channel`); it is **always unencrypted** (a `GLOBAL_PTT` join carrying a `keyCheck` is rejected
 with `encryption_not_allowed`, so anyone can join without knowing a passphrase); and it is created with a
@@ -83,8 +89,9 @@ annotations stay under `com.fasterxml.jackson.core`). Jackson 3 exceptions are u
 binary frame is `[1-byte codec tag][payload]`: tag `1` = Opus (48 kHz, 20 ms / 960-samples-per-channel
 frames), tag `2` = raw PCM S16LE 48 kHz. Channel count is carried inside the Opus stream, and decoders
 emit their own configured channel count (down/upmixing as needed) — so the mono browser and a stereo
-Java client interoperate. The **server never inspects the payload** — it relays frames opaquely and
-only enforces `walkie.max-audio-frame-bytes` (plus the PTT-floor / membership gate). E2EE makes the *payload*
+Java client interoperate. The **server never inspects the payload** — it relays frames opaquely and only
+enforces `walkie.max-audio-frame-bytes`, a per-sender frame-rate cap (`walkie.max-audio-frames-per-second`,
+dropped before fan-out — `AudioRateLimiter`), and the PTT-floor / membership gate. E2EE makes the *payload*
 opaque to an honest-but-curious relay; it does **not** constrain the relay as **router** — a malicious relay can
 still drop, reorder, duplicate or misroute frames, and the per-sender stream index it stamps is plaintext. The browser
 encodes Opus via WebCodecs (mono; PCM
