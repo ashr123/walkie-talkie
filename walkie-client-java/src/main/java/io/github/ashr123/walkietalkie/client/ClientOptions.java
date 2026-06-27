@@ -13,6 +13,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 /// @param key           passphrase for AES-256-GCM end-to-end audio encryption; null/blank disables it
 /// @param tlsTruststore path to a PEM certificate to additionally trust for TLS (besides the system CAs and,
 ///                      on localhost, the server's auto-generated dev cert); null relies on those defaults
+/// @param startMuted    full-duplex only: connect with the mic muted (default: mic is live on connect)
 public record ClientOptions(String server,
                             String channel,
                             ChannelMode mode,
@@ -20,6 +21,7 @@ public record ClientOptions(String server,
                             boolean highFidelity,
                             String inputDevice,
                             String key,
-                            String tlsTruststore
+                            String tlsTruststore,
+                            boolean startMuted
 ) {
 }

@@ -171,6 +171,20 @@
             color: var(--accent);
         }
 
+        /* The channel owner is flagged with a crown in the roster (so you don't have to scan the log). */
+        /*noinspection CssUnusedSymbol*/
+        ul#members li .owner-badge {
+            margin-right: 4px;
+            color: var(--accent);
+        }
+
+        /* A member is highlighted while transmitting, in any mode, until they go quiet. */
+        /*noinspection CssUnusedSymbol*/
+        ul#members li.speaking {
+            background: #16321d;
+            box-shadow: inset 3px 0 0 var(--ok);
+        }
+
         #log {
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
             font-size: 12px;
@@ -225,6 +239,9 @@
 		<div class="hint" hidden id="channelHint">Global push-to-talk uses one shared channel for everyone — the name is fixed to <code>global</code>.</div>
 		<label style="display:flex; align-items:center; gap:8px; margin-top:10px;">
 			<input id="hifi" style="width:auto;" type="checkbox"> High fidelity (disable mic processing)
+		</label>
+		<label id="startMutedRow" style="display:none; align-items:center; gap:8px; margin-top:10px;">
+			<input id="startMuted" style="width:auto;" type="checkbox"> Connect muted
 		</label>
 		<label for="passphrase">Encryption passphrase (optional, relay)</label>
 		<input autocomplete="off" id="passphrase" placeholder="shared secret — leave blank for none" type="password">

@@ -31,6 +31,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /// Console walkie-talkie client over the WebSocket-relay transport (the only one available to a pure-Java
 /// client; WebRTC is browser-to-browser). It orchestrates login, the relay WebSocket connection, the
@@ -51,6 +52,9 @@ public final class WalkieClient implements AutoCloseable {
 	);
 	// Stateless, thread-safe infrastructure with no per-connection input — shared by every client instance.
 	private static final ObjectMapper JSON_MAPPER = JsonMapper.builder().build();
+	/// Sentinel owner id the server stamps on the server-managed "global" room (mirrors
+	/// `ConnectionService.GLOBAL_CHANNEL_OWNER`); that channel has no participant owner.
+	private static final String SERVER_OWNER = "server";
 	/// Upper bound on how long [#close] waits for the HttpClient — and the WebSocket close handshake riding on
 	/// it — to drain gracefully before forcing termination, so quitting can never hang on a slow or vanished
 	/// server. Two seconds is ample for a localhost/LAN close handshake while still feeling instant to a user.
@@ -99,19 +103,14 @@ public final class WalkieClient implements AutoCloseable {
 		consoleLoop();
 	}
 
-	/// Lists the audio mixers that expose a capture line, for use with `--input`.
-	static void listInputDevices() {
-		AudioEngine.listInputDevices();
-	}
-
 	/// Prints a status line prefixed with the local timestamp (`yyyy-MM-dd HH:mm:ss,SSS`).
 	private static void log(String message) {
 		System.out.println(LocalDateTime.now().format(DATE_TIME_FORMATTER) + " " + message);
 	}
 
-	private static String modeHint(ChannelMode mode) {
+	private static String modeHint(ChannelMode mode, boolean micLive) {
 		return mode == ChannelMode.FULL_DUPLEX
-				? "Full-duplex: mic is live — type 't' to mute/unmute."
+				? "Full-duplex: mic is " + (micLive ? "live" : "muted") + " — type 't' to mute/unmute."
 				: "Push-to-talk: type 't' to grab/release the floor.";
 	}
 
@@ -120,7 +119,8 @@ public final class WalkieClient implements AutoCloseable {
 	private static void printHelp() {
 		System.out.println("""
 				--------------------------------------------------------------------------------------------------
-				 Commands:  t = talk/stop   m <ptt|global|duplex> = mode   f = hi-fi on/off   q = quit   h = help
+				 Commands:  t = talk/stop   w = who's here   m <ptt|global|duplex> = mode
+				            f = hi-fi on/off   q = quit   h = help
 				--------------------------------------------------------------------------------------------------""");
 	}
 
@@ -191,14 +191,23 @@ public final class WalkieClient implements AutoCloseable {
 				this.selfId = selfId;
 				this.ownerId = ownerId;
 				this.currentMode = mode;
-				// Full-duplex: the mic is live as soon as you join (matches the browser client); PTT/global
-				// start muted and require 't' to grab the floor. (Full-duplex transmit needs no floor request.)
-				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX);
+				// Full-duplex: the mic is live as soon as you join, unless --muted was passed; PTT/global start
+				// muted and require 't' to grab the floor. (Full-duplex transmit needs no floor request.)
+				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX && !options.startMuted());
 				memberNames.clear();
 				members.forEach(member -> memberNames.put(member.id(), member.displayName()));
-				log("[joined] channel=" + channel + " mode=" + mode + " members=" + members.size()
-						+ (selfId.equals(ownerId) ? " (you own this channel)" : "") + System.lineSeparator()
-						+ modeHint(mode));
+				String ownerLine = SERVER_OWNER.equals(ownerId)
+						? "server-managed room — no owner, unencrypted"
+						: selfId.equals(ownerId)
+						  ? "you own this channel — 'm <ptt|global|duplex>' to change the mode for everyone"
+						  : "owner: " + name(ownerId);
+				// If the channel already existed in another mode, its owner's mode wins and you adopt it.
+				String modeNote = mode == options.mode()
+						? ""
+						: " (you requested " + options.mode() + ", adopted the channel's existing mode)";
+				log("[joined] channel=" + channel + " mode=" + mode + modeNote + " members=" + members.size()
+						+ System.lineSeparator() + "[owner] " + ownerLine
+						+ System.lineSeparator() + modeHint(mode, audio.isTransmitting()));
 			}
 			case ServerMessage.MemberJoined(MemberInfo member) -> announceJoin(member);
 			case ServerMessage.MemberLeft(String memberId) -> announceLeave(memberId);
@@ -212,10 +221,10 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.FloorIdle _ -> log("[floor free]");
 			case ServerMessage.ModeChanged(ChannelMode mode) -> {
 				currentMode = mode;
-				// Match the browser: switching to full-duplex opens the mic immediately; any other mode mutes.
-				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX);
+				// Match the browser: switching to full-duplex opens the mic (unless --muted); else it mutes.
+				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX && !options.startMuted());
 				log("[mode changed] now " + mode + System.lineSeparator()
-						+ modeHint(mode));
+						+ modeHint(mode, audio.isTransmitting()));
 			}
 			case ServerMessage.OwnerChanged(String ownerId) -> {
 				this.ownerId = ownerId;
@@ -237,16 +246,13 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	/// Resolves a member's display name from its session id, falling back to the raw id if unknown. When
-	/// more than one member shares that display name, a short session-id prefix is appended so the two are
-	/// distinguishable — the session id is the real identity.
+	/// Resolves a member's display name from its session id, always suffixed with a short session-id prefix
+	/// (the session id is the real identity — display names aren't unique), or the raw id if the name is unknown.
 	private String name(String id) {
 		String display = memberNames.get(id);
-		if (display == null) {
-			return id;
-		}
-		long sharing = memberNames.values().stream().filter(display::equals).count();
-		return sharing > 1 ? display + " (#" + id.substring(0, Math.min(8, id.length())) + ")" : display;
+		return display == null
+				? id
+				: display + " (#" + id.substring(0, Math.min(8, id.length())) + ")";
 	}
 
 	private void announceJoin(MemberInfo member) {
@@ -257,6 +263,30 @@ public final class WalkieClient implements AutoCloseable {
 	private void announceLeave(String memberId) {
 		log("[-] " + name(memberId));
 		memberNames.remove(memberId);
+	}
+
+	/// Prints the current roster on demand (the 'w' command), sorted lexicographically by display name (then by
+	/// id), each member shown via [#name] (display name + `#id` prefix) with `(you)` / `(owner)` markers.
+	private void listMembers() {
+		if (memberNames.isEmpty()) {
+			log("[members] (none yet — join a channel first)");
+			return;
+		}
+		log(memberNames.entrySet().stream()
+				.sorted(Map.Entry.<String, String>comparingByValue(String.CASE_INSENSITIVE_ORDER)
+						.thenComparing(Map.Entry.comparingByKey()))   // lexicographic by name, then id
+				.map(entry -> {
+					String id = entry.getKey();
+					return name(id) + (id.equals(selfId)
+							? " (you)"
+							: id.equals(ownerId)
+							  ? " (owner)"
+							  : "");
+				})
+				.collect(Collectors.joining(
+						System.lineSeparator() + "  - ",
+						"[members] " + memberNames.size() + " in this channel:" + System.lineSeparator() + "  - ",
+						"")));
 	}
 
 	// --- Console control --------------------------------------------------------------------------
@@ -271,11 +301,12 @@ public final class WalkieClient implements AutoCloseable {
 					case "t", "talk" -> toggleTalk();
 					case "m", "mode" -> changeMode(parts.length > 1 ? parts[1] : "");
 					case "f", "fidelity" -> toggleFidelity();
+					case "w", "who", "members" -> listMembers();
 					case "q", "quit", "exit" -> running.set(false);
 					case "h", "help" -> printHelp();
 					case "" -> { /* ignore blank lines */ }
 					default ->
-							System.out.println("Commands: 't' talk/stop, 'm <ptt|global|duplex>' mode, 'f' hi-fi, 'q' quit, 'h' help.");
+							System.out.println("Commands: 't' talk/stop, 'w' who's here, 'm <ptt|global|duplex>' mode, 'f' hi-fi, 'q' quit, 'h' help.");
 				}
 			}
 		} catch (IOException _) {

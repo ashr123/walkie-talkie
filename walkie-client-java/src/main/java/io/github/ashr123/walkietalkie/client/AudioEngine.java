@@ -31,8 +31,9 @@ final class AudioEngine implements AutoCloseable {
 	private static final byte CODEC_OPUS = 1;
 	private static final byte CODEC_PCM = 2;
 	private static final int MAX_ACTIVE_LANES = 8;          // cap on simultaneous per-sender decoders we mix (O(N^2) fan-out guard)
-	private static final int LANE_JITTER_CAP = 50;          // ~1 s per lane; drop oldest on overflow (audio is loss-tolerant)
-	private static final int LANE_TARGET_DEPTH = 4;         // per-tick catch-up: drop stale frames so a backed-up lane re-aligns
+	private static final int LANE_JITTER_CAP = 50;          // ~1 s hard cap per lane; drop oldest on overflow (audio is loss-tolerant)
+	private static final int LANE_TARGET_DEPTH = 4;         // jitter cushion (~80 ms): prebuffer this many frames before a lane plays (and re-prime after an underrun) so timing jitter doesn't gap
+	private static final int LANE_MAX_DEPTH = 12;           // drift ceiling (~240 ms): only past this does a lane trim back to the target, so steady-state frames are never dropped
 	private static final long SILENCE_TTL_NANOS = 4_000_000_000L;   // close a lane after ~4 s of silence (survives speech gaps)
 	/// Marker substrings of well-known virtual / loopback audio drivers that present as capture devices but
 	/// usually carry no microphone signal (they capture silence unless an app routes through them). The
@@ -67,16 +68,6 @@ final class AudioEngine implements AutoCloseable {
 		this.highFidelity = new AtomicBoolean(options.highFidelity());
 	}
 
-	/// Lists the audio mixers that expose a capture line, for use with `--input`.
-	static void listInputDevices() {
-		System.out.println("Available input devices (match with --input \"<name>\"):");
-		for (Mixer.Info info : AudioSystem.getMixerInfo()) {
-			if (AudioSystem.getMixer(info).getTargetLineInfo().length > 0) {
-				System.out.println("  - " + info.getName());
-			}
-		}
-	}
-
 	private static boolean lineSupported(Mixer.Info mixerInfo, DataLine.Info lineInfo) {
 		return mixerInfo == null
 				? AudioSystem.isLineSupported(lineInfo)
@@ -85,7 +76,7 @@ final class AudioEngine implements AutoCloseable {
 
 	/// Whether `name` looks like a virtual/loopback audio driver (see [#VIRTUAL_DEVICE_MARKERS]) rather than a
 	/// real microphone, so the no-`--input` auto-selection can skip it.
-	private static boolean isVirtualDevice(String name) {
+	static boolean isVirtualDevice(String name) {
 		return VIRTUAL_DEVICE_MARKERS.parallelStream().unordered()
 				.anyMatch(name.toLowerCase(Locale.ROOT)::contains);
 	}
@@ -210,10 +201,10 @@ final class AudioEngine implements AutoCloseable {
 		Mixer.Info auto = firstReal48k != null ? firstReal48k : firstRealAny;
 		if (auto != null) {
 			System.out.println("Capturing from input device: " + auto.getName()
-					+ " (auto-selected, skipping virtual devices — pass --input to override, --list-inputs to see all)");
+					+ " (auto-selected, skipping virtual devices — pass --input to override; --help lists all devices)");
 			return auto;
 		}
-		System.out.println("No real capture device identified; using the system default (may be silent — see --list-inputs).");
+		System.out.println("No real capture device identified; using the system default (may be silent — --help lists all devices).");
 		return null;
 	}
 
@@ -407,6 +398,7 @@ final class AudioEngine implements AutoCloseable {
 	private static final class Lane {
 
 		private final ArrayDeque<byte[]> jitter = new ArrayDeque<>();
+		private boolean priming = true;     // accumulate a cushion before playing (and after an underrun); playback thread only
 		private OpusDecoder decoder;        // created/used only on the playback thread
 		private volatile long lastSeen;     // System.nanoTime of the last frame offered (for age-out)
 
@@ -418,10 +410,25 @@ final class AudioEngine implements AutoCloseable {
 		}
 
 		synchronized byte[] take() {
-			while (jitter.size() > LANE_TARGET_DEPTH) {
-				jitter.removeFirst();   // catch up: discard stale frames so a backed-up lane re-aligns
+			// Prebuffer a small cushion before a lane starts playing (and rebuild it after an underrun), so the
+			// normal timing jitter between the receive thread and this playback thread doesn't leave a gap.
+			if (priming) {
+				if (jitter.size() < LANE_TARGET_DEPTH) {
+					return null;   // still filling the cushion -> this tick is silence for the lane
+				}
+				priming = false;
+			} else if (jitter.size() > LANE_MAX_DEPTH) {
+				// Sustained drift (sender's clock faster than ours): trim back to the target so latency stays
+				// bounded. Only here, never every tick, so steady-state audio is not dropped.
+				while (jitter.size() > LANE_TARGET_DEPTH) {
+					jitter.removeFirst();
+				}
 			}
-			return jitter.pollFirst();
+			byte[] frame = jitter.pollFirst();
+			if (frame == null) {
+				priming = true;   // underran the cushion -> re-prime before resuming (avoids choppy 1-frame play)
+			}
+			return frame;
 		}
 	}
 }

@@ -59,7 +59,7 @@ two reference clients, and three channel modes.
   and class-file level via `options.release = 25`, so it builds on a newer host JDK without needing a
   separate JDK 25 install. To pin a strict JDK 25 toolchain instead, see the note in
   [`build.gradle.kts`](build.gradle.kts).
-- The bundled Gradle wrapper (Gradle 9.6) — no system Gradle required.
+- The bundled Gradle wrapper (Gradle 9.6.1) — no system Gradle required.
 
 > **Environment note (this machine):** the shell exports a `JAVA_OPTS` containing the long-removed
 > `-XX:PermSize` PermGen flags, and Gradle's launcher inherits `JAVA_OPTS`. Prefix Gradle commands with
@@ -145,7 +145,9 @@ throughout.
    immediately). To encrypt audio **end-to-end**, set the same **Encryption
    passphrase** as everyone else in the channel (relay transport only; needs HTTPS or `localhost`).
    Click **Connect** and allow microphone access.
-3. **Push-to-talk** modes: hold the big button (or hold **Space**). **Full-duplex**: click to toggle your mic.
+3. **Push-to-talk** modes: hold the big button (or hold **Space**). **Full-duplex**: click to toggle your
+   mic — or tick **Connect muted** before connecting to join with the mic off (it stays muted until you
+   click Talk). That checkbox shows only in full-duplex mode and locks once connected.
 4. **Disconnect** (or closing the tab) closes the WebSocket, which ends your session — the signed token is
    stateless and self-expiring, so there's nothing to revoke.
 
@@ -168,24 +170,24 @@ JAVA_OPTS= ./gradlew :walkie-client-java:run --args="\
 
 All flags are optional (run with `--args="--help"` for the full list):
 
-| Flag                         | Default                 | Purpose                                                                                                                                                                                    |
-|------------------------------|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--server <url>`             | `https://localhost:8443`| Base URL of the server (on localhost the dev cert is auto-trusted; use `http://…` for a server run with `walkie.tls.enabled=false`).                                                                                                                                                               |
-| `--channel <name>`           | `lobby`                 | Channel to join (ignored for global mode; the name `global` is reserved for global mode).                                                                                                                                                 |
-| `--mode ptt\|global\|duplex` | `ptt`                   | Conversation mode **when creating** a channel; a later joiner adopts the channel's existing mode.                                                                                          |
-| `--display <name>`           | `guest`                 | Name shown to others — **1–32 chars of `[A-Za-z0-9_.-]`, no spaces** (the server rejects anything else).                                                                                   |
-| `--hifi`                     | off                     | Start in the Opus **music** profile (vs. voice); toggle live with `f` at the prompt.                                                                                                       |
-| `--input <substr>`           | system default          | Capture from the input device whose name contains `<substr>`.                                                                                                                              |
-| `--list-inputs`              | —                       | Print the available input devices and exit.                                                                                                                                                |
-| `--key <passphrase>`         | `$WALKIE_KEY`           | **End-to-end encrypt** the audio (AES-256-GCM). Everyone in the channel — including browser peers — must use the same passphrase on the same channel/mode; a mismatch is rejected at join. Ignored in global mode — that room is the server's unencrypted broadcast channel. |
-| `--tls-truststore <pem>`     | —                       | Extra PEM certificate to trust for TLS, besides the system CAs and (on localhost) the server's auto-generated dev cert. Verification stays on. |
+| Flag                         | Default                  | Purpose                                                                                                                                                                                                                                                                      |
+|------------------------------|--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--server <url>`             | `https://localhost:8443` | Base URL of the server (on localhost the dev cert is auto-trusted; use `http://…` for a server run with `walkie.tls.enabled=false`).                                                                                                                                         |
+| `--channel <name>`           | `lobby`                  | Channel to join (ignored for global mode; the name `global` is reserved for global mode).                                                                                                                                                                                    |
+| `--mode ptt\|global\|duplex` | `ptt`                    | Conversation mode **when creating** a channel; a later joiner adopts the channel's existing mode.                                                                                                                                                                            |
+| `--display <name>`           | `guest`                  | Name shown to others — **1–32 chars of `[A-Za-z0-9_.-]`, no spaces** (the server rejects anything else).                                                                                                                                                                     |
+| `--hifi`                     | off                      | Start in the Opus **music** profile (vs. voice); toggle live with `f` at the prompt.                                                                                                                                                                                         |
+| `--input <substr>`           | system default           | Capture from the input device whose name contains `<substr>`. Run `--help` to see the detected device names.                                                                                                                                                                 |
+| `--key <passphrase>`         | `$WALKIE_KEY`            | **End-to-end encrypt** the audio (AES-256-GCM). Everyone in the channel — including browser peers — must use the same passphrase on the same channel/mode; a mismatch is rejected at join. Ignored in global mode — that room is the server's unencrypted broadcast channel. |
+| `--tls-truststore <pem>`     | —                        | Extra PEM certificate to trust for TLS, besides the system CAs and (on localhost) the server's auto-generated dev cert. Verification stays on.                                                                                                                               |
+| `--muted`                    | off                      | Full-duplex only: join with the mic muted (type `t` to unmute). Ignored in push-to-talk modes.                                                                                                                                                                               |
 
-> Tip: run once with `--list-inputs` to see capture-device names, then pass a distinctive substring to
+> Tip: run `--help` to see the detected capture-device names, then pass a distinctive substring to
 > `--input` (e.g. `--input "USB"`).
 
-**Interactive commands** (type at the prompt): `t` talk/stop · `m <ptt|global|duplex>` change the mode
-(owner only) · `f` toggle hi-fi (music/voice) live · `q` quit (closes the socket, ending the session) · `h`
-help.
+**Interactive commands** (type at the prompt): `t` talk/stop · `w` list who's in the channel · `m
+<ptt|global|duplex>` change the mode (owner only) · `f` toggle hi-fi (music/voice) live · `q` quit (closes the
+socket, ending the session) · `h` help.
 
 The client encodes Opus at 48 kHz with in-band FEC (Concentus) — stereo when the audio device supports it,
 otherwise mono — and interoperates with relay-mode browser clients.
@@ -217,9 +219,11 @@ otherwise mono — and interoperates with relay-mode browser clients.
 - Stateless, CSRF-free token model; static client, health check and login are the only public routes.
 - Input is validated (display-name + channel-name patterns, audio-frame size caps). The browser renders
   member names with `textContent` to avoid markup injection.
-- **For production:** serve over WSS/HTTPS (TLS 1.2+) — see _Transport encryption (TLS / WSS)_ above and the `deploy/` proxy configs — restrict `walkie.allowed-origins`, set
-  `WALKIE_AUTH_SIGNING_KEY`, and swap the signed-token mint/verify for real IdP/JWT validation — the filter
-  wiring stays the same.
+- **For production:** serve over WSS/HTTPS (TLS 1.2+) — see _Transport encryption (TLS / WSS)_ above and the
+  `deploy/` proxy configs — and **override `walkie.allowed-origins`**: it **defaults to `*`** (wide open),
+  and because CSRF is disabled this WebSocket origin check is the sole anti-CSWSH (cross-site WebSocket
+  hijacking) control, so it MUST be set to your real HTTPS origin(s). Also set `WALKIE_AUTH_SIGNING_KEY`, and
+  swap the signed-token mint/verify for real IdP/JWT validation — the filter wiring stays the same.
 
 ## Java 25 features used
 

@@ -7,8 +7,14 @@ import picocli.CommandLine.ITypeConverter;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.TypeConversionException;
 
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.Mixer;
+import javax.sound.sampled.TargetDataLine;
+import java.util.Arrays;
+import java.util.Iterator;
 import java.util.Locale;
 import java.util.concurrent.Callable;
+import java.util.function.Predicate;
 
 /// Entry point for the desktop walkie-talkie client, parsed with picocli.
 ///
@@ -47,12 +53,10 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 	@Option(names = "--hifi", description = "Use the Opus music profile instead of the voice profile.")
 	private boolean highFidelity;
 
-	@Option(names = "--input",
-			description = "Capture from the input device whose name contains this text (default: the system default). See --list-inputs.")
+	@Option(names = "--input", completionCandidates = InputDeviceCandidates.class,
+			description = "Capture from the input device whose name contains this text (default: the system "
+					+ "default). Detected input devices: ${COMPLETION-CANDIDATES}")
 	private String input;
-
-	@Option(names = "--list-inputs", description = "List available audio input devices and exit.")
-	private boolean listInputs;
 
 	@Option(names = "--key", defaultValue = "${env:WALKIE_KEY:-}",
 			description = "Passphrase for end-to-end audio encryption (AES-256-GCM). Every participant in a "
@@ -64,16 +68,16 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 					+ "trusted, and on localhost the server's auto-generated dev cert is trusted automatically.")
 	private String tlsTruststore;
 
+	@Option(names = "--muted", description = "Full-duplex only: connect with the mic muted (type 't' to "
+			+ "unmute). By default the mic is live on connect; ignored in push-to-talk modes.")
+	private boolean startMuted;
+
 	static void main(String... args) {
 		System.exit(new CommandLine(new WalkieClientLauncher()).execute(args));
 	}
 
 	@Override
 	public Integer call() throws Exception {
-		if (listInputs) {
-			WalkieClient.listInputDevices();
-			return 0;
-		}
 		try (WalkieClient _ = new WalkieClient(new ClientOptions(
 				server,
 				channel,
@@ -82,10 +86,32 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 				highFidelity,
 				input,
 				key,
-				tlsTruststore
+				tlsTruststore,
+				startMuted
 		))) {
 		}
 		return 0;
+	}
+
+	/// Supplies the detected audio capture devices as picocli completion candidates, so they show up directly
+	/// in `--help` (via the `${COMPLETION-CANDIDATES}` variable in the `--input` description) and in generated
+	/// shell completions — there is no separate "list devices" run. Enumerated lazily, only when picocli
+	/// renders help or completions, never on a normal launch.
+	private static final class InputDeviceCandidates implements Iterable<String> {
+		@Override
+		public Iterator<String> iterator() {
+			return Arrays.stream(AudioSystem.getMixerInfo())
+					// A mixer is a real capture device only if it exposes a TargetDataLine. Testing
+					// getTargetLineInfo().length > 0 is wrong: Java Sound "Port ..." mixers invert direction and
+					// report OUTPUT ports (speakers, line-out) as target lines, so that test admits outputs (and
+					// drops mic Port mixers, whose mic is a *source* line). Check the line class, matching what
+					// AudioEngine.resolveInputMixer() actually requires when opening the capture line.
+					.filter(info -> Arrays.stream(AudioSystem.getMixer(info).getTargetLineInfo())
+							.anyMatch(line -> TargetDataLine.class.isAssignableFrom(line.getLineClass())))
+					.map(Mixer.Info::getName)
+					.filter(Predicate.not(AudioEngine::isVirtualDevice))
+					.iterator();
+		}
 	}
 
 	/// Accepts friendly aliases for [ChannelMode] in addition to the enum names.
