@@ -7,7 +7,6 @@ import io.github.ashr123.walkietalkie.server.session.WebSocketClientSession;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.jspecify.annotations.NonNull;
 import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
@@ -25,8 +24,6 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 	private static final int SEND_BUFFER_LIMIT_BYTES = 512 * 1024;
 	protected final ConnectionService connectionService;
 	protected final MessageCodec codec;
-	@SuppressWarnings("NonConstantLogger")
-	private final Logger log = LoggerFactory.getLogger(getClass());
 	private final Transport transport;
 
 	protected BaseWalkieHandler(ConnectionService connectionService, MessageCodec codec, Transport transport) {
@@ -48,7 +45,7 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 		try {
 			connectionService.onMessage(clientSession, codec.decode(message.getPayload()));
 		} catch (RuntimeException e) {
-			log.debug("Bad control message from {}: {}", clientSession.id(), e.getMessage());
+			getLogger().debug("Bad control message from {}: {}", clientSession.id(), e.getMessage());
 			clientSession.send(new ServerMessage.ErrorMessage("bad_message", "Could not parse control message"));
 		}
 	}
@@ -69,7 +66,7 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 
 	@Override
 	public void handleTransportError(WebSocketSession session, Throwable exception) {
-		log.debug("Transport error on session {}: {}", session.getId(), exception.toString());
+		getLogger().debug("Transport error on session {}: {}", session.getId(), exception.toString());
 		// A transport error may precede afterConnectionClosed; close the pump now (idempotent) so it can't leak.
 		ClientSession clientSession = lookup(session);
 		if (clientSession != null) {
@@ -107,4 +104,6 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 		clientSession.start();
 		ConnectionService.onConnect(clientSession);
 	}
+
+	protected abstract Logger getLogger();
 }
