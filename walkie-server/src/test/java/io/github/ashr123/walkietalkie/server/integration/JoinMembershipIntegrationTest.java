@@ -71,7 +71,7 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sb, new ClientMessage.Join("names", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
 			ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 
-			assertTrue(joinedB.members().stream().anyMatch(m -> m.displayName().equals("Al.ice-1_2")),
+			assertTrue(joinedB.members().stream().anyMatch(m -> "Al.ice-1_2".equals(m.displayName())),
 					"the validated display name is preserved verbatim in the snapshot");
 			assertEquals("Bob", awaitType(a.messages, ServerMessage.MemberJoined.class).member().displayName());
 		}

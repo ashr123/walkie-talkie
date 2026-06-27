@@ -5,7 +5,6 @@ import io.github.ashr123.walkietalkie.server.FakeClientSession;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
-import io.github.ashr123.walkietalkie.server.floor.FloorControlService;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -24,7 +23,7 @@ class ConnectionServiceTest {
 
 	private final ChannelRegistry channelRegistry = new ChannelRegistry();
 	private final ConnectionService service = new ConnectionService(
-			channelRegistry, new FloorControlService(), new WalkieProperties(List.of("*"), 8192, 65536, null));
+			channelRegistry, new WalkieProperties(List.of("*"), 8192, 65536, null));
 
 	private static FakeClientSession session(String id) {
 		return new FakeClientSession(id, Transport.AUDIO_RELAY, id);
@@ -333,7 +332,7 @@ class ConnectionServiceTest {
 	void aRelayFailureToOneRecipientDoesNotBlockOthers() {
 		FakeClientSession alice = join("alice", "relayfail", ChannelMode.FULL_DUPLEX);
 		FakeClientSession good = join("good", "relayfail", ChannelMode.FULL_DUPLEX);
-		ThrowingSession bad = new ThrowingSession("bad");
+		ClientSession bad = new ThrowingSession("bad");
 		service.onMessage(bad, new ClientMessage.Join("relayfail", ChannelMode.FULL_DUPLEX, "bad", null));
 
 		byte[] frame = {4, 5, 6};
@@ -406,7 +405,7 @@ class ConnectionServiceTest {
 		int aliceSid = channel("sid-roster").streamIndexOf("alice");
 		assertEquals(aliceSid, firstOf(alice, ServerMessage.Joined.class).members().getFirst().streamId());
 
-		FakeClientSession bob = join("bob", "sid-roster", ChannelMode.MULTI_CHANNEL_PTT);
+		join("bob", "sid-roster", ChannelMode.MULTI_CHANNEL_PTT);
 		int bobSid = channel("sid-roster").streamIndexOf("bob");
 		assertNotEquals(aliceSid, bobSid, "members get distinct stream indices");
 		assertEquals(bobSid, firstOf(alice, ServerMessage.MemberJoined.class).member().streamId(),

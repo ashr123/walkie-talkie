@@ -39,7 +39,7 @@ final class TlsTrust {
 	/// The system-default context when no extra certificates apply, otherwise a context trusting the system
 	/// CAs plus the extra certificate(s) — still fully verifying.
 	static SSLContext forServer(String serverUrl, String trustStorePath) throws GeneralSecurityException, IOException {
-		List<X509Certificate> extra = new ArrayList<>();
+		Collection<X509Certificate> extra = new ArrayList<>();
 		if (trustStorePath != null && !trustStorePath.isBlank()) {
 			extra.addAll(loadPemCertificates(Path.of(trustStorePath)));
 		}
@@ -63,7 +63,7 @@ final class TlsTrust {
 				return false;
 			}
 			String lower = host.toLowerCase(Locale.ROOT);
-			return lower.equals("localhost") || lower.equals("127.0.0.1") || lower.equals("::1") || lower.equals("[::1]");
+			return "localhost".equals(lower) || "127.0.0.1".equals(lower) || "::1".equals(lower) || "[::1]".equals(lower);
 		} catch (RuntimeException _) {
 			return false;
 		}
@@ -89,7 +89,7 @@ final class TlsTrust {
 		return firstX509(trustManagerFactory(null));
 	}
 
-	private static X509TrustManager trustManagerFor(List<X509Certificate> certificates) throws GeneralSecurityException, IOException {
+	private static X509TrustManager trustManagerFor(Iterable<? extends X509Certificate> certificates) throws GeneralSecurityException, IOException {
 		KeyStore store = KeyStore.getInstance(KeyStore.getDefaultType());
 		store.load(null, null);
 		int index = 0;

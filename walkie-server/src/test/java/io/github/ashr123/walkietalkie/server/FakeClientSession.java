@@ -4,13 +4,14 @@ import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /// In-memory [ClientSession] for unit tests; records everything sent to it.
 public final class FakeClientSession implements ClientSession {
 
-	public final List<ServerMessage> sent = new CopyOnWriteArrayList<>();
+	public final Collection<ServerMessage> sent = new CopyOnWriteArrayList<>();
 	public final List<byte[]> audio = new CopyOnWriteArrayList<>();
 	private final String id;
 	private final Transport transport;

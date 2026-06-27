@@ -79,6 +79,9 @@ class AuthBoundaryIntegrationTest extends WebSocketIntegrationTestSupport {
 		}
 	}
 
+	// connect() returns a WebSocketSession (Closeable), but here the handshake fails so it never returns one —
+	// there is nothing to close. Suppress the AutoCloseableResource false positive.
+	@SuppressWarnings("resource")
 	@Test
 	void aGarbageQueryTokenFailsTheRealWebSocketHandshake() {
 		// The handshake is rejected before the handler, so execute().get() completes exceptionally.

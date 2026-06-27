@@ -11,11 +11,9 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
-class FloorControlServiceTest {
+class FloorControlUtilTest {
 
-	private final FloorControlService service = new FloorControlService();
-
-	private FakeClientSession session(String id) {
+	private static FakeClientSession session(String id) {
 		return new FakeClientSession(id, Transport.AUDIO_RELAY, id);
 	}
 
@@ -27,9 +25,9 @@ class FloorControlServiceTest {
 		channel.add(alice);
 		channel.add(bob);
 
-		assertInstanceOf(FloorResult.Granted.class, service.requestFloor(channel, alice));
+		assertInstanceOf(FloorResult.Granted.class, FloorControlUtil.requestFloor(channel, alice));
 
-		FloorResult second = service.requestFloor(channel, bob);
+		FloorResult second = FloorControlUtil.requestFloor(channel, bob);
 		FloorResult.Denied denied = assertInstanceOf(FloorResult.Denied.class, second);
 		assertEquals("alice", denied.currentHolderId());
 		assertTrue(channel.holdsFloor("alice"));
@@ -42,9 +40,9 @@ class FloorControlServiceTest {
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 
-		assertInstanceOf(FloorResult.Granted.class, service.requestFloor(channel, alice));
-		assertTrue(service.releaseFloor(channel, alice));
-		assertInstanceOf(FloorResult.Granted.class, service.requestFloor(channel, bob));
+		assertInstanceOf(FloorResult.Granted.class, FloorControlUtil.requestFloor(channel, alice));
+		assertTrue(FloorControlUtil.releaseFloor(channel, alice));
+		assertInstanceOf(FloorResult.Granted.class, FloorControlUtil.requestFloor(channel, bob));
 		assertEquals(new Some<>("bob"), channel.floorHolder());
 	}
 
@@ -54,8 +52,8 @@ class FloorControlServiceTest {
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 
-		service.requestFloor(channel, alice);
-		assertFalse(service.releaseFloor(channel, bob));
+		FloorControlUtil.requestFloor(channel, alice);
+		assertFalse(FloorControlUtil.releaseFloor(channel, bob));
 		assertTrue(channel.holdsFloor("alice"));
 	}
 
@@ -65,8 +63,8 @@ class FloorControlServiceTest {
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 
-		assertInstanceOf(FloorResult.Granted.class, service.requestFloor(channel, alice));
-		assertInstanceOf(FloorResult.Granted.class, service.requestFloor(channel, bob));
+		assertInstanceOf(FloorResult.Granted.class, FloorControlUtil.requestFloor(channel, alice));
+		assertInstanceOf(FloorResult.Granted.class, FloorControlUtil.requestFloor(channel, bob));
 		assertTrue(channel.holdsFloor("alice"));
 		assertTrue(channel.holdsFloor("bob"));
 		assertInstanceOf(None.class, channel.floorHolder());
@@ -82,7 +80,7 @@ class FloorControlServiceTest {
 		when(channel.floorHolder()).thenReturn(None.instance());
 
 		FloorResult.Denied denied = assertInstanceOf(FloorResult.Denied.class,
-				service.requestFloor(channel, session("alice")));
+				FloorControlUtil.requestFloor(channel, session("alice")));
 		assertNull(denied.currentHolderId(), "the denial carries no holder when the floor read back empty");
 	}
 }

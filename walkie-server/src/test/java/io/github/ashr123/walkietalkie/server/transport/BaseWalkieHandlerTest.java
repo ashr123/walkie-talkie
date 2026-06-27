@@ -20,6 +20,9 @@ import static org.mockito.Mockito.*;
 /// [io.github.ashr123.walkietalkie.server.session.ClientSession] are ignored rather than throwing. These
 /// branches sit before the [ConnectionService] is ever reached, so they can't be exercised over a real,
 /// security-authenticated socket — hence the direct unit test.
+// Mockito mocks of Closeable types (WebSocketSession) trip IntelliJ's "AutoCloseableResource" inspection,
+// but a mock is not a real resource — there is nothing to close. Suppress that false positive class-wide.
+@SuppressWarnings("resource")
 class BaseWalkieHandlerTest {
 
 	private final ConnectionService connectionService = mock(ConnectionService.class);
@@ -33,7 +36,7 @@ class BaseWalkieHandlerTest {
 		handler.afterConnectionEstablished(session);
 
 		verify(session).close(argThat(status -> status.getCode() == CloseStatus.POLICY_VIOLATION.getCode()));
-		verify(connectionService, never()).onConnect(any());
+		verify(session, never()).getAttributes();   // bailed before registering the session (getAttributes().put)
 	}
 
 	@Test
@@ -43,7 +46,7 @@ class BaseWalkieHandlerTest {
 		doThrow(new IOException("close failed")).when(session).close(any(CloseStatus.class));
 
 		assertDoesNotThrow(() -> handler.afterConnectionEstablished(session));
-		verify(connectionService, never()).onConnect(any());
+		verify(session, never()).getAttributes();   // even when close() fails, it never proceeds to register
 	}
 
 	@Test

@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 
 	/// Joins Alice (owner) then Bob to a fresh channel, draining Alice's MemberJoined; returns [aliceId,bobId].
-	private String[] joinPair(String path, String channel, ChannelMode mode,
+	private String[] joinPair(String channel, ChannelMode mode,
 	                          WebSocketSession sa, CollectingHandler a,
 	                          WebSocketSession sb, CollectingHandler b) throws Exception {
 		send(sa, new ClientMessage.Join(channel, mode, "Alice", null));
@@ -31,7 +31,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			joinPair(AUDIO, "mode-bcast", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			joinPair("mode-bcast", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
 
 			assertEquals(ChannelMode.FULL_DUPLEX, awaitType(a.messages, ServerMessage.ModeChanged.class).mode());
@@ -47,7 +47,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			joinPair(AUDIO, "mode-clear", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			joinPair("mode-clear", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			// Bob takes the floor.
 			send(sb, new ClientMessage.RequestFloor());
 			awaitType(b.messages, ServerMessage.FloorGranted.class);
@@ -71,7 +71,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			joinPair(AUDIO, "mode-same", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			joinPair("mode-same", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));   // already this mode
 			assertNotReceived(a.messages, ServerMessage.ModeChanged.class);
 			assertNotReceived(b.messages, ServerMessage.ModeChanged.class);
@@ -109,7 +109,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			String[] ids = joinPair(AUDIO, "owner-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			String[] ids = joinPair("owner-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.Leave());
 			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
 			assertEquals(ids[1], awaitType(b.messages, ServerMessage.OwnerChanged.class).ownerId(),
@@ -123,7 +123,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			String[] ids = joinPair(AUDIO, "nonowner-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			String[] ids = joinPair("nonowner-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sb, new ClientMessage.Leave());   // Bob is not the owner
 			assertEquals(ids[1], awaitType(a.messages, ServerMessage.MemberLeft.class).memberId());
 			assertNotReceived(a.messages, ServerMessage.OwnerChanged.class);
@@ -136,7 +136,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			String[] ids = joinPair(AUDIO, "owner-floor-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			String[] ids = joinPair("owner-floor-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
 			awaitType(b.messages, ServerMessage.FloorTaken.class);
@@ -156,7 +156,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login());
 		     WebSocketSession sc = connect(AUDIO, c, login())) {
-			String[] ids = joinPair(AUDIO, "reelect", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			String[] ids = joinPair("reelect", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			// Alice leaves; Bob is the only remaining member, so he is elected owner.
 			send(sa, new ClientMessage.Leave());
 			assertEquals(ids[1], awaitType(b.messages, ServerMessage.OwnerChanged.class).ownerId());
@@ -179,7 +179,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(SIGNAL, a, login());
 		     WebSocketSession sb = connect(SIGNAL, b, login())) {
-			String[] ids = joinPair(SIGNAL, "owner-signal", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			String[] ids = joinPair("owner-signal", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.Leave());
 			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
 			assertEquals(ids[1], awaitType(b.messages, ServerMessage.OwnerChanged.class).ownerId());

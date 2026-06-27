@@ -1,25 +1,12 @@
 package io.github.ashr123.walkietalkie.client;
 
-import io.github.jaredmdobson.concentus.OpusApplication;
-import io.github.jaredmdobson.concentus.OpusDecoder;
-import io.github.jaredmdobson.concentus.OpusEncoder;
-import io.github.jaredmdobson.concentus.OpusException;
-import io.github.jaredmdobson.concentus.OpusSignal;
+import io.github.jaredmdobson.concentus.*;
 
-import javax.sound.sampled.AudioFormat;
-import javax.sound.sampled.AudioSystem;
-import javax.sound.sampled.DataLine;
-import javax.sound.sampled.LineUnavailableException;
-import javax.sound.sampled.Mixer;
-import javax.sound.sampled.SourceDataLine;
-import javax.sound.sampled.TargetDataLine;
+import javax.sound.sampled.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.ArrayDeque;
+import java.util.*;
 import java.util.Arrays;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -348,7 +335,7 @@ final class AudioEngine implements AutoCloseable {
 				}
 			}
 			for (int i = 0; i < frameSamples; i++) {
-				short clipped = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, mix[i]));
+				short clipped = (short) Math.clamp(mix[i], Short.MIN_VALUE, Short.MAX_VALUE);
 				out[i * 2] = (byte) clipped;
 				out[i * 2 + 1] = (byte) (clipped >> 8);
 			}

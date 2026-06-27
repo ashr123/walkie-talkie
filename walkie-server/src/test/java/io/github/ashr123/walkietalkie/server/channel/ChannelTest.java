@@ -1,13 +1,15 @@
 package io.github.ashr123.walkietalkie.server.channel;
 
 import io.github.ashr123.option.None;
+import io.github.ashr123.walkietalkie.server.floor.FloorControlUtil;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Channel-level floor semantics that the service tests don't reach directly — in particular that
-/// `tryAcquireFloor` short-circuits to a grant in full-duplex (its only caller, [io.github.ashr123.walkietalkie.server.floor.FloorControlService],
+/// `tryAcquireFloor` short-circuits to a grant in full-duplex (its only caller, [FloorControlUtil],
 /// already guards that mode, so this self-contained guarantee is only observable by calling it directly).
 class ChannelTest {
 

@@ -168,7 +168,7 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 	// and so cannot go in a try-with-resources. inheritIO (below) creates no pipes, so there is nothing to
 	// close anyway — the IDE's resource warning is a false-positive for this build target.
 	@SuppressWarnings("resource")
-	private static void runKeytool(List<String> arguments) throws IOException, InterruptedException {
+	private static void runKeytool(Collection<String> arguments) throws IOException, InterruptedException {
 		List<String> command = new ArrayList<>();
 		command.add(Path.of(
 				System.getProperty("java.home"),

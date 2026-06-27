@@ -12,7 +12,7 @@ class ChannelRegistryTest {
 
 	private final ChannelRegistry registry = new ChannelRegistry();
 
-	private FakeClientSession session(String id) {
+	private static FakeClientSession session(String id) {
 		return new FakeClientSession(id, Transport.AUDIO_RELAY, id);
 	}
 

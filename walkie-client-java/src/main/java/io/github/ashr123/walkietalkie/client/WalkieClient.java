@@ -395,6 +395,7 @@ public final class WalkieClient implements AutoCloseable {
 
 	private final class ClientListener implements WebSocket.Listener {
 
+		@SuppressWarnings("StringBufferField")
 		private final StringBuilder textBuffer = new StringBuilder();
 		private final ByteArrayOutputStream binaryBuffer = new ByteArrayOutputStream();
 

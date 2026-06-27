@@ -41,7 +41,7 @@ public final class Channel {
 	/// member's still-in-flight frames. Allocation/free are synchronized; reads go through the concurrent map.
 	private final Map<String, Integer> streamIndices = new ConcurrentHashMap<>();
 	private final boolean[] indexInUse = new boolean[STREAM_INDEX_RANGE];
-	private int rotation = 0;
+	private int rotation;
 
 	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck) {
 		this.name = name;
@@ -139,7 +139,7 @@ public final class Channel {
 	}
 
 	/// Applies an action to every member except the one with `excludeSessionId`.
-	public void forEachOther(String excludeSessionId, Consumer<ClientSession> action) {
+	public void forEachOther(String excludeSessionId, Consumer<? super ClientSession> action) {
 		for (ClientSession session : members.values()) {
 			if (!session.id().equals(excludeSessionId)) {
 				action.accept(session);

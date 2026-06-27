@@ -25,6 +25,7 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 	private static final int SEND_BUFFER_LIMIT_BYTES = 512 * 1024;
 	protected final ConnectionService connectionService;
 	protected final MessageCodec codec;
+	@SuppressWarnings("NonConstantLogger")
 	private final Logger log = LoggerFactory.getLogger(getClass());
 	private final Transport transport;
 
@@ -34,27 +35,8 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 		this.transport = transport;
 	}
 
-	@Override
-	public void afterConnectionEstablished(WebSocketSession session) {
-		Principal principal = session.getPrincipal();
-		if (principal == null) {
-			closeUnauthenticated(session);
-			return;
-		}
-		WebSocketClientSession clientSession = new WebSocketClientSession(
-				new ConcurrentWebSocketSessionDecorator(
-						session,
-						SEND_TIME_LIMIT_MS,
-						SEND_BUFFER_LIMIT_BYTES
-				),
-				codec,
-				transport
-		);
-		session.getAttributes().put(SESSION_KEY, clientSession);
-		// Start the outbound pump only after the session is registered, so afterConnectionClosed can always
-		// find and close it (no construct-before-register leak window).
-		clientSession.start();
-		connectionService.onConnect(clientSession);
+	protected static ClientSession lookup(WebSocketSession session) {
+		return (ClientSession) session.getAttributes().get(SESSION_KEY);
 	}
 
 	@Override
@@ -95,15 +77,34 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 		}
 	}
 
-	protected ClientSession lookup(WebSocketSession session) {
-		return (ClientSession) session.getAttributes().get(SESSION_KEY);
-	}
-
-	private void closeUnauthenticated(WebSocketSession session) {
+	private static void closeUnauthenticated(WebSocketSession session) {
 		try {
 			session.close(CloseStatus.POLICY_VIOLATION.withReason("unauthenticated"));
 		} catch (Exception _) {
 			// best-effort
 		}
+	}
+
+	@Override
+	public void afterConnectionEstablished(WebSocketSession session) {
+		Principal principal = session.getPrincipal();
+		if (principal == null) {
+			closeUnauthenticated(session);
+			return;
+		}
+		WebSocketClientSession clientSession = new WebSocketClientSession(
+				new ConcurrentWebSocketSessionDecorator(
+						session,
+						SEND_TIME_LIMIT_MS,
+						SEND_BUFFER_LIMIT_BYTES
+				),
+				codec,
+				transport
+		);
+		session.getAttributes().put(SESSION_KEY, clientSession);
+		// Start the outbound pump only after the session is registered, so afterConnectionClosed can always
+		// find and close it (no construct-before-register leak window).
+		clientSession.start();
+		ConnectionService.onConnect(clientSession);
 	}
 }

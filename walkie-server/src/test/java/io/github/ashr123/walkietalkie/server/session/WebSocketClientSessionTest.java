@@ -11,15 +11,16 @@ import java.io.IOException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 /// The session's outbound path is asynchronous and non-blocking, with control and audio handled separately:
 /// audio is droppable on overflow, control is delivered reliably (with priority) or — if it cannot even be
 /// queued — the hopelessly-behind session is closed. These tests pin isolation, failure-swallowing, the
 /// audio drop policy, control reliability under audio congestion, the control-overflow close, and teardown.
+// Mockito mocks of Closeable types (WebSocketSession) trip IntelliJ's "AutoCloseableResource" inspection,
+// but a mock is not a real resource — there is nothing to close. Suppress that false positive class-wide.
+@SuppressWarnings("resource")
 class WebSocketClientSessionTest {
 
 	/// A doAnswer body that blocks until `release`, surviving an interrupt (so close() teardown is clean).
