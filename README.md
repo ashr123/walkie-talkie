@@ -121,7 +121,7 @@ hardcoded or committed):
 
 ```bash
 export WALKIE_TLS_KEYSTORE_PASSWORD=…              # your keystore password
-scripts/gen-dev-cert.sh                            # optional: writes ./dev-keystore.p12 (RSA-16384) + ./dev-cert.pem
+scripts/gen-dev-cert.sh                            # optional: writes ./dev-keystore.p12 (EC P-384) + ./dev-cert.pem
 WALKIE_TLS_KEYSTORE="file:$PWD/dev-keystore.p12" JAVA_OPTS= ./gradlew :walkie-server:bootRun
 # Java client against a custom cert:  --tls-truststore ./dev-cert.pem
 ```

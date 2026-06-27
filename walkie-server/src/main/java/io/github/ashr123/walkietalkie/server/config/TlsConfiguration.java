@@ -20,7 +20,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
-import java.security.interfaces.RSAPublicKey;
+import java.security.interfaces.ECPublicKey;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -33,9 +33,9 @@ import java.util.concurrent.TimeUnit;
 /// - if `WALKIE_TLS_KEYSTORE` (+ `WALKIE_TLS_KEYSTORE_PASSWORD`) is set, that operator keystore is used (real
 ///   CA cert in production);
 /// - otherwise a self-signed localhost dev certificate is auto-generated into `~/.walkie-talkie/` on first
-///   use and **reused** across restarts (RSA-16384, so the slow keygen is a one-time cost); its public cert
-///   is exported to `dev-cert.pem` so the Java client can trust it on localhost. Browsers show a one-time
-///   warning. For a CA-issued cert, point `WALKIE_TLS_KEYSTORE` at your keystore.
+///   use and **reused** across restarts (EC P-384 — strong, fast to sign, and browser-compatible);
+///   its public cert is exported to `dev-cert.pem` so the Java client can trust it on localhost. Browsers show
+///   a one-time warning. For a CA-issued cert, point `WALKIE_TLS_KEYSTORE` at your keystore.
 @Configuration
 @ConditionalOnProperty(name = "walkie.tls.enabled", havingValue = "true", matchIfMissing = true)
 public class TlsConfiguration implements WebServerFactoryCustomizer<ConfigurableServletWebServerFactory> {
@@ -44,15 +44,22 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 
 	private static final int TLS_PORT = 8443;
 	private static final String DEV_ALIAS = "walkie-dev";
-	/// RSA-16384 — the maximum the JCA RSA provider supports. The keygen is slow (can take minutes), so the
-	/// cert is generated once and **reused** across restarts (see [#ensureDevCertificate]) — a one-time cost,
-	/// not per-boot.
-	private static final int DEV_KEY_BITS = 16384;
-	/// SHA-512 with RSA for the certificate signature (keytool would otherwise default to SHA384withRSA).
-	private static final String DEV_SIG_ALG = "SHA512withRSA";
+	/// EC P-384 (`secp384r1`, ~192-bit security) — the strongest curve browsers actually support for TLS.
+	/// (P-521 is stronger, but Chrome/BoringSSL does NOT implement it for TLS — neither the curve nor the
+	/// `ecdsa_secp521r1_sha512` scheme — so a P-521 cert fails the handshake with ERR_CONNECTION_CLOSED.)
+	/// Preferred over a large RSA key because the server signs with this key on EVERY TLS handshake and RSA
+	/// private-key cost grows ~cubically (RSA-16384 ≈ 300-500 ms/handshake — a CPU + DoS-amplification hazard),
+	/// whereas a P-384 signature is well under a millisecond.
+	private static final String DEV_KEY_ALG = "EC";
+	private static final String DEV_EC_CURVE = "secp384r1";
+	/// P-384's prime-field size in bits — uniquely identifies the curve when validating a persisted keystore.
+	private static final int DEV_EC_FIELD_BITS = 384;
+	/// SHA-384 with ECDSA — the hash TLS binds to P-384 (`ecdsa_secp384r1_sha384`). ECDSA locks the hash to the
+	/// curve, and SHA-512 ECDSA would require the browser-unsupported P-521; SHA-384 is no practical downgrade.
+	private static final String DEV_SIG_ALG = "SHA384withECDSA";
 	private static final int DEV_CERT_VALIDITY_DAYS = 825;
 	private static final int PASSWORD_BYTES = 24;                 // 192 bits of entropy, Base64url -> 32 chars
-	private static final long KEYTOOL_TIMEOUT_SECONDS = 600;   // RSA-16384 keygen can take minutes; this only bounds a wedged keytool
+	private static final long KEYTOOL_TIMEOUT_SECONDS = 60;   // EC keygen is instant; this only bounds a wedged keytool process
 
 	private static final Path DEV_TLS_DIR = Path.of(System.getProperty("user.home"), ".walkie-talkie");
 	private static final Path DEV_KEYSTORE = DEV_TLS_DIR.resolve("dev-keystore.p12");
@@ -93,9 +100,28 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 		factory.setPort(TLS_PORT);
 	}
 
+	/// Whether the persisted keystore can be reused: openable with `password`, holding an unexpired EC cert on
+	/// the current curve ([#DEV_EC_CURVE]). Any failure (wrong password, expired, a different key algorithm/curve
+	/// from an older cert, corrupt) returns false so a fresh cert is generated instead.
+	private static boolean isReusable(String password) {
+		try (InputStream in = Files.newInputStream(DEV_KEYSTORE)) {
+			KeyStore store = KeyStore.getInstance("PKCS12");
+			store.load(in, password.toCharArray());
+			if (store.getCertificate(DEV_ALIAS) instanceof X509Certificate cert) {
+				cert.checkValidity();   // throws if expired / not yet valid
+				return cert.getPublicKey() instanceof ECPublicKey ec
+						&& ec.getParams().getCurve().getField().getFieldSize() == DEV_EC_FIELD_BITS;
+			}
+			return false;
+		} catch (GeneralSecurityException | IOException _) {
+			return false;
+		}
+	}
+
 	/// Returns the dev keystore password, reusing the previously-generated keystore when it is present, valid,
-	/// and the current [#DEV_KEY_BITS] strength — otherwise generating a fresh one. Persisting and reusing
-	/// makes the slow RSA-16384 keygen a one-time cost rather than a per-boot one.
+	/// and on the current [#DEV_EC_CURVE] — otherwise generating a fresh one. Persisting and reusing keeps a
+	/// stable cert across restarts (so the browser's one-time trust prompt isn't re-triggered every boot) and
+	/// means a key-algorithm change (e.g. an older RSA keystore) is detected and regenerated.
 	private String ensureDevCertificate() {
 		try {
 			createPrivateDirectory(DEV_TLS_DIR);
@@ -116,37 +142,19 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 		}
 	}
 
-	/// Whether the persisted keystore can be reused: openable with `password`, holding an unexpired RSA cert of
-	/// the current [#DEV_KEY_BITS] strength. Any failure (wrong password, expired, wrong size, corrupt) returns
-	/// false so a fresh cert is generated instead.
-	private static boolean isReusable(String password) {
-		try (InputStream in = Files.newInputStream(DEV_KEYSTORE)) {
-			KeyStore store = KeyStore.getInstance("PKCS12");
-			store.load(in, password.toCharArray());
-			if (store.getCertificate(DEV_ALIAS) instanceof X509Certificate cert) {
-				cert.checkValidity();   // throws if expired / not yet valid
-				return cert.getPublicKey() instanceof RSAPublicKey rsa && rsa.getModulus().bitLength() == DEV_KEY_BITS;
-			}
-			return false;
-		} catch (GeneralSecurityException | IOException _) {
-			return false;
-		}
-	}
-
-	/// Generates a fresh self-signed localhost keystore (RSA-16384, signed [#DEV_SIG_ALG]), exports its public
-	/// cert to PEM, and persists the random keystore password — all under `~/.walkie-talkie/`. Uses the JDK's
-	/// own `keytool` with a FIXED argument list (no external/user input reaches the process), per policy.
+	/// Generates a fresh self-signed localhost keystore (EC [#DEV_EC_CURVE], signed [#DEV_SIG_ALG]), exports its
+	/// public cert to PEM, and persists the random keystore password — all under `~/.walkie-talkie/`. Uses the
+	/// JDK's own `keytool` with a FIXED argument list (no external/user input reaches the process), per policy.
 	private String generateDevCertificate() throws IOException, InterruptedException {
 		byte[] entropy = new byte[PASSWORD_BYTES];
 		secureRandom.nextBytes(entropy);
 		String password = Base64.getUrlEncoder().withoutPadding().encodeToString(entropy);
 
-		log.info("Generating a new RSA-{} self-signed dev certificate — a one-time cost that can take a while; "
-				+ "it is reused on later starts.", DEV_KEY_BITS);
+		log.info("Generating a new EC {} self-signed dev certificate; it is reused on later starts.", DEV_EC_CURVE);
 		Files.deleteIfExists(DEV_KEYSTORE);
 		runKeytool(List.of(
 				"-genkeypair", "-alias", DEV_ALIAS,
-				"-keyalg", "RSA", "-keysize", Integer.toString(DEV_KEY_BITS),
+				"-keyalg", DEV_KEY_ALG, "-groupname", DEV_EC_CURVE,
 				"-sigalg", DEV_SIG_ALG,
 				"-validity", Integer.toString(DEV_CERT_VALIDITY_DAYS),
 				"-storetype", "PKCS12",

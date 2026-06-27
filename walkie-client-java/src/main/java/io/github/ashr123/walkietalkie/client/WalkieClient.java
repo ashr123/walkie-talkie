@@ -111,7 +111,7 @@ public final class WalkieClient implements AutoCloseable {
 
 	private static String modeHint(ChannelMode mode) {
 		return mode == ChannelMode.FULL_DUPLEX
-				? "Full-duplex: type 't' to start/stop your mic."
+				? "Full-duplex: mic is live — type 't' to mute/unmute."
 				: "Push-to-talk: type 't' to grab/release the floor.";
 	}
 
@@ -191,6 +191,9 @@ public final class WalkieClient implements AutoCloseable {
 				this.selfId = selfId;
 				this.ownerId = ownerId;
 				this.currentMode = mode;
+				// Full-duplex: the mic is live as soon as you join (matches the browser client); PTT/global
+				// start muted and require 't' to grab the floor. (Full-duplex transmit needs no floor request.)
+				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX);
 				memberNames.clear();
 				members.forEach(member -> memberNames.put(member.id(), member.displayName()));
 				log("[joined] channel=" + channel + " mode=" + mode + " members=" + members.size()
@@ -209,7 +212,8 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.FloorIdle _ -> log("[floor free]");
 			case ServerMessage.ModeChanged(ChannelMode mode) -> {
 				currentMode = mode;
-				audio.setTransmitting(false);
+				// Match the browser: switching to full-duplex opens the mic immediately; any other mode mutes.
+				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX);
 				log("[mode changed] now " + mode + System.lineSeparator()
 						+ modeHint(mode));
 			}

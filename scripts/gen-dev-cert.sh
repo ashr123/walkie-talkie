@@ -5,8 +5,9 @@
 # you only need this for a *stable* cert (e.g. to avoid re-accepting it in the browser after each restart).
 # Point the server at it with WALKIE_TLS_KEYSTORE (see the printed command below).
 #
-# It uses RSA-16384 (the JCA maximum) signed with SHA-512 — the strongest available — but generating a
-# 16384-bit key can take a while (a one-time cost); lower -keysize below (e.g. 8192) if that's too slow.
+# It uses an EC P-384 (secp384r1) key signed with SHA-384 — the strongest curve browsers support for TLS
+# (Chrome/BoringSSL does NOT implement P-521). It generates instantly and, unlike a large RSA key, keeps TLS
+# handshakes cheap: the server signs with this key on every handshake, and RSA cost grows ~cubically.
 #
 # Development only — browsers warn that the cert is untrusted (click through on localhost). For production
 # use a real CA-issued cert, ideally via the reverse proxy in deploy/ (see the README).
@@ -31,8 +32,8 @@ fi
 
 keytool -genkeypair \
 	-alias walkie-dev \
-	-keyalg RSA -keysize 16384 \
-	-sigalg SHA512withRSA \
+	-keyalg EC -groupname secp384r1 \
+	-sigalg SHA384withECDSA \
 	-validity 825 \
 	-storetype PKCS12 \
 	-keystore "$KEYSTORE" \
