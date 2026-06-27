@@ -217,7 +217,17 @@ public final class WalkieClient implements AutoCloseable {
 			}
 			case ServerMessage.FloorDenied(String currentHolderId) ->
 					log("[floor busy] currently held by " + name(currentHolderId));
+			case ServerMessage.FloorTaken(String holderId) when audio.isTransmitting() && currentMode != ChannelMode.FULL_DUPLEX -> {
+				// We held the floor and the server handed it to someone else (idle auto-release): stop.
+				audio.setTransmitting(false);
+				log("[released] floor reassigned to " + name(holderId) + " — type 't' to request it again");
+			}
 			case ServerMessage.FloorTaken(String holderId) -> log("[talking] " + name(holderId));
+			case ServerMessage.FloorIdle _ when audio.isTransmitting() && currentMode != ChannelMode.FULL_DUPLEX -> {
+				// The server freed our floor (max talk-time reached): stop; re-request to keep talking.
+				audio.setTransmitting(false);
+				log("[released] your talk time was up — type 't' to request the floor again");
+			}
 			case ServerMessage.FloorIdle _ -> log("[floor free]");
 			case ServerMessage.ModeChanged(ChannelMode mode) -> {
 				currentMode = mode;

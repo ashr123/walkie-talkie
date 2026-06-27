@@ -228,6 +228,12 @@ function onWsMessage(ev) {
 				setSpeaking(msg.holderId, true);
 			}
 			log('Talking: ' + (state.members.get(msg.holderId) || msg.holderId));
+			// If we were the PTT holder and the floor is now someone else's, the server reassigned it away from
+			// us (idle auto-release) — stop our mic and reset the button so we're not talking into a closed floor.
+			if (state.transmitting && state.mode !== 'FULL_DUPLEX' && msg.holderId !== state.selfId) {
+				endTransmit();
+				log('You were released from the floor (idle) — tap Talk to speak again');
+			}
 			break;
 		case 'floorIdle':
 			if (state.floorSpeaker) {
@@ -235,6 +241,11 @@ function onWsMessage(ev) {
 				state.floorSpeaker = null;
 			}
 			log('Floor is free');
+			// Server-initiated release while we held it (e.g. the max-hold talk timeout) — stop transmitting.
+			if (state.transmitting && state.mode !== 'FULL_DUPLEX') {
+				endTransmit();
+				log('Your talk time was up — tap Talk to speak again');
+			}
 			break;
 		case 'modeChanged':
 			onModeChanged(msg.mode);

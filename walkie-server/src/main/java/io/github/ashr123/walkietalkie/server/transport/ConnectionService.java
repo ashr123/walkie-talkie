@@ -4,6 +4,7 @@ import io.github.ashr123.option.Some;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
+import io.github.ashr123.walkietalkie.server.ratelimit.AudioRateLimiter;
 import io.github.ashr123.walkietalkie.server.floor.FloorControlUtil;
 import io.github.ashr123.walkietalkie.server.floor.FloorResult;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
@@ -14,8 +15,12 @@ import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.regex.Pattern;
 
 /// Transport-agnostic heart of the server. Both WebSocket handlers feed decoded control messages and
@@ -38,11 +43,30 @@ public class ConnectionService {
 
 	private final ChannelRegistry channelRegistry;
 	private final WalkieProperties properties;
+	private final AudioRateLimiter audioRateLimiter;
+	private final Clock clock;
+	private final Duration floorIdleRelease;
+	private final Duration floorMaxHold;
 
+	@Autowired
 	public ConnectionService(ChannelRegistry channelRegistry,
-	                         WalkieProperties properties) {
+	                         WalkieProperties properties,
+	                         AudioRateLimiter audioRateLimiter) {
+		this(channelRegistry, properties, audioRateLimiter, Clock.systemUTC());
+	}
+
+	/// Package-private seam: lets tests drive the push-to-talk floor timers with a controllable clock instead
+	/// of wall time.
+	ConnectionService(ChannelRegistry channelRegistry,
+	                  WalkieProperties properties,
+	                  AudioRateLimiter audioRateLimiter,
+	                  Clock clock) {
 		this.channelRegistry = channelRegistry;
 		this.properties = properties;
+		this.audioRateLimiter = audioRateLimiter;
+		this.clock = clock;
+		this.floorIdleRelease = Duration.ofSeconds(properties.floorIdleReleaseSeconds());
+		this.floorMaxHold = Duration.ofSeconds(properties.floorMaxHoldSeconds());
 	}
 
 	public static void onConnect(ClientSession session) {
@@ -183,14 +207,37 @@ public class ConnectionService {
 			return;
 		}
 		switch (FloorControlUtil.requestFloor(channel, session)) {
-			case FloorResult.Granted _ -> {
-				session.send(new ServerMessage.FloorGranted());
-				ServerMessage taken = new ServerMessage.FloorTaken(session.id());
-				channel.forEachOther(session.id(), other -> safeSend(other, taken));
+			case FloorResult.Granted _ -> grantFloor(channel, session);
+			// Idle auto-release: reclaim the floor for this requester if the current holder has gone silent
+			// past the configured window. "Silent" = no relayed frame for that long, which the server sees
+			// from frame timing without decoding audio — so it works on encrypted channels too. A holder who
+			// keeps talking is never idle and is instead bounded by the max-hold cap in onAudio. Restricted
+			// to a relay holder: a WebRTC holder's media flows peer-to-peer and never reaches onAudio, so the
+			// server has no activity signal for it and must not preempt an active WebRTC speaker as "idle".
+			case FloorResult.Denied(String currentHolderId) when !floorIdleRelease.isZero()
+					&& currentHolderId != null
+					&& !currentHolderId.equals(session.id())
+					&& channel.member(currentHolderId) instanceof Some(ClientSession holder)
+					&& holder.supportsAudioRelay()
+					&& channel.preemptFloorIfIdle(currentHolderId, session.id(),
+					clock.instant().minus(floorIdleRelease)) -> {
+				log.info("session={} preempted idle floor holder={} on channel={}",
+						session.id(), currentHolderId, channel.name());
+				grantFloor(channel, session);
 			}
 			case FloorResult.Denied(String currentHolderId) ->
 					session.send(new ServerMessage.FloorDenied(currentHolderId));
 		}
+	}
+
+	/// Confirms the (already-acquired) floor to `session`: stamps the acquire time for the hold timers and
+	/// announces the new holder to everyone else. The `FloorTaken` broadcast doubles as the notice to a
+	/// just-preempted ex-holder that the floor is no longer theirs.
+	private void grantFloor(Channel channel, ClientSession session) {
+		channel.markFloorAcquired(clock.instant());
+		session.send(new ServerMessage.FloorGranted());
+		ServerMessage taken = new ServerMessage.FloorTaken(session.id());
+		channel.forEachOther(session.id(), other -> safeSend(other, taken));
 	}
 
 	private void handleReleaseFloor(ClientSession session) {
@@ -208,13 +255,43 @@ public class ConnectionService {
 	/// is dropped when the sender is not currently authorized to talk (push-to-talk floor not held) or
 	/// when it violates the configured size bounds.
 	public void onAudio(ClientSession session, byte[] audio) {
-		if (!session.supportsAudioRelay() ||
-				audio.length == 0 ||
-				audio.length > properties.maxAudioFrameBytes()
+		if (!session.supportsAudioRelay()
+				|| audio.length == 0
+				|| audio.length > properties.maxAudioFrameBytes()
 				|| session.channelName() == null
 				|| !(channelRegistry.find(session.channelName()) instanceof Some(Channel channel))
 				|| !channel.holdsFloor(session.id())) {
 			return;
+		}
+		// Per-sender flood guard: drop frames from a sender exceeding the configured rate BEFORE fan-out, so a
+		// flooder can't amplify cost across the channel (N recipients) or force excess decode work. This counts
+		// frames without inspecting them, so it works on end-to-end-encrypted channels too (see AudioRateLimiter).
+		if (!audioRateLimiter.tryAcquire(session.id())) {
+			return;
+		}
+		// Push-to-talk hold limits (no-op in full-duplex, which has no single holder). The sender is the floor
+		// holder here (the gate above checked holdsFloor). Max-hold caps continuous talk; otherwise we refresh
+		// the activity mark so idle auto-release measures silence from this frame. Both key off frame timing,
+		// never audio content, so they hold on encrypted channels too.
+		if (channel.mode() != ChannelMode.FULL_DUPLEX) {
+			Instant now = clock.instant();
+			if (!floorMaxHold.isZero()
+					&& Duration.between(channel.floorAcquiredAt(), now).compareTo(floorMaxHold) >= 0) {
+				// Talk-time limit reached. Release ONLY if we still hold the floor: a concurrent RequestFloor may
+				// have legitimately handed it to someone else between this check and here, and a blind clear +
+				// broadcast would yank the floor from that new holder (a stray FloorIdle stopping their client).
+				// On a lost CAS, just drop this frame silently. On success, notify the channel INCLUDING the
+				// (ex-)speaker so its client stops transmitting and resets; the speaker must re-request.
+				if (channel.releaseFloor(session.id())) {
+					ServerMessage idle = new ServerMessage.FloorIdle();
+					session.send(idle);
+					channel.forEachOther(session.id(), other -> safeSend(other, idle));
+					log.info("session={} reached the max floor-hold time on channel={}; floor released",
+							session.id(), channel.name());
+				}
+				return;
+			}
+			channel.markFloorActivity(now);
 		}
 		// Tag the fan-out with the sender's per-channel stream index so receivers can demultiplex talkers;
 		// every client decodes per sender and mixes locally (see docs/CLIENT_PROTOCOL.md §5).
@@ -242,6 +319,7 @@ public class ConnectionService {
 
 	public void onClose(ClientSession session) {
 		handleLeave(session);
+		audioRateLimiter.forget(session.id());
 		log.info("Disconnected: session={}", session.id());
 	}
 

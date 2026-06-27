@@ -5,6 +5,7 @@ import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -169,5 +170,46 @@ public final class Channel {
 
 	public Option<String> floorHolder() {
 		return Option.of(floorHolder.get());
+	}
+
+	// --- floor hold timing (push-to-talk anti-hogging) --------------------------------------------
+	// Two marks let the server bound how long one member keeps the floor WITHOUT ever inspecting audio content
+	// — so the limits hold on end-to-end-encrypted channels too. `floorAcquiredAt` backs a max-hold cap
+	// (continuous talk time); `floorActivityAt` (the holder's most recent relayed frame) backs idle
+	// auto-release. Both are instants supplied by the caller, so Channel stays clock-free and unit-testable;
+	// they start at EPOCH and are only read after a real acquire stamps them (see ConnectionService).
+	private volatile Instant floorAcquiredAt = Instant.EPOCH;
+	private volatile Instant floorActivityAt = Instant.EPOCH;
+
+	/// Records that the floor was just acquired at `now`, resetting both the hold and the activity marks.
+	public void markFloorAcquired(Instant now) {
+		floorAcquiredAt = now;
+		floorActivityAt = now;
+	}
+
+	/// Refreshes the activity mark — call when the current holder transmits a frame, so idle auto-release
+	/// measures silence from the last frame, not from acquisition.
+	public void markFloorActivity(Instant now) {
+		floorActivityAt = now;
+	}
+
+	/// When the floor was acquired — the basis for the max-hold cap.
+	public Instant floorAcquiredAt() {
+		return floorAcquiredAt;
+	}
+
+	/// When the holder most recently transmitted — the basis for idle auto-release.
+	public Instant floorActivityAt() {
+		return floorActivityAt;
+	}
+
+	/// Atomically reassigns the floor from `expectedHolder` to `newHolder` for an idle auto-release: it succeeds
+	/// only if `expectedHolder` still holds the floor AND its last activity is at or before `idleBefore` (so a
+	/// holder that just refreshed — sent a frame, or released and re-acquired — is not preempted). The idle
+	/// check and the swap are one synchronized step; the activity *write* ([#markFloorActivity]) stays lock-free
+	/// on the per-frame path and only moves the mark forward, so it can't manufacture a false idle.
+	public synchronized boolean preemptFloorIfIdle(String expectedHolder, String newHolder, Instant idleBefore) {
+		return !floorActivityAt.isAfter(idleBefore)    // the holder was active within the window — leave it alone
+				&& floorHolder.compareAndSet(expectedHolder, newHolder);
 	}
 }

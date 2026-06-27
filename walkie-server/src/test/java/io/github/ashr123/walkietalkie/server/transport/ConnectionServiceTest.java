@@ -2,9 +2,11 @@ package io.github.ashr123.walkietalkie.server.transport;
 
 import io.github.ashr123.option.Some;
 import io.github.ashr123.walkietalkie.server.FakeClientSession;
+import io.github.ashr123.walkietalkie.server.MutableClock;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
+import io.github.ashr123.walkietalkie.server.ratelimit.AudioRateLimiter;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -12,6 +14,9 @@ import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 
@@ -22,8 +27,16 @@ import static org.junit.jupiter.api.Assertions.*;
 class ConnectionServiceTest {
 
 	private final ChannelRegistry channelRegistry = new ChannelRegistry();
+	private final WalkieProperties properties = new WalkieProperties(List.of("*"), 8192, 65536, 100, 5, 300, null);
 	private final ConnectionService service = new ConnectionService(
-			channelRegistry, new WalkieProperties(List.of("*"), 8192, 65536, null));
+			channelRegistry, properties, new AudioRateLimiter(properties));
+
+	/// Builds a service over the shared registry but with a hand-driven clock, so the push-to-talk floor
+	/// timers (idle auto-release, max-hold) can be tested deterministically.
+	private ConnectionService serviceWithClock(Clock clock, int idleSeconds, int maxHoldSeconds) {
+		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1000, idleSeconds, maxHoldSeconds, null);
+		return new ConnectionService(channelRegistry, props, new AudioRateLimiter(props), clock);
+	}
 
 	private static FakeClientSession session(String id) {
 		return new FakeClientSession(id, Transport.AUDIO_RELAY, id);
@@ -423,6 +436,127 @@ class ConnectionServiceTest {
 
 		assertNotEquals(aliceSid, channel("sid-reuse").streamIndexOf("carol"),
 				"a freed index is quarantined by the rotating allocator, not immediately reused");
+	}
+
+	// --- push-to-talk floor anti-hogging (idle auto-release + max-hold), driven with a fake clock ----------
+
+	@Test
+	void idleAutoReleaseReassignsTheFloorFromASilentHolder() {
+		MutableClock clock = new MutableClock(Instant.EPOCH);
+		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle-release 5 s, max-hold off
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("ptt", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("ptt", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice takes the floor at t=0
+		assertTrue(channel("ptt").holdsFloor("alice"));
+
+		bob.sent.clear();
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // immediate retry: alice isn't idle yet
+		assertEquals("alice", firstOf(bob, ServerMessage.FloorDenied.class).currentHolderId());
+		assertTrue(channel("ptt").holdsFloor("alice"), "the floor is still alice's");
+
+		clock.advance(Duration.ofSeconds(6));                    // 6 s of silence from alice
+		bob.sent.clear();
+		alice.sent.clear();
+		svc.onMessage(bob, new ClientMessage.RequestFloor());
+
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorGranted.class::isInstance),
+				"bob preempts the idle holder and is granted the floor");
+		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorTaken.class::isInstance),
+				"the ex-holder is told (via FloorTaken) that the floor moved, so its client stops transmitting");
+		assertTrue(channel("ptt").holdsFloor("bob"));
+	}
+
+	@Test
+	void maxHoldReleasesTheFloorAfterContinuousHolding() {
+		MutableClock clock = new MutableClock(Instant.EPOCH);
+		ConnectionService svc = serviceWithClock(clock, 0, 10);   // idle-release off, max-hold 10 s
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("ptt2", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("ptt2", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds at t=0
+		bob.audio.clear();
+		alice.sent.clear();
+		bob.sent.clear();
+
+		svc.onAudio(alice, new byte[]{1, 2, 3});                  // within the cap -> relayed
+		assertEquals(1, bob.audio.size(), "a frame within the hold cap is relayed");
+
+		clock.advance(Duration.ofSeconds(11));                   // past the 10 s cap
+		svc.onAudio(alice, new byte[]{4, 5, 6});
+
+		assertEquals(1, bob.audio.size(), "the over-cap frame is dropped, not relayed");
+		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+				"the speaker is told its talk time was up so its client stops");
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+				"the other members are told the floor was released");
+		assertFalse(channel("ptt2").holdsFloor("alice"), "the floor is freed for the next requester");
+	}
+
+	@Test
+	void anActiveSpeakerRefreshingTheFloorIsNotPreempted() {
+		MutableClock clock = new MutableClock(Instant.EPOCH);
+		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle-release 5 s, max-hold off
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("ptt-active", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("ptt-active", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice acquires at t=0
+		assertTrue(channel("ptt-active").holdsFloor("alice"));
+
+		clock.advance(Duration.ofSeconds(4));
+		svc.onAudio(alice, new byte[]{1, 2, 3});                  // active speaker -> refreshes the activity mark to t=4 s
+
+		clock.advance(Duration.ofSeconds(2));                    // t=6 s: only 2 s since the last frame (< 5 s idle window)
+		bob.sent.clear();
+		svc.onMessage(bob, new ClientMessage.RequestFloor());
+
+		assertEquals("alice", firstOf(bob, ServerMessage.FloorDenied.class).currentHolderId(),
+				"an active speaker's recent frame refreshes the activity mark, so bob is denied");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
+				"an actively-talking holder is not preempted");
+		assertTrue(channel("ptt-active").holdsFloor("alice"), "the floor is still alice's");
+	}
+
+	@Test
+	void aSenderOverItsAudioRateHasFramesDroppedBeforeFanOut() {
+		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 2, 0, 0, null);   // 2 fps -> burst 2
+		ConnectionService svc = new ConnectionService(channelRegistry, props, new AudioRateLimiter(props));
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, "bob", null));
+
+		byte[] frame = {1, 2, 3};
+		svc.onAudio(alice, frame);
+		svc.onAudio(alice, frame);
+		assertEquals(2, bob.audio.size(), "the burst-capacity frames are relayed");
+		svc.onAudio(alice, frame);   // over the per-sender rate -> dropped before fan-out
+		assertEquals(2, bob.audio.size(), "a frame past the rate cap is dropped before fan-out");
+	}
+
+	@Test
+	void onCloseForgetsTheSendersRateBucketSoAReconnectStartsFull() {
+		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1, 0, 0, null);   // 1 fps -> burst 1
+		ConnectionService svc = new ConnectionService(channelRegistry, props, new AudioRateLimiter(props));
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "bob", null));
+
+		byte[] frame = {1, 2, 3};
+		svc.onAudio(alice, frame);
+		svc.onAudio(alice, frame);   // exhausts the 1-token bucket
+		assertEquals(1, bob.audio.size(), "the second frame is over the cap and dropped");
+
+		svc.onClose(alice);          // must evict alice's bucket
+		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "alice", null));   // same id reconnects
+		bob.audio.clear();
+		svc.onAudio(alice, frame);
+		assertEquals(1, bob.audio.size(), "after onClose evicts the bucket, the reconnecting id starts from a full bucket");
 	}
 
 	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a
