@@ -26,6 +26,12 @@ public sealed interface ServerMessage {
 	record MemberLeft(String memberId) implements ServerMessage {
 	}
 
+	/// A participant changed its display name. The `memberId` (session id) is unchanged — only the human label
+	/// moves — so clients just update that member's name (and, for their own id, their self label).
+	@JsonTypeName("memberRenamed")
+	record MemberRenamed(String memberId, String displayName) implements ServerMessage {
+	}
+
 	/// The floor was granted to you; you may transmit.
 	@JsonTypeName("floorGranted")
 	record FloorGranted() implements ServerMessage {

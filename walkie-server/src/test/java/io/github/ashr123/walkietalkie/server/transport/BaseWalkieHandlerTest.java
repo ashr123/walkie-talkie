@@ -73,7 +73,7 @@ class BaseWalkieHandlerTest {
 		when(session.getAttributes()).thenReturn(new HashMap<>());
 
 		assertDoesNotThrow(() -> handler.afterConnectionClosed(session, CloseStatus.NORMAL));
-		verify(connectionService, never()).onClose(any());
+		verify(connectionService, never()).onClose(any(), any());
 	}
 
 	@Test

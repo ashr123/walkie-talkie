@@ -75,6 +75,49 @@ class ConnectionServiceTest {
 	}
 
 	@Test
+	void renamingBroadcastsMemberRenamedToEveryoneIncludingSelf() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+
+		service.onMessage(alice, new ClientMessage.Rename("alice2"));
+
+		ServerMessage.MemberRenamed toBob = firstOf(bob, ServerMessage.MemberRenamed.class);
+		assertEquals("alice", toBob.memberId(), "the session id is unchanged — only the label moves");
+		assertEquals("alice2", toBob.displayName());
+
+		ServerMessage.MemberRenamed toSelf = firstOf(alice, ServerMessage.MemberRenamed.class);
+		assertEquals("alice", toSelf.memberId(), "the renamer is notified too, as confirmation");
+		assertEquals("alice2", toSelf.displayName());
+
+		assertEquals("alice2", alice.displayName(), "the server-side session label is updated");
+	}
+
+	@Test
+	void aRenameIsReflectedInALaterJoinersRoster() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.Rename("alice2"));
+
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		ServerMessage.Joined joined = firstOf(bob, ServerMessage.Joined.class);
+		assertTrue(joined.members().stream()
+						.anyMatch(member -> member.id().equals("alice") && member.displayName().equals("alice2")),
+				"a new joiner's roster snapshot carries the renamed member's current name");
+	}
+
+	@Test
+	void anInvalidRenameIsRejectedAndNotBroadcast() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+
+		service.onMessage(alice, new ClientMessage.Rename("bad name"));   // a space is not in the allowed charset
+
+		assertEquals("invalid_display_name", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals("alice", alice.displayName(), "the label is unchanged on rejection");
+		assertFalse(bob.sent.stream().anyMatch(ServerMessage.MemberRenamed.class::isInstance),
+				"no rename is broadcast for an invalid name");
+	}
+
+	@Test
 	void aDuplicateJoinToTheSameChannelIsIdempotentAndDoesNotChurnMembership() {
 		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
@@ -135,7 +178,7 @@ class ConnectionServiceTest {
 		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		bob.sent.clear();
 
-		service.onClose(alice);
+		service.onClose(alice, "test close");
 
 		assertEquals("bob", firstOf(bob, ServerMessage.OwnerChanged.class).ownerId());
 		assertEquals("bob", channel("team").ownerId());
@@ -289,7 +332,7 @@ class ConnectionServiceTest {
 		FakeClientSession bob = join("bob", null, ChannelMode.GLOBAL_PTT);
 		bob.sent.clear();
 
-		service.onClose(alice);   // a member leaving must not re-elect a user as owner of the global room
+		service.onClose(alice, "test close");   // a member leaving must not re-elect a user as owner of the global room
 
 		assertTrue(bob.sent.stream().noneMatch(ServerMessage.OwnerChanged.class::isInstance),
 				"the global channel stays server-owned; no ownership is re-elected on a leave");
@@ -299,7 +342,7 @@ class ConnectionServiceTest {
 	@Test
 	void theGlobalChannelIsRecreatedServerOwnedAfterEmptying() {
 		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
-		service.onClose(alice);
+		service.onClose(alice, "test close");
 		assertNull(channel("global"), "the global channel is dropped once empty");
 		FakeClientSession bob = join("bob", null, ChannelMode.GLOBAL_PTT);
 		assertEquals("server", firstOf(bob, ServerMessage.Joined.class).ownerId(),
@@ -432,7 +475,7 @@ class ConnectionServiceTest {
 		join("bob", "sid-reuse", ChannelMode.MULTI_CHANNEL_PTT);   // keeps the channel alive when Alice leaves
 		int aliceSid = channel("sid-reuse").streamIndexOf("alice");
 
-		service.onClose(alice);
+		service.onClose(alice, "test close");
 		join("carol", "sid-reuse", ChannelMode.MULTI_CHANNEL_PTT);
 
 		assertNotEquals(aliceSid, channel("sid-reuse").streamIndexOf("carol"),
@@ -605,7 +648,7 @@ class ConnectionServiceTest {
 		svc.onAudio(alice, frame);   // exhausts the 1-token bucket
 		assertEquals(1, bob.audio.size(), "the second frame is over the cap and dropped");
 
-		svc.onClose(alice);          // must evict alice's bucket
+		svc.onClose(alice, "test close");          // must evict alice's bucket
 		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "alice", null));   // same id reconnects
 		bob.audio.clear();
 		svc.onAudio(alice, frame);

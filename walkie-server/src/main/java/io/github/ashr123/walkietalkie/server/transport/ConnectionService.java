@@ -71,7 +71,10 @@ public class ConnectionService {
 	}
 
 	public static void onConnect(ClientSession session) {
-		log.info("Connected: session={} transport={}", session.id(), session.transport());
+		// Scope the lifecycle line so it carries the session id (and the name, once known) via the MDC, like the
+		// per-message lines. At connect the client hasn't joined yet, so the name is still blank.
+		RequestContext.runAs(session.id(), session.displayName(),
+				() -> log.info("connected (transport={})", session.transport()));
 	}
 
 	/// Handles one decoded control message. The caller's identity is bound for the dynamic scope of the
@@ -79,7 +82,7 @@ public class ConnectionService {
 	/// MDC) — see [RequestContext#runAs]. The audio relay path ({@link #onAudio}) is deliberately not
 	/// scoped, to avoid per-frame MDC churn.
 	public void onMessage(ClientSession session, ClientMessage message) {
-		RequestContext.runAs(session.id(), () -> dispatch(session, message));
+		RequestContext.runAs(session.id(), session.displayName(), () -> dispatch(session, message));
 	}
 
 	private void dispatch(ClientSession session, ClientMessage message) {
@@ -89,6 +92,7 @@ public class ConnectionService {
 			case ClientMessage.RequestFloor _ -> handleRequestFloor(session);
 			case ClientMessage.ReleaseFloor _ -> handleReleaseFloor(session);
 			case ClientMessage.ChangeMode(ChannelMode mode) -> handleChangeMode(session, mode);
+			case ClientMessage.Rename(String displayName) -> handleRename(session, displayName);
 			case ClientMessage.Offer(String target, String sdp) ->
 					relaySignal(session, target, new ServerMessage.SignalOffer(session.id(), sdp));
 			case ClientMessage.Answer(String target, String sdp) ->
@@ -104,6 +108,14 @@ public class ConnectionService {
 		} catch (RuntimeException e) {
 			log.debug("Control send to {} failed: {}", session.id(), e.getMessage());
 		}
+	}
+
+	/// Sends a control-plane error to the requester AND logs why the request was refused — so an operator can
+	/// see the reason, and when a client then disconnects (e.g. it closes after a passphrase mismatch) the
+	/// preceding line explains why. Runs in the requester's message scope, so the log carries its id + name.
+	private static void sendError(ClientSession session, String code, String message) {
+		log.info("request refused: {} — {}", code, message);
+		safeSend(session, new ServerMessage.ErrorMessage(code, message));
 	}
 
 	private void handleJoin(ClientSession session, ClientMessage.Join join) {
@@ -125,28 +137,32 @@ public class ConnectionService {
 		}
 
 		if (requested == null || !CHANNEL_NAME.matcher(requested).matches()) {
-			session.send(new ServerMessage.ErrorMessage("invalid_channel",
-					"Channel name must match " + CHANNEL_NAME.pattern()));
+			sendError(session, "invalid_channel",
+					"Channel name must match " + CHANNEL_NAME.pattern());
 			return;
 		}
 		if (join.displayName() == null || !DISPLAY_NAME.matcher(join.displayName()).matches()) {
-			session.send(new ServerMessage.ErrorMessage("invalid_display_name",
-					"Display name must match " + DISPLAY_NAME.pattern()));
+			sendError(session, "invalid_display_name",
+					"Display name must match " + DISPLAY_NAME.pattern());
 			return;
 		}
 		// The "global" channel is the server-managed broadcast room: reachable ONLY via global push-to-talk,
 		// and never end-to-end encrypted — so anyone can join it (there is no shared passphrase to know).
 		if (GLOBAL_CHANNEL.equals(requested) && mode != ChannelMode.GLOBAL_PTT) {
-			session.send(new ServerMessage.ErrorMessage("reserved_channel",
-					"'" + GLOBAL_CHANNEL + "' is reserved — use Single global push-to-talk to join it."));
+			sendError(session, "reserved_channel",
+					"'" + GLOBAL_CHANNEL + "' is reserved — use Single global push-to-talk to join it.");
 			return;
 		}
 		if (mode == ChannelMode.GLOBAL_PTT && join.keyCheck() != null) {
-			session.send(new ServerMessage.ErrorMessage("encryption_not_allowed",
-					"The global channel can't be end-to-end encrypted — clear the passphrase to join it."));
+			sendError(session, "encryption_not_allowed",
+					"The global channel can't be end-to-end encrypted — clear the passphrase to join it.");
 			return;
 		}
 		session.setDisplayName(join.displayName());
+		// The name is only known now (after validation), but onMessage snapshotted the MDC name at scope entry
+		// when it was still blank — advance it so this handler's lines (the "joined" line below) carry name=...
+		// instead of name=-. The scope's restore-on-exit still cleans it up.
+		RequestContext.updateDisplayName(join.displayName());
 
 		// Emit the joiner's initial state — its Joined snapshot then, if the floor is held, the FloorTaken hint —
 		// from INSIDE the registry's add monitor span (see joinOrCreate's onJoinUnderLock). Sending it there,
@@ -170,8 +186,8 @@ public class ConnectionService {
 				? channelRegistry.joinOrCreate(requested, mode, null, session, GLOBAL_CHANNEL_OWNER, emitInitialState)
 				: channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session, emitInitialState);
 		if (joined == null) {
-			session.send(new ServerMessage.ErrorMessage("passphrase_mismatch",
-					"This channel is using a different encryption passphrase (or none) — you can't join it."));
+			sendError(session, "passphrase_mismatch",
+					"This channel is using a different encryption passphrase (or none) — you can't join it.");
 			return;
 		}
 		Channel channel = joined.channel();
@@ -182,8 +198,10 @@ public class ConnectionService {
 				new MemberInfo(session.id(), session.displayName(), channel.streamIndexOf(session.id())));
 		channel.forEachOther(session.id(), other -> safeSend(other, notice));
 
-		log.info("session={} ({}) joined channel={} mode={}",
-				session.id(), session.displayName(), channel.name(), channel.mode());
+		// Identity (session + name) is carried by the MDC prefix now that the name has been advanced above.
+		// "created" when this join brought the channel into being; "joined" when it already existed.
+		log.info("{} channel={} mode={}",
+				joined.created() ? "created" : "joined", channel.name(), channel.mode());
 	}
 
 	private void handleLeave(ClientSession session) {
@@ -221,9 +239,11 @@ public class ConnectionService {
 					// believing it is a member who has already left.
 					ServerMessage ownerMsg = new ServerMessage.OwnerChanged(channel.ownerId());
 					channel.forEachOther(session.id(), other -> safeSend(other, ownerMsg));
+					log.info("ownership of channel={} transferred to session={}", channelName, channel.ownerId());
 				}
 			}
 		}
+		log.info("left channel={}", channelName);
 		session.leftChannel();
 	}
 
@@ -242,16 +262,17 @@ public class ConnectionService {
 		synchronized (channel) {
 			if (channel.tryAcquireFloor(session.id(), now)) {
 				grantFloor(channel, session);
+				log.debug("acquired the floor on channel={}", channel.name());
 				return;
 			}
 			// Denied — name the current holder (or null if it freed up between our failed acquire and this read).
 			String currentHolderId = channel.floorHolder() instanceof Some(String holder) ? holder : null;
 			if (preemptIfIdle(channel, session, currentHolderId, now)) {
-				log.info("session={} preempted idle floor holder={} on channel={}",
-						session.id(), currentHolderId, channel.name());
+				log.info("preempted idle floor holder={} on channel={}", currentHolderId, channel.name());
 				grantFloor(channel, session);
 			} else {
 				session.send(new ServerMessage.FloorDenied(currentHolderId));
+				log.debug("denied the floor on channel={} (held by session={})", channel.name(), currentHolderId);
 			}
 		}
 	}
@@ -289,6 +310,7 @@ public class ConnectionService {
 			if (channel.releaseFloor(session.id())) {
 				ServerMessage idle = new ServerMessage.FloorIdle();
 				channel.forEachOther(session.id(), other -> safeSend(other, idle));
+				log.debug("released the floor on channel={}", channel.name());
 			}
 		}
 	}
@@ -314,8 +336,11 @@ public class ConnectionService {
 				if (holder != null) {
 					ServerMessage idle = new ServerMessage.FloorIdle();
 					channel.forEach(member -> safeSend(member, idle));
-					log.info("session={} reached the max floor-hold time on channel={}; floor released by sweep",
-							holder, channel.name());
+					// The sweep is a scheduled task, not bound to a session scope, and the holder is some OTHER
+					// session — so log its id + name explicitly rather than relying on the MDC.
+					String holderName = channel.member(holder) instanceof Some(ClientSession held) ? held.displayName() : "?";
+					log.info("session={} ({}) reached the max floor-hold time on channel={}; floor released by sweep",
+							holder, holderName, channel.name());
 				}
 			}
 		}
@@ -358,8 +383,9 @@ public class ConnectionService {
 					// so its client stops transmitting and resets); the speaker must re-request to continue.
 					ServerMessage idle = new ServerMessage.FloorIdle();
 					channel.forEach(member -> safeSend(member, idle));
-					log.info("session={} reached the max floor-hold time on channel={}; floor released",
-							session.id(), channel.name());
+					// onAudio is intentionally not session-scoped (no per-frame MDC churn), so log id + name inline.
+					log.info("session={} ({}) reached the max floor-hold time on channel={}; floor released",
+							session.id(), session.displayName(), channel.name());
 					return;
 				}
 				channel.markFloorActivity(now);
@@ -401,10 +427,17 @@ public class ConnectionService {
 		return out;
 	}
 
-	public void onClose(ClientSession session) {
-		handleLeave(session);
-		audioRateLimiter.forget(session.id());
-		log.info("Disconnected: session={}", session.id());
+	/// `closeReason` is a short human description of why the socket closed (from the WebSocket close code +
+	/// reason — e.g. "normal close", "abnormal close — no close frame …", "policy violation — send backlog"),
+	/// supplied by the transport handler so the disconnect line explains the cause.
+	public void onClose(ClientSession session, String closeReason) {
+		// Scope the whole teardown so the leave + disconnect lines carry the session id AND the display name via
+		// the MDC (this is why a disconnect previously logged no name — onClose wasn't bound to the identity).
+		RequestContext.runAs(session.id(), session.displayName(), () -> {
+			handleLeave(session);
+			audioRateLimiter.forget(session.id());
+			log.info("disconnected ({})", closeReason);
+		});
 	}
 
 	private void relaySignal(ClientSession session, String targetId, ServerMessage message) {
@@ -415,14 +448,14 @@ public class ConnectionService {
 		if (channel.member(targetId) instanceof Some(ClientSession target))
 			safeSend(target, message);
 		else
-			session.send(new ServerMessage.ErrorMessage("unknown_target",
-					"No member '" + targetId + "' in this channel"));
+			sendError(session, "unknown_target",
+					"No member '" + targetId + "' in this channel");
 	}
 
 	private Channel requireChannel(ClientSession session) {
 		String name = session.channelName();
 		if (name == null) {
-			session.send(new ServerMessage.ErrorMessage("not_in_channel", "Join a channel first"));
+			sendError(session, "not_in_channel", "Join a channel first");
 			return null;
 		}
 		return channelRegistry.find(name) instanceof Some(Channel channel) ?
@@ -438,11 +471,11 @@ public class ConnectionService {
 			return;
 		}
 		if (!session.id().equals(channel.ownerId())) {
-			session.send(new ServerMessage.ErrorMessage("not_owner", "Only the channel owner can change the mode"));
+			sendError(session, "not_owner", "Only the channel owner can change the mode");
 			return;
 		}
 		if (mode == ChannelMode.GLOBAL_PTT && !channel.name().equals(GLOBAL_CHANNEL)) {
-			session.send(new ServerMessage.ErrorMessage("invalid_mode", "Global PTT applies only to the 'global' channel"));
+			sendError(session, "invalid_mode", "Global PTT applies only to the 'global' channel");
 			return;
 		}
 		if (channel.mode() == mode) {
@@ -462,6 +495,44 @@ public class ConnectionService {
 				safeSend(member, floorIdle);
 			});
 		}
-		log.info("session={} changed channel={} mode to {}", session.id(), channel.name(), mode);
+		log.info("changed channel={} mode to {}", channel.name(), mode);
+	}
+
+	/// Changes the requester's display name — the human label only. The session id, which keys the floor,
+	/// ownership, WebRTC signaling and audio routing, is NOT touched, so a rename can't affect any of those.
+	/// The name is validated against the same charset as a join; on success it is applied and announced to the
+	/// whole channel, including the requester (its `MemberRenamed` for its own id is the confirmation that the
+	/// name was accepted — on rejection it gets an `ErrorMessage` instead and shows nothing unvalidated).
+	///
+	/// Concurrency: the `setDisplayName` + broadcast run under the channel monitor, so they serialize with a
+	/// concurrent join's roster snapshot (taken under the same monitor in [ChannelRegistry]'s join hook). A
+	/// member joining at the same instant therefore either captures the new name in its `Joined` roster, or is
+	/// already a member and receives this `MemberRenamed` — it can never be left showing the old name forever
+	/// (the same hazard the post-removal `MemberLeft` ordering avoids for departures).
+	private void handleRename(ClientSession session, String displayName) {
+		if (displayName == null || !DISPLAY_NAME.matcher(displayName).matches()) {
+			sendError(session, "invalid_display_name",
+					"Display name must match " + DISPLAY_NAME.pattern());
+			return;
+		}
+		String previous = session.displayName();   // the old label, for the transition logged below (before overwrite)
+		String channelName = session.channelName();
+		if (channelName != null && channelRegistry.find(channelName) instanceof Some(Channel channel)) {
+			synchronized (channel) {
+				session.setDisplayName(displayName);
+				ServerMessage renamed = new ServerMessage.MemberRenamed(session.id(), displayName);
+				channel.forEach(member -> safeSend(member, renamed));
+			}
+			// Advance the MDC name so this line's prefix carries the NEW name, like every line after it (onMessage
+			// snapshotted the old name at scope entry); the scope's restore-on-exit still cleans it up.
+			RequestContext.updateDisplayName(displayName);
+			log.info("renamed from {} to {} on channel={}", previous, displayName, channelName);
+		} else {
+			// Not in a channel (or it vanished): just update the label — the next Join carries it, and there is
+			// no roster to keep consistent or members to notify. (No meaningful prior name before the first join.)
+			session.setDisplayName(displayName);
+			RequestContext.updateDisplayName(displayName);
+			log.info("renamed to {}", displayName);
+		}
 	}
 }

@@ -41,6 +41,27 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
+	void renamingBroadcastsTheNewNameToOtherMembersOverTheWire() throws Exception {
+		CollectingHandler a = new CollectingHandler();
+		CollectingHandler b = new CollectingHandler();
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
+			send(sa, new ClientMessage.Join("rename-room", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
+			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
+			send(sb, new ClientMessage.Join("rename-room", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
+			awaitType(b.messages, ServerMessage.Joined.class);
+			awaitType(a.messages, ServerMessage.MemberJoined.class);
+
+			// Exercises the JSON wire round-trip of the new Rename / MemberRenamed message types end-to-end.
+			send(sa, new ClientMessage.Rename("Alicia"));
+
+			ServerMessage.MemberRenamed renamed = awaitType(b.messages, ServerMessage.MemberRenamed.class);
+			assertEquals(joinedA.selfId(), renamed.memberId(), "the session id is unchanged; only the label moves");
+			assertEquals("Alicia", renamed.displayName());
+		}
+	}
+
+	@Test
 	void memberJoinedFanOutCarriesNewcomerInfoAndExcludesTheJoiner() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();

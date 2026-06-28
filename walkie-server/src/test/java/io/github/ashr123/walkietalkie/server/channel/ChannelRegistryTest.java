@@ -85,6 +85,15 @@ class ChannelRegistryTest {
 	}
 
 	@Test
+	void joinResultFlagsWhetherThisJoinCreatedTheChannel() {
+		ChannelRegistry.JoinResult creator = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"));
+		assertTrue(creator.created(), "the first joiner brought the channel into being");
+
+		ChannelRegistry.JoinResult later = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
+		assertFalse(later.created(), "a joiner of an already-existing channel did not create it");
+	}
+
+	@Test
 	void joinResultCapturesTheCurrentFloorHolderAsTheHint() {
 		Channel channel = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
 		channel.tryAcquireFloor("a", Instant.EPOCH);

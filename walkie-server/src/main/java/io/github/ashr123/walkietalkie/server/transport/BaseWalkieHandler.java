@@ -55,13 +55,41 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 		ClientSession clientSession = lookup(session);
 		if (clientSession != null) {
 			try {
-				connectionService.onClose(clientSession);
+				connectionService.onClose(clientSession, describeClose(status));
 			} finally {
 				clientSession.close();   // tear down the outbound pump even if onClose throws
 			}
 		}
 		// The bearer token is stateless and self-expiring, so there is nothing to revoke here: closing the
 		// WebSocket already ends the session (membership is dropped in onClose).
+	}
+
+	/// A short human description of WHY the socket closed, for the disconnect log line: a friendly label for the
+	/// common WebSocket close codes (NORMAL = a clean/manual close; NO_CLOSE_FRAME = an abnormal drop with no
+	/// close handshake, e.g. a network failure or a browser tab closed abruptly; POLICY_VIOLATION = a
+	/// server-initiated kick such as the send-backlog termination), plus the close reason when one was given
+	/// (server-initiated closes carry one, e.g. "send backlog"). Uses the [CloseStatus] named codes, not magic
+	/// numbers.
+	private static String describeClose(CloseStatus status) {
+		// Match on the close CODE only, via CloseStatus.equalsCode, not on the whole status: a real close carries
+		// a reason ("bye", "send backlog", …) while the named constants don't, so equals() — which compares code
+		// AND reason — would miss them. The reason is appended separately below.
+		String label;
+		if (status.equalsCode(CloseStatus.NORMAL)) {
+			label = "normal close";
+		} else if (status.equalsCode(CloseStatus.NO_CLOSE_FRAME)) {
+			label = "abnormal close — no close frame (network drop or client closed abruptly)";
+		} else if (status.equalsCode(CloseStatus.GOING_AWAY)) {
+			label = "going away";
+		} else if (status.equalsCode(CloseStatus.POLICY_VIOLATION)) {
+			label = "policy violation";
+		} else if (status.equalsCode(CloseStatus.SERVER_ERROR)) {
+			label = "server error";
+		} else {
+			label = "close code " + status.getCode();
+		}
+		String reason = status.getReason();
+		return reason == null || reason.isBlank() ? label : label + " — " + reason;
 	}
 
 	@Override

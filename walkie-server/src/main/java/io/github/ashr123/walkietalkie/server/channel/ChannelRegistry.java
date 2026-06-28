@@ -23,11 +23,12 @@ public class ChannelRegistry {
 
 	private final Map<String, Channel> channels = new ConcurrentHashMap<>();
 
-	/// The outcome of a successful join: the joined `channel`, plus the joiner's view of the channel captured
-	/// **atomically with its add** — the member `roster` (including the joiner) and the current `floorHolder`
-	/// (the talk-floor hint). Both are snapshotted inside the map update under the channel monitor, so the
-	/// `Joined` roster and floor hint the caller sends can't be torn by a concurrent floor grant or leave.
-	public record JoinResult(Channel channel, List<MemberInfo> roster, Option<String> floorHolder) {
+	/// The outcome of a successful join: the joined `channel`, whether this join `created` it (vs joining one
+	/// that already existed), plus the joiner's view of the channel captured **atomically with its add** — the
+	/// member `roster` (including the joiner) and the current `floorHolder` (the talk-floor hint). The roster and
+	/// hint are snapshotted inside the map update under the channel monitor, so the `Joined` roster and floor
+	/// hint the caller sends can't be torn by a concurrent floor grant or leave.
+	public record JoinResult(Channel channel, boolean created, List<MemberInfo> roster, Option<String> floorHolder) {
 	}
 
 	/// Adds `session` to the named channel — creating it (owned by `session`, with `mode` and the joiner's
@@ -75,7 +76,7 @@ public class ChannelRegistry {
 				// roster disagreeing with the leaver's MemberLeft.
 				synchronized (channel) {
 					channel.add(session);
-					JoinResult result = new JoinResult(channel, channel.memberInfos(), channel.floorHolder());
+					JoinResult result = new JoinResult(channel, existing == null, channel.memberInfos(), channel.floorHolder());
 					onJoinUnderLock.accept(result);
 					joined.set(result);
 				}

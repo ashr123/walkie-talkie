@@ -44,6 +44,14 @@ public sealed interface ClientMessage {
 	record ChangeMode(ChannelMode mode) implements ClientMessage {
 	}
 
+	/// Change this client's display name. Validated against the same charset as [Join#displayName]; on success
+	/// the server applies it and broadcasts a [ServerMessage.MemberRenamed] to the channel (including the
+	/// requester, as confirmation). Only the human label changes — the session id, which is the routing
+	/// identity for the floor, ownership, WebRTC and audio, is unaffected.
+	@JsonTypeName("rename")
+	record Rename(String displayName) implements ClientMessage {
+	}
+
 	/// WebRTC: an SDP offer aimed at another member, relayed by the server.
 	@JsonTypeName("offer")
 	record Offer(String target, String sdp) implements ClientMessage {

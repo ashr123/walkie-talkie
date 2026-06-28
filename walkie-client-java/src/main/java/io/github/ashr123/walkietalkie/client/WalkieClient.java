@@ -31,6 +31,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /// Console walkie-talkie client over the WebSocket-relay transport (the only one available to a pure-Java
@@ -55,6 +56,9 @@ public final class WalkieClient implements AutoCloseable {
 	/// Sentinel owner id the server stamps on the server-managed "global" room (mirrors
 	/// `ConnectionService.GLOBAL_CHANNEL_OWNER`); that channel has no participant owner.
 	private static final String SERVER_OWNER = "server";
+	/// Display-name charset, mirrored from the server's validation so the `n` command can reject a bad name
+	/// locally before the round-trip (the server validates authoritatively too).
+	private static final Pattern DISPLAY_NAME = Pattern.compile("[A-Za-z0-9_.-]{1,32}");
 	/// Upper bound on how long [#close] waits for the HttpClient — and the WebSocket close handshake riding on
 	/// it — to drain gracefully before forcing termination, so quitting can never hang on a slow or vanished
 	/// server. Two seconds is ample for a localhost/LAN close handshake while still feeling instant to a user.
@@ -120,7 +124,7 @@ public final class WalkieClient implements AutoCloseable {
 		System.out.println("""
 				--------------------------------------------------------------------------------------------------
 				 Commands:  t = talk/stop   w = who's here   m <ptt|global|duplex> = mode
-				            f = hi-fi on/off   q = quit   h = help
+				            n <name> = rename   f = hi-fi on/off   q = quit   h = help
 				--------------------------------------------------------------------------------------------------""");
 	}
 
@@ -211,6 +215,7 @@ public final class WalkieClient implements AutoCloseable {
 			}
 			case ServerMessage.MemberJoined(MemberInfo member) -> announceJoin(member);
 			case ServerMessage.MemberLeft(String memberId) -> announceLeave(memberId);
+			case ServerMessage.MemberRenamed(String memberId, String displayName) -> announceRename(memberId, displayName);
 			case ServerMessage.FloorGranted _ -> {
 				audio.setTransmitting(true);
 				log("[floor granted] talking — type 't' to stop");
@@ -275,6 +280,23 @@ public final class WalkieClient implements AutoCloseable {
 		memberNames.remove(memberId);
 	}
 
+	/// A member changed its display name (its session id — the routing identity — is unchanged). Update the
+	/// id→name map; everything else (floor, audio, ownership) is keyed by id and so is unaffected.
+	///
+	/// Only updates a member we already know: a rename that races the renamer's own disconnect can arrive after
+	/// their MemberLeft (the server's two broadcasts can interleave), and re-adding them here would leave a ghost
+	/// in the roster. Server messages are handled one-at-a-time on the listener thread, so the get-then-act is safe.
+	private void announceRename(String memberId, String displayName) {
+		String previous = memberNames.get(memberId);
+		if (previous == null) {
+			return;
+		}
+		memberNames.put(memberId, displayName);
+		log(memberId.equals(selfId)
+				? "[name] you are now " + name(memberId)
+				: "[name] " + previous + " is now " + name(memberId));
+	}
+
 	/// Prints the current roster on demand (the 'w' command), sorted lexicographically by display name (then by
 	/// id), each member shown via [#name] (display name + `#id` prefix) with `(you)` / `(owner)` markers.
 	private void listMembers() {
@@ -310,13 +332,14 @@ public final class WalkieClient implements AutoCloseable {
 				switch (parts[0].toLowerCase(Locale.ROOT)) {
 					case "t", "talk" -> toggleTalk();
 					case "m", "mode" -> changeMode(parts.length > 1 ? parts[1] : "");
+					case "n", "name" -> rename(parts.length > 1 ? parts[1] : "");
 					case "f", "fidelity" -> toggleFidelity();
 					case "w", "who", "members" -> listMembers();
 					case "q", "quit", "exit" -> running.set(false);
 					case "h", "help" -> printHelp();
 					case "" -> { /* ignore blank lines */ }
 					default ->
-							System.out.println("Commands: 't' talk/stop, 'w' who's here, 'm <ptt|global|duplex>' mode, 'f' hi-fi, 'q' quit, 'h' help.");
+							System.out.println("Commands: 't' talk/stop, 'w' who's here, 'm <ptt|global|duplex>' mode, 'n <name>' rename, 'f' hi-fi, 'q' quit, 'h' help.");
 				}
 			}
 		} catch (IOException _) {
@@ -360,6 +383,17 @@ public final class WalkieClient implements AutoCloseable {
 			case "duplex", "full" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
 			default -> System.out.println("Usage: m <ptt|global|duplex>");
 		}
+	}
+
+	/// Asks the server to change our display name. Validated locally for a fast no, but the server validates
+	/// authoritatively and the resulting [ServerMessage.MemberRenamed] (broadcast back to us) is what actually
+	/// updates the roster — so a rejected name surfaces as an `[error]` line instead.
+	private void rename(String newName) {
+		if (!DISPLAY_NAME.matcher(newName).matches()) {
+			System.out.println("Usage: n <new-name>  (1-32 chars of letters, digits, _ . or -)");
+			return;
+		}
+		enqueue(new ClientMessage.Rename(newName));
 	}
 
 	private WebSocket connect(String token) {
