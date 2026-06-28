@@ -152,12 +152,15 @@ talk control:
   on encrypted channels; it applies to **relay holders only** (the server has no activity signal for WebRTC
   media, §3a).
 - **`floorIdle` while you held the floor** — you were force-released by the **max-hold** cap
-  (`walkie.floor-max-hold-seconds`, default 300, of continuous holding). Re-`requestFloor` to keep talking.
+  (`walkie.floor-max-hold-seconds`, default 300) after holding the floor that long. Re-`requestFloor` to keep
+  talking.
 
-Both timers `0`-disable. A normal active talker is **never** preempted: it transmits continuously while
-holding (the mic sends a frame every 20 ms, even through speech pauses), which refreshes the activity mark on
-every frame — so idle auto-release only catches a holder that genuinely went silent on the wire without
-releasing.
+Both timers `0`-disable. Max-hold is a pure time cap (a periodic server sweep enforces it) and bounds **any**
+holder, including a WebRTC peer (§3a); idle auto-release applies to **relay holders only**, since it needs the
+per-frame activity signal that peer-to-peer WebRTC media doesn't give the server. A normal active relay talker
+is **never** idle-released: it transmits continuously while holding (the mic sends a frame every 20 ms, even
+through speech pauses), which refreshes the activity mark on every frame — so idle auto-release only catches a
+holder that genuinely went silent on the wire without releasing.
 
 ---
 
@@ -377,8 +380,9 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 - **Inbound audio frame rate:** ≤ `walkie.max-audio-frames-per-second` per sender (default 100; ~50 fps is
   nominal). Excess frames are dropped **before** fan-out — a flood guard that counts frames without inspecting
   them, so it works on encrypted channels. Always on (0/blank → default, never disabled).
-- **PTT floor timers:** idle auto-release after `walkie.floor-idle-release-seconds` (default 5; relay holders,
-  on contention) and force-release after `walkie.floor-max-hold-seconds` (default 300); each `0`-disables (§3b).
+- **PTT floor timers:** max-hold force-release of **any** holder after `walkie.floor-max-hold-seconds`
+  (default 300; a periodic sweep, plus a relay holder's next frame) and idle auto-release of a silent **relay**
+  holder after `walkie.floor-idle-release-seconds` (default 5; on contention); each `0`-disables (§3b).
 - **Error codes** (`error.code`):
 
 | Code                  | Triggered by                                                          |

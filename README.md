@@ -43,6 +43,60 @@ two reference clients, and three channel modes.
   Media plane (webrtc): Opus 48 kHz fullband, tuned (high bitrate + FEC), peer-to-peer
 ```
 
+### Relay data flow
+
+This traces one captured frame from a sender to every other member on the **WebSocket relay** path — the
+virtual-thread model, the per-recipient control/audio mailbox, and the abuse/backpressure hardening. (WebRTC
+is peer-to-peer: the server relays only signaling, so media never flows through here.)
+
+The inbound frame is handled on the *sender's* virtual thread, which runs the gates and then *hands it
+off* (a non-blocking `offer()`) into each recipient's mailbox; each recipient session owns two queues —
+**control** (reliable, drained first) and **audio** (bounded, lossy) — drained by its **own** dedicated
+virtual thread, so a slow recipient never stalls the sender or the others. (The recipient stage is shown
+once, for Bob.)
+
+```
+  Alice  (sender client)
+    │   capture 20 ms  →  Opus encode  →  (optional) AES-256-GCM encrypt
+    │   binary  [tag][payload]   (or  [0xE2][IV][ciphertext])
+    ▼   /ws/audio   —  handled on Alice's inbound VIRTUAL THREAD
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │ ConnectionService.onAudio        (still on Alice's inbound virtual thread)          │
+  │                                                                                     │
+  │ Drop the frame — no fan-out — if ANY gate fails:                                    │
+  │    1.  size ≤ walkie.max-audio-frame-bytes                                          │
+  │    2.  holdsFloor(Alice)?           ─  push-to-talk floor                           │
+  │    3.  AudioRateLimiter.tryAcquire? ─  per-sender token bucket  (flood guard)       │
+  │    4.  within max-hold?             ─  else free the floor + broadcast FloorIdle    │
+  │                                                                                     │
+  │ Then  prefix 1-byte stream id  →  [sid][body] ,  markFloorActivity                  │
+  │ Then  Channel.forEachOther(Alice)  →  offer() one frame into EACH recipient mailbox │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+       │
+       │   HAND-OFF ONLY: offer() returns at once, so Alice's vthread never blocks.
+       │   Fan-out = one independent lane per recipient (a slow Bob never delays Carol).
+       ▼   The recipient stage below is shown once, for Bob.
+  ┌─────────────────────────────────────────────────────────────────────────────────────┐
+  │ Bob's session  (WebSocketClientSession)   —  TWO queues, ONE drainer vthread        │
+  │                                                                                     │
+  │ controlOut  (cap 1024,  RELIABLE)    ─  floor / mode / owner / membership           │
+  │    overflow → close the socket (POLICY_VIOLATION);                                  │
+  │               the client reconnects and re-syncs via the Joined snapshot            │
+  │                                                                                     │
+  │ audioOut    (cap 256 ≈ 5 s,  LOSSY)  ─  the fanned-out [sid][body] frames land here │
+  │    overflow → drop THIS frame   (a momentary click; the next frame heals)           │
+  │                                                                                     │
+  │      │   drainLoop — ONE virtual thread:                                            │
+  │      ▼   poll controlOut FIRST (state stays timely), then audioOut (200 ms), FIFO   │
+  │ ConcurrentWebSocketSessionDecorator    —  socket-layer backstop                     │
+  │      │   bounds a wedged in-flight write; write errors are swallowed,               │
+  │      ▼   so one bad recipient never affects the others                              │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+       ▼
+  Bob  (recipient client)
+     demux stream id  →  (optional) decrypt  →  per-sender Opus decode  →  mix  →  play
+```
+
 ### Modules
 
 | Module               | Purpose                                                                                                                           |
@@ -224,12 +278,14 @@ otherwise mono — and interoperates with relay-mode browser clients.
   dropped **before** fan-out, so one client can't amplify load across the channel (N recipients) or force
   excess decode work. It counts frames without inspecting them, so it works on encrypted channels too — the
   per-frame **size** cap is `walkie.max-audio-frame-bytes` (default 8 KiB).
-- **Push-to-talk floor anti-hogging.** A half-duplex channel's talk floor can't be held forever: a holder
-  that goes silent is reclaimed for a waiting requester after `walkie.floor-idle-release-seconds` (default 5;
-  measured from frame timing, so it works on encrypted channels), and any holder is force-released after
-  `walkie.floor-max-hold-seconds` (default 300) of continuous holding. Set either to `0` to disable. On a
-  server-initiated release the (ex-)holder is notified so its client stops transmitting. (Idle auto-release
-  applies to relay holders only — the server has no activity signal for peer-to-peer WebRTC media.)
+- **Push-to-talk floor anti-hogging.** A half-duplex channel's talk floor can't be held forever: any holder is
+  force-released after `walkie.floor-max-hold-seconds` (default 300) of continuous holding — a periodic
+  background sweep enforces this hard cap (a relay holder also hits it immediately on its next frame). On top of
+  that, **idle auto-release** hands the floor to a waiting requester once the current holder has sent no audio
+  for `walkie.floor-idle-release-seconds` (default 5). Set either to `0` to disable. On a server-initiated
+  release the (ex-)holder is notified so its client stops transmitting. Idle auto-release applies to **relay
+  holders only** — it needs a per-frame activity signal, which peer-to-peer WebRTC media doesn't give the
+  server; max-hold is a pure time cap and bounds every holder, including WebRTC.
 - **For production:** serve over WSS/HTTPS (TLS 1.2+) — see _Transport encryption (TLS / WSS)_ above and the
   `deploy/` proxy configs — and **override `walkie.allowed-origins`**: it **defaults to `*`** (wide open),
   and because CSRF is disabled this WebSocket origin check is the sole anti-CSWSH (cross-site WebSocket

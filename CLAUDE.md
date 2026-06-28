@@ -62,12 +62,15 @@ every site to handle it.
 **Channel modes** (`ChannelMode`): `MULTI_CHANNEL_PTT`, `GLOBAL_PTT` (channel name forced to `global`),
 `FULL_DUPLEX` (no floor). A channel's mode is set at creation and **adopted** by later joiners; only
 the **owner** (creator) may change it (`ChangeMode` → broadcast `ModeChanged`), and ownership transfers
-to another member if the owner leaves. Floor state is an `AtomicReference<String>` on `Channel`;
-full-duplex bypasses it. **Floor anti-hogging** (PTT modes, in `ConnectionService`): a holder gone silent past
+to another member if the owner leaves. Floor state is a monitor-guarded `volatile String` holder on `Channel`
+(every mutation runs under the channel monitor; the hot-path reads `holdsFloor`/`floorHolder` are lock-free
+volatile reads, re-validated under the monitor before audio fan-out); full-duplex bypasses it. **Floor anti-hogging** (PTT modes, in `ConnectionService`): a holder gone silent past
 `walkie.floor-idle-release-seconds` (default 5) is preempted when another member requests the floor (idle
-auto-release — `Channel.preemptFloorIfIdle`, relay holders only, keyed off frame *timing* not content), and
-any holder is force-released after `walkie.floor-max-hold-seconds` (default 300) of continuous holding
-(max-hold, CAS-gated in `onAudio`). Both `0`-disable; on a server-initiated release the (ex-)holder is told
+auto-release — `Channel.preemptFloorIfIdle`, relay holders only, keyed off frame *timing* not content), and any
+holder is force-released after `walkie.floor-max-hold-seconds` (default 300) of continuous holding (max-hold —
+a scheduled sweep `releaseExpiredFloors` via `Channel.releaseIfExpired`, plus an immediate check in `onAudio` on
+a relay holder's next frame). Max-hold is a pure time cap and bounds **any** holder incl. WebRTC; idle
+auto-release is relay-only. Both `0`-disable; on a server-initiated release the (ex-)holder is told
 (`FloorTaken`/`FloorIdle`) so its client stops transmitting. Floor timing uses a `java.time.Clock` + `Instant`
 (injectable for tests). **The `global` channel is special and server-managed:** it is reachable *only*
 via `GLOBAL_PTT` (a `MULTI_CHANNEL_PTT`/`FULL_DUPLEX` join naming `global` is rejected with
