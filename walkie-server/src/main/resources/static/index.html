@@ -24,12 +24,20 @@
             box-sizing: border-box;
         }
 
+        html, body {
+            height: 100%;
+        }
+
         body {
             margin: 0;
             font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
             background: var(--bg);
             color: var(--text);
             line-height: 1.4;
+            /* Header + main stack vertically and main fills the rest of the viewport, so the inner scroll
+               containers (notably #log) can be height-bounded and actually scroll instead of growing the page. */
+            display: flex;
+            flex-direction: column;
         }
 
         header {
@@ -51,8 +59,11 @@
         main {
             display: grid;
             grid-template-columns: 340px 1fr;
+            grid-template-rows: minmax(0, 1fr); /* one row that fills main and may shrink, so children can scroll */
             gap: 20px;
             padding: 20px 24px;
+            flex: 1;       /* fill the viewport height below the header... */
+            min-height: 0; /* ...and let inner scroll containers (e.g. #log) bound themselves instead of growing */
         }
 
         .panel {
@@ -60,6 +71,15 @@
             border: 1px solid #28323d;
             border-radius: 10px;
             padding: 16px;
+        }
+
+        /* Keep the Connect panel at its natural height (don't stretch it to fill the viewport-bounded row),
+           but never let it exceed the viewport — on a short screen it scrolls within itself rather than
+           growing the page. */
+        #setup {
+            align-self: start;
+            max-height: 100%;
+            overflow-y: auto;
         }
 
         label {
@@ -223,6 +243,8 @@
 		<div class="hint">Shown to others. Your identity in a channel is a per-connection id; if two people
 			share a display name, each is shown with a short <code>#id</code> to tell them apart.
 		</div>
+		<button class="secondary" hidden id="renameBtn" style="width:100%; margin-top:8px;">Rename</button>
+		<div class="hint" hidden id="renameHint">Edit the name above and click Rename (or press Enter in the field).</div>
 		<label for="transport">Transport</label>
 		<select id="transport">
 			<option value="relay">WebSocket relay (server forwards audio)</option>
@@ -251,7 +273,7 @@
 		<div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Disconnected</span></div>
 	</section>
 
-	<section style="display:flex; flex-direction:column; gap:20px;">
+	<section style="display:flex; flex-direction:column; gap:20px; min-height:0;">
 		<div class="panel">
 			<h2>Talk</h2>
 			<button disabled id="talkBtn">Connect first</button>

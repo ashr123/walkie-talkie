@@ -159,6 +159,9 @@ async function connect() {
 			setStatus(true, 'Connected — ' + state.transport);
 			byId('connectBtn').disabled = true;
 			byId('disconnectBtn').disabled = false;
+			// Renaming only makes sense while connected, so the button (and its hint) appear only then.
+			byId('renameBtn').hidden = false;
+			byId('renameHint').hidden = false;
 		};
 		ws.onmessage = onWsMessage;
 		ws.onclose = (ev) => {
@@ -190,6 +193,21 @@ function sendCtrl(obj) {
 	}
 }
 
+// Ask the server to change our display name to the current value of the Display name field. The server
+// validates it and, on success, broadcasts memberRenamed (including back to us) — so our own roster label
+// updates from that broadcast, not optimistically, and an invalid name surfaces as a server error instead.
+function rename() {
+	if (!isOpen()) {
+		return;
+	}
+	const display = byId('display').value.trim();
+	if (!DISPLAY_NAME.test(display)) {
+		log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
+		return;
+	}
+	sendCtrl({type: 'rename', displayName: display});
+}
+
 // --- incoming messages ----------------------------------------------------------------------------
 
 function onWsMessage(ev) {
@@ -209,6 +227,9 @@ function onWsMessage(ev) {
 		case 'memberLeft':
 			removeMember(msg.memberId);
 			closePeer(msg.memberId);
+			break;
+		case 'memberRenamed':
+			renameMember(msg.memberId, msg.displayName);
 			break;
 		case 'floorGranted':
 			log('Floor granted — you are live');
@@ -970,6 +991,18 @@ function addMember(member) {
 	renderMembers();
 }
 
+// A member changed its display name (id is unchanged — only the label moves). Update the roster map and
+// re-render; the streamId / speaking state / decoder lanes are keyed by id, so they're untouched.
+function renameMember(id, name) {
+	const old = state.members.get(id);
+	if (old === undefined) {
+		return;   // not a member we're tracking (shouldn't happen for a channel rename)
+	}
+	state.members.set(id, name);
+	renderMembers();
+	log(id === state.selfId ? `You are now "${name}"` : `"${old}" is now "${name}"`);
+}
+
 function removeMember(id) {
 	setSpeaking(id, false);
 	clearTimeout(state.speakTimers.get(id));
@@ -1127,6 +1160,8 @@ function cleanup() {
 	talkBtn.classList.remove('live');
 	byId('connectBtn').disabled = false;
 	byId('disconnectBtn').disabled = true;
+	byId('renameBtn').hidden = true;
+	byId('renameHint').hidden = true;
 	setStatus(false, 'Disconnected');
 	updateModeControl();
 	updateGlobalModeLocks();
@@ -1147,6 +1182,24 @@ function closeCodec(codec) {
 window.addEventListener('DOMContentLoaded', () => {
 	byId('connectBtn').addEventListener('click', connect);
 	byId('disconnectBtn').addEventListener('click', disconnect);
+
+	byId('renameBtn').addEventListener('click', rename);
+
+	// The Connect fields aren't wrapped in a <form>, so Enter in one does nothing by default. Treat Enter in
+	// the Connect panel as "Connect" when a connect is possible (button enabled, i.e. disconnected); once
+	// connected, Enter in the Display name field instead renames (the Connect button is then disabled).
+	byId('setup').addEventListener('keydown', (e) => {
+		if (e.key !== 'Enter' || e.isComposing) {
+			return;
+		}
+		if (!byId('connectBtn').disabled) {
+			e.preventDefault();
+			connect();
+		} else if (isOpen() && e.target.id === 'display') {
+			e.preventDefault();
+			rename();
+		}
+	});
 
 	// While connected, only the owner can change the mode (the selector is disabled for others); this
 	// sends ChangeMode and the server's ModeChanged broadcast updates everyone. Pre-connect it just
