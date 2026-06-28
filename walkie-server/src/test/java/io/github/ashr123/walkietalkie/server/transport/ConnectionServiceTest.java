@@ -32,10 +32,11 @@ class ConnectionServiceTest {
 			channelRegistry, properties, new AudioRateLimiter(properties));
 
 	/// Builds a service over the shared registry but with a hand-driven clock, so the push-to-talk floor
-	/// timers (idle auto-release, max-hold) can be tested deterministically.
+	/// timers (idle auto-release, max-hold) — and the rate limiter — are all tested against the same deterministic
+	/// clock rather than wall time.
 	private ConnectionService serviceWithClock(Clock clock, int idleSeconds, int maxHoldSeconds) {
 		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1000, idleSeconds, maxHoldSeconds, null);
-		return new ConnectionService(channelRegistry, props, new AudioRateLimiter(props), clock);
+		return new ConnectionService(channelRegistry, props, new AudioRateLimiter(props, clock), clock);
 	}
 
 	private static FakeClientSession session(String id) {
@@ -467,6 +468,58 @@ class ConnectionServiceTest {
 		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorTaken.class::isInstance),
 				"the ex-holder is told (via FloorTaken) that the floor moved, so its client stops transmitting");
 		assertTrue(channel("ptt").holdsFloor("bob"));
+	}
+
+	@Test
+	void aFreshlyPreemptedHolderIsNotImmediatelyDoublePreempted() {
+		// Regression: the idle-preempt must stamp the new holder's activity ATOMICALLY with the swap. Otherwise
+		// bob (who just took the floor from idle alice) still carries alice's stale mark, and carol could steal
+		// it the same instant despite bob never being idle.
+		MutableClock clock = new MutableClock(Instant.EPOCH);
+		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle-release 5 s, max-hold off
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		FakeClientSession carol = session("carol");
+		svc.onMessage(alice, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(carol, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds at t=0, then goes silent
+
+		clock.advance(Duration.ofSeconds(6));
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob preempts idle alice -> holds, stamped active at t=6
+		assertTrue(channel("ptt3").holdsFloor("bob"));
+
+		carol.sent.clear();
+		svc.onMessage(carol, new ClientMessage.RequestFloor());   // same instant: bob is freshly active, not idle
+		assertEquals("bob", firstOf(carol, ServerMessage.FloorDenied.class).currentHolderId(),
+				"carol cannot steal the floor from a holder that was just granted it");
+		assertTrue(channel("ptt3").holdsFloor("bob"), "bob keeps the floor he just acquired");
+	}
+
+	@Test
+	void aSilentHolderIsSweptOffTheFloorAfterMaxHoldWithoutContentionOrIdleRelease() {
+		MutableClock clock = new MutableClock(Instant.EPOCH);
+		ConnectionService svc = serviceWithClock(clock, 0, 10);   // idle-release OFF, max-hold 10 s
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("swept", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("swept", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds at t=0, then goes silent (no frames, no release)
+		assertTrue(channel("swept").holdsFloor("alice"));
+
+		alice.sent.clear();
+		bob.sent.clear();
+		svc.releaseExpiredFloors();                               // within the cap -> no-op
+		assertTrue(channel("swept").holdsFloor("alice"), "the sweep leaves a holder alone before the cap");
+
+		clock.advance(Duration.ofSeconds(11));                    // past the cap, with no audio frame and no other requester
+		svc.releaseExpiredFloors();
+
+		assertFalse(channel("swept").holdsFloor("alice"), "the silent over-cap holder is reclaimed by the sweep");
+		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+				"the (ex-)holder is notified so its client stops transmitting");
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+				"other members are notified the floor is free");
 	}
 
 	@Test

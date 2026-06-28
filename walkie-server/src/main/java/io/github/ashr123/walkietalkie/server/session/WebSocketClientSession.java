@@ -30,10 +30,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 ///   - **Audio** ([#audioOut]) is bounded and **lossy**: when it overflows (a recipient ~[#AUDIO_CAPACITY]
 ///     frames behind) the frame is dropped — a momentary click that the next frame heals.
 ///   - **Control** ([#controlOut]) is state-changing (floor/mode/owner/membership) and is **never silently
-///     dropped**: dropping it would permanently desync a client that stays connected (full state re-syncs
-///     only via the `Joined` snapshot on (re)join). It has generous headroom; if even that overflows the
-///     client is hopelessly behind, so the session is closed ([#terminateForBacklog]) to force a clean
-///     reconnect + re-sync. The drainer services control ahead of audio so state updates stay timely.
+///     dropped for a live session**: dropping it would permanently desync a client that stays connected (full
+///     state re-syncs only via the `Joined` snapshot on (re)join). It has generous headroom; if even that
+///     overflows the client is hopelessly behind, so the session is closed ([#terminateForBacklog]) to force a
+///     clean reconnect + re-sync. The drainer services control ahead of audio so state updates stay timely.
+///     (The one window where a control frame is not delivered is a frame enqueued at the instant this session
+///     is itself being torn down — `send` passed its `closed` check just as [#stopPump] flipped it and the
+///     drainer exited; the lost frame is only ever to *this* closing recipient, which re-syncs via `Joined` on
+///     reconnect, so no still-connected client is desynced.)
 public final class WebSocketClientSession implements ClientSession {
 
 	private static final Logger log = LoggerFactory.getLogger(WebSocketClientSession.class);
@@ -54,7 +58,9 @@ public final class WebSocketClientSession implements ClientSession {
 	private final BlockingQueue<Runnable> controlOut = new LinkedBlockingQueue<>(CONTROL_CAPACITY);
 	private final BlockingQueue<Runnable> audioOut = new LinkedBlockingQueue<>(AUDIO_CAPACITY);
 	private final AtomicBoolean closed = new AtomicBoolean(false);
-	private Thread drainer;   // the single consumer; started by start() after the session is registered
+	// volatile so stopPump()/close() on another thread reliably observes the drainer assigned by start()
+	// (their only happens-before edge is the session's publication, which precedes the drainer write).
+	private volatile Thread drainer;   // the single consumer; started by start() after the session is registered
 
 	// Set when the client joins a channel (from the validated Join.displayName); "" until then.
 	private volatile String displayName = "";

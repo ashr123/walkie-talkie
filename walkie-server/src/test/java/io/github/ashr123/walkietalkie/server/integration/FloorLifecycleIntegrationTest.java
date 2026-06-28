@@ -146,8 +146,9 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			awaitType(b.messages, ServerMessage.FloorTaken.class);
 
 			send(sa, new ClientMessage.Leave());
-			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
+			// FloorIdle precedes MemberLeft — see the disconnect test above for why this order is correct + benign.
 			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class), "the leaver's floor is released");
+			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
 		}
 	}
 
@@ -163,8 +164,11 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			awaitType(b.messages, ServerMessage.FloorTaken.class);
 
 			sa.close(CloseStatus.NORMAL);   // abrupt disconnect while holding
-			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
+			// FloorIdle precedes MemberLeft: the floor is freed and announced atomically with the release (before
+			// the member is removed), whereas MemberLeft is broadcast only after removal to avoid a ghost-member
+			// race. The order is irrelevant to clients — the two update independent state, and FloorIdle has no id.
 			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class));
+			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
 		}
 	}
 

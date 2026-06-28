@@ -142,8 +142,11 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			awaitType(b.messages, ServerMessage.FloorTaken.class);
 
 			send(sa, new ClientMessage.Leave());
-			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
+			// Broadcast order on an owner-holder leaving is FloorIdle → MemberLeft → OwnerChanged: the floor is
+			// freed atomically with the release (before removal); MemberLeft + OwnerChanged are sent after removal
+			// (ghost-member fix), OwnerChanged carrying the live owner so concurrent owner churn converges.
 			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class), "the held floor is released");
+			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
 			assertEquals(ids[1], awaitType(b.messages, ServerMessage.OwnerChanged.class).ownerId());
 		}
 	}

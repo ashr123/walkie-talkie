@@ -175,9 +175,11 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			// Alice re-joins a different channel; the server leaves "old" first.
 			send(sa, new ClientMessage.Join("new", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 
+			// FloorIdle precedes MemberLeft: the floor is freed atomically with the release (before removal), while
+			// MemberLeft is broadcast only after removal (ghost-member fix). Order is benign — independent state.
+			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class), "her held floor is released");
 			ServerMessage.MemberLeft left = awaitType(b.messages, ServerMessage.MemberLeft.class);
 			assertEquals(joinedA.selfId(), left.memberId(), "the old channel is told Alice left");
-			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class), "her held floor is released");
 
 			ServerMessage.Joined rejoined = awaitType(a.messages, ServerMessage.Joined.class);
 			assertEquals("new", rejoined.channel());

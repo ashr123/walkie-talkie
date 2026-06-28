@@ -25,7 +25,13 @@ public class AudioRateLimiter {
 
 	@Autowired
 	public AudioRateLimiter(WalkieProperties properties) {
-		this(properties.maxAudioFramesPerSecond(), Clock.systemUTC());
+		this(properties, Clock.systemUTC());
+	}
+
+	/// Seam for callers that want the limiter to share a specific clock (e.g. tests driving a deterministic
+	/// clock alongside the rest of the server, so the rate limiter and the floor timers see the same time).
+	public AudioRateLimiter(WalkieProperties properties, Clock clock) {
+		this(properties.maxAudioFramesPerSecond(), clock);
 	}
 
 	/// @param maxFramesPerSecond sustained per-sender ceiling on relayed frames; also the burst capacity (one

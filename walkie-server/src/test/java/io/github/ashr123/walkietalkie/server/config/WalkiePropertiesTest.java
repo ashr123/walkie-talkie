@@ -46,4 +46,12 @@ class WalkiePropertiesTest {
 		assertEquals(0, p.floorIdleReleaseSeconds(), "0 disables idle auto-release (not coerced to the default)");
 		assertEquals(0, p.floorMaxHoldSeconds(), "0 disables the max-hold cap (not coerced to the default)");
 	}
+
+	@Test
+	void anAbsurdlyHighAudioFrameRateIsClampedSoTheTokenIntervalCannotRoundToZero() {
+		// 1 s / rate must stay >= 1 ns, else the rate limiter's Duration.dividedBy(perToken) throws. Anything
+		// above 1e9 fps is clamped to 1e9 (still far above any real audio rate).
+		WalkieProperties p = new WalkieProperties(List.of("*"), 1, 1, 2_000_000_000L, 5, 300, null);
+		assertEquals(1_000_000_000L, p.maxAudioFramesPerSecond(), "rates above 1e9 fps are clamped to 1e9");
+	}
 }

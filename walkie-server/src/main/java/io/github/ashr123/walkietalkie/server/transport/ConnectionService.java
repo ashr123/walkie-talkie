@@ -5,8 +5,6 @@ import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.ratelimit.AudioRateLimiter;
-import io.github.ashr123.walkietalkie.server.floor.FloorControlUtil;
-import io.github.ashr123.walkietalkie.server.floor.FloorResult;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.support.RequestContext;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -16,11 +14,14 @@ import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 /// Transport-agnostic heart of the server. Both WebSocket handlers feed decoded control messages and
@@ -147,28 +148,39 @@ public class ConnectionService {
 		}
 		session.setDisplayName(join.displayName());
 
+		// Emit the joiner's initial state — its Joined snapshot then, if the floor is held, the FloorTaken hint —
+		// from INSIDE the registry's add monitor span (see joinOrCreate's onJoinUnderLock). Sending it there,
+		// atomically with the joiner becoming broadcast-eligible, serializes it with floor transitions: a
+		// concurrent release can't slip a FloorIdle in before this hint (which would orphan it on a now-free
+		// floor), and a concurrent grant/preempt can't leave the hint naming a stale holder — the joiner instead
+		// receives the grant's own FloorTaken right after, via the normal broadcast, and converges on the truth.
+		Consumer<ChannelRegistry.JoinResult> emitInitialState = joined -> {
+			Channel joinedChannel = joined.channel();
+			session.joinedChannel(joinedChannel.name());
+			safeSend(session, new ServerMessage.Joined(session.id(), joinedChannel.name(),
+					joinedChannel.mode(), joinedChannel.ownerId(), joined.roster()));
+			if (joined.floorHolder() instanceof Some(String holder)) {
+				safeSend(session, new ServerMessage.FloorTaken(holder));
+			}
+		};
+
 		// Global is server-owned (sentinel owner) and forced unencrypted (null key-check); every other channel
 		// is owned by its creator and adopts the joiner's key-check.
-		Channel channel = mode == ChannelMode.GLOBAL_PTT
-				? channelRegistry.joinOrCreate(requested, mode, null, session, GLOBAL_CHANNEL_OWNER)
-				: channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session);
-		if (channel == null) {
+		ChannelRegistry.JoinResult joined = mode == ChannelMode.GLOBAL_PTT
+				? channelRegistry.joinOrCreate(requested, mode, null, session, GLOBAL_CHANNEL_OWNER, emitInitialState)
+				: channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session, emitInitialState);
+		if (joined == null) {
 			session.send(new ServerMessage.ErrorMessage("passphrase_mismatch",
 					"This channel is using a different encryption passphrase (or none) — you can't join it."));
 			return;
 		}
+		Channel channel = joined.channel();
 
-		session.joinedChannel(channel.name());
-		session.send(new ServerMessage.Joined(
-				session.id(), channel.name(), channel.mode(), channel.ownerId(), channel.memberInfos()));
-
+		// Tell the OTHER members about the joiner. This is intentionally OUTSIDE the registry lock: it concerns
+		// the joiner's visibility to others, not the joiner's own floor view, so it needs no floor serialization.
 		ServerMessage notice = new ServerMessage.MemberJoined(
 				new MemberInfo(session.id(), session.displayName(), channel.streamIndexOf(session.id())));
 		channel.forEachOther(session.id(), other -> safeSend(other, notice));
-
-		if (channel.floorHolder() instanceof Some(String holder)) {
-			session.send(new ServerMessage.FloorTaken(holder));
-		}
 
 		log.info("session={} ({}) joined channel={} mode={}",
 				session.id(), session.displayName(), channel.name(), channel.mode());
@@ -179,20 +191,38 @@ public class ConnectionService {
 		if (channelName == null) {
 			return;
 		}
-		if (channelRegistry.find(channelName) instanceof Some(Channel channel)) {
-			boolean wasHolding = channel.releaseFloor(session.id());
-			ServerMessage left = new ServerMessage.MemberLeft(session.id());
-			channel.forEachOther(session.id(), other -> safeSend(other, left));
-			if (wasHolding) {
-				ServerMessage idle = new ServerMessage.FloorIdle();
-				channel.forEachOther(session.id(), other -> safeSend(other, idle));
+		Channel channel = channelRegistry.find(channelName) instanceof Some(Channel found) ? found : null;
+		if (channel != null) {
+			// Free the leaver's floor (if held) and tell the others, under the floor monitor so this FloorIdle
+			// can't race a new holder's grant. Capture wasHolding HERE — registry.leave (below) also clears the
+			// floor as it removes the member, so reading it afterwards would always be false. (Must NOT call
+			// channelRegistry.leave while holding this monitor — see the lock-order note on Channel.)
+			synchronized (channel) {
+				if (channel.releaseFloor(session.id())) {
+					ServerMessage idle = new ServerMessage.FloorIdle();
+					channel.forEachOther(session.id(), other -> safeSend(other, idle));
+				}
 			}
 		}
-		// Removal and ownership re-election are atomic in the registry; announce a new owner (if one was
-		// elected) to the members that remain after the leaver is gone.
-		if (channelRegistry.leave(channelName, session.id()) instanceof Some(String newOwner)
-				&& channelRegistry.find(channelName) instanceof Some(Channel channel)) {
-			channel.forEachOther(session.id(), other -> safeSend(other, new ServerMessage.OwnerChanged(newOwner)));
+		// Remove the member + re-elect an owner atomically in the registry, THEN announce — broadcasting MemberLeft
+		// only AFTER the removal closes the ghost-member window: a member joining between an earlier broadcast and
+		// the removal could otherwise snapshot a roster still containing the leaver yet never receive its MemberLeft.
+		boolean ownerChanged = channelRegistry.leave(channelName, session.id()) instanceof Some(String _);
+		if (channel != null) {
+			// Announce to the survivors of the SAME channel object the leave acted on — NOT a fresh find()-by-name,
+			// which could resolve a dropped-and-recreated same-named channel and notify its members instead.
+			synchronized (channel) {
+				ServerMessage left = new ServerMessage.MemberLeft(session.id());
+				channel.forEachOther(session.id(), other -> safeSend(other, left));
+				if (ownerChanged) {
+					// Read the CURRENT owner (not the value leave returned) under the monitor: when two owners
+					// leave back-to-back, the monitor orders the OwnerChanged broadcasts and each carries the
+					// latest elected owner, so a survivor converges on the real owner rather than ending up
+					// believing it is a member who has already left.
+					ServerMessage ownerMsg = new ServerMessage.OwnerChanged(channel.ownerId());
+					channel.forEachOther(session.id(), other -> safeSend(other, ownerMsg));
+				}
+			}
 		}
 		session.leftChannel();
 	}
@@ -206,35 +236,45 @@ public class ConnectionService {
 			session.send(new ServerMessage.FloorGranted());
 			return;
 		}
-		switch (FloorControlUtil.requestFloor(channel, session)) {
-			case FloorResult.Granted _ -> grantFloor(channel, session);
-			// Idle auto-release: reclaim the floor for this requester if the current holder has gone silent
-			// past the configured window. "Silent" = no relayed frame for that long, which the server sees
-			// from frame timing without decoding audio — so it works on encrypted channels too. A holder who
-			// keeps talking is never idle and is instead bounded by the max-hold cap in onAudio. Restricted
-			// to a relay holder: a WebRTC holder's media flows peer-to-peer and never reaches onAudio, so the
-			// server has no activity signal for it and must not preempt an active WebRTC speaker as "idle".
-			case FloorResult.Denied(String currentHolderId) when !floorIdleRelease.isZero()
-					&& currentHolderId != null
-					&& !currentHolderId.equals(session.id())
-					&& channel.member(currentHolderId) instanceof Some(ClientSession holder)
-					&& holder.supportsAudioRelay()
-					&& channel.preemptFloorIfIdle(currentHolderId, session.id(),
-					clock.instant().minus(floorIdleRelease)) -> {
+		Instant now = clock.instant();
+		// Acquire/preempt AND the grant broadcast happen under the floor monitor so the FloorGranted/FloorTaken
+		// can't interleave with a concurrent release's FloorIdle (which would otherwise reach the new holder).
+		synchronized (channel) {
+			if (channel.tryAcquireFloor(session.id(), now)) {
+				grantFloor(channel, session);
+				return;
+			}
+			// Denied — name the current holder (or null if it freed up between our failed acquire and this read).
+			String currentHolderId = channel.floorHolder() instanceof Some(String holder) ? holder : null;
+			if (preemptIfIdle(channel, session, currentHolderId, now)) {
 				log.info("session={} preempted idle floor holder={} on channel={}",
 						session.id(), currentHolderId, channel.name());
 				grantFloor(channel, session);
+			} else {
+				session.send(new ServerMessage.FloorDenied(currentHolderId));
 			}
-			case FloorResult.Denied(String currentHolderId) ->
-					session.send(new ServerMessage.FloorDenied(currentHolderId));
 		}
 	}
 
-	/// Confirms the (already-acquired) floor to `session`: stamps the acquire time for the hold timers and
-	/// announces the new holder to everyone else. The `FloorTaken` broadcast doubles as the notice to a
-	/// just-preempted ex-holder that the floor is no longer theirs.
-	private void grantFloor(Channel channel, ClientSession session) {
-		channel.markFloorAcquired(clock.instant());
+	/// Idle auto-release: reclaim the floor for `requester` if the current holder has gone silent past the
+	/// configured window. "Silent" = no relayed frame for that long, which the server reads from frame timing
+	/// without decoding audio — so it works on encrypted channels too. A holder who keeps talking is never idle
+	/// and is instead bounded by the max-hold cap in onAudio. Restricted to a relay holder: a WebRTC holder's
+	/// media flows peer-to-peer and never reaches onAudio, so the server has no activity signal for it and must
+	/// not preempt an active WebRTC speaker as "idle". The swap and re-stamp are atomic in [Channel].
+	private boolean preemptIfIdle(Channel channel, ClientSession requester, String currentHolderId, Instant now) {
+		return !floorIdleRelease.isZero()
+				&& currentHolderId != null
+				&& !currentHolderId.equals(requester.id())
+				&& channel.member(currentHolderId) instanceof Some(ClientSession holder)
+				&& holder.supportsAudioRelay()
+				&& channel.preemptFloorIfIdle(currentHolderId, requester.id(), now, now.minus(floorIdleRelease));
+	}
+
+	/// Confirms the (already-acquired) floor to `session` and announces the new holder to everyone else (the
+	/// acquire/activity marks were stamped atomically with the swap in [Channel]). The `FloorTaken` broadcast
+	/// doubles as the notice to a just-preempted ex-holder that the floor is no longer theirs.
+	private static void grantFloor(Channel channel, ClientSession session) {
 		session.send(new ServerMessage.FloorGranted());
 		ServerMessage taken = new ServerMessage.FloorTaken(session.id());
 		channel.forEachOther(session.id(), other -> safeSend(other, taken));
@@ -245,9 +285,39 @@ public class ConnectionService {
 		if (channel == null || channel.mode() == ChannelMode.FULL_DUPLEX) {
 			return;
 		}
-		if (FloorControlUtil.releaseFloor(channel, session)) {
-			ServerMessage idle = new ServerMessage.FloorIdle();
-			channel.forEachOther(session.id(), other -> safeSend(other, idle));
+		synchronized (channel) {
+			if (channel.releaseFloor(session.id())) {
+				ServerMessage idle = new ServerMessage.FloorIdle();
+				channel.forEachOther(session.id(), other -> safeSend(other, idle));
+			}
+		}
+	}
+
+	/// Scheduled safety net for the push-to-talk max-hold cap. onAudio enforces the cap lazily on the holder's
+	/// next frame; this sweep also reclaims a holder that has STOPPED sending frames without releasing — the case
+	/// onAudio can't see — so the floor is freed even with idle auto-release disabled and no other member
+	/// contending. It keys off hold time only (never audio content), so it bounds **any** holder, including a
+	/// WebRTC member whose media never reaches the server. No-op while max-hold is disabled (0); the per-channel
+	/// release runs under the channel monitor, so it can't race a concurrent grant (and at most one of the sweep /
+	/// onAudio releases the same hold).
+	@Scheduled(fixedDelay = 1, timeUnit = TimeUnit.SECONDS)
+	void releaseExpiredFloors() {
+		if (floorMaxHold.isZero()) {
+			return;
+		}
+		Instant cutoff = clock.instant().minus(floorMaxHold);
+		for (Channel channel : channelRegistry.channels()) {
+			// Release-and-notify under the floor monitor so a member acquiring the freed floor can't receive the
+			// sweep's stray FloorIdle. forEach notifies the whole channel incl. the (ex-)holder so its client stops.
+			synchronized (channel) {
+				String holder = channel.releaseIfExpired(cutoff);
+				if (holder != null) {
+					ServerMessage idle = new ServerMessage.FloorIdle();
+					channel.forEach(member -> safeSend(member, idle));
+					log.info("session={} reached the max floor-hold time on channel={}; floor released by sweep",
+							holder, channel.name());
+				}
+			}
 		}
 	}
 
@@ -263,35 +333,49 @@ public class ConnectionService {
 				|| !channel.holdsFloor(session.id())) {
 			return;
 		}
+		// Push-to-talk hold limits (no-op in full-duplex, which has no single holder). The sender is the floor
+		// holder here (the gate above checked holdsFloor). Done BEFORE the rate-limit gate so a holder's activity
+		// is recorded from every frame it SENDS — even ones the flood guard later drops — and the max-hold cap
+		// is evaluated on each received frame. Both key off frame timing, never audio content, so they hold on
+		// encrypted channels too.
+		if (channel.mode() != ChannelMode.FULL_DUPLEX) {
+			Instant now = clock.instant();
+			// Re-check the holder + expiry AND release-and-notify under the floor monitor, so the whole
+			// transition is atomic with its broadcast (no concurrent grant can slip in and get a stray FloorIdle)
+			// and the expiry is read against a holder that can't change under us. markFloorActivity / the acquire
+			// / the other release paths all take this same monitor, so transitions are totally ordered per channel.
+			synchronized (channel) {
+				// Re-validate the floor UNDER the monitor: the entry gate's holdsFloor read (above) is lock-free and
+				// may be stale (a concurrent leave/preempt can have revoked the floor since). If it's no longer ours,
+				// drop the frame so a revoked holder's audio is never fanned out (PTT single-talker invariant).
+				if (!channel.holdsFloor(session.id())) {
+					return;
+				}
+				if (!floorMaxHold.isZero()
+						&& Duration.between(channel.floorAcquiredAt(), now).compareTo(floorMaxHold) >= 0
+						&& channel.releaseFloor(session.id())) {
+					// Talk-time limit reached: free the floor and tell the whole channel (incl. the (ex-)speaker
+					// so its client stops transmitting and resets); the speaker must re-request to continue.
+					ServerMessage idle = new ServerMessage.FloorIdle();
+					channel.forEach(member -> safeSend(member, idle));
+					log.info("session={} reached the max floor-hold time on channel={}; floor released",
+							session.id(), channel.name());
+					return;
+				}
+				channel.markFloorActivity(now);
+			}
+		}
+		// A late frame from a session that left/closed since the entry gate must not resurrect a rate-limiter
+		// bucket after onClose's forget(); re-check liveness before computeIfAbsent. (For PTT the holdsFloor
+		// re-check above already covers it; this also covers full-duplex.)
+		if (session.channelName() == null) {
+			return;
+		}
 		// Per-sender flood guard: drop frames from a sender exceeding the configured rate BEFORE fan-out, so a
 		// flooder can't amplify cost across the channel (N recipients) or force excess decode work. This counts
 		// frames without inspecting them, so it works on end-to-end-encrypted channels too (see AudioRateLimiter).
 		if (!audioRateLimiter.tryAcquire(session.id())) {
 			return;
-		}
-		// Push-to-talk hold limits (no-op in full-duplex, which has no single holder). The sender is the floor
-		// holder here (the gate above checked holdsFloor). Max-hold caps continuous talk; otherwise we refresh
-		// the activity mark so idle auto-release measures silence from this frame. Both key off frame timing,
-		// never audio content, so they hold on encrypted channels too.
-		if (channel.mode() != ChannelMode.FULL_DUPLEX) {
-			Instant now = clock.instant();
-			if (!floorMaxHold.isZero()
-					&& Duration.between(channel.floorAcquiredAt(), now).compareTo(floorMaxHold) >= 0) {
-				// Talk-time limit reached. Release ONLY if we still hold the floor: a concurrent RequestFloor may
-				// have legitimately handed it to someone else between this check and here, and a blind clear +
-				// broadcast would yank the floor from that new holder (a stray FloorIdle stopping their client).
-				// On a lost CAS, just drop this frame silently. On success, notify the channel INCLUDING the
-				// (ex-)speaker so its client stops transmitting and resets; the speaker must re-request.
-				if (channel.releaseFloor(session.id())) {
-					ServerMessage idle = new ServerMessage.FloorIdle();
-					session.send(idle);
-					channel.forEachOther(session.id(), other -> safeSend(other, idle));
-					log.info("session={} reached the max floor-hold time on channel={}; floor released",
-							session.id(), channel.name());
-				}
-				return;
-			}
-			channel.markFloorActivity(now);
 		}
 		// Tag the fan-out with the sender's per-channel stream index so receivers can demultiplex talkers;
 		// every client decodes per sender and mixes locally (see docs/CLIENT_PROTOCOL.md §5).
@@ -364,18 +448,20 @@ public class ConnectionService {
 		if (channel.mode() == mode) {
 			return;
 		}
-		channel.setMode(mode);
-		channel.clearFloor();
-		// Broadcast to everyone (incl. the owner): the new mode and a floor reset, so any 'talking'
-		// indicator is superseded and a fresh push-to-talk floor is available.
+		// Mode switch + floor reset + the broadcast happen under the floor monitor, so the FloorIdle can't race a
+		// concurrent grant and the mode/floor everyone sees is consistent.
 		ServerMessage modeChanged = new ServerMessage.ModeChanged(mode);
 		ServerMessage floorIdle = new ServerMessage.FloorIdle();
-		session.send(modeChanged);
-		session.send(floorIdle);
-		channel.forEachOther(session.id(), other -> {
-			safeSend(other, modeChanged);
-			safeSend(other, floorIdle);
-		});
+		synchronized (channel) {
+			channel.setMode(mode);
+			channel.clearFloor();
+			// Broadcast to everyone (incl. the owner): the new mode and a floor reset, so any 'talking'
+			// indicator is superseded and a fresh push-to-talk floor is available.
+			channel.forEach(member -> {
+				safeSend(member, modeChanged);
+				safeSend(member, floorIdle);
+			});
+		}
 		log.info("session={} changed channel={} mode to {}", session.id(), channel.name(), mode);
 	}
 }

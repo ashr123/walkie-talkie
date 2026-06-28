@@ -9,7 +9,6 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /// A single conversation room. Membership, the talk floor, the mode and the owner are tracked with
@@ -24,8 +23,12 @@ public final class Channel {
 	private final String name;
 	private final Map<String, ClientSession> members = new ConcurrentHashMap<>();
 
-	/// The session id currently holding the floor, or `null` when the floor is free.
-	private final AtomicReference<String> floorHolder = new AtomicReference<>();
+	/// The session id currently holding the floor, or `null` when the floor is free. Written only under this
+	/// channel's monitor, so the check-then-set in the acquire/release/preempt paths is atomic; `volatile` so
+	/// the lock-free reads on the hot audio path ([#holdsFloor]) and the join hint ([#floorHolder]) see the
+	/// latest value. (A lock-free read may be momentarily stale — that is why the audio path re-validates under
+	/// the monitor before fanning a frame out.)
+	private volatile String floorHolder;
 
 	private volatile ChannelMode mode;
 	private volatile String ownerId;
@@ -82,8 +85,15 @@ public final class Channel {
 
 	public void remove(String sessionId) {
 		members.remove(sessionId);
-		floorHolder.compareAndSet(sessionId, null);
-		freeStreamIndex(sessionId);
+		synchronized (this) {
+			// Clear the floor under the SAME monitor as tryAcquireFloor/preemptFloorIfIdle/releaseIfExpired, so a
+			// leaver's floor release is serialized with a concurrent grant's holder-swap-and-stamp and can't leave
+			// the holder reference and the acquire/activity marks disagreeing.
+			if (sessionId.equals(floorHolder)) {
+				floorHolder = null;
+			}
+			freeStreamIndex(sessionId);   // reentrant — also synchronized(this)
+		}
 	}
 
 	public boolean isEmpty() {
@@ -148,48 +158,75 @@ public final class Channel {
 		}
 	}
 
-	/// Attempts to acquire the talk floor. Full-duplex channels always grant.
-	public boolean tryAcquireFloor(String sessionId) {
-		return mode == ChannelMode.FULL_DUPLEX || floorHolder.compareAndSet(null, sessionId);
+	/// Applies an action to **every** member (including any current floor holder) — used to broadcast a floor
+	/// release/reset to the whole channel.
+	public void forEach(Consumer<? super ClientSession> action) {
+		members.values().forEach(action);
 	}
 
-	/// Releases the floor if held by `sessionId`; returns whether a release actually happened.
-	public boolean releaseFloor(String sessionId) {
-		return mode != ChannelMode.FULL_DUPLEX && floorHolder.compareAndSet(sessionId, null);
+	/// Attempts to acquire the talk floor, stamping the acquire + activity marks **atomically** with the holder
+	/// swap (under the monitor) so a concurrent idle-preempt can never observe a stale, idle mark for a holder
+	/// that has just acquired. Full-duplex channels have no floor and always grant (no holder, no marks).
+	public synchronized boolean tryAcquireFloor(String sessionId, Instant now) {
+		if (mode == ChannelMode.FULL_DUPLEX) {
+			return true;
+		}
+		if (floorHolder == null) {   // free? take it — atomic since the whole method holds the monitor
+			floorHolder = sessionId;
+			floorAcquiredAt = now;
+			floorActivityAt = now;
+			return true;
+		}
+		return false;
 	}
 
-	/// Unconditionally frees the floor (used when the mode changes).
+	/// Releases the floor if held by `sessionId`; returns whether a release actually happened. Synchronized so
+	/// the holder check and the clear are one atomic step (callers also already hold the monitor — it is reentrant).
+	public synchronized boolean releaseFloor(String sessionId) {
+		if (mode == ChannelMode.FULL_DUPLEX || !sessionId.equals(floorHolder)) {
+			return false;
+		}
+		floorHolder = null;
+		return true;
+	}
+
+	/// Unconditionally frees the floor (used when the mode changes). The single volatile write is itself atomic;
+	/// callers make it ordered with the other floor transitions by holding the monitor across mutate-and-notify.
 	public void clearFloor() {
-		floorHolder.set(null);
+		floorHolder = null;
 	}
 
 	/// Whether `sessionId` may currently transmit (always true in full-duplex mode).
 	public boolean holdsFloor(String sessionId) {
-		return mode == ChannelMode.FULL_DUPLEX || sessionId.equals(floorHolder.get());
+		return mode == ChannelMode.FULL_DUPLEX || sessionId.equals(floorHolder);
 	}
 
 	public Option<String> floorHolder() {
-		return Option.of(floorHolder.get());
+		return Option.of(floorHolder);
 	}
 
 	// --- floor hold timing (push-to-talk anti-hogging) --------------------------------------------
 	// Two marks let the server bound how long one member keeps the floor WITHOUT ever inspecting audio content
 	// — so the limits hold on end-to-end-encrypted channels too. `floorAcquiredAt` backs a max-hold cap
-	// (continuous talk time); `floorActivityAt` (the holder's most recent relayed frame) backs idle
-	// auto-release. Both are instants supplied by the caller, so Channel stays clock-free and unit-testable;
-	// they start at EPOCH and are only read after a real acquire stamps them (see ConnectionService).
+	// (continuous talk time); `floorActivityAt` (the holder's most recent frame) backs idle auto-release. Both
+	// are stamped under the monitor by the acquire / preempt / activity methods and read lock-free via the
+	// getters (volatile); they start at EPOCH and are only read after a real acquire stamps them.
+	//
+	// Serialization contract: the floor-mutating methods here (tryAcquireFloor / releaseFloor / preemptFloorIfIdle /
+	// markFloorActivity / releaseIfExpired) synchronize on THIS Channel instance, so each does its check-then-set
+	// on the plain `floorHolder` field atomically. A caller that must make a floor transition atomic with the
+	// message it broadcasts about it (so a concurrently-acquiring member can't be told the floor is free, or
+	// vice-versa) wraps the whole mutate-and-notify in `synchronized (channel)` — reentrant with these methods.
+	// holdsFloor / floorHolder() stay lock-free (volatile) reads for the per-frame path.
+	// NOTE for such callers: never invoke a ChannelRegistry mutate (joinOrCreate/leave) while holding this
+	// monitor — the registry takes its bin lock then this monitor (via add/remove), so the reverse order deadlocks.
 	private volatile Instant floorAcquiredAt = Instant.EPOCH;
 	private volatile Instant floorActivityAt = Instant.EPOCH;
 
-	/// Records that the floor was just acquired at `now`, resetting both the hold and the activity marks.
-	public void markFloorAcquired(Instant now) {
-		floorAcquiredAt = now;
-		floorActivityAt = now;
-	}
-
 	/// Refreshes the activity mark — call when the current holder transmits a frame, so idle auto-release
-	/// measures silence from the last frame, not from acquisition.
-	public void markFloorActivity(Instant now) {
+	/// measures silence from the last frame, not from acquisition. Synchronized so it can't interleave between
+	/// a preempt's idle check and its swap.
+	public synchronized void markFloorActivity(Instant now) {
 		floorActivityAt = now;
 	}
 
@@ -203,13 +240,35 @@ public final class Channel {
 		return floorActivityAt;
 	}
 
-	/// Atomically reassigns the floor from `expectedHolder` to `newHolder` for an idle auto-release: it succeeds
-	/// only if `expectedHolder` still holds the floor AND its last activity is at or before `idleBefore` (so a
-	/// holder that just refreshed — sent a frame, or released and re-acquired — is not preempted). The idle
-	/// check and the swap are one synchronized step; the activity *write* ([#markFloorActivity]) stays lock-free
-	/// on the per-frame path and only moves the mark forward, so it can't manufacture a false idle.
-	public synchronized boolean preemptFloorIfIdle(String expectedHolder, String newHolder, Instant idleBefore) {
-		return !floorActivityAt.isAfter(idleBefore)    // the holder was active within the window — leave it alone
-				&& floorHolder.compareAndSet(expectedHolder, newHolder);
+	/// Atomically reassigns the floor from `expectedHolder` to `newHolder` for an idle auto-release, stamping
+	/// the new holder's acquire + activity marks **in the same step** as the swap. It succeeds only if
+	/// `expectedHolder` still holds the floor AND its last activity is at or before `idleBefore` (so a holder
+	/// that just refreshed — sent a frame, or was just granted — is not preempted). Doing the idle check, the
+	/// swap, and the re-stamp under one monitor closes the window where a freshly-granted holder still shows the
+	/// previous holder's stale (idle) mark and could be double-preempted.
+	public synchronized boolean preemptFloorIfIdle(String expectedHolder, String newHolder, Instant now, Instant idleBefore) {
+		// expectedHolder is the non-null current-holder id the caller observed; only swap if it still holds.
+		if (floorActivityAt.isAfter(idleBefore) || !expectedHolder.equals(floorHolder)) {
+			return false;
+		}
+		floorHolder = newHolder;
+		floorAcquiredAt = now;
+		floorActivityAt = now;
+		return true;
+	}
+
+	/// Force-releases the floor if a holder has held it since at or before `acquiredAtOrBefore` (the max-hold
+	/// cutoff, i.e. `now − cap`), and returns the released holder's id; returns `null` if there is no holder, the
+	/// channel is full-duplex, or the hold has not yet reached the cap.
+	/// Synchronized so the acquire-time read and the clear can't interleave with a concurrent acquire's stamp.
+	/// Unlike idle auto-release this is a pure hold-time cap, so it bounds **any** holder — including a WebRTC
+	/// member whose media never reaches the server.
+	public synchronized String releaseIfExpired(Instant acquiredAtOrBefore) {
+		String holder = floorHolder;
+		if (mode == ChannelMode.FULL_DUPLEX || holder == null || floorAcquiredAt.isAfter(acquiredAtOrBefore)) {
+			return null;
+		}
+		floorHolder = null;
+		return holder;
 	}
 }
