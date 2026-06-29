@@ -25,7 +25,7 @@ class WebSocketClientSessionTest {
 
 	/// A doAnswer body that blocks until `release`, surviving an interrupt (so close() teardown is clean).
 	private static org.mockito.stubbing.Answer<Object> blockUntil(CountDownLatch entered, CountDownLatch release) {
-		return invocation -> {
+		return _ -> {
 			entered.countDown();
 			try {
 				release.await();
