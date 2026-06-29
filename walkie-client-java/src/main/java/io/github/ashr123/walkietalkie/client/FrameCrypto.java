@@ -37,8 +37,8 @@ final class FrameCrypto {
 	// OWASP's PBKDF2-HMAC-SHA512 floor (210k). It must match the browser's WebCrypto iteration count exactly —
 	// it's part of the cross-platform key-derivation contract.
 	private static final int PBKDF2_ITERATIONS = 600_000;
-	private static final int KEY_BITS = 32 * Byte.SIZE;
-	private static final int KCV_BITS = 16 * Byte.SIZE;          // 16-byte key-check value, derived alongside the AES key
+	private static final int KEY_BITS = Byte.SIZE * 32;
+	private static final int KCV_BITS = Byte.SIZE * 16;          // 16-byte key-check value, derived alongside the AES key
 	private static final String SALT_PREFIX = "walkie-talkie:e2ee:";
 
 	private final SecretKey key;
