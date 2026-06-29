@@ -124,8 +124,12 @@ abstract class WebSocketIntegrationTestSupport {
 	/// `Origin` check (CSWSH defense): a handshake with a disallowed `Origin` fails, surfacing as the returned
 	/// future throwing rather than yielding a session.
 	protected WebSocketSession connect(String path, WebSocketHandler handler, String token, WebSocketHttpHeaders headers) throws Exception {
-		URI uri = URI.create("ws://localhost:" + port + path + "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8));
-		return wsClient.execute(handler, headers, uri).get(5, TimeUnit.SECONDS);
+		return wsClient.execute(
+				handler,
+						headers,
+						URI.create("ws://localhost:" + port + path + "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8))
+				)
+				.get(5, TimeUnit.SECONDS);
 	}
 
 	/// Waits up to 5 seconds for the server to close `session` (e.g. after it rejects an over-cap frame),

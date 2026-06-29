@@ -2,6 +2,7 @@ package io.github.ashr123.walkietalkie.server.ratelimit;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.Temporal;
 
 /// A classic token bucket: tokens accrue at a fixed rate up to a fixed capacity, and each admitted event
 /// spends one. It is refilled lazily from an externally supplied [Instant] on each check, so it holds no timer
@@ -26,7 +27,7 @@ final class TokenBucket {
 
 	/// Adds the whole tokens earned since the last check, then spends one if available. Returns whether the
 	/// event is admitted.
-	synchronized boolean tryConsume(Instant now) {
+	synchronized boolean tryConsume(Temporal now) {
 		long earned = Duration.between(lastRefill, now).dividedBy(perToken);
 		if (earned > 0) {
 			tokens = Math.min(capacity, tokens + earned);

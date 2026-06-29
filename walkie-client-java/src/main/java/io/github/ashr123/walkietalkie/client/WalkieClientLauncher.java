@@ -78,6 +78,7 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 
 	@Override
 	public Integer call() throws Exception {
+		//noinspection EmptyTryBlock
 		try (WalkieClient _ = new WalkieClient(new ClientOptions(
 				server,
 				channel,
