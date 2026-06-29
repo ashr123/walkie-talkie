@@ -105,4 +105,70 @@ class ChannelRegistryTest {
 	private static Set<String> ids(ChannelRegistry.JoinResult result) {
 		return result.roster().stream().map(MemberInfo::id).collect(Collectors.toSet());
 	}
+
+	// --- changePassphrase outcome matrix (the OK / NOT_OWNER / NOT_FOUND contract + same-object channel()) ---
+
+	@Test
+	void changePassphraseRotatesForTheOwnerAndReturnsTheSameChannel() {
+		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a")).channel();
+		ChannelRegistry.RekeyResult result = registry.changePassphrase("team", "a", "kcv-B");
+		assertEquals(ChannelRegistry.RekeyOutcome.OK, result.outcome());
+		assertSame(created, result.channel(), "OK returns the exact mutated channel instance (not a fresh find())");
+		assertEquals("kcv-B", created.keyCheck(), "the key-check is rotated in place");
+	}
+
+	@Test
+	void changePassphraseRefusesANonOwnerAndLeavesTheKeyCheck() {
+		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a")).channel();
+		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("b"));
+		ChannelRegistry.RekeyResult result = registry.changePassphrase("team", "b", "kcv-B");
+		assertEquals(ChannelRegistry.RekeyOutcome.NOT_OWNER, result.outcome());
+		assertNull(result.channel(), "a non-OK result carries no channel");
+		assertEquals("kcv-A", created.keyCheck(), "a refused rotation leaves the key-check unchanged");
+	}
+
+	@Test
+	void changePassphraseOnAMissingChannelIsNotFound() {
+		ChannelRegistry.RekeyResult result = registry.changePassphrase("ghost", "a", "kcv-B");
+		assertEquals(ChannelRegistry.RekeyOutcome.NOT_FOUND, result.outcome());
+		assertNull(result.channel());
+	}
+
+	// --- transferOwnership outcome matrix (OK / NOT_OWNER / NOT_A_MEMBER / NOT_FOUND + same-object channel()) ---
+
+	@Test
+	void transferOwnershipMovesTheOwnerForTheOwnerAndReturnsTheSameChannel() {
+		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
+		ChannelRegistry.TransferResult result = registry.transferOwnership("team", "a", "b");
+		assertEquals(ChannelRegistry.TransferOutcome.OK, result.outcome());
+		assertSame(created, result.channel());
+		assertEquals("b", created.ownerId(), "ownership moved to the named member");
+	}
+
+	@Test
+	void transferOwnershipRefusesANonOwner() {
+		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
+		ChannelRegistry.TransferResult result = registry.transferOwnership("team", "b", "b");
+		assertEquals(ChannelRegistry.TransferOutcome.NOT_OWNER, result.outcome());
+		assertNull(result.channel());
+		assertEquals("a", created.ownerId(), "ownership is unchanged");
+	}
+
+	@Test
+	void transferOwnershipToANonMemberIsRejected() {
+		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		ChannelRegistry.TransferResult result = registry.transferOwnership("team", "a", "ghost");
+		assertEquals(ChannelRegistry.TransferOutcome.NOT_A_MEMBER, result.outcome());
+		assertNull(result.channel());
+		assertEquals("a", created.ownerId(), "ownership is unchanged");
+	}
+
+	@Test
+	void transferOwnershipOnAMissingChannelIsNotFound() {
+		ChannelRegistry.TransferResult result = registry.transferOwnership("ghost", "a", "b");
+		assertEquals(ChannelRegistry.TransferOutcome.NOT_FOUND, result.outcome());
+		assertNull(result.channel());
+	}
 }

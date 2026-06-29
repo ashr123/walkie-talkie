@@ -13,8 +13,9 @@ import java.util.function.Consumer;
 
 /// A single conversation room. Membership, the talk floor, the mode and the owner are tracked with
 /// concurrent primitives so that connections handled on different (virtual) threads can join, leave,
-/// transmit and re-configure safely. The `mode` and `ownerId` are mutable: the owner may change the
-/// mode, and ownership transfers to another member when the owner leaves.
+/// transmit and re-configure safely. The `mode`, `ownerId` and `keyCheck` are mutable: the owner may change
+/// the mode or rotate the encryption passphrase, and ownership transfers to another member when the owner
+/// leaves.
 public final class Channel {
 
 	/// Usable stream indices are 0..254; 255 (0xFF) is reserved as a future "extended id" escape.
@@ -34,9 +35,19 @@ public final class Channel {
 	private volatile String ownerId;
 
 	/// The key-check value every member must present to join (a short value derived from the E2EE
-	/// passphrase, or `null` for an unencrypted channel), set by the creator. The server compares it to
-	/// reject a mismatched passphrase; it is not the key and reveals nothing usable about it.
-	private final String keyCheck;
+	/// passphrase, or `null` for an unencrypted channel), set by the creator and changed by the owner on a
+	/// passphrase rotation. The server compares it to reject a mismatched passphrase; it is not the key and
+	/// reveals nothing usable about it.
+	///
+	/// Concurrency: the **write** ([#setKeyCheck], from [ChannelRegistry#changePassphrase]) and the
+	/// join-validation **read** ([ChannelRegistry#joinOrCreate]) both happen inside the registry's
+	/// `channels.computeIfPresent(name, …)` / `compute(name, …)` remapping, so the `ConcurrentHashMap` bin lock
+	/// for the channel name serializes a rotation with every join's key-check check. It is also read **live** when
+	/// `ConnectionService.handleChangePassphrase` announces a rotation (under the channel monitor, a *different*
+	/// lock), so the field is `volatile` for that cross-lock visibility — the monitor + live read make
+	/// back-to-back rotations converge on the channel's current value (mirroring the `OwnerChanged` discipline).
+	/// Still mutate it only via [#setKeyCheck] from the registry's bin-locked remapping.
+	private volatile String keyCheck;
 
 	/// Per-channel stream-index allocator: maps each member's session id to a uint8 routing index (0..254).
 	/// The server prefixes this index onto a member's relayed audio so multi-stream receivers can demultiplex
@@ -60,6 +71,13 @@ public final class Channel {
 
 	public String keyCheck() {
 		return keyCheck;
+	}
+
+	/// Replaces the key-check on a passphrase rotation. Call **only** from [ChannelRegistry#changePassphrase],
+	/// i.e. inside the channel-name `channels.compute(…)` span, so it serializes with join validation (see the
+	/// `keyCheck` field's concurrency note).
+	public void setKeyCheck(String keyCheck) {
+		this.keyCheck = keyCheck;
 	}
 
 	public ChannelMode mode() {

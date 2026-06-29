@@ -101,6 +101,8 @@ public class ConnectionService {
 			case ClientMessage.RequestFloor _ -> handleRequestFloor(session);
 			case ClientMessage.ReleaseFloor _ -> handleReleaseFloor(session);
 			case ClientMessage.ChangeMode(ChannelMode mode) -> handleChangeMode(session, mode);
+			case ClientMessage.ChangePassphrase(String keyCheck) -> handleChangePassphrase(session, keyCheck);
+			case ClientMessage.TransferOwnership(String newOwnerId) -> handleTransferOwnership(session, newOwnerId);
 			case ClientMessage.Rename(String displayName) -> handleRename(session, displayName);
 			case ClientMessage.Offer(String target, String sdp) ->
 					relaySignal(session, target, new ServerMessage.SignalOffer(session.id(), sdp));
@@ -141,10 +143,10 @@ public class ConnectionService {
 			return;
 		}
 
-		if (session.channelName() != null) {
-			handleLeave(session);
-		}
-
+		// Validate the switch TARGET before leaving the current channel, so a bad request (typo'd channel name,
+		// invalid display name, or reserved/encryption misuse) is refused WITHOUT dropping the client from the
+		// channel it is already in. Only a passphrase mismatch can still drop a switcher — it is detectable only
+		// by the atomic joinOrCreate below, which necessarily runs after the leave.
 		if (requested == null || !CHANNEL_NAME.matcher(requested).matches()) {
 			sendError(session, "invalid_channel",
 					"Channel name must match " + CHANNEL_NAME.pattern());
@@ -166,6 +168,11 @@ public class ConnectionService {
 			sendError(session, "encryption_not_allowed",
 					"The global channel can't be end-to-end encrypted — clear the passphrase to join it.");
 			return;
+		}
+
+		// Switching channels: leave the current one only after the target passed the validations above.
+		if (session.channelName() != null) {
+			handleLeave(session);
 		}
 		session.setDisplayName(join.displayName());
 		// The name is only known now (after validation), but onMessage snapshotted the MDC name at scope entry
@@ -506,6 +513,85 @@ public class ConnectionService {
 			});
 		}
 		log.info("changed channel={} mode to {}", channel.name(), mode);
+	}
+
+	/// Rotates the current channel's end-to-end-encryption passphrase, but only for its owner. The server never
+	/// learns the passphrase — the request carries only the key-check derived from the new one (or `null` to make
+	/// the channel unencrypted) — so all it does is record the new key-check and broadcast a `PassphraseChanged`
+	/// to every member (including the owner) so each client re-derives its key from the new passphrase, obtained
+	/// out-of-band exactly as the original was. A non-owner gets `not_owner`; a request before joining gets
+	/// `not_in_channel`. The server-managed `global` room has the sentinel owner, so a rotation there is refused
+	/// as `not_owner` — it stays the unencrypted broadcast room.
+	///
+	/// Concurrency: the key-check write happens inside the registry's channel-name `computeIfPresent` span (see
+	/// [ChannelRegistry#changePassphrase]), serializing it with every join's key-check validation. The broadcast
+	/// then runs **under the channel monitor reading the channel's LIVE key-check** — mirroring [#handleLeave]'s
+	/// `OwnerChanged` discipline — over the mutated channel the registry returns (not a fresh `find()`). Reading
+	/// the live value under the monitor (rather than fanning out the request's captured key-check lock-free) makes
+	/// two rotations that straddle an ownership change CONVERGE: a broadcast delayed past a later rotation carries
+	/// the channel's current key-check, so no member is left comparing its no-plaintext gate against a stale
+	/// key-check the channel no longer uses. The audio relay path needs no change — it forwards frames opaquely,
+	/// so a brief transition where some members hold the new key and others the old just drops a few GCM-failing
+	/// frames, exactly as a channel switch does.
+	private void handleChangePassphrase(ClientSession session, String keyCheck) {
+		String channelName = session.channelName();
+		if (channelName == null) {
+			sendError(session, "not_in_channel", "Join a channel first");
+			return;
+		}
+		ChannelRegistry.RekeyResult result = channelRegistry.changePassphrase(channelName, session.id(), keyCheck);
+		switch (result.outcome()) {
+			case NOT_FOUND -> sendError(session, "not_in_channel", "Join a channel first");
+			case NOT_OWNER -> sendError(session, "not_owner", "Only the channel owner can change the passphrase");
+			case OK -> {
+				Channel channel = result.channel();
+				synchronized (channel) {
+					ServerMessage passphraseChanged = new ServerMessage.PassphraseChanged(channel.keyCheck());
+					channel.forEach(member -> safeSend(member, passphraseChanged));
+				}
+				// Log the encrypted/plaintext STATUS only — never the key-check token itself.
+				log.info("changed passphrase on channel={} (now {})", channelName,
+						keyCheck == null ? "unencrypted" : "encrypted");
+			}
+		}
+	}
+
+	/// Hands channel ownership to another current member, but only on the current owner's request. Broadcasts the
+	/// same `OwnerChanged` that a departure-triggered auto-election sends, so every client re-renders owner-only
+	/// controls. A non-owner gets `not_owner`; a target that is not a member of the channel gets `unknown_target`;
+	/// a request before joining gets `not_in_channel`. The global room's sentinel owner means a transfer there is
+	/// refused as `not_owner`.
+	///
+	/// Concurrency: the owner check, the target-membership check and the owner write are one atomic step inside
+	/// the registry's channel-name `computeIfPresent` span (see [ChannelRegistry#transferOwnership]), so the
+	/// transfer can't race the auto-election a concurrent `leave` performs, nor hand ownership to a member that is
+	/// concurrently leaving. The broadcast then runs **under the channel monitor reading the channel's LIVE
+	/// owner** — the same discipline [#handleLeave] uses — over the mutated channel the registry returns (not a
+	/// fresh `find()`). Reading the live owner under the monitor (rather than fanning out the request's captured
+	/// `newOwnerId` lock-free) makes a transfer that races a leave-election or a second transfer CONVERGE: a
+	/// broadcast delayed past a later owner change carries the current owner, so no survivor is left believing a
+	/// since-departed member still owns the channel (a permanently stuck ghost owner with no corrector).
+	private void handleTransferOwnership(ClientSession session, String newOwnerId) {
+		String channelName = session.channelName();
+		if (channelName == null) {
+			sendError(session, "not_in_channel", "Join a channel first");
+			return;
+		}
+		ChannelRegistry.TransferResult result = channelRegistry.transferOwnership(channelName, session.id(), newOwnerId);
+		switch (result.outcome()) {
+			case NOT_FOUND -> sendError(session, "not_in_channel", "Join a channel first");
+			case NOT_OWNER -> sendError(session, "not_owner", "Only the channel owner can transfer ownership");
+			case NOT_A_MEMBER -> sendError(session, "unknown_target",
+					"No member '" + newOwnerId + "' in this channel");
+			case OK -> {
+				Channel channel = result.channel();
+				synchronized (channel) {
+					ServerMessage ownerChanged = new ServerMessage.OwnerChanged(channel.ownerId());
+					channel.forEach(member -> safeSend(member, ownerChanged));
+				}
+				log.info("transferred ownership of channel={} to {}", channelName, newOwnerId);
+			}
+		}
 	}
 
 	/// Changes the requester's display name — the human label only. The session id, which keys the floor,

@@ -48,6 +48,12 @@ class ConnectionServiceTest {
 		return session.sent.stream().filter(type::isInstance).map(type::cast).findFirst().orElseThrow();
 	}
 
+	/// The LAST message of a type a session received — the value it would currently believe, given a recipient's
+	/// strictly-ordered (FIFO) mailbox. Used to assert convergence after multiple owner/passphrase changes.
+	private static <T extends ServerMessage> T lastOf(FakeClientSession session, Class<T> type) {
+		return session.sent.stream().filter(type::isInstance).map(type::cast).reduce((a, b) -> b).orElseThrow();
+	}
+
 	private Channel channel(String name) {
 		return channelRegistry.find(name) instanceof Some(Channel channel) ? channel : null;
 	}
@@ -101,7 +107,7 @@ class ConnectionServiceTest {
 		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		ServerMessage.Joined joined = firstOf(bob, ServerMessage.Joined.class);
 		assertTrue(joined.members().stream()
-						.anyMatch(member -> member.id().equals("alice") && member.displayName().equals("alice2")),
+						.anyMatch(member -> "alice".equals(member.id()) && "alice2".equals(member.displayName())),
 				"a new joiner's roster snapshot carries the renamed member's current name");
 	}
 
@@ -145,6 +151,19 @@ class ConnectionServiceTest {
 		assertEquals("other", firstOf(alice, ServerMessage.Joined.class).channel(), "joining a different channel switches");
 		assertNull(channel("team"), "the previous channel is left (and dropped once empty)");
 		assertEquals(1, channel("other").size());
+	}
+
+	@Test
+	void aSwitchToAnInvalidTargetKeepsTheClientInItsCurrentChannel() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		alice.sent.clear();
+
+		// Bad target channel name: validated BEFORE leaving, so the switch is refused without dropping alice.
+		service.onMessage(alice, new ClientMessage.Join("bad name!", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+
+		assertEquals("invalid_channel", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals("team", alice.channelName(), "an invalid switch target must not drop the client from its channel");
+		assertEquals(1, channel("team").size(), "alice is still a member of her channel");
 	}
 
 	@Test
@@ -213,6 +232,258 @@ class ConnectionServiceTest {
 
 		assertEquals("invalid_mode", firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals(ChannelMode.MULTI_CHANNEL_PTT, channel("team").mode(), "the mode is unchanged");
+	}
+
+	@Test
+	void theOwnerCanChangeThePassphraseAndEveryoneIsNotified() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		alice.sent.clear();
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+
+		assertEquals("kcv-B", firstOf(alice, ServerMessage.PassphraseChanged.class).keyCheck(), "the owner is notified too");
+		assertEquals("kcv-B", firstOf(bob, ServerMessage.PassphraseChanged.class).keyCheck());
+		assertEquals("kcv-B", channel("team").keyCheck(), "the channel's recorded key-check is rotated");
+	}
+
+	@Test
+	void aNonOwnerCannotChangeThePassphrase() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		bob.sent.clear();
+
+		service.onMessage(bob, new ClientMessage.ChangePassphrase("kcv-B"));
+
+		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals("kcv-A", channel("team").keyCheck(), "a non-owner cannot rotate the key");
+	}
+
+	@Test
+	void changingThePassphraseBeforeJoiningIsRejected() {
+		FakeClientSession session = session("sess-1");
+		service.onMessage(session, new ClientMessage.ChangePassphrase("kcv-B"));
+		assertEquals("not_in_channel", firstOf(session, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void afterARekeyANewJoinerMustPresentTheNewKeyCheck() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+
+		// The old passphrase no longer works...
+		FakeClientSession stale = session("stale");
+		service.onMessage(stale, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "stale", "kcv-A"));
+		assertEquals("passphrase_mismatch", firstOf(stale, ServerMessage.ErrorMessage.class).code());
+
+		// ...but the new one does.
+		FakeClientSession fresh = session("fresh");
+		service.onMessage(fresh, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "fresh", "kcv-B"));
+		assertEquals("team", firstOf(fresh, ServerMessage.Joined.class).channel());
+		assertEquals(2, channel("team").size(), "alice + the joiner using the new key");
+	}
+
+	@Test
+	void theOwnerCanDisableEncryptionByClearingThePassphrase() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		alice.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.ChangePassphrase(null));   // null key-check = make it plaintext
+
+		assertNull(firstOf(alice, ServerMessage.PassphraseChanged.class).keyCheck(), "null key-check announces 'unencrypted'");
+		assertNull(channel("team").keyCheck(), "the channel is now unencrypted");
+		// A plaintext joiner can now join, and an encrypted one is rejected.
+		FakeClientSession plain = session("plain");
+		service.onMessage(plain, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "plain", null));
+		assertEquals("team", firstOf(plain, ServerMessage.Joined.class).channel());
+		FakeClientSession enc = session("enc");
+		service.onMessage(enc, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "enc", "kcv-A"));
+		assertEquals("passphrase_mismatch", firstOf(enc, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void rotatingThePassphraseOnTheGlobalRoomIsRefused() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("global", ChannelMode.GLOBAL_PTT, "alice", null));
+		alice.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+
+		// The global room is server-owned (sentinel owner), so no participant can rotate it — it stays unencrypted.
+		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertNull(channel("global").keyCheck());
+	}
+
+	@Test
+	void theOwnerCanReEnableEncryptionAfterClearingIt() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase(null));      // disable encryption
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));   // re-enable with a new key
+		assertEquals("kcv-B", channel("team").keyCheck());
+		// A plaintext joiner is now rejected again; one with the new key-check is accepted.
+		FakeClientSession plain = session("plain");
+		service.onMessage(plain, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "plain", null));
+		assertEquals("passphrase_mismatch", firstOf(plain, ServerMessage.ErrorMessage.class).code());
+		FakeClientSession enc = session("enc");
+		service.onMessage(enc, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "enc", "kcv-B"));
+		assertEquals("team", firstOf(enc, ServerMessage.Joined.class).channel());
+	}
+
+	@Test
+	void aSecondRotationReplacesTheKeyCheckAgain() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-C"));
+		assertEquals("kcv-C", channel("team").keyCheck(), "the latest rotation wins");
+		List<ServerMessage.PassphraseChanged> announced = alice.sent.stream()
+				.filter(ServerMessage.PassphraseChanged.class::isInstance)
+				.map(ServerMessage.PassphraseChanged.class::cast)
+				.toList();
+		assertEquals("kcv-C", announced.getLast().keyCheck(), "the final announcement carries the final key-check");
+	}
+
+	@Test
+	void theOwnerCanTransferOwnershipAndEveryoneIsNotified() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		alice.sent.clear();
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
+
+		assertEquals("bob", firstOf(alice, ServerMessage.OwnerChanged.class).ownerId(), "the old owner is notified too");
+		assertEquals("bob", firstOf(bob, ServerMessage.OwnerChanged.class).ownerId());
+		assertEquals("bob", channel("team").ownerId());
+	}
+
+	@Test
+	void aNonOwnerCannotTransferOwnership() {
+		join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		bob.sent.clear();
+
+		service.onMessage(bob, new ClientMessage.TransferOwnership("bob"));
+
+		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals("alice", channel("team").ownerId(), "ownership is unchanged");
+	}
+
+	@Test
+	void transferringOwnershipToANonMemberIsRejected() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		alice.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.TransferOwnership("ghost"));
+
+		assertEquals("unknown_target", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals("alice", channel("team").ownerId(), "ownership is unchanged");
+	}
+
+	@Test
+	void transferringOwnershipBeforeJoiningIsRejected() {
+		FakeClientSession session = session("sess-1");
+		service.onMessage(session, new ClientMessage.TransferOwnership("whoever"));
+		assertEquals("not_in_channel", firstOf(session, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void theNewOwnerCanRotateAndTheOldOwnerCannot() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
+		alice.sent.clear();
+		bob.sent.clear();
+
+		// The NEW owner (bob) can rotate; everyone — including the old owner — is notified.
+		service.onMessage(bob, new ClientMessage.ChangePassphrase("kcv-B"));
+		assertEquals("kcv-B", channel("team").keyCheck());
+		assertEquals("kcv-B", firstOf(bob, ServerMessage.PassphraseChanged.class).keyCheck());
+		assertEquals("kcv-B", firstOf(alice, ServerMessage.PassphraseChanged.class).keyCheck());
+
+		// The OLD owner (alice) no longer can — authority moved with ownership.
+		alice.sent.clear();
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-C"));
+		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals("kcv-B", channel("team").keyCheck(), "the rejected rotation leaves the key unchanged");
+	}
+
+	@Test
+	void aRotationFollowedByATransferKeepsBothMutations() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
+
+		// Both writes go through the same channel-name bin lock; the composed result keeps both.
+		assertEquals("kcv-B", channel("team").keyCheck(), "the rotation survives the transfer");
+		assertEquals("bob", channel("team").ownerId(), "ownership moved");
+	}
+
+	@Test
+	void afterTransferAndTheNewOwnerLeavingSurvivorsConvergeOnACurrentMember() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession carol = join("carol", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		carol.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));   // alice -> bob
+		service.onClose(bob, "bob leaves");                                    // new owner departs -> re-election
+
+		// The LAST OwnerChanged a bystander saw must name the channel's CURRENT owner (a present member) — never
+		// the departed bob. This is the OwnerChanged-names-a-current-member convergence invariant.
+		String announced = lastOf(carol, ServerMessage.OwnerChanged.class).ownerId();
+		assertEquals(channel("team").ownerId(), announced, "survivors converge on the live owner");
+		assertNotEquals("bob", announced, "never left believing the departed member still owns the channel");
+		assertTrue(channel("team").member(announced) instanceof Some(ClientSession _), "the announced owner is a current member");
+	}
+
+	@Test
+	void aSwitchToAChannelWithAWrongPassphraseDropsTheClientFromBoth() {
+		// alice owns encrypted "team"; "other" already exists with a DIFFERENT key-check.
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession bootstrap = session("bootstrap");
+		service.onMessage(bootstrap, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bootstrap", "kcv-OTHER"));
+		alice.sent.clear();
+
+		// In-place switch to "other" with the WRONG key-check: handleJoin leaves "team" BEFORE joinOrCreate
+		// validates the target's key-check, so this is the one switch failure that genuinely drops you.
+		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-WRONG"));
+
+		assertEquals("passphrase_mismatch", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertNull(alice.channelName(), "a wrong-passphrase switch drops the client from BOTH channels");
+		assertNull(channel("team"), "the old channel was left (and dropped once empty)");
+		assertEquals(1, channel("other").size(), "the mismatched switcher was not added to the target");
+	}
+
+	@Test
+	void anUninvolvedMemberAlsoHearsTheOwnerAndPassphraseChanges() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(session("bob"), new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		FakeClientSession carol = session("carol");   // neither owner nor the transfer target — a pure bystander
+		service.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", "kcv-A"));
+		carol.sent.clear();
+
+		// Both broadcasts fan out to the WHOLE channel (forEach), so the bystander must receive them.
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+		assertEquals("kcv-B", firstOf(carol, ServerMessage.PassphraseChanged.class).keyCheck(), "bystander hears the rotation");
+		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
+		assertEquals("bob", firstOf(carol, ServerMessage.OwnerChanged.class).ownerId(), "bystander hears the transfer");
 	}
 
 	// --- additional branch coverage: validation edges and audio-relay rules that are awkward to reach over

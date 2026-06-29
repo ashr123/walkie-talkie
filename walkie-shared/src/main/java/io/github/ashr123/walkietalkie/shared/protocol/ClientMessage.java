@@ -44,6 +44,27 @@ public sealed interface ClientMessage {
 	record ChangeMode(ChannelMode mode) implements ClientMessage {
 	}
 
+	/// Ask the server to change (rotate, set, or clear) the current channel's end-to-end-encryption passphrase.
+	/// Honored only for the channel owner (a non-owner gets `not_owner`; sending it before joining gets
+	/// `not_in_channel`). `keyCheck` is the key-check value derived from the **new** passphrase (see the clients'
+	/// key derivation), or `null` to make the channel unencrypted. As with [Join#keyCheck] the server never sees
+	/// the passphrase itself — it only records the new key-check and broadcasts a
+	/// [ServerMessage.PassphraseChanged] so every member re-derives its key from the new passphrase, which the
+	/// members obtain out-of-band exactly as they did the original one.
+	@JsonTypeName("changePassphrase")
+	record ChangePassphrase(String keyCheck) implements ClientMessage {
+	}
+
+	/// Ask the server to hand channel ownership to another member. Honored only for the current owner (a
+	/// non-owner gets `not_owner`; sending it before joining gets `not_in_channel`); `newOwnerId` must be the
+	/// session id of a **current member** of the channel (else `unknown_target`). On success the server reassigns
+	/// the owner and broadcasts a [ServerMessage.OwnerChanged] to the whole channel — the same message a
+	/// departure-triggered auto-election sends — so the new owner gains the owner-only controls and the old owner
+	/// loses them. The server-managed `global` room has a sentinel owner, so a transfer there is refused.
+	@JsonTypeName("transferOwnership")
+	record TransferOwnership(String newOwnerId) implements ClientMessage {
+	}
+
 	/// Change this client's display name. Validated against the same charset as [Join#displayName]; on success
 	/// the server applies it and broadcasts a [ServerMessage.MemberRenamed] to the channel (including the
 	/// requester, as confirmation). Only the human label changes — the session id, which is the routing

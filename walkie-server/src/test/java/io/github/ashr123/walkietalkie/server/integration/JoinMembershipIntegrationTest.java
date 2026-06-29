@@ -204,6 +204,10 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 
 			ServerMessage.Joined rejoined = awaitType(a.messages, ServerMessage.Joined.class);
 			assertEquals("new", rejoined.channel());
+			// Identity survives an in-place switch: it is the SAME socket, so selfId is unchanged (CLIENT_PROTOCOL
+			// §3c — unlike a reconnect, which gets a fresh id). Clients rely on this (the browser keeps its mic /
+			// AudioContext, the Java client its capture/playback loops) rather than treating a switch as a reconnect.
+			assertEquals(joinedA.selfId(), rejoined.selfId(), "an in-place channel switch keeps the same session id");
 		}
 	}
 }

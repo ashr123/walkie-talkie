@@ -270,6 +270,13 @@
 		<div class="hint" hidden id="passphraseHint">The global channel is the server's unencrypted broadcast room — encryption isn't available there.</div>
 		<button id="connectBtn">Connect</button>
 		<button class="secondary" disabled id="disconnectBtn" style="width:100%; margin-top:8px;">Disconnect</button>
+		<label for="ownerSelect" hidden id="ownerLabel" style="margin-top:8px;">Channel owner</label>
+		<select hidden id="ownerSelect"></select>
+		<button hidden id="applyBtn" style="width:100%; margin-top:8px;">Apply changes</button>
+		<div class="hint" hidden id="applyHint">Change the transport, mode, channel or passphrase above, then click.
+			A new channel name switches rooms (carrying the chosen properties); otherwise the change applies to the
+			current channel — mode and passphrase are owner-only, and changing the transport reconnects. Clear the
+			passphrase and Apply to turn encryption off.</div>
 		<div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Disconnected</span></div>
 	</section>
 

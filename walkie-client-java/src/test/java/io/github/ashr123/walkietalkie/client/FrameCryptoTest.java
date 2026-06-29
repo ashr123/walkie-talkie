@@ -67,4 +67,28 @@ class FrameCryptoTest {
 		frame[0] = 1;   // CODEC_OPUS tag — i.e. a plaintext Opus frame, not the 0xE2 scheme byte
 		assertThrows(GeneralSecurityException.class, () -> crypto.decrypt(frame));
 	}
+
+	@Test
+	void derivesADifferentKeyPerChannel() throws GeneralSecurityException {
+		// The key is salted on the channel name, so switching rooms (or the forced 'global') re-keys. A regression
+		// to passphrase-only salting would still pass the single-channel KATs above yet silently reuse one key
+		// across every room.
+		assertNotEquals(
+				FrameCrypto.fromPassphrase(PASSPHRASE, "room-a").keyCheck(),
+				FrameCrypto.fromPassphrase(PASSPHRASE, "room-b").keyCheck(),
+				"different channels must derive different key-checks");
+		assertFalse(
+				java.util.Arrays.equals(
+						FrameCrypto.deriveKeyBytes(PASSPHRASE, "room-a"),
+						FrameCrypto.deriveKeyBytes(PASSPHRASE, "room-b")),
+				"different channels must derive different AES keys");
+	}
+
+	@Test
+	void rejectsAFrameTooShortToBeEncrypted() throws GeneralSecurityException {
+		FrameCrypto crypto = FrameCrypto.fromPassphrase(PASSPHRASE, CHANNEL);
+		byte[] runt = {(byte) 0xE2, 1, 2, 3};   // scheme byte + a few bytes, well under the 1+12+16 = 29-byte minimum
+		assertThrows(GeneralSecurityException.class, () -> crypto.decrypt(runt),
+				"a frame too short to hold scheme+IV+tag must be rejected before reaching the cipher");
+	}
 }

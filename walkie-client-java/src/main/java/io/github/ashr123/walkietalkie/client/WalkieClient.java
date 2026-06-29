@@ -75,11 +75,18 @@ public final class WalkieClient implements AutoCloseable {
 	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
 	private final AudioEngine audio;
 	private final WebSocket webSocket;
-	private final FrameCrypto crypto;          // AES-256-GCM E2EE, or null when no passphrase; set before the loops start
+	// AES-256-GCM E2EE for the current channel, or null when no passphrase. Volatile + reassigned on an in-place
+	// channel switch (the `c` command), since the capture/playback loops read it from other threads.
+	private volatile FrameCrypto crypto;
 
 	private volatile String selfId = "";
 	private volatile String ownerId;
 	private volatile ChannelMode currentMode;
+	private volatile String currentChannel;     // server-confirmed current channel (updated on Joined)
+	private volatile String currentPassphrase;   // passphrase backing the current channel's key (for switch defaults)
+	private volatile String currentChannelKeyCheck;   // the channel's currently-announced key-check (null = unencrypted); the yardstick a member re-keys against
+	private volatile boolean rekeyInFlight;      // true between sending our own ChangePassphrase (owner) and its echoed PassphraseChanged
+	private volatile String pendingPassphrase;   // the new passphrase we (as owner) submitted, applied when the echo arrives
 	private volatile boolean warnedDecrypt; // listener thread only today, but volatile so the warn-once intent survives a threading refactor
 
 	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
@@ -88,10 +95,13 @@ public final class WalkieClient implements AutoCloseable {
 				.sslContext(TlsTrust.forServer(options.server(), options.tlsTruststore()))
 				.build();
 		this.currentMode = options.mode();
+		this.currentChannel = options.channel();
+		this.currentPassphrase = options.key();
 		this.audio = new AudioEngine(options, this::sendAudioFrame);
 		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
 		String token = login();
-		crypto = setupCrypto();
+		crypto = deriveCrypto(options.key(), options.mode(), options.channel());
+		currentChannelKeyCheck = crypto == null ? null : crypto.keyCheck();   // baseline the channel's key-check from our own join key
 		audio.start();
 		System.out.println("Audio: " + audio.description()
 				+ (crypto == null ? "" : ", end-to-end encrypted (AES-256-GCM)"));
@@ -124,7 +134,9 @@ public final class WalkieClient implements AutoCloseable {
 		System.out.println("""
 				--------------------------------------------------------------------------------------------------
 				 Commands:  t = talk/stop   w = who's here   m <ptt|global|duplex> = mode
-				            n <name> = rename   f = hi-fi on/off   q = quit   h = help
+				            c <channel> [mode] [key] = switch channel   n <name> = rename
+				            p [passphrase] = change passphrase (owner; blank turns encryption off)
+				            o <#id> = give ownership to a member (owner)   f = hi-fi on/off   q = quit   h = help
 				--------------------------------------------------------------------------------------------------""");
 	}
 
@@ -145,18 +157,17 @@ public final class WalkieClient implements AutoCloseable {
 	/// Builds the AES-256-GCM frame cipher from `--key` (or the WALKIE_KEY env var), or null to disable
 	/// E2EE. Salted with the effective channel (the server forces "global" for global mode), so every
 	/// client in the channel derives the same key.
-	private FrameCrypto setupCrypto() throws GeneralSecurityException {
-		String passphrase = options.key();
+	private static FrameCrypto deriveCrypto(String passphrase, ChannelMode mode, String channel) throws GeneralSecurityException {
 		if (passphrase == null || passphrase.isBlank()) {
 			return null;
 		}
-		if (options.mode() == ChannelMode.GLOBAL_PTT) {
+		if (mode == ChannelMode.GLOBAL_PTT) {
 			// Global is the server-managed, always-unencrypted broadcast room — the server rejects an
 			// encrypted global join, so drop the key here (and warn) rather than fail the join.
-			log("[warn] global mode uses the server's unencrypted broadcast channel — ignoring --key");
+			log("[warn] global mode uses the server's unencrypted broadcast channel — ignoring the passphrase");
 			return null;
 		}
-		return FrameCrypto.fromPassphrase(passphrase, options.channel());
+		return FrameCrypto.fromPassphrase(passphrase, channel);
 	}
 
 	private void senderLoop() {
@@ -175,14 +186,39 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	/// Frame sink for [AudioEngine] (runs on its capture thread): encrypt the captured `[tag][opus]` frame
-	/// when E2EE is on, then queue it for the sender loop.
+	/// Frame sink for [AudioEngine] (runs on its capture thread): decide what (if anything) to put on the wire for
+	/// the captured `[tag][opus]` frame, then queue it for the sender loop. Reads both volatiles **once** as the
+	/// arguments to [#outboundFrame]; the rotation writer ([#handlePassphraseChanged]) publishes
+	/// `currentChannelKeyCheck` *before* `crypto`, so the no-plaintext gate engages the instant encryption is
+	/// announced — it does not depend on us having derived the new key yet.
 	private void sendAudioFrame(byte[] frame) {
 		try {
-			sendQueue.offer(new Outbound.Binary(crypto == null ? frame : crypto.encrypt(frame)));
+			byte[] out = outboundFrame(frame, crypto, currentChannelKeyCheck);
+			if (out != null) {
+				sendQueue.offer(new Outbound.Binary(out));
+			}
 		} catch (GeneralSecurityException _) {
 			// drop this frame; keep going
 		}
+	}
+
+	/// Decides what to send for a captured frame, given the key we currently hold and the channel's announced
+	/// key-check: returns the bytes to put on the wire, or `null` to **drop** (stay silent). Pure (no field
+	/// access) so the invariant below is unit-testable without a live socket.
+	///
+	/// Invariant — **never transmit plaintext into a channel the owner has declared encrypted:**
+	/// - key present → send ciphertext under that key (covers the owner's seamless re-key AND an
+	///   encrypted→encrypted rotation where a member still holds only the *old* key — others can't decode it, but
+	///   nothing leaks in the clear);
+	/// - no key + the channel announces a key-check (`announcedKeyCheck != null`) → **drop**. This is the
+	///   plaintext→encrypted *enable* transition for a not-yet-rekeyed member: it has no old key, so "keep the old
+	///   key" would mean staying plaintext — instead it goes silent until it applies the new passphrase;
+	/// - no key + no announced key-check → a genuinely unencrypted channel: send as-is.
+	static byte[] outboundFrame(byte[] frame, FrameCrypto key, String announcedKeyCheck) throws GeneralSecurityException {
+		if (key != null) {
+			return key.encrypt(frame);
+		}
+		return announcedKeyCheck == null ? frame : null;
 	}
 
 	// --- Server messages --------------------------------------------------------------------------
@@ -192,9 +228,18 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.Joined(
 					String selfId, String channel, ChannelMode mode, String ownerId, List<MemberInfo> members
 			) -> {
+				boolean channelChanged = !channel.equals(this.currentChannel);
 				this.selfId = selfId;
 				this.ownerId = ownerId;
 				this.currentMode = mode;
+				this.currentChannel = channel;
+				if (channelChanged) {
+					// Baseline the channel's announced key-check from the key we joined with — only on an ACTUAL
+					// channel change (a switch). switchTo deliberately doesn't advance it, so the transmit gate keeps
+					// suppressing plaintext through the switch round-trip; a same-channel re-snapshot must not reset
+					// it either (it would clobber a pending rotation), mirroring the browser's onJoined.
+					currentChannelKeyCheck = crypto == null ? null : crypto.keyCheck();
+				}
 				// Full-duplex: the mic is live as soon as you join, unless --muted was passed; PTT/global start
 				// muted and require 't' to grab the floor. (Full-duplex transmit needs no floor request.)
 				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX && !options.startMuted());
@@ -242,15 +287,34 @@ public final class WalkieClient implements AutoCloseable {
 						+ modeHint(mode, audio.isTransmitting()));
 			}
 			case ServerMessage.OwnerChanged(String ownerId) -> {
+				boolean becameOwner = selfId.equals(ownerId) && !selfId.equals(this.ownerId);
 				this.ownerId = ownerId;
 				log(selfId.equals(ownerId)
 						? "[owner] you are now the owner — 'm <ptt|global|duplex>' to change the mode"
 						: "[owner] channel owner is now " + name(ownerId));
+				// Mirror the browser: if we were promoted while still holding a key that doesn't match the channel
+				// (a rotation we never reconciled), warn that 'p' now ROTATES for everyone — so a user must not
+				// just re-type the stale passphrase (it would re-key the whole channel to it).
+				FrameCrypto held = crypto;
+				if (becameOwner && currentChannelKeyCheck != null
+						&& (held == null || !currentChannelKeyCheck.equals(held.keyCheck()))) {
+					log("[owner] note: your key doesn't match the channel — as owner, 'p <passphrase>' now ROTATES it for everyone, so set one you actually hold instead of re-typing a stale one.");
+				}
 			}
+			case ServerMessage.PassphraseChanged(String keyCheck) -> handlePassphraseChanged(keyCheck);
 			case ServerMessage.SignalOffer _, ServerMessage.SignalAnswer _,
 			     ServerMessage.SignalIce _ -> { /* WebRTC: not used by the relay client */ }
 			case ServerMessage.ErrorMessage(String code, String message) -> {
 				log("[error] " + code + ": " + message);
+				// Abandon an in-flight rekey ONLY when THIS error is the one that rejected our ChangePassphrase
+				// (not_owner if we lost ownership in a race, or not_in_channel) — otherwise a later PassphraseChanged
+				// (from the new owner) would wrongly apply our stashed passphrase. Scope it to those codes so an
+				// UNRELATED error (e.g. a rejected rename/mode we sent just before) can't wipe a legitimately
+				// in-flight rotation and lock us out of our own just-rotated channel.
+				if ("not_owner".equals(code) || "not_in_channel".equals(code)) {
+					rekeyInFlight = false;
+					pendingPassphrase = null;
+				}
 				// A passphrase mismatch is fatal: the channel requires a different --key, so there's nothing
 				// to do but disconnect. getAndSet(false) makes this fire once (mirrors onConnectionLost).
 				if ("passphrase_mismatch".equals(code) && running.getAndSet(false)) {
@@ -332,6 +396,9 @@ public final class WalkieClient implements AutoCloseable {
 				switch (parts[0].toLowerCase(Locale.ROOT)) {
 					case "t", "talk" -> toggleTalk();
 					case "m", "mode" -> changeMode(parts.length > 1 ? parts[1] : "");
+					case "c", "channel" -> switchChannel(parts.length > 1 ? parts[1] : "");
+					case "p", "passphrase" -> changePassphrase(parts.length > 1 ? parts[1] : "");
+					case "o", "owner" -> transferOwnership(parts.length > 1 ? parts[1] : "");
 					case "n", "name" -> rename(parts.length > 1 ? parts[1] : "");
 					case "f", "fidelity" -> toggleFidelity();
 					case "w", "who", "members" -> listMembers();
@@ -339,7 +406,7 @@ public final class WalkieClient implements AutoCloseable {
 					case "h", "help" -> printHelp();
 					case "" -> { /* ignore blank lines */ }
 					default ->
-							System.out.println("Commands: 't' talk/stop, 'w' who's here, 'm <ptt|global|duplex>' mode, 'n <name>' rename, 'f' hi-fi, 'q' quit, 'h' help.");
+							System.out.println("Commands: 't' talk/stop, 'w' who's here, 'm <ptt|global|duplex>' mode, 'c <channel> [mode] [key]' switch channel, 'p [passphrase]' change passphrase, 'o <#id>' give ownership, 'n <name>' rename, 'f' hi-fi, 'q' quit, 'h' help.");
 				}
 			}
 		} catch (IOException _) {
@@ -385,6 +452,157 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
+	/// `p [passphrase]` — change the channel's end-to-end-encryption passphrase. For the OWNER this rotates it for
+	/// everyone (a blank passphrase turns encryption off); the new key is applied only when the server echoes
+	/// [ServerMessage.PassphraseChanged], so a rejected request leaves the old key intact. For a MEMBER it applies
+	/// the owner's already-announced new passphrase LOCALLY (no server round-trip — the server never carries the
+	/// passphrase), verifying it against the channel's announced key-check so a wrong one is caught rather than
+	/// silently desyncing.
+	private void changePassphrase(String arg) {
+		String passphrase = arg.strip();
+		if (currentMode == ChannelMode.GLOBAL_PTT) {
+			log("[passphrase] the global room is the server's unencrypted broadcast channel — encryption isn't available there.");
+			return;
+		}
+		if (selfId.equals(ownerId)) {
+			try {
+				FrameCrypto next = deriveCrypto(passphrase, currentMode, currentChannel);   // blank -> null -> no encryption
+				pendingPassphrase = next == null ? null : passphrase;
+				rekeyInFlight = true;
+				enqueue(new ClientMessage.ChangePassphrase(next == null ? null : next.keyCheck()));
+				log(next == null
+						? "[passphrase] requested encryption OFF for everyone..."
+						: "[passphrase] requested a re-key for everyone (share the new passphrase out-of-band)...");
+			} catch (GeneralSecurityException e) {
+				log("[passphrase] key derivation failed: " + e.getMessage());
+			}
+		} else {
+			applyMemberPassphrase(passphrase);
+		}
+	}
+
+	/// The decision for an announced passphrase change, given the channel's announced key-check and the key a
+	/// client derived from the passphrase it currently holds. Pure (no field access) so the security rule — NEVER
+	/// adopt a key whose key-check doesn't match the announced one, and only clear the key on an explicit disable
+	/// — is unit-testable without a live socket. `APPLY`: adopt `candidate`. `KEEP`: hold the current key (we
+	/// don't have the new passphrase yet, or it mismatched). `DISABLE`: the owner turned encryption off.
+	enum RekeyAction {APPLY, KEEP, DISABLE}
+
+	static RekeyAction rekeyAction(String announcedKeyCheck, FrameCrypto candidate) {
+		if (announcedKeyCheck == null) {
+			return RekeyAction.DISABLE;
+		}
+		return candidate != null && announcedKeyCheck.equals(candidate.keyCheck()) ? RekeyAction.APPLY : RekeyAction.KEEP;
+	}
+
+	/// A member adopting the owner's new passphrase locally. Re-derives the key and applies it only if it matches
+	/// the channel's announced key-check ([#rekeyAction]); on a mismatch it warns and KEEPS the current key —
+	/// never falling back to plaintext, which would broadcast in the clear into a still-encrypted channel.
+	private void applyMemberPassphrase(String passphrase) {
+		try {
+			FrameCrypto candidate = currentChannelKeyCheck == null ? null : deriveCrypto(passphrase, currentMode, currentChannel);
+			switch (rekeyAction(currentChannelKeyCheck, candidate)) {
+				case DISABLE -> {
+					crypto = null;
+					currentPassphrase = null;
+					log("[passphrase] this channel is currently unencrypted.");
+				}
+				case APPLY -> {
+					crypto = candidate;
+					currentPassphrase = passphrase;
+					log("[passphrase] re-keyed — end-to-end encryption updated.");
+				}
+				case KEEP -> log("[passphrase] that passphrase doesn't match the channel's current key — try 'p <passphrase>' again.");
+			}
+		} catch (GeneralSecurityException e) {
+			log("[passphrase] key derivation failed: " + e.getMessage());
+		}
+	}
+
+	/// Applies an owner's passphrase rotation echoed by the server. The server relays only the new key-check (or
+	/// `null` to disable encryption), never the passphrase — so we re-derive the key from a passphrase we already
+	/// hold and verify it against `keyCheck` via [#rekeyAction]. If we initiated this (we are the owner) that is
+	/// the passphrase we just submitted; for a member it is the one currently in use, which won't match until the
+	/// user re-enters the new one with `p`. On a mismatch we KEEP the old key (no plaintext fallback). The
+	/// volatile `crypto` swap is read once by the capture/listener threads, so the worst a transition does is drop
+	/// a few frames on a failed GCM tag.
+	private void handlePassphraseChanged(String keyCheck) {
+		currentChannelKeyCheck = keyCheck;
+		boolean initiating = rekeyInFlight;
+		String passphrase = initiating ? pendingPassphrase : currentPassphrase;
+		rekeyInFlight = false;
+		pendingPassphrase = null;
+		try {
+			FrameCrypto candidate = keyCheck == null ? null : deriveCrypto(passphrase, currentMode, currentChannel);
+			switch (rekeyAction(keyCheck, candidate)) {
+				case DISABLE -> {
+					crypto = null;
+					currentPassphrase = null;
+					log("[passphrase] the owner turned encryption OFF for this channel.");
+				}
+				case APPLY -> {
+					crypto = candidate;
+					currentPassphrase = passphrase;
+					log("[passphrase] channel re-keyed — end-to-end encryption updated.");
+				}
+				case KEEP -> log("[passphrase] the owner changed the passphrase — run 'p <new-passphrase>' to keep talking.");
+			}
+		} catch (GeneralSecurityException e) {
+			log("[passphrase] key derivation failed: " + e.getMessage());
+		}
+	}
+
+	/// Switches to a different channel WITHOUT dropping the session: the server treats a fresh Join as
+	/// "leave the old channel, join the new one" on the same socket, so the session id (and the audio loops)
+	/// survive. Mode and passphrase are optional and default to the current ones. Usage: c <channel> [mode] [key].
+	private void switchChannel(String args) {
+		String[] parts = args.strip().split("\\s+", 3);
+		String channel = parts[0];
+		if (channel.isBlank()) {
+			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]");
+			return;
+		}
+		switchTo(channel,
+				parts.length > 1 ? parseMode(parts[1], currentMode) : currentMode,
+				parts.length > 2 ? parts[2] : currentPassphrase);
+	}
+
+	/// Re-derives the E2EE key for the new channel (the key salts on the channel name) and sends the Join; the
+	/// resulting Joined snapshot resets the roster/mode like the initial join. NOTE: switching to a channel whose
+	/// passphrase doesn't match drops you from the current channel — the server leaves the old channel before the
+	/// new join is validated — so supply the right passphrase for the target.
+	private void switchTo(String channel, ChannelMode mode, String passphrase) {
+		String effective = mode == ChannelMode.GLOBAL_PTT ? "global" : channel;
+		if (effective.equals(currentChannel)) {
+			log("[switch] already in \"" + effective + "\" — use 'p <passphrase>' to change the passphrase here, or pick a different channel to switch.");
+			return;
+		}
+		try {
+			FrameCrypto next = deriveCrypto(passphrase, mode, channel);
+			crypto = next;                 // volatile — the capture/playback loops pick up the new key
+			currentPassphrase = passphrase;
+			// Do NOT advance currentChannelKeyCheck here: leave it at the OLD channel's value until the server
+			// confirms the switch (the Joined handler baselines it). The server still routes our audio to the OLD
+			// channel during the join round-trip, so if we're switching OUT of an encrypted channel to a plaintext
+			// one, keeping the old (non-null) key-check makes the transmit gate (outboundFrame) keep dropping
+			// frames instead of leaking cleartext into the channel we're leaving.
+			String display = memberNames.getOrDefault(selfId, options.display());
+			enqueue(new ClientMessage.Join(channel, mode, display, next == null ? null : next.keyCheck()));
+			log("[switch] joining \"" + channel + "\" (" + mode + ")...");
+		} catch (GeneralSecurityException e) {
+			log("[switch] key derivation failed: " + e.getMessage());
+		}
+	}
+
+	private static ChannelMode parseMode(String arg, ChannelMode fallback) {
+		return switch (arg.toLowerCase(Locale.ROOT)) {
+			case "ptt", "multi" -> ChannelMode.MULTI_CHANNEL_PTT;
+			case "global" -> ChannelMode.GLOBAL_PTT;
+			case "duplex", "full" -> ChannelMode.FULL_DUPLEX;
+			default -> fallback;
+		};
+	}
+
 	/// Asks the server to change our display name. Validated locally for a fast no, but the server validates
 	/// authoritatively and the resulting [ServerMessage.MemberRenamed] (broadcast back to us) is what actually
 	/// updates the roster — so a rejected name surfaces as an `[error]` line instead.
@@ -394,6 +612,38 @@ public final class WalkieClient implements AutoCloseable {
 			return;
 		}
 		enqueue(new ClientMessage.Rename(newName));
+	}
+
+	/// `o <id-prefix>` — hand channel ownership to another member, identified by the start of its session id (the
+	/// `#`-prefix shown next to each member in the roster; a leading `#` is optional). Gated locally to the owner
+	/// (the server enforces it too); the resulting [ServerMessage.OwnerChanged] is what actually moves the
+	/// owner-only controls.
+	private void transferOwnership(String arg) {
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can transfer ownership");
+			return;
+		}
+		String prefix = arg.strip();
+		if (prefix.startsWith("#")) {
+			prefix = prefix.substring(1);
+		}
+		if (prefix.isBlank()) {
+			System.out.println("Usage: o <id-prefix>  (the #id shown next to a member in 'w')");
+			return;
+		}
+		String needle = prefix;
+		List<String> matches = memberNames.keySet().stream()
+				.filter(id -> !id.equals(selfId) && id.startsWith(needle))
+				.toList();
+		switch (matches.size()) {
+			case 0 -> log("[transfer] no other member's id starts with \"" + needle + "\" — use 'w' to list members.");
+			case 1 -> {
+				String target = matches.getFirst();
+				enqueue(new ClientMessage.TransferOwnership(target));
+				log("[transfer] handing ownership to " + name(target) + "...");
+			}
+			default -> log("[transfer] \"" + needle + "\" matches " + matches.size() + " members — use more of the id.");
+		}
 	}
 
 	private WebSocket connect(String token) {
@@ -514,11 +764,12 @@ public final class WalkieClient implements AutoCloseable {
 				if (frame.length >= 2) {
 					int sid = frame[0] & 0xFF;
 					byte[] body = Arrays.copyOfRange(frame, 1, frame.length);
-					if (crypto == null) {
+					FrameCrypto key = crypto;   // read the volatile once — a concurrent channel switch may swap it
+					if (key == null) {
 						audio.play(sid, body);
 					} else {
 						try {
-							audio.play(sid, crypto.decrypt(body));
+							audio.play(sid, key.decrypt(body));
 						} catch (GeneralSecurityException _) {
 							if (!warnedDecrypt) {
 								warnedDecrypt = true;

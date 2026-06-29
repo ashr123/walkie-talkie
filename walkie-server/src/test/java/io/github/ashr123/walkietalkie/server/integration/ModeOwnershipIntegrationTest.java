@@ -8,6 +8,7 @@ import org.springframework.web.socket.WebSocketSession;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /// Owner-only mode changes and their side effects, plus ownership transfer when the owner departs. The
 /// owner-gating and ownership election are transport-agnostic, so one case runs over /ws/signal.
@@ -173,6 +174,34 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			awaitType(c.messages, ServerMessage.Joined.class);
 			send(sc, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
 			assertEquals("not_owner", awaitType(c.messages, ServerMessage.ErrorMessage.class).code());
+		}
+	}
+
+	@Test
+	void passphraseRotationAndOwnershipTransferRoundTripOverTheWire() throws Exception {
+		// Drives the three BRAND-NEW wire types — ChangePassphrase, PassphraseChanged, TransferOwnership — through
+		// real Jackson 3 polymorphic (de)serialization over /ws/audio (the FakeClientSession unit tests never cross
+		// JSON). A typo'd @JsonTypeName, a dropped field, or a null-handling regression would only surface here.
+		CollectingHandler a = new CollectingHandler();
+		CollectingHandler b = new CollectingHandler();
+		try (WebSocketSession sa = connect(AUDIO, a, login());
+		     WebSocketSession sb = connect(AUDIO, b, login())) {
+			String[] ids = joinPair("rotate-wire", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+
+			// Enable encryption with a non-null key-check — both peers receive PassphraseChanged carrying it.
+			send(sa, new ClientMessage.ChangePassphrase("kcv-hex-1"));
+			assertEquals("kcv-hex-1", awaitType(a.messages, ServerMessage.PassphraseChanged.class).keyCheck());
+			assertEquals("kcv-hex-1", awaitType(b.messages, ServerMessage.PassphraseChanged.class).keyCheck());
+
+			// Disable — the NULL key-check must survive the JSON round-trip (a Jackson null regression shows only here).
+			send(sa, new ClientMessage.ChangePassphrase(null));
+			assertNull(awaitType(a.messages, ServerMessage.PassphraseChanged.class).keyCheck());
+			assertNull(awaitType(b.messages, ServerMessage.PassphraseChanged.class).keyCheck());
+
+			// Explicit ownership transfer — both peers receive OwnerChanged naming Bob.
+			send(sa, new ClientMessage.TransferOwnership(ids[1]));
+			assertEquals(ids[1], awaitType(a.messages, ServerMessage.OwnerChanged.class).ownerId());
+			assertEquals(ids[1], awaitType(b.messages, ServerMessage.OwnerChanged.class).ownerId());
 		}
 	}
 

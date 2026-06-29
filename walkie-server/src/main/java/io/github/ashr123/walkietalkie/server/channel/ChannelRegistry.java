@@ -50,7 +50,7 @@ public class ChannelRegistry {
 
 	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], plus a hook run on a successful add. See
 	/// the six-argument form for what `onJoinUnderLock` guarantees.
-	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, Consumer<JoinResult> onJoinUnderLock) {
+	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, Consumer<? super JoinResult> onJoinUnderLock) {
 		return joinOrCreate(name, mode, keyCheck, session, session.id(), onJoinUnderLock);
 	}
 
@@ -61,7 +61,7 @@ public class ChannelRegistry {
 	/// it) and a grant/preempt can't leave the hint naming a stale holder. The hook MUST be short and
 	/// non-blocking — it runs under the registry bin lock and the channel monitor, and must NOT call back into
 	/// the registry (that would invert the bin→monitor order). It is skipped entirely on a key-check mismatch.
-	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, Consumer<JoinResult> onJoinUnderLock) {
+	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, Consumer<? super JoinResult> onJoinUnderLock) {
 		AtomicReference<JoinResult> joined = new AtomicReference<>();
 		channels.compute(name, (key, existing) -> {
 			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck) : existing;
@@ -108,6 +108,71 @@ public class ChannelRegistry {
 			return channel;
 		});
 		return Option.of(newOwner.get());
+	}
+
+	/// The outcome of a [#changePassphrase] attempt: `OK` (the key-check was replaced), `NOT_OWNER` (the
+	/// requester does not own the channel), or `NOT_FOUND` (no such channel — e.g. it emptied and was dropped).
+	public enum RekeyOutcome {OK, NOT_OWNER, NOT_FOUND}
+
+	/// A [#changePassphrase] result: the `outcome` and, on `OK`, the exact `Channel` instance whose key-check was
+	/// rotated. The caller broadcasts over **that** object — never a fresh `find()`-by-name, which could resolve a
+	/// dropped-and-recreated same-named channel and misroute the notice (the same-object discipline [#leave] uses).
+	public record RekeyResult(RekeyOutcome outcome, Channel channel) {
+	}
+
+	/// Rotates (sets/clears) a channel's key-check on the owner's request. The owner check and the key-check
+	/// write happen **inside** `channels.computeIfPresent(name, …)`, i.e. under the same `ConcurrentHashMap` bin
+	/// lock that [#joinOrCreate]'s `channels.compute` validates a joiner's key-check under — so a rotation is
+	/// atomic with respect to every concurrent join (a joiner either validates against the old value and is then
+	/// told of the change, or validates against the new value), and with respect to the ownership transfer a
+	/// concurrent [#leave] performs (also under this bin lock). On `OK` the result carries the mutated channel so
+	/// the caller broadcasts [io.github.ashr123.walkietalkie.shared.protocol.ServerMessage.PassphraseChanged] over
+	/// that exact instance; any member present at the rotation is still in its (concurrent) member view when the
+	/// broadcast iterates, and any member that joins afterwards already used the new key-check.
+	public RekeyResult changePassphrase(String name, String requesterId, String newKeyCheck) {
+		AtomicReference<RekeyResult> result = new AtomicReference<>(new RekeyResult(RekeyOutcome.NOT_FOUND, null));
+		channels.computeIfPresent(name, (_, channel) -> {
+			if (requesterId.equals(channel.ownerId())) {
+				channel.setKeyCheck(newKeyCheck);
+				result.set(new RekeyResult(RekeyOutcome.OK, channel));
+			} else {
+				result.set(new RekeyResult(RekeyOutcome.NOT_OWNER, null));
+			}
+			return channel;
+		});
+		return result.get();
+	}
+
+	/// The outcome of a [#transferOwnership] attempt: `OK`, `NOT_OWNER` (the requester does not own the channel),
+	/// `NOT_A_MEMBER` (the target id is not a member here), or `NOT_FOUND` (no such channel).
+	public enum TransferOutcome {OK, NOT_OWNER, NOT_A_MEMBER, NOT_FOUND}
+
+	/// A [#transferOwnership] result: the `outcome` and, on `OK`, the `Channel` whose owner changed — so the
+	/// caller broadcasts over that exact instance (see [RekeyResult] for why a fresh `find()` would be unsafe).
+	public record TransferResult(TransferOutcome outcome, Channel channel) {
+	}
+
+	/// Hands ownership to another current member on the owner's request. The owner check, the membership check
+	/// and the owner write all happen **inside** `channels.computeIfPresent(name, …)` — the same bin lock under
+	/// which [#leave] performs its departure-triggered auto-election — so an explicit transfer can't race that
+	/// election (one wins the lock, then the other observes the result) and can't hand ownership to a member who
+	/// is concurrently leaving (the membership check and the write are one atomic step). On `OK` the result
+	/// carries the channel so the caller broadcasts
+	/// [io.github.ashr123.walkietalkie.shared.protocol.ServerMessage.OwnerChanged] over that exact instance.
+	public TransferResult transferOwnership(String name, String requesterId, String newOwnerId) {
+		AtomicReference<TransferResult> result = new AtomicReference<>(new TransferResult(TransferOutcome.NOT_FOUND, null));
+		channels.computeIfPresent(name, (_, channel) -> {
+			if (!requesterId.equals(channel.ownerId())) {
+				result.set(new TransferResult(TransferOutcome.NOT_OWNER, null));
+			} else if (channel.member(newOwnerId) instanceof Some(ClientSession _)) {
+				channel.setOwner(newOwnerId);
+				result.set(new TransferResult(TransferOutcome.OK, channel));
+			} else {
+				result.set(new TransferResult(TransferOutcome.NOT_A_MEMBER, null));
+			}
+			return channel;
+		});
+		return result.get();
 	}
 
 	public int channelCount() {

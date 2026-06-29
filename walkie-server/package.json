@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Marks the browser client's ES modules under src/main/resources/static/assets/ as ESM so Node's built-in test runner (node --test) can import them from src/test/js/. No npm dependencies; not served (it lives outside static/). Run the tests with the Gradle :walkie-server:jsTest task or `node --test src/test/js/`."
+}

@@ -64,6 +64,16 @@ public sealed interface ServerMessage {
 	record OwnerChanged(String ownerId) implements ServerMessage {
 	}
 
+	/// The channel owner changed the end-to-end-encryption passphrase. `keyCheck` is the new key-check value, or
+	/// `null` if the channel is now unencrypted. Every member — including the owner who initiated it — re-derives
+	/// its AES key from the new passphrase and verifies the derived key-check against this one. The passphrase
+	/// itself is shared out-of-band; the server never sees it. A member that doesn't yet have the new passphrase
+	/// stays in the channel but can't decrypt or encrypt audio until it enters it (and a client must NOT fall back
+	/// to sending plaintext into a still-encrypted channel).
+	@JsonTypeName("passphraseChanged")
+	record PassphraseChanged(String keyCheck) implements ServerMessage {
+	}
+
 	/// WebRTC: an SDP offer relayed from another member.
 	@JsonTypeName("signalOffer")
 	record SignalOffer(String from, String sdp) implements ServerMessage {

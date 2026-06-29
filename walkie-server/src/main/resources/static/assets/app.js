@@ -8,6 +8,8 @@
 // 1-byte codec tag so receivers can decode whatever the sender used. The WebRTC path uses the
 // browser's native Opus, tuned up via SDP + sender bitrate.
 
+import {E2EE_SCHEME, deriveKey, encryptFrame, decryptFrame, frameDisposition, rekeyAction} from './e2ee.js';
+
 // Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
 const byId = (id) => document.getElementById(id);
 const STUN = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
@@ -18,8 +20,6 @@ const MONO_BITRATE = 64000;      // fullband voice, high quality
 const STEREO_BITRATE = 128000;   // stereo needs ~2x for equivalent quality
 const CODEC_OPUS = 1;
 const CODEC_PCM = 2;
-const E2EE_SCHEME = 0xe2;        // wire marker for an encrypted frame: [scheme][IV(12)][ciphertext+tag]; kept outside the codec-tag set {1,2} so a plaintext receiver drops it cleanly
-const E2EE_AAD = Uint8Array.of(E2EE_SCHEME);   // the scheme byte, authenticated (GCM additionalData) but not encrypted, so the envelope is covered by the tag
 const OPUS_SUPPORTED = (typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined');
 const DISPLAY_NAME = /^[A-Za-z0-9_.-]{1,32}$/;   // must match the server's display-name validation
 const SERVER_OWNER = 'server';   // ownerId the server stamps on the server-managed "global" room (matches ConnectionService.GLOBAL_CHANNEL_OWNER); no participant owns it
@@ -44,12 +44,17 @@ const state = {
 	channels: 1,            // negotiated in setupAudio: 2 if the mic provides stereo, else 1
 	transmitting: false,
 	connecting: false,      // true while a connect() flow is in flight — guards against double-clicking Connect
+	channel: null,          // the channel currently joined (server-confirmed), so a Switch can tell same vs new
+	pendingReconnect: false, // set when a transport change requires tearing down + reconnecting (a new session)
 	opusEncoder: null,
 	captureTs: 0,
 	warnedNoOpus: false,
 	warnedChannels: false,
 	cryptoKey: null,        // AES-256-GCM key for relay E2EE, or null when no passphrase
 	keyCheck: null,         // key-check value sent in the join so the server can reject a mismatched passphrase
+	passphrase: '',         // raw passphrase backing the current channel key (for the adaptive button's change-detection)
+	channelKeyCheck: null,  // the channel's currently-announced key-check (null = unencrypted); a member re-keys to match it
+	rekeyPending: false,    // owner changed the passphrase but our current passphrase doesn't match it yet
 	txChain: null,          // serializes async frame encryption (send side) so it can't reorder our Opus stream
 	warnedDecrypt: false,
 	warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
@@ -84,6 +89,22 @@ function isOpen() {
 }
 
 // --- connection -----------------------------------------------------------------------------------
+
+// Derive (or clear) the relay E2EE key + key-check for a (transport, passphrase, mode, channel) and store them
+// in state. WebRTC media is already peer-to-peer encrypted, so it never uses a relay key. Shared by connect()
+// and applyOrSwitch() so re-keying on a channel switch matches the initial-connect derivation exactly.
+async function deriveJoinKey(transport, passphrase, mode, channel) {
+	// Global is the server-managed, always-unencrypted room — the server rejects an encrypted global join
+	// (encryption_not_allowed). So drop the key for GLOBAL_PTT regardless of any passphrase still sitting in the
+	// field (e.g. when switching INTO global from an encrypted channel), mirroring the Java client's deriveCrypto;
+	// otherwise the join would carry a non-null keyCheck and be refused, silently failing the switch.
+	const derived = (transport === 'relay' && passphrase && mode !== 'GLOBAL_PTT')
+		? await deriveKey(passphrase, channel)
+		: null;
+	state.cryptoKey = derived ? derived.key : null;
+	state.keyCheck = derived ? derived.keyCheck : null;
+	state.passphrase = derived ? passphrase : '';   // remember what backs the current key, for the adaptive button
+}
 
 async function connect() {
 	if (state.connecting || isOpen()) {
@@ -134,11 +155,7 @@ async function connect() {
 			: 'WebRTC: Opus 48 kHz (tuned)');
 
 		// End-to-end encryption applies to the relay path only (WebRTC media is already peer-to-peer).
-		const derived = (state.transport === 'relay' && passphrase)
-			? await deriveKey(passphrase, state.mode === 'GLOBAL_PTT' ? 'global' : channel)
-			: null;
-		state.cryptoKey = derived ? derived.key : null;
-		state.keyCheck = derived ? derived.keyCheck : null;
+		await deriveJoinKey(state.transport, passphrase, state.mode, channel);
 		state.txChain = Promise.resolve();
 		state.warnedDecrypt = false;
 		if (state.transport === 'relay') {
@@ -159,14 +176,21 @@ async function connect() {
 			setStatus(true, 'Connected — ' + state.transport);
 			byId('connectBtn').disabled = true;
 			byId('disconnectBtn').disabled = false;
-			// Renaming only makes sense while connected, so the button (and its hint) appear only then.
+			// Renaming and switching only make sense while connected, so these controls appear only then.
 			byId('renameBtn').hidden = false;
 			byId('renameHint').hidden = false;
+			// The adaptive Apply/Switch button and the owner dropdown appear once the Joined snapshot arrives
+			// (they need the roster + owner), via updateApplyControls() / renderOwnerSelect() in onJoined.
 		};
 		ws.onmessage = onWsMessage;
 		ws.onclose = (ev) => {
 			log('WebSocket closed (' + ev.code + ')');
+			const reconnecting = state.pendingReconnect;
+			state.pendingReconnect = false;
 			cleanup();
+			if (reconnecting) {
+				connect();   // transport changed — reopen as a NEW session with the current settings
+			}
 		};
 		ws.onerror = () => log('WebSocket error');
 	} catch (err) {
@@ -187,10 +211,239 @@ function disconnect() {
 	}
 }
 
+// One adaptive action for the connected form. SWITCH to a different channel when the channel name changed
+// (carrying the chosen mode/passphrase), or APPLY the current channel's properties (mode / passphrase /
+// transport) in one click when it hasn't — think of mode+passphrase+transport as the channel's properties.
+// A switch is a fresh Join on the same socket ("leave old, join new"), so the session id (and the mic,
+// AudioContext and socket) survive and the new Joined snapshot resets per-channel state (resetChannelState in
+// onJoined). Changing the TRANSPORT can't be done in place (different socket endpoint + audio pipeline), so it
+// reconnects as a new session; connect() re-reads the form, carrying any other pending change into the join.
+async function applyOrSwitch() {
+	if (state.connecting || !isOpen()) {
+		return;
+	}
+	const transport = byId('transport').value;
+	const mode = byId('mode').value;
+	const channel = byId('channel').value.trim() || 'lobby';
+	const passphrase = byId('passphrase').value;
+	const display = byId('display').value.trim();
+	if (!DISPLAY_NAME.test(display)) {
+		log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
+		return;
+	}
+	const effectiveChannel = mode === 'GLOBAL_PTT' ? 'global' : channel;
+
+	if (transport !== state.transport) {
+		log('Transport changed — reconnecting as a new session…');
+		state.pendingReconnect = true;
+		disconnect();   // ws.onclose -> cleanup -> connect() with the current form values
+		return;
+	}
+
+	if (effectiveChannel !== state.channel) {
+		// Different channel: switch (re-Join), carrying the chosen mode + passphrase.
+		if (transport === 'relay' && passphrase
+			&& !(window.isSecureContext && window.crypto && crypto.subtle)) {
+			log('End-to-end encryption needs a secure context (HTTPS or localhost). Clear the passphrase to switch.');
+			return;
+		}
+		await deriveJoinKey(transport, passphrase, mode, channel);
+		if (transport === 'relay') {
+			log(state.cryptoKey ? 'Re-keyed for the new channel: E2EE ON' : 'E2EE off for the new channel');
+		}
+		sendCtrl({type: 'join', channel, mode, displayName: display, keyCheck: state.keyCheck});
+		log(`Switching to "${effectiveChannel}" (${mode})…`);
+		updateApplyControls();
+		return;
+	}
+
+	// Same channel & transport: apply this channel's property changes. Mode/passphrase are owner-only (the Mode
+	// selector is disabled for non-owners, so a mode change here means we own the channel); a member uses the
+	// passphrase path to adopt the owner's announced rotation.
+	const iAmOwner = state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	let acted = false;
+	if (mode !== state.mode) {
+		sendCtrl({type: 'changeMode', mode});
+		acted = true;
+	}
+	if (transport === 'relay' && (passphrase !== (state.passphrase || '') || state.rekeyPending)) {
+		if (iAmOwner) {
+			await initiatePassphraseChange();   // rotate for everyone; applied on the echo
+		} else if (state.channelKeyCheck) {
+			// Non-owner adopting the owner's announced rotation: re-derive and verify against the announced KCV.
+			const ok = await applyAnnouncedPassphrase();
+			log(ok
+				? 'Applied the channel passphrase — you can be heard again.'
+				: 'That passphrase does not match the channel — get the owner’s new passphrase and try again.');
+		} else {
+			// Non-owner on an unencrypted channel: only the owner can turn encryption on. Clear the field so the
+			// button settles instead of looping on a silent no-op.
+			log('Only the channel owner can change the passphrase.');
+			byId('passphrase').value = '';
+		}
+		acted = true;
+	}
+	if (!acted) {
+		log('Nothing to apply.');
+	}
+	updateApplyControls();
+}
+
+// Reflects whether the adaptive button can act and what it does. Shown only while connected; labeled
+// "Switch channel" when the channel name differs from the current one, else "Apply changes"; disabled when
+// nothing changed (a pending member re-key keeps it enabled so the new passphrase can still be applied).
+function updateApplyControls() {
+	const btn = byId('applyBtn');
+	const hint = byId('applyHint');
+	if (!isOpen()) {
+		btn.hidden = true;
+		hint.hidden = true;
+		return;
+	}
+	btn.hidden = false;
+	hint.hidden = false;
+	const transport = byId('transport').value;
+	const mode = byId('mode').value;
+	const channel = byId('channel').value.trim() || 'lobby';
+	const effectiveChannel = mode === 'GLOBAL_PTT' ? 'global' : channel;
+	const passphrase = byId('passphrase').value;
+	const channelChanged = effectiveChannel !== state.channel;
+	const changed = channelChanged
+		|| transport !== state.transport
+		|| mode !== state.mode
+		|| (transport === 'relay' && passphrase !== (state.passphrase || ''));
+	btn.textContent = channelChanged ? 'Switch channel' : 'Apply changes';
+	btn.disabled = !changed && !state.rekeyPending;
+}
+
+// The owner dropdown: lists members and lets the current owner hand ownership to another (selecting a different
+// member sends transferOwnership; the echoed ownerChanged is what actually moves the controls). Disabled for
+// non-owners and for the server-managed global room. Rebuilt with the roster (called from renderMembers).
+function renderOwnerSelect() {
+	const select = byId('ownerSelect');
+	const label = byId('ownerLabel');
+	if (!isOpen()) {
+		select.hidden = true;
+		label.hidden = true;
+		return;
+	}
+	select.hidden = false;
+	label.hidden = false;
+	if (state.ownerId === SERVER_OWNER) {
+		const opt = document.createElement('option');
+		opt.value = SERVER_OWNER;
+		opt.textContent = 'server-managed (no owner)';
+		select.replaceChildren(opt);
+		select.value = SERVER_OWNER;
+		select.disabled = true;
+		return;
+	}
+	select.replaceChildren(...[...state.members.entries()]
+		.sort(([, a], [, b]) => a.localeCompare(b, undefined, {sensitivity: 'base'}))
+		.map(([id, name]) => {
+			const opt = document.createElement('option');
+			opt.value = id;
+			// textContent (set via the option's text) avoids markup injection from a crafted display name.
+			opt.textContent = `${name} (#${id.slice(0, 8)})` + (id === state.selfId ? ' (you)' : '');
+			return opt;
+		}));
+	select.value = state.ownerId;
+	select.disabled = state.selfId !== state.ownerId;   // only the owner can hand it off
+}
+
+function onOwnerSelectChange() {
+	const newOwnerId = byId('ownerSelect').value;
+	if (!isOpen() || state.selfId !== state.ownerId || newOwnerId === state.ownerId) {
+		byId('ownerSelect').value = state.ownerId;   // revert a stray change (non-owner / no-op)
+		return;
+	}
+	sendCtrl({type: 'transferOwnership', newOwnerId});
+	log('Transferring ownership to ' + (state.members.get(newOwnerId) || newOwnerId) + '…');
+}
+
 function sendCtrl(obj) {
 	if (isOpen()) {
 		state.ws.send(JSON.stringify(obj));
 	}
+}
+
+// --- passphrase rotation (the owner changes the channel's E2EE key for everyone) -------------------
+
+// Owner action (invoked by Apply changes): derive the key-check from the passphrase field for the CURRENT
+// channel and ask the server to rotate it for everyone (a blank field clears encryption → a null key-check).
+// We do NOT swap our own key here — we apply it when the server echoes passphraseChanged, so a rejected request
+// changes nothing.
+async function initiatePassphraseChange() {
+	if (!isOpen() || byId('transport').value !== 'relay') {
+		return;
+	}
+	const passphrase = byId('passphrase').value;
+	if (passphrase && !(window.isSecureContext && window.crypto && crypto.subtle)) {
+		log('End-to-end encryption needs a secure context (HTTPS or localhost). Clear the passphrase to turn it off.');
+		return;
+	}
+	const effectiveChannel = state.mode === 'GLOBAL_PTT' ? 'global' : state.channel;
+	const derived = passphrase ? await deriveKey(passphrase, effectiveChannel) : null;
+	sendCtrl({type: 'changePassphrase', keyCheck: derived ? derived.keyCheck : null});
+	log(passphrase
+		? 'Requested a re-key for everyone (share the new passphrase out-of-band)…'
+		: 'Requested encryption OFF for everyone…');
+}
+
+// Re-derive the key from the passphrase field and apply it ONLY if it matches the channel's announced key-check.
+// Used when a passphraseChanged arrives and when a member re-applies via Apply changes after typing the new
+// secret. On a mismatch we keep the old key (or no key) and flag a pending re-key — sendTagged then stays SILENT
+// rather than leak plaintext into the now-encrypted channel. Returns whether it applied.
+async function applyAnnouncedPassphrase() {
+	const passphrase = byId('passphrase').value;
+	// Derive only when encryption IS announced and we have a passphrase in a secure context; otherwise leave
+	// `derived` null and let rekeyAction decide ('disable' when nothing's announced, 'keep' when we can't match
+	// yet). Decide against the LIVE state.channelKeyCheck read AFTER the await, so two rapid rotations can't apply
+	// a key that only matched a stale announced value.
+	let derived = null;
+	if (state.channelKeyCheck != null && passphrase && window.isSecureContext && window.crypto && crypto.subtle) {
+		derived = await deriveKey(passphrase, state.mode === 'GLOBAL_PTT' ? 'global' : state.channel);
+	}
+	switch (rekeyAction(state.channelKeyCheck, derived ? derived.keyCheck : null)) {
+		case 'disable':
+			state.cryptoKey = null;
+			state.keyCheck = null;
+			state.passphrase = '';
+			state.rekeyPending = false;
+			updateApplyControls();
+			return true;
+		case 'apply':
+			state.cryptoKey = derived.key;
+			state.keyCheck = derived.keyCheck;
+			state.passphrase = passphrase;
+			state.rekeyPending = false;
+			updateApplyControls();
+			return true;
+		default:   // 'keep' — we hold no matching key yet; stay muted (sendTagged drops) until the user re-keys
+			state.rekeyPending = true;
+			updateApplyControls();
+			return false;
+	}
+}
+
+// Server told us (and everyone) the channel's passphrase changed. Record the new key-check and try to apply it
+// from whatever is in the passphrase field — seamless for the owner who just set it (and any member who
+// pre-entered the new secret), a clear prompt for everyone else.
+async function onPassphraseChanged(keyCheck) {
+	state.channelKeyCheck = keyCheck;
+	if (keyCheck == null) {
+		state.cryptoKey = null;
+		state.keyCheck = null;
+		state.passphrase = '';
+		state.rekeyPending = false;
+		updateApplyControls();
+		log('The owner turned end-to-end encryption OFF for this channel.');
+		return;
+	}
+	const applied = await applyAnnouncedPassphrase();
+	log(applied
+		? 'The channel passphrase changed — re-keyed, E2EE updated.'
+		: 'The owner changed the passphrase — enter the new one above and click "Apply changes" to keep talking (you can\'t be heard until you do).');
 }
 
 // Ask the server to change our display name to the current value of the Display name field. The server
@@ -274,6 +527,9 @@ function onWsMessage(ev) {
 		case 'ownerChanged':
 			onOwnerChanged(msg.ownerId);
 			break;
+		case 'passphraseChanged':
+			onPassphraseChanged(msg.keyCheck).catch((err) => log('Passphrase change error: ' + err.message));
+			break;
 		case 'signalOffer':
 			onOffer(msg.from, msg.sdp).catch((err) => log('Offer error: ' + err.message));
 			break;
@@ -288,6 +544,10 @@ function onWsMessage(ev) {
 			if (msg.code === 'passphrase_mismatch') {
 				log('Disconnecting — this channel needs a different passphrase.');
 				disconnect();
+			} else if (msg.code === 'not_owner' || msg.code === 'unknown_target') {
+				// A rejected ownership transfer leaves the dropdown showing the failed target — snap it back to the
+				// real owner (state.ownerId is unchanged on a rejection).
+				renderOwnerSelect();
 			}
 			break;
 		default:
@@ -296,22 +556,30 @@ function onWsMessage(ev) {
 }
 
 function onJoined(msg) {
+	// A Joined snapshot — whether the initial join or an in-place channel switch — reassigns every stream index
+	// and replaces the roster, so fully reset the current-channel state first (drops the previous channel's
+	// peers, decode lanes, roster and floor/speaking highlights), then rebuild from this snapshot.
+	const channelChanged = msg.channel !== state.channel;
+	resetChannelState();
 	state.selfId = msg.selfId;
 	state.ownerId = msg.ownerId;
 	state.mode = msg.mode;
-	// A fresh snapshot (including our own reconnect) reassigns every stream index, so drop all decode lanes
-	// and rebuild the roster + stream-index maps from scratch.
-	closeAllLanes();
-	state.memberOfStream.clear();
-	state.streamOf.clear();
-	state.members.clear();
+	state.channel = msg.channel;
+	if (channelChanged) {
+		// Baseline the announced key-check to what we joined with, and clear any pending rotation — ONLY on an
+		// actual channel change. A same-channel idempotent re-snapshot must NOT reset these, or it would revert a
+		// pending rotation's announced key-check (KCV) and silently hide the prompt to apply the new passphrase,
+		// leaving us mis-keyed with no recovery.
+		state.channelKeyCheck = state.keyCheck;
+		state.rekeyPending = false;
+	}
 	msg.members.forEach(addMember);
 	renderMembers();
 	log(`Joined "${msg.channel}" (${msg.mode}) with ${msg.members.length} member(s)`);
 	log(state.ownerId === SERVER_OWNER
 		? 'Server-managed global room — everyone can talk (push-to-talk), no owner, no encryption.'
 		: state.selfId === state.ownerId
-			? 'You own this channel — use the Mode selector to change it for everyone.'
+			? 'You own this channel — change mode/passphrase and click Apply, or pick a new owner.'
 			: 'Owner: ' + (state.members.get(state.ownerId) || state.ownerId));
 
 	if (state.transport === 'webrtc') {
@@ -330,6 +598,8 @@ function onJoined(msg) {
 	updateTalkButton();
 	updateModeControl();
 	updateGlobalModeLocks();
+	updateApplyControls();
+	renderOwnerSelect();
 }
 
 function onModeChanged(mode) {
@@ -342,15 +612,29 @@ function onModeChanged(mode) {
 	updateTalkButton();
 	updateModeControl();
 	updateGlobalModeLocks();
+	updateApplyControls();   // the live mode now matches the selector again → the Apply button settles
 	log('Mode changed to ' + mode);
 }
 
 function onOwnerChanged(ownerId) {
+	const becameOwner = state.selfId === ownerId && state.ownerId !== ownerId;
 	state.ownerId = ownerId;
 	updateModeControl();
+	renderOwnerSelect();
+	updateApplyControls();
 	log(state.selfId === ownerId
-		? 'You are now the channel owner — you can change the mode.'
+		? 'You are now the channel owner — you can change the mode/passphrase and pick the next owner.'
 		: 'Channel owner is now ' + (state.members.get(ownerId) || ownerId));
+	if (becameOwner && state.rekeyPending) {
+		// We were promoted while still holding a stale key we never reconciled. As owner, Apply now ROTATES the
+		// channel for everyone — so clear the leftover unmatched passphrase and the pending flag, otherwise a
+		// click would rotate the whole channel to that stale/garbage text. To set a key, the new owner types a
+		// passphrase they actually hold and clicks Apply.
+		state.rekeyPending = false;
+		byId('passphrase').value = '';
+		updateApplyControls();
+		log('You became owner while your passphrase was unmatched — it was cleared. Type a passphrase you hold and click Apply to re-key the channel.');
+	}
 }
 
 // Reflects the live mode in the selector and lets only the owner change it while connected; when
@@ -566,16 +850,26 @@ function sendTagged(tag, payloadBytes) {
 	if (!isOpen()) {
 		return;
 	}
+	// One pure decision (see e2ee.frameDisposition): 'drop' = the channel announces encryption but we hold no
+	// matching key (e.g. the owner just turned encryption ON and we haven't applied the new passphrase) — stay
+	// SILENT rather than leak cleartext to the relay; 'plaintext' = a genuinely unencrypted channel; 'encrypt' =
+	// we hold a key.
+	const disposition = frameDisposition(state.cryptoKey, state.channelKeyCheck);
+	if (disposition === 'drop') {
+		return;
+	}
 	const out = new Uint8Array(payloadBytes.length + 1);
 	out[0] = tag;
 	out.set(payloadBytes, 1);
-	if (!state.cryptoKey) {
+	if (disposition === 'plaintext') {
 		state.ws.send(out.buffer);
 		return;
 	}
-	// Serialize encryption so async WebCrypto can't reorder the stateful Opus stream.
+	// Serialize encryption so async WebCrypto can't reorder the stateful Opus stream. Read state.cryptoKey at
+	// execution time (a concurrent re-key may swap it); a frame that started before a key change just encrypts
+	// under whatever key is current when it runs.
 	state.txChain = state.txChain
-		.then(() => encryptFrame(out))
+		.then(() => encryptFrame(out, state.cryptoKey))
 		.then((enc) => {
 			if (isOpen()) {
 				state.ws.send(enc.buffer);
@@ -585,58 +879,6 @@ function sendTagged(tag, payloadBytes) {
 }
 
 // --- end-to-end encryption (relay path) -----------------------------------------------------------
-
-// Derive the per-channel material from the shared passphrase. Must match the Java client and FrameCryptoTest
-// exactly: PBKDF2-HMAC-SHA512, 600000 iterations, salt "walkie-talkie:e2ee:" + channel. A single 384-bit
-// derivation gives the AES-256-GCM key (first 32 bytes) plus a 16-byte key-check value (next 16) sent in the
-// join so the server can reject a mismatched passphrase. PBKDF2's first block is length-independent, so the
-// AES key is identical to a 256-bit derivation — the known-answer test still holds. Returns {key, keyCheck}.
-async function deriveKey(passphrase, effectiveChannel) {
-	const enc = new TextEncoder();
-	const base = await crypto.subtle.importKey('raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveBits']);
-	const bits = new Uint8Array(await crypto.subtle.deriveBits(
-		{
-			name: 'PBKDF2',
-			salt: enc.encode('walkie-talkie:e2ee:' + effectiveChannel),
-			iterations: 600000,
-			hash: 'SHA-512'
-		},
-		base, 384));
-	const key = await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['encrypt', 'decrypt']);
-	const keyCheck = [...bits.slice(32, 48)].map((b) => Number(b).toString(16).padStart(2, '0')).join('');
-	return {key, keyCheck};
-}
-
-// Wraps a plaintext frame as scheme(1) ‖ IV(12) ‖ ciphertext+tag(16). The scheme byte lets a receiver
-// distinguish an encrypted frame from a plaintext peer's [codec tag][payload] (which starts with 1 or 2).
-async function encryptFrame(plaintext) {
-	const iv = crypto.getRandomValues(new Uint8Array(12));
-	const ct = new Uint8Array(await crypto.subtle.encrypt({
-		name: 'AES-GCM',
-		iv,
-		tagLength: 128,
-		additionalData: E2EE_AAD
-	}, state.cryptoKey, plaintext));
-	const out = new Uint8Array(1 + iv.length + ct.length);
-	out[0] = E2EE_SCHEME;
-	out.set(iv, 1);
-	out.set(ct, 1 + iv.length);
-	return out;
-}
-
-// Recovers the plaintext frame from scheme ‖ IV ‖ ciphertext+tag; rejects on a missing scheme byte (a
-// plaintext peer in an encrypted channel) or a bad tag (tampered / wrong passphrase) — never decoding ciphertext as audio.
-function decryptFrame(frame) {
-	if (frame.length < 29 || frame[0] !== E2EE_SCHEME) {  // 1 scheme + 12 IV + 16 tag minimum
-		return Promise.reject(new Error('not an end-to-end-encrypted frame'));
-	}
-	return crypto.subtle.decrypt({
-		name: 'AES-GCM',
-		iv: frame.subarray(1, 13),
-		tagLength: 128,
-		additionalData: E2EE_AAD
-	}, state.cryptoKey, frame.subarray(13));
-}
 
 // Decrypts (when E2EE is on) before decoding. Decryption is serialized through a promise chain so async
 // WebCrypto can't hand frames to the stateful Opus decoder out of order.
@@ -663,7 +905,7 @@ function handleAudioFrame(arrayBuffer) {
 	// Decryption is serialized PER sender (one stateful decoder per lane), so a slow decrypt for one sender
 	// can't reorder that sender's frames or head-of-line-block another.
 	lane.rxChain = lane.rxChain
-		.then(() => decryptFrame(body))
+		.then(() => decryptFrame(body, state.cryptoKey))
 		.then((plaintext) => processFrame(lane, new Uint8Array(plaintext)))
 		.catch(() => {
 			if (!state.warnedDecrypt) {
@@ -1099,6 +1341,7 @@ function renderMembers() {
 		state.memberLis.set(id, li);
 		ul.appendChild(li);
 	});
+	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
 }
 
 function enableTalkButton(enabled) {
@@ -1115,13 +1358,13 @@ function updateTalkButton() {
 	}
 }
 
-function cleanup() {
+// Resets everything tied to the CURRENT channel — peers, decode lanes, roster, and floor/speaking highlights —
+// but NOT the connection (socket, mic, AudioContext, encoder). Used by cleanup() on disconnect AND by onJoined,
+// so an in-place channel switch (a re-Join on the same session) starts the new channel from a clean slate and
+// can't leak the old channel's peer connections, decoders, members, or "talking" state.
+function resetChannelState() {
 	state.peers.forEach((_, id) => closePeer(id));
 	state.peers.clear();
-	if (state.laneSweep) {
-		clearInterval(state.laneSweep);
-		state.laneSweep = null;
-	}
 	closeAllLanes();
 	state.memberOfStream.clear();
 	state.streamOf.clear();
@@ -1130,7 +1373,16 @@ function cleanup() {
 	state.speaking.clear();
 	state.floorSpeaker = null;
 	state.members.clear();
+}
+
+function cleanup() {
+	resetChannelState();
+	if (state.laneSweep) {
+		clearInterval(state.laneSweep);
+		state.laneSweep = null;
+	}
 	renderMembers();
+	state.channel = null;
 	state.transmitting = false;
 	state.connecting = false;
 	closeCodec(state.opusEncoder);
@@ -1140,6 +1392,9 @@ function cleanup() {
 	state.warnedChannels = false;
 	state.cryptoKey = null;
 	state.keyCheck = null;
+	state.passphrase = '';
+	state.channelKeyCheck = null;
+	state.rekeyPending = false;
 	state.warnedDecrypt = false;
 	state.warnedEncryptedNoKey = false;
 	if (state.micStream) {
@@ -1162,6 +1417,10 @@ function cleanup() {
 	byId('disconnectBtn').disabled = true;
 	byId('renameBtn').hidden = true;
 	byId('renameHint').hidden = true;
+	byId('applyBtn').hidden = true;
+	byId('applyHint').hidden = true;
+	byId('ownerSelect').hidden = true;
+	byId('ownerLabel').hidden = true;
 	setStatus(false, 'Disconnected');
 	updateModeControl();
 	updateGlobalModeLocks();
@@ -1184,6 +1443,12 @@ window.addEventListener('DOMContentLoaded', () => {
 	byId('disconnectBtn').addEventListener('click', disconnect);
 
 	byId('renameBtn').addEventListener('click', rename);
+	byId('applyBtn').addEventListener('click', applyOrSwitch);
+	byId('ownerSelect').addEventListener('change', onOwnerSelectChange);
+	// Re-evaluate the adaptive Switch/Apply button as the form fields change (mode is handled in its own listener).
+	byId('channel').addEventListener('input', updateApplyControls);
+	byId('passphrase').addEventListener('input', updateApplyControls);
+	byId('transport').addEventListener('change', updateApplyControls);
 
 	// The Connect fields aren't wrapped in a <form>, so Enter in one does nothing by default. Treat Enter in
 	// the Connect panel as "Connect" when a connect is possible (button enabled, i.e. disconnected); once
@@ -1201,21 +1466,14 @@ window.addEventListener('DOMContentLoaded', () => {
 		}
 	});
 
-	// While connected, only the owner can change the mode (the selector is disabled for others); this
-	// sends ChangeMode and the server's ModeChanged broadcast updates everyone. Pre-connect it just
-	// picks the initial mode for the next Connect.
+	// The Mode selector is a channel PROPERTY now: while connected, only the owner can change it (the selector
+	// is disabled for others via updateModeControl), and the change is applied by the adaptive Apply button —
+	// not live on select — so mode/passphrase/transport apply together in one click. Pre-connect it just picks
+	// the initial mode for the next Connect.
 	const modeSelect = byId('mode');
 	modeSelect.addEventListener('change', () => {
 		updateGlobalModeLocks(); // reflect the global-mode channel lock immediately (pre- and post-connect)
-		if (!isOpen()) {
-			return; // pre-connect: just choosing the initial mode for the next Connect
-		}
-		if (state.selfId === state.ownerId) {
-			sendCtrl({type: 'changeMode', mode: modeSelect.value});
-		} else {
-			modeSelect.value = state.mode; // non-owner can't change it live — snap back
-			updateGlobalModeLocks();        // re-sync the lock to the snapped-back mode
-		}
+		updateApplyControls();   // enable/relabel the Apply button to reflect the pending mode change
 	});
 	updateGlobalModeLocks(); // set the initial channel-input state to match the default mode
 
