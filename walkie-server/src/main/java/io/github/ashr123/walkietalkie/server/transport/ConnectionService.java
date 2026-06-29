@@ -75,7 +75,7 @@ public class ConnectionService {
 	public static void onConnect(ClientSession session) {
 		// Scope the lifecycle line so it carries the session id (and the name, once known) via the MDC, like the
 		// per-message lines. At connect the client hasn't joined yet, so the name is still blank.
-		RequestContext.runAs(session.id(), session.displayName(),
+		RequestContext.runAs(session.id(), session.displayName(), session.channelName(),
 				() -> log.info("connected (transport={})", session.transport()));
 	}
 
@@ -91,7 +91,7 @@ public class ConnectionService {
 		if (!controlRateLimiter.tryAcquire(session.id())) {
 			return;
 		}
-		RequestContext.runAs(session.id(), session.displayName(), () -> dispatch(session, message));
+		RequestContext.runAs(session.id(), session.displayName(), session.channelName(), () -> dispatch(session, message));
 	}
 
 	private void dispatch(ClientSession session, ClientMessage message) {
@@ -208,6 +208,9 @@ public class ConnectionService {
 			return;
 		}
 		Channel channel = joined.channel();
+		// Advance the MDC channel so this handler's "joined" line (and anything after it in this scope) is tagged
+		// with the channel just joined, instead of repeating channel=… in the body.
+		RequestContext.updateChannel(channel.name());
 
 		// Tell the OTHER members about the joiner. This is intentionally OUTSIDE the registry lock: it concerns
 		// the joiner's visibility to others, not the joiner's own floor view, so it needs no floor serialization.
@@ -215,10 +218,9 @@ public class ConnectionService {
 				new MemberInfo(session.id(), session.displayName(), channel.streamIndexOf(session.id())));
 		channel.forEachOther(session.id(), other -> safeSend(other, notice));
 
-		// Identity (session + name) is carried by the MDC prefix now that the name has been advanced above.
-		// "created" when this join brought the channel into being; "joined" when it already existed.
-		log.info("{} channel={} mode={}",
-				joined.created() ? "created" : "joined", channel.name(), channel.mode());
+		// Identity (session + name) and the channel are carried by the MDC prefix now (the name advanced above,
+		// the channel just updated). "created" when this join brought the channel into being; else "joined".
+		log.info("{} mode={}", joined.created() ? "created" : "joined", channel.mode());
 	}
 
 	private void handleLeave(ClientSession session) {
@@ -256,11 +258,12 @@ public class ConnectionService {
 					// believing it is a member who has already left.
 					ServerMessage ownerMsg = new ServerMessage.OwnerChanged(channel.ownerId());
 					channel.forEachOther(session.id(), other -> safeSend(other, ownerMsg));
-					log.info("ownership of channel={} transferred to session={}", channelName, channel.ownerId());
+					log.info("ownership transferred to session={}", channel.ownerId());
 				}
 			}
 		}
-		log.info("left channel={}", channelName);
+		log.info("left");   // the channel left is in the MDC prefix; clear it for any later line in this scope
+		RequestContext.updateChannel(null);
 		session.leftChannel();
 	}
 
@@ -279,17 +282,17 @@ public class ConnectionService {
 		synchronized (channel) {
 			if (channel.tryAcquireFloor(session.id(), now)) {
 				grantFloor(channel, session);
-				log.debug("acquired the floor on channel={}", channel.name());
+				log.debug("acquired the floor");
 				return;
 			}
 			// Denied — name the current holder (or null if it freed up between our failed acquire and this read).
 			String currentHolderId = channel.floorHolder() instanceof Some(String holder) ? holder : null;
 			if (preemptIfIdle(channel, session, currentHolderId, now)) {
-				log.info("preempted idle floor holder={} on channel={}", currentHolderId, channel.name());
+				log.info("preempted idle floor holder={}", currentHolderId);
 				grantFloor(channel, session);
 			} else {
 				session.send(new ServerMessage.FloorDenied(currentHolderId));
-				log.debug("denied the floor on channel={} (held by session={})", channel.name(), currentHolderId);
+				log.debug("denied the floor (held by session={})", currentHolderId);
 			}
 		}
 	}
@@ -327,7 +330,7 @@ public class ConnectionService {
 			if (channel.releaseFloor(session.id())) {
 				ServerMessage idle = new ServerMessage.FloorIdle();
 				channel.forEachOther(session.id(), other -> safeSend(other, idle));
-				log.debug("released the floor on channel={}", channel.name());
+				log.debug("released the floor");
 			}
 		}
 	}
@@ -450,7 +453,7 @@ public class ConnectionService {
 	public void onClose(ClientSession session, String closeReason) {
 		// Scope the whole teardown so the leave + disconnect lines carry the session id AND the display name via
 		// the MDC (this is why a disconnect previously logged no name — onClose wasn't bound to the identity).
-		RequestContext.runAs(session.id(), session.displayName(), () -> {
+		RequestContext.runAs(session.id(), session.displayName(), session.channelName(), () -> {
 			handleLeave(session);
 			audioRateLimiter.forget(session.id());
 			controlRateLimiter.forget(session.id());
@@ -513,7 +516,7 @@ public class ConnectionService {
 				safeSend(member, floorIdle);
 			});
 		}
-		log.info("changed channel={} mode to {}", channel.name(), mode);
+		log.info("changed mode to {}", mode);
 	}
 
 	/// Rotates the current channel's end-to-end-encryption passphrase, but only for its owner. The server never
@@ -555,8 +558,7 @@ public class ConnectionService {
 					channel.forEach(member -> safeSend(member, passphraseChanged));
 				}
 				// Log the encrypted/plaintext STATUS only — never the key-check token or the wrapped blob.
-				log.info("changed passphrase on channel={} (now {})", channelName,
-						keyCheck == null ? "unencrypted" : "encrypted");
+				log.info("changed passphrase (now {})", keyCheck == null ? "unencrypted" : "encrypted");
 			}
 		}
 	}
@@ -594,7 +596,7 @@ public class ConnectionService {
 					ServerMessage ownerChanged = new ServerMessage.OwnerChanged(channel.ownerId());
 					channel.forEach(member -> safeSend(member, ownerChanged));
 				}
-				log.info("transferred ownership of channel={} to {}", channelName, newOwnerId);
+				log.info("transferred ownership to {}", newOwnerId);
 			}
 		}
 	}
@@ -635,7 +637,7 @@ public class ConnectionService {
 			// Advance the MDC name so this line's prefix carries the NEW name, like every line after it (onMessage
 			// snapshotted the old name at scope entry); the scope's restore-on-exit still cleans it up.
 			RequestContext.updateDisplayName(displayName);
-			log.info("renamed from {} to {} on channel={}", previous, displayName, channelName);
+			log.info("renamed from {} to {}", previous, displayName);
 		} else {
 			// Not in a channel (or it vanished): just update the label — the next Join carries it, and there is
 			// no roster to keep consistent or members to notify. (No meaningful prior name before the first join.)

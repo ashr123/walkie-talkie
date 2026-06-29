@@ -42,8 +42,9 @@ management:
 logging:
   level:
     io.github.ashr123.walkietalkie: DEBUG
-  # Inject the RequestContext identity (mirrored into the MDC) onto every log line: the session id and the
-  # display name. Lines outside a message scope (e.g. startup) show "system"/"-"; connection-lifecycle and
-  # per-message lines carry the real session, and the name once the client has joined.
+  # Inject the RequestContext identity (mirrored into the MDC) onto every log line: the session id, the
+  # display name, and the channel the session is in. Lines outside a message scope (e.g. startup) show
+  # "system"/"-"/"-"; connection-lifecycle and per-message lines carry the real session, the name once the
+  # client has joined, and the channel while it is in one.
   pattern:
-    level: "%5p [session=%X{session:-system} name=%X{name:--}]"
+    level: "%5p [session=%X{session:-system} name=%X{name:--} channel=%X{channel:--}]"
