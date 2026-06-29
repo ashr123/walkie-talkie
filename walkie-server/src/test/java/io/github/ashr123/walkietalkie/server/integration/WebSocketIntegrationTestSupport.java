@@ -10,6 +10,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketHandler;
+import org.springframework.web.socket.WebSocketHttpHeaders;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.client.WebSocketClient;
 import org.springframework.web.socket.client.standard.StandardWebSocketClient;
@@ -116,8 +117,28 @@ abstract class WebSocketIntegrationTestSupport {
 	/// Opens an authenticated WebSocket to `path` ([#AUDIO] or [#SIGNAL]), passing the token as the `?token=`
 	/// query parameter exactly as the real clients do (the browser can't set headers on a WS handshake).
 	protected WebSocketSession connect(String path, WebSocketHandler handler, String token) throws Exception {
+		return connect(path, handler, token, null);
+	}
+
+	/// As [#connect(String, WebSocketHandler, String)] but with extra handshake headers — used to drive the
+	/// `Origin` check (CSWSH defense): a handshake with a disallowed `Origin` fails, surfacing as the returned
+	/// future throwing rather than yielding a session.
+	protected WebSocketSession connect(String path, WebSocketHandler handler, String token, WebSocketHttpHeaders headers) throws Exception {
 		URI uri = URI.create("ws://localhost:" + port + path + "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8));
-		return wsClient.execute(handler, null, uri).get(5, TimeUnit.SECONDS);
+		return wsClient.execute(handler, headers, uri).get(5, TimeUnit.SECONDS);
+	}
+
+	/// Waits up to 5 seconds for the server to close `session` (e.g. after it rejects an over-cap frame),
+	/// returning whether it closed within that window.
+	protected static boolean awaitClosed(WebSocketSession session) throws InterruptedException {
+		long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		while (System.nanoTime() < deadlineNanos) {
+			if (!session.isOpen()) {
+				return true;
+			}
+			Thread.sleep(50);
+		}
+		return false;
 	}
 
 	/// Asserts a relayed audio frame carries `expected` as its body after the mandatory 1-byte stream-index
