@@ -20,9 +20,13 @@ walkie:
   max-text-message-bytes: 65536
   # Per-sender flood guard: drop relayed audio frames beyond this many per second (nominal traffic is ~50 fps,
   # one 20 ms frame per tick). Excess is dropped before fan-out; counts frames without inspecting them, so it
-  # works on encrypted channels too. See AudioRateLimiter. Always on — 0/blank uses the default, it can't be
+  # works on encrypted channels too. See SessionRateLimiter. Always on — 0/blank uses the default, it can't be
   # disabled (unlike the floor timers below, where 0 means off).
   max-audio-frames-per-second: 100
+  # Control-plane flood guard: drop inbound control (text) messages from a session beyond this many per second.
+  # Control is sparse (a few floor presses, the odd join/rename/mode, a WebRTC ICE-candidate burst at setup), so
+  # this is generous for an honest client while bounding a control flood. Always on — 0/blank uses the default.
+  max-control-messages-per-second: 200
   # Push-to-talk floor anti-hogging (seconds; 0 disables). Both work off frame timing only — never audio
   # content — so they apply on encrypted channels too. idle-release: reclaim the floor for a new requester once
   # the holder has sent no audio for this long. max-hold: force-release after this much continuous holding.

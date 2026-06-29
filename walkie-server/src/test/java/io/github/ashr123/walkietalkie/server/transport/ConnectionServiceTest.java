@@ -6,7 +6,6 @@ import io.github.ashr123.walkietalkie.server.MutableClock;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
-import io.github.ashr123.walkietalkie.server.ratelimit.AudioRateLimiter;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -27,16 +26,18 @@ import static org.junit.jupiter.api.Assertions.*;
 class ConnectionServiceTest {
 
 	private final ChannelRegistry channelRegistry = new ChannelRegistry();
-	private final WalkieProperties properties = new WalkieProperties(List.of("*"), 8192, 65536, 100, 5, 300, null);
-	private final ConnectionService service = new ConnectionService(
-			channelRegistry, properties, new AudioRateLimiter(properties));
+	// Control rate set effectively-unlimited (1_000_000) so the control-plane flood guard never throttles the
+	// handful of control messages an ordinary test sends; the dedicated control-flood test uses a low rate.
+	private final WalkieProperties properties = new WalkieProperties(List.of("*"), 8192, 65536, 100, 1_000_000, 5, 300, null);
+	private final ConnectionService service = new ConnectionService(channelRegistry, properties);
 
 	/// Builds a service over the shared registry but with a hand-driven clock, so the push-to-talk floor
-	/// timers (idle auto-release, max-hold) — and the rate limiter — are all tested against the same deterministic
-	/// clock rather than wall time.
+	/// timers (idle auto-release, max-hold) — and the rate limiters — are all tested against the same deterministic
+	/// clock rather than wall time. Control rate is left effectively-unlimited so a fixed clock (no token refill)
+	/// doesn't throttle the test's own control messages.
 	private ConnectionService serviceWithClock(Clock clock, int idleSeconds, int maxHoldSeconds) {
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1000, idleSeconds, maxHoldSeconds, null);
-		return new ConnectionService(channelRegistry, props, new AudioRateLimiter(props, clock), clock);
+		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1000, 1_000_000, idleSeconds, maxHoldSeconds, null);
+		return new ConnectionService(channelRegistry, props, clock);
 	}
 
 	private static FakeClientSession session(String id) {
@@ -619,8 +620,8 @@ class ConnectionServiceTest {
 
 	@Test
 	void aSenderOverItsAudioRateHasFramesDroppedBeforeFanOut() {
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 2, 0, 0, null);   // 2 fps -> burst 2
-		ConnectionService svc = new ConnectionService(channelRegistry, props, new AudioRateLimiter(props));
+		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 2, 1_000_000, 0, 0, null);   // audio 2 fps -> burst 2
+		ConnectionService svc = new ConnectionService(channelRegistry, props);
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 		svc.onMessage(alice, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, "alice", null));
@@ -636,8 +637,8 @@ class ConnectionServiceTest {
 
 	@Test
 	void onCloseForgetsTheSendersRateBucketSoAReconnectStartsFull() {
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1, 0, 0, null);   // 1 fps -> burst 1
-		ConnectionService svc = new ConnectionService(channelRegistry, props, new AudioRateLimiter(props));
+		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1, 1_000_000, 0, 0, null);   // audio 1 fps -> burst 1
+		ConnectionService svc = new ConnectionService(channelRegistry, props);
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "alice", null));
@@ -653,6 +654,23 @@ class ConnectionServiceTest {
 		bob.audio.clear();
 		svc.onAudio(alice, frame);
 		assertEquals(1, bob.audio.size(), "after onClose evicts the bucket, the reconnecting id starts from a full bucket");
+	}
+
+	@Test
+	void controlMessagesOverTheRateAreDroppedBeforeDispatch() {
+		MutableClock clock = new MutableClock(Instant.EPOCH);   // fixed -> no token refill, so burst == the rate
+		// control rate 2 -> burst 2: the Join spends the first token and the first Rename the second; the second
+		// Rename is over the cap and dropped before dispatch, so the applied name stays at the first rename.
+		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1000, 2, 0, 0, null);
+		ConnectionService svc = new ConnectionService(channelRegistry, props, clock);
+		FakeClientSession alice = session("alice");
+
+		svc.onMessage(alice, new ClientMessage.Join("flood-ctl", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));   // token 1
+		svc.onMessage(alice, new ClientMessage.Rename("renamed-once"));    // token 2 -> applied
+		svc.onMessage(alice, new ClientMessage.Rename("renamed-twice"));   // over the rate -> dropped
+
+		assertEquals("renamed-once", alice.displayName(),
+				"the control message past the per-session rate cap is dropped before dispatch");
 	}
 
 	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a

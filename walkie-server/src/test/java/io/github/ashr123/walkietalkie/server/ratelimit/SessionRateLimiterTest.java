@@ -11,12 +11,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Verifies the per-sender flood guard with a hand-driven clock: bursts are bounded, refill resumes over
 /// time, each sender has an independent bucket, and a forgotten (disconnected) sender resets cleanly.
-class AudioRateLimiterTest {
+class SessionRateLimiterTest {
 
 	@Test
 	void admitsUpToTheBurstThenDropsUntilRefill() {
 		MutableClock clock = new MutableClock(Instant.EPOCH);
-		AudioRateLimiter limiter = new AudioRateLimiter(10, clock);   // 10 fps -> burst 10, refill 10/s
+		SessionRateLimiter limiter = new SessionRateLimiter(10, clock);   // 10 fps -> burst 10, refill 10/s
 		for (int i = 0; i < 10; i++) {
 			assertTrue(limiter.tryAcquire("a"), "the first second's worth bursts through");
 		}
@@ -27,7 +27,7 @@ class AudioRateLimiterTest {
 
 	@Test
 	void bucketsArePerSession() {
-		AudioRateLimiter limiter = new AudioRateLimiter(2, new MutableClock(Instant.EPOCH));
+		SessionRateLimiter limiter = new SessionRateLimiter(2, new MutableClock(Instant.EPOCH));
 		assertTrue(limiter.tryAcquire("a"));
 		assertTrue(limiter.tryAcquire("a"));
 		assertFalse(limiter.tryAcquire("a"), "'a' is over its own limit");
@@ -38,7 +38,7 @@ class AudioRateLimiterTest {
 
 	@Test
 	void forgetResetsASenderBucket() {
-		AudioRateLimiter limiter = new AudioRateLimiter(1, new MutableClock(Instant.EPOCH));
+		SessionRateLimiter limiter = new SessionRateLimiter(1, new MutableClock(Instant.EPOCH));
 		assertTrue(limiter.tryAcquire("a"));
 		assertFalse(limiter.tryAcquire("a"));
 		limiter.forget("a");

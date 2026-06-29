@@ -4,7 +4,7 @@ import io.github.ashr123.option.Some;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
-import io.github.ashr123.walkietalkie.server.ratelimit.AudioRateLimiter;
+import io.github.ashr123.walkietalkie.server.ratelimit.SessionRateLimiter;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.support.RequestContext;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -44,27 +44,29 @@ public class ConnectionService {
 
 	private final ChannelRegistry channelRegistry;
 	private final WalkieProperties properties;
-	private final AudioRateLimiter audioRateLimiter;
+	private final SessionRateLimiter audioRateLimiter;
+	private final SessionRateLimiter controlRateLimiter;
 	private final Clock clock;
 	private final Duration floorIdleRelease;
 	private final Duration floorMaxHold;
 
 	@Autowired
 	public ConnectionService(ChannelRegistry channelRegistry,
-	                         WalkieProperties properties,
-	                         AudioRateLimiter audioRateLimiter) {
-		this(channelRegistry, properties, audioRateLimiter, Clock.systemUTC());
+	                         WalkieProperties properties) {
+		this(channelRegistry, properties, Clock.systemUTC());
 	}
 
-	/// Package-private seam: lets tests drive the push-to-talk floor timers with a controllable clock instead
-	/// of wall time.
+	/// Package-private seam: lets tests drive the push-to-talk floor timers and both rate limiters with a
+	/// controllable clock instead of wall time. The audio and control flood guards are owned here (one
+	/// [SessionRateLimiter] each, from the configured per-second ceilings) rather than injected, so they share
+	/// this clock.
 	ConnectionService(ChannelRegistry channelRegistry,
 	                  WalkieProperties properties,
-	                  AudioRateLimiter audioRateLimiter,
 	                  Clock clock) {
 		this.channelRegistry = channelRegistry;
 		this.properties = properties;
-		this.audioRateLimiter = audioRateLimiter;
+		this.audioRateLimiter = new SessionRateLimiter(properties.maxAudioFramesPerSecond(), clock);
+		this.controlRateLimiter = new SessionRateLimiter(properties.maxControlMessagesPerSecond(), clock);
 		this.clock = clock;
 		this.floorIdleRelease = Duration.ofSeconds(properties.floorIdleReleaseSeconds());
 		this.floorMaxHold = Duration.ofSeconds(properties.floorMaxHoldSeconds());
@@ -82,6 +84,13 @@ public class ConnectionService {
 	/// MDC) — see [RequestContext#runAs]. The audio relay path ({@link #onAudio}) is deliberately not
 	/// scoped, to avoid per-frame MDC churn.
 	public void onMessage(ClientSession session, ClientMessage message) {
+		// Per-session control-plane flood guard: drop messages from a sender over its rate ceiling BEFORE doing
+		// any work (dispatch, broadcasts, the MDC scope), so a control flood — e.g. a rename storm fanning out to
+		// the whole channel — can't amplify cost. Dropped silently, like the audio guard (replying would itself
+		// amplify); an honest client (sparse control + ICE bursts) stays well under the limit.
+		if (!controlRateLimiter.tryAcquire(session.id())) {
+			return;
+		}
 		RequestContext.runAs(session.id(), session.displayName(), () -> dispatch(session, message));
 	}
 
@@ -399,7 +408,7 @@ public class ConnectionService {
 		}
 		// Per-sender flood guard: drop frames from a sender exceeding the configured rate BEFORE fan-out, so a
 		// flooder can't amplify cost across the channel (N recipients) or force excess decode work. This counts
-		// frames without inspecting them, so it works on end-to-end-encrypted channels too (see AudioRateLimiter).
+		// frames without inspecting them, so it works on end-to-end-encrypted channels too (see SessionRateLimiter).
 		if (!audioRateLimiter.tryAcquire(session.id())) {
 			return;
 		}
@@ -436,6 +445,7 @@ public class ConnectionService {
 		RequestContext.runAs(session.id(), session.displayName(), () -> {
 			handleLeave(session);
 			audioRateLimiter.forget(session.id());
+			controlRateLimiter.forget(session.id());
 			log.info("disconnected ({})", closeReason);
 		});
 	}
