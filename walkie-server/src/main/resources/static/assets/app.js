@@ -8,7 +8,7 @@
 // 1-byte codec tag so receivers can decode whatever the sender used. The WebRTC path uses the
 // browser's native Opus, tuned up via SDP + sender bitrate.
 
-import {decryptFrame, deriveKey, E2EE_SCHEME, encryptFrame, frameDisposition, rekeyAction} from './e2ee.js';
+import {decryptFrame, deriveKey, E2EE_SCHEME, encryptFrame, frameDisposition, rekeyAction, unwrapPassphrase, wrapPassphrase} from './e2ee.js';
 
 // Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
 const byId = id => document.getElementById(id);
@@ -22,6 +22,7 @@ const CODEC_OPUS = 1;
 const CODEC_PCM = 2;
 const OPUS_SUPPORTED = typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined';
 const DISPLAY_NAME = /^[A-Za-z0-9_.-]{1,32}$/;   // must match the server's display-name validation
+const CHANNEL_NAME = /^[A-Za-z0-9_-]{1,64}$/;    // must match the server's CHANNEL_NAME validation (no '.', unlike display names)
 const SERVER_OWNER = 'server';   // ownerId the server stamps on the server-managed "global" room (matches ConnectionService.GLOBAL_CHANNEL_OWNER); no participant owns it
 const MAX_ACTIVE_DECODERS = 8;   // cap on per-sender decoders we mix at once (O(N^2) fan-out guard); evict longest-silent
 const SILENCE_TTL_MS = 4000;     // close a per-sender lane after this much silence (survives speech gaps + jitter)
@@ -115,11 +116,17 @@ async function connect() {
 	state.hifi = byId('hifi').checked;
 	state.startMuted = byId('startMuted').checked;   // full-duplex only: join with the mic muted
 	const display = byId('display').value.trim();
-	const channel = byId('channel').value.trim() || 'lobby';
+	const channel = byId('channel').value.trim();
 	const passphrase = byId('passphrase').value;   // read once; used only on the relay path (E2EE)
 
 	if (!DISPLAY_NAME.test(display)) {
 		log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
+		return;
+	}
+	// A channel name is required (no silent default) — except in global mode, where the field is hidden and the
+	// server forces the channel to "global".
+	if (state.mode !== 'GLOBAL_PTT' && !CHANNEL_NAME.test(channel)) {
+		log('Channel name must be 1-64 chars of letters, digits, _ or - (no spaces).');
 		return;
 	}
 
@@ -136,13 +143,17 @@ async function connect() {
 	// Commit to a single connect flow: hold the button down for the whole async sequence (login -> mic -> WS),
 	// not just from ws.onopen, so rapid double-clicks can't kick off a second login / mic grab / socket.
 	state.connecting = true;
-	byId('connectBtn').disabled = true;
+	// One button at a time: from the moment a session starts connecting (through being connected) show only
+	// Disconnect; cleanup() flips back to Connect when the session ends or the attempt fails.
+	byId('connectBtn').hidden = true;
+	byId('disconnectBtn').hidden = false;
 	try {
 		// Login takes no input: it just mints a signed, short-lived token. Identity in a channel is the
 		// server-assigned session id; the display name is sent with the join below.
 		const res = await fetch('/api/auth/login', {method: 'POST'});
 		if (!res.ok) {
 			log('Login failed: HTTP ' + res.status);
+			cleanup();   // reset the connecting state and flip back to the Connect button
 			return;
 		}
 		const auth = await res.json();
@@ -174,13 +185,11 @@ async function connect() {
 			log('WebSocket open (' + state.transport + ')');
 			sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck});
 			setStatus(true, 'Connected — ' + state.transport);
-			byId('connectBtn').disabled = true;
-			byId('disconnectBtn').disabled = false;
-			// Renaming and switching only make sense while connected, so these controls appear only then.
-			byId('renameBtn').hidden = false;
-			byId('renameHint').hidden = false;
-			// The adaptive Apply/Switch button and the owner dropdown appear once the Joined snapshot arrives
-			// (they need the roster + owner), via updateApplyControls() / renderOwnerSelect() in onJoined.
+			// The Connect/Disconnect buttons were already flipped to "Disconnect only" when the connect flow began.
+			// The in-channel controls — Rename, the adaptive Apply/Switch button, the owner dropdown — appear only
+			// once the server confirms the join (the Joined snapshot), via onJoined. Revealing them here on a mere
+			// socket-open would flash them for a join the server then rejects (e.g. a wrong passphrase →
+			// passphrase_mismatch closes the socket right after it opened).
 		};
 		ws.onmessage = onWsMessage;
 		ws.onclose = ev => {
@@ -224,7 +233,7 @@ async function applyOrSwitch() {
 	}
 	const transport = byId('transport').value;
 	const mode = byId('mode').value;
-	const channel = byId('channel').value.trim() || 'lobby';
+	const channel = byId('channel').value.trim();
 	const passphrase = byId('passphrase').value;
 	const display = byId('display').value.trim();
 	if (!DISPLAY_NAME.test(display)) {
@@ -241,7 +250,12 @@ async function applyOrSwitch() {
 	}
 
 	if (effectiveChannel !== state.channel) {
-		// Different channel: switch (re-Join), carrying the chosen mode + passphrase.
+		// Different channel: switch (re-Join), carrying the chosen mode + passphrase. A channel name is required
+		// (no silent default) — global is exempt (channel forced to "global" server-side; the field is hidden).
+		if (mode !== 'GLOBAL_PTT' && !CHANNEL_NAME.test(channel)) {
+			log('Channel name must be 1-64 chars of letters, digits, _ or - (no spaces).');
+			return;
+		}
 		if (transport === 'relay' && passphrase
 			&& !(window.isSecureContext && window.crypto && crypto.subtle)) {
 			log('End-to-end encryption needs a secure context (HTTPS or localhost). Clear the passphrase to switch.');
@@ -297,43 +311,92 @@ function updateApplyControls() {
 	if (!isOpen()) {
 		btn.hidden = true;
 		hint.hidden = true;
+		byId('shareRekeyRow').hidden = true;   // a rotation control — meaningless until connected
+		byId('shareRekey').checked = true;     // back to the default-checked (auto-share) state
 		return;
 	}
-	btn.hidden = false;
-	hint.hidden = false;
 	const transport = byId('transport').value;
 	const mode = byId('mode').value;
-	const effectiveChannel = mode === 'GLOBAL_PTT' ? 'global' : byId('channel').value.trim() || 'lobby';
+	const channelField = byId('channel').value.trim();
+	const effectiveChannel = mode === 'GLOBAL_PTT' ? 'global' : channelField;   // no silent "lobby" default
 	const channelChanged = effectiveChannel !== state.channel;
+	// A required, valid channel name (global is exempt — its channel is fixed/forced server-side). An empty or
+	// malformed name has no valid target, so we never offer a switch to it (the button stays hidden below).
+	const channelValid = mode === 'GLOBAL_PTT' || CHANNEL_NAME.test(channelField);
+	const passphraseValue = byId('passphrase').value;
+	const passphraseChanged = passphraseValue !== (state.passphrase || '');
 	const changed = channelChanged
 		|| transport !== state.transport
 		|| mode !== state.mode
-		|| transport === 'relay'
-		&& byId('passphrase').value !== (state.passphrase || '');
+		|| transport === 'relay' && passphraseChanged;
+	// No disabled state: the button — and its explanatory hint — appear ONLY when there's something to do (a
+	// pending property change, or a member re-key to adopt) AND the channel name is valid, and are hidden
+	// otherwise. The label switches between "Switch channel" (the channel name changed → a fresh join) and
+	// "Apply changes" (in-place edit).
+	const actionable = (changed && channelValid) || state.rekeyPending;
+	btn.hidden = !actionable;
+	hint.hidden = !actionable;
 	btn.textContent = channelChanged ? 'Switch channel' : 'Apply changes';
-	btn.disabled = !changed && !state.rekeyPending;
+
+	// Post-connect, the channel's properties — transport, mode, passphrase — are editable only by the channel
+	// OWNER, or by anyone who has changed the channel NAME to switch to a different room (a fresh join, so you
+	// pick its properties). A non-owner staying on the current channel can change none of them — the passphrase
+	// is the one exception, re-enabling to ADOPT an owner's announced re-key (rekeyPending). In GLOBAL_PTT the
+	// passphrase stays locked by updateGlobalModeLocks (encryption isn't allowed there), so leave it alone here.
+	const iAmOwner = state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const inGlobalRoom = state.ownerId === SERVER_OWNER;
+	const lockedForMember = !iAmOwner && !channelChanged;
+	// The Mode selector is ALSO the only way to LEAVE the server-managed global room: its channel field is locked
+	// to "global" and it has no owner to host an in-place mode change, so a member there could otherwise never
+	// switch out (both channel and mode would be locked). Keep Mode editable in global — changing it away from
+	// GLOBAL_PTT unlocks the channel field and turns the action into a switch to a regular channel.
+	const modeLocked = lockedForMember && !inGlobalRoom;
+	byId('transport').disabled = lockedForMember;
+	byId('mode').disabled = modeLocked;
+	if (lockedForMember) {
+		// A locked member always sees the channel's LIVE transport (not a stale pending pick it can't apply).
+		byId('transport').value = state.transport;
+	}
+	if (modeLocked) {
+		byId('mode').value = state.mode;
+	}
+	if (mode !== 'GLOBAL_PTT') {
+		byId('passphrase').disabled = lockedForMember && !state.rekeyPending;
+	}
+
+	// The "share new passphrase" control is shown to the OWNER setting a NEW, non-empty passphrase on the CURRENT
+	// relay channel (a name change is a switch, not a rotation; clearing the field disables encryption — nothing
+	// to share). Two cases:
+	//  - encrypted→encrypted ROTATION (we hold an OLD key): the box is ENABLED — leave it checked to wrap the new
+	//    passphrase under the old key so members auto-adopt, or uncheck for a revocation-style re-key;
+	//  - plaintext→encrypted ENABLE (no old key to wrap under): auto-distribution is impossible, so the box is
+	//    DISABLED + unchecked and the label tells the owner every member must enter the new passphrase themselves.
+	const settingNewPassphrase = iAmOwner && !channelChanged && passphraseChanged && passphraseValue !== ''
+		&& transport === 'relay' && mode !== 'GLOBAL_PTT';
+	const canAutoShare = state.cryptoKey != null;   // need an OLD key to wrap the new passphrase under
+	byId('shareRekeyRow').hidden = !settingNewPassphrase;
+	byId('shareRekey').disabled = !canAutoShare;
+	byId('shareRekeyText').textContent = canAutoShare
+		? 'Share new passphrase with current members (uncheck to require everyone to re-enter it)'
+		: 'No existing key to share under — every member must enter the new passphrase themselves';
+	if (!settingNewPassphrase) {
+		byId('shareRekey').checked = true;    // hidden → back to the auto-share default for the next rotation
+	} else if (!canAutoShare) {
+		byId('shareRekey').checked = false;   // enable: can't auto-share, so reflect "members must re-enter"
+	}
+	// (rotation + canAutoShare: leave .checked alone, so a manual uncheck isn't undone on the next keystroke)
 }
 
 // The owner dropdown: lists members and lets the current owner hand ownership to another (selecting a different
-// member sends transferOwnership; the echoed ownerChanged is what actually moves the controls). Disabled for
-// non-owners and for the server-managed global room. Rebuilt with the roster (called from renderMembers).
+// member sends transferOwnership; the echoed ownerChanged is what actually moves the controls). Shown ONLY to
+// the current owner — everyone else already sees who owns the channel via the crown in the members list, so a
+// disabled dropdown would just be confusing noise. Rebuilt with the roster (called from renderMembers).
 function renderOwnerSelect() {
 	const select = byId('ownerSelect');
-	const label = byId('ownerLabel');
-	if (!isOpen()) {
-		select.hidden = true;
-		label.hidden = true;
-		return;
-	}
-	select.hidden = false;
-	label.hidden = false;
-	if (state.ownerId === SERVER_OWNER) {
-		const opt = document.createElement('option');
-		opt.value = SERVER_OWNER;
-		opt.textContent = 'server-managed (no owner)';
-		select.replaceChildren(opt);
-		select.value = SERVER_OWNER;
-		select.disabled = true;
+	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	select.hidden = !iAmOwner;
+	byId('ownerLabel').hidden = !iAmOwner;
+	if (!iAmOwner) {
 		return;
 	}
 	select.replaceChildren(...[...state.members.entries()]
@@ -346,7 +409,7 @@ function renderOwnerSelect() {
 			return opt;
 		}));
 	select.value = state.ownerId;
-	select.disabled = state.selfId !== state.ownerId;   // only the owner can hand it off
+	select.disabled = false;   // we are the owner
 }
 
 function onOwnerSelectChange() {
@@ -382,9 +445,19 @@ async function initiatePassphraseChange() {
 	}
 	const effectiveChannel = state.mode === 'GLOBAL_PTT' ? 'global' : state.channel;
 	const derived = passphrase ? await deriveKey(passphrase, effectiveChannel) : null;
-	sendCtrl({type: 'changePassphrase', keyCheck: derived ? derived.keyCheck : null});
+	// Auto-distribution: when the owner opted in (the "Share with current members" box) AND we currently hold a
+	// key (so this is a rotation, not the plaintext→encrypted enable) AND we're setting a new passphrase, wrap the
+	// new passphrase under the OLD key so connected members adopt it automatically. The server relays the blob
+	// without ever seeing the passphrase. Opting out (or no old key / disabling) sends no wrap, so members must
+	// re-enter it out-of-band — use that for a revocation-style rotation that locks out the old key.
+	const wrappedKey = (derived && state.cryptoKey && byId('shareRekey').checked)
+		? await wrapPassphrase(passphrase, state.cryptoKey)
+		: null;
+	sendCtrl({type: 'changePassphrase', keyCheck: derived ? derived.keyCheck : null, wrappedKey});
 	log(passphrase
-		? 'Requested a re-key for everyone (share the new passphrase out-of-band)…'
+		? wrappedKey
+			? 'Requested a re-key — connected members will adopt it automatically…'
+			: 'Requested a re-key for everyone (members must enter the new passphrase out-of-band)…'
 		: 'Requested encryption OFF for everyone…');
 }
 
@@ -431,8 +504,11 @@ async function applyAnnouncedPassphrase() {
 // Server told us (and everyone) the channel's passphrase changed. Record the new key-check and try to apply it
 // from whatever is in the passphrase field — seamless for the owner who just set it (and any member who
 // pre-entered the new secret), a clear prompt for everyone else.
-async function onPassphraseChanged(keyCheck) {
+async function onPassphraseChanged(keyCheck, wrappedKey) {
 	state.channelKeyCheck = keyCheck;
+	// A new key era — re-arm the one-shot "could not decrypt" notice so a member who misses THIS rotation gets a
+	// fresh cue (the flag is otherwise set on the first failure and never cleared until reconnect).
+	state.warnedDecrypt = false;
 	if (keyCheck == null) {
 		state.cryptoKey = null;
 		state.keyCheck = null;
@@ -442,10 +518,32 @@ async function onPassphraseChanged(keyCheck) {
 		log('The owner turned end-to-end encryption OFF for this channel.');
 		return;
 	}
+	// Auto-adopt: if the owner shared the new passphrase wrapped under the OLD key (which we still hold), unwrap
+	// it, confirm it derives the announced key-check, and adopt silently — seamless for everyone who held the old
+	// key (including the owner echoing their own rotation). Compare against the LIVE state.channelKeyCheck read
+	// AFTER the awaits, so a second rotation racing in can't make us adopt a key that only matched a stale value.
+	if (wrappedKey && state.cryptoKey) {
+		try {
+			const passphrase = await unwrapPassphrase(wrappedKey, state.cryptoKey);
+			const derived = await deriveKey(passphrase, state.mode === 'GLOBAL_PTT' ? 'global' : state.channel);
+			if (derived.keyCheck === state.channelKeyCheck) {
+				state.cryptoKey = derived.key;
+				state.keyCheck = derived.keyCheck;
+				state.passphrase = passphrase;
+				state.rekeyPending = false;
+				byId('passphrase').value = passphrase;
+				updateApplyControls();
+				log('The channel passphrase changed — re-keyed automatically.');
+				return;
+			}
+		} catch {
+			// The blob wasn't wrapped under our (old) key, or was tampered/superseded — fall back to manual.
+		}
+	}
 	const applied = await applyAnnouncedPassphrase();
 	log(applied
 		? 'The channel passphrase changed — re-keyed, E2EE updated.'
-		: 'The owner changed the passphrase — enter the new one above and click "Apply changes" to keep talking (you can\'t be heard until you do).');
+		: 'The owner changed the passphrase — enter the new one above and click "Apply changes" to keep talking (others won\'t hear you until you do).');
 }
 
 // Ask the server to change our display name to the current value of the Display name field. The server
@@ -460,7 +558,21 @@ function rename() {
 		log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
 		return;
 	}
+	if (display === state.members.get(state.selfId)) {
+		return;   // no-op: same as the current name (the button is disabled for this, and the server rejects it)
+	}
 	sendCtrl({type: 'rename', displayName: display});
+}
+
+// Enable Rename only when the Display name field holds a name DIFFERENT from the server-confirmed current one —
+// a no-op rename is pointless (and the server rejects it). Called on every keystroke in the field, on join, and
+// whenever our own name changes. Only meaningful while connected; the button is hidden (and this no-ops) until then.
+function updateRenameButton() {
+	const btn = byId('renameBtn');
+	if (btn.hidden) {
+		return;
+	}
+	btn.disabled = byId('display').value.trim() === state.members.get(state.selfId);
 }
 
 // --- incoming messages ----------------------------------------------------------------------------
@@ -530,7 +642,7 @@ function onWsMessage(ev) {
 			onOwnerChanged(msg.ownerId);
 			break;
 		case 'passphraseChanged':
-			onPassphraseChanged(msg.keyCheck).catch(err => log('Passphrase change error: ' + err.message));
+			onPassphraseChanged(msg.keyCheck, msg.wrappedKey).catch(err => log('Passphrase change error: ' + err.message));
 			break;
 		case 'signalOffer':
 			onOffer(msg.from, msg.sdp).catch(err => log('Offer error: ' + err.message));
@@ -600,6 +712,11 @@ function onJoined(msg) {
 	updateTalkButton();
 	updateModeControl();
 	updateGlobalModeLocks();
+	// Reveal the in-channel controls only now that the server has confirmed the join. Renaming makes sense only in
+	// a channel, and showing it here (not on socket-open) avoids flashing it for a join the server rejects.
+	byId('renameBtn').hidden = false;
+	byId('renameHint').hidden = false;
+	updateRenameButton();   // starts disabled — the field matches our just-joined name
 	updateApplyControls();
 	renderOwnerSelect();
 }
@@ -622,6 +739,10 @@ function onOwnerChanged(ownerId) {
 	const becameOwner = state.selfId === ownerId && state.ownerId !== ownerId;
 	state.ownerId = ownerId;
 	updateModeControl();
+	// updateModeControl may have snapped the selector back to the live mode (e.g. ownership moved away while a
+	// pending GLOBAL_PTT pick was open); re-run the global locks so the channel/passphrase show/hide can't lag the
+	// selector and leave the passphrase stuck hidden. (onJoined/onModeChanged pair these two for the same reason.)
+	updateGlobalModeLocks();
 	renderOwnerSelect();
 	updateApplyControls();
 	log(state.selfId === ownerId
@@ -644,31 +765,49 @@ function onOwnerChanged(ownerId) {
 function updateModeControl() {
 	const select = byId('mode');
 	if (isOpen()) {
-		select.value = state.mode;
-		select.disabled = state.selfId !== state.ownerId;
+		select.value = state.mode;   // reflect the live mode; updateApplyControls owns the connected disabled state
 	} else {
-		select.disabled = false;
+		select.disabled = false;     // pre-connect: the initial-mode chooser, always editable
 	}
 }
 
 // Locks the channel + passphrase inputs in GLOBAL_PTT mode. That mode joins the server-managed "global"
 // room, which forces the channel name to "global" and forbids end-to-end encryption (the server rejects an
 // encrypted global join), so both fields are misleading if editable. Each field's typed value is stashed and
-// restored when switching back. Driven by the live mode when connected, else the selector.
+// restored when switching back. Driven by the mode SELECTOR (the pending pick), not the live mode.
 function updateGlobalModeLocks() {
-	const mode = isOpen() ? state.mode : byId('mode').value;
+	// Key the locks off the mode SELECTOR (what you're about to connect or switch with), not the live state.mode.
+	// This (a) disables the channel field the moment GLOBAL_PTT is picked — pre-connect AND while connected — and
+	// (b) RE-enables it (restoring your saved channel name) the moment you pick a non-global mode, which is the only
+	// way to LEAVE the server-managed global room (whose channel is fixed and whose mode you can't change in place).
+	// The callers that fire on a server-confirmed mode (onJoined / onModeChanged) run updateModeControl first, which
+	// syncs the selector to state.mode, so this stays correct there; only a deliberate pending pick diverges.
+	const mode = byId('mode').value;
 	const global = mode === 'GLOBAL_PTT';
 	lockInGlobalMode(byId('channel'), byId('channelHint'), 'global', global);
-	lockInGlobalMode(byId('passphrase'), byId('passphraseHint'), '', global);
-	// "Connect muted" only applies to full-duplex (the sole mode whose mic auto-opens on join — push-to-talk
-	// never auto-transmits), so it is shown only there. This follows the *effective* mode, so it also hides
-	// itself if the room overrode the requested mode (this client isn't the owner). Toggle display directly
-	// rather than the `hidden` attribute: this row's inline `display:flex` would override the UA
-	// `[hidden]{display:none}` rule.
-	byId('startMutedRow').style.display = mode === 'FULL_DUPLEX' ? 'flex' : 'none';
-	// The value is captured once at connect and can't take effect on a live session, so lock it while
-	// connected (re-enabled on disconnect, since cleanup() nulls state.ws before calling this).
-	byId('startMuted').disabled = isOpen();
+	// The global room is always unencrypted, so the passphrase doesn't apply there: HIDE its label + input (not
+	// just disable them) and DELETE any typed secret, leaving the hint to explain the absence. A non-global mode
+	// shows the field again, empty, for the user to re-enter. (passphrase.disabled is managed by updateApplyControls
+	// for the non-global connected case; here we only show/hide + clear.)
+	byId('passphraseLabel').hidden = global;
+	byId('passphrase').hidden = global;
+	byId('passphraseHint').hidden = !global;
+	if (global) {
+		byId('passphrase').value = '';
+	}
+	// LEAVING the global room: when we're connected IN global (state.channel === 'global') but the selector has
+	// moved to a non-global mode, CLEAR the channel field (instead of restoring the pre-global name) — global was
+	// never a channel the user typed, so blank it to make clear they must enter the channel to switch to. The field
+	// is already re-enabled by lockInGlobalMode above. (Doesn't fire pre-connect or in a regular channel.)
+	if (!global && state.channel === 'global') {
+		byId('channel').value = '';
+	}
+	// "Connect muted" is a connect-time-only choice for full-duplex (the sole mode whose mic auto-opens on join;
+	// push-to-talk never auto-transmits). It is captured once at connect and can't take effect on a live session,
+	// so show it only PRE-CONNECT when full-duplex is the selected mode — and hide it once connected (rather than
+	// showing it greyed-out). Toggle display directly rather than the `hidden` attribute: this row's inline
+	// `display:flex` would override the UA `[hidden]{display:none}` rule.
+	byId('startMutedRow').style.display = (!isOpen() && mode === 'FULL_DUPLEX') ? 'flex' : 'none';
 }
 
 // Disables `input` and shows `hint` while in global mode, swapping in `lockedValue` and stashing the user's
@@ -858,7 +997,7 @@ function sendTagged(tag, payloadBytes) {
 	// matching key (e.g. the owner just turned encryption ON and we haven't applied the new passphrase) — stay
 	// SILENT rather than leak cleartext to the relay; 'plaintext' = a genuinely unencrypted channel; 'encrypt' =
 	// we hold a key.
-	const disposition = frameDisposition(state.cryptoKey, state.channelKeyCheck);
+	const disposition = frameDisposition(state.keyCheck, state.channelKeyCheck);
 	if (disposition === 'drop') {
 		return;
 	}
@@ -1250,6 +1389,7 @@ function renameMember(id, name) {
 	}
 	state.members.set(id, name);
 	renderMembers();
+	updateRenameButton();   // if this was our own rename, the field now matches the new name → Rename re-disables
 	log(id === state.selfId ? `You are now "${name}"` : `"${old}" is now "${name}"`);
 }
 
@@ -1423,17 +1563,21 @@ function cleanup() {
 	const talkBtn = byId('talkBtn');
 	talkBtn.textContent = 'Connect first';
 	talkBtn.classList.remove('live');
-	byId('connectBtn').disabled = false;
-	byId('disconnectBtn').disabled = true;
+	byId('connectBtn').hidden = false;
+	byId('disconnectBtn').hidden = true;
 	byId('renameBtn').hidden = true;
 	byId('renameHint').hidden = true;
 	byId('applyBtn').hidden = true;
 	byId('applyHint').hidden = true;
 	byId('ownerSelect').hidden = true;
 	byId('ownerLabel').hidden = true;
+	byId('shareRekeyRow').hidden = true;   // owner-only rotation control; updateApplyControls only runs while connected
+	byId('shareRekey').checked = true;     // back to the default-checked (auto-share) state for the next session
 	setStatus(false, 'Disconnected');
-	updateModeControl();
-	updateGlobalModeLocks();
+	byId('transport').disabled = false;   // re-enable for the next connect (updateApplyControls only runs while connected)
+	byId('passphrase').disabled = false;  // ditto — its locked state is set by updateApplyControls only while connected
+	updateModeControl();                  // re-enables the mode selector (pre-connect branch)
+	updateGlobalModeLocks();              // re-shows/hides + re-enables the channel, and shows/clears the passphrase, per the selected mode
 }
 
 function closeCodec(codec) {
@@ -1459,18 +1603,20 @@ window.addEventListener('DOMContentLoaded', () => {
 	byId('channel').addEventListener('input', updateApplyControls);
 	byId('passphrase').addEventListener('input', updateApplyControls);
 	byId('transport').addEventListener('change', updateApplyControls);
+	// Enable Rename only once the Display name field differs from the current name.
+	byId('display').addEventListener('input', updateRenameButton);
 
 	// The Connect fields aren't wrapped in a <form>, so Enter in one does nothing by default. Treat Enter in
-	// the Connect panel as "Connect" when a connect is possible (button enabled, i.e. disconnected); once
-	// connected, Enter in the Display name field instead renames (the Connect button is then disabled).
+	// the Connect panel as "Connect" when a connect is possible (the Connect button is showing, i.e. disconnected);
+	// once connected, Enter in the Display name field instead renames (the Connect button is then hidden).
 	byId('setup').addEventListener('keydown', e => {
 		if (e.key !== 'Enter' || e.isComposing) {
 			return;
 		}
-		if (!byId('connectBtn').disabled) {
+		if (!byId('connectBtn').hidden) {
 			e.preventDefault();
 			connect();
-		} else if (isOpen() && e.target.id === 'display') {
+		} else if (isOpen() && e.target.id === 'display' && !byId('renameBtn').disabled) {
 			e.preventDefault();
 			rename();
 		}

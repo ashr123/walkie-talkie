@@ -189,12 +189,12 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			String[] ids = joinPair("rotate-wire", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 
 			// Enable encryption with a non-null key-check — both peers receive PassphraseChanged carrying it.
-			send(sa, new ClientMessage.ChangePassphrase("kcv-hex-1"));
+			send(sa, new ClientMessage.ChangePassphrase("kcv-hex-1", null));
 			assertEquals("kcv-hex-1", awaitType(a.messages, ServerMessage.PassphraseChanged.class).keyCheck());
 			assertEquals("kcv-hex-1", awaitType(b.messages, ServerMessage.PassphraseChanged.class).keyCheck());
 
 			// Disable — the NULL key-check must survive the JSON round-trip (a Jackson null regression shows only here).
-			send(sa, new ClientMessage.ChangePassphrase(null));
+			send(sa, new ClientMessage.ChangePassphrase(null, null));
 			assertNull(awaitType(a.messages, ServerMessage.PassphraseChanged.class).keyCheck());
 			assertNull(awaitType(b.messages, ServerMessage.PassphraseChanged.class).keyCheck());
 

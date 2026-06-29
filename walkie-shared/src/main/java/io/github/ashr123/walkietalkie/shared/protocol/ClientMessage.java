@@ -48,11 +48,17 @@ public sealed interface ClientMessage {
 	/// Honored only for the channel owner (a non-owner gets `not_owner`; sending it before joining gets
 	/// `not_in_channel`). `keyCheck` is the key-check value derived from the **new** passphrase (see the clients'
 	/// key derivation), or `null` to make the channel unencrypted. As with [Join#keyCheck] the server never sees
-	/// the passphrase itself — it only records the new key-check and broadcasts a
-	/// [ServerMessage.PassphraseChanged] so every member re-derives its key from the new passphrase, which the
-	/// members obtain out-of-band exactly as they did the original one.
+	/// the passphrase itself — it only records the new key-check and broadcasts a [ServerMessage.PassphraseChanged].
+	///
+	/// `wrappedKey` is an OPTIONAL convenience: the new passphrase encrypted under the channel's **OLD** key
+	/// (base64 of an AES-256-GCM blob the owner computes with the key it currently holds), or `null`. When
+	/// present, connected members decrypt it with the old key they already hold and adopt the new passphrase
+	/// automatically — so a rotation needs no out-of-band step. The server still never learns the passphrase (it
+	/// relays the blob opaquely, exactly like the audio it forwards). It is `null` when the owner opts out (a
+	/// revocation-style rotation that forces out-of-band re-entry, since anyone holding the old key could unwrap
+	/// it), when there is no old key (a plaintext→encrypted *enable*), or when disabling encryption.
 	@JsonTypeName("changePassphrase")
-	record ChangePassphrase(String keyCheck) implements ClientMessage {
+	record ChangePassphrase(String keyCheck, String wrappedKey) implements ClientMessage {
 	}
 
 	/// Ask the server to hand channel ownership to another member. Honored only for the current owner (a

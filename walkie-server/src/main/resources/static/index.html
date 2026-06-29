@@ -24,6 +24,14 @@
             box-sizing: border-box;
         }
 
+        /* The `hidden` attribute must win. The author rule `label { display: block }` below would otherwise
+           override the user-agent `[hidden] { display: none }` (author origin beats UA origin), leaving
+           `<label hidden>` elements — the Channel owner label and the share-rekey row — visible even when JS
+           sets `.hidden = true`. `!important` keeps the attribute authoritative for every element. */
+        [hidden] {
+            display: none !important;
+        }
+
         html, body {
             height: 100%;
         }
@@ -245,6 +253,12 @@
 		</div>
 		<button class="secondary" hidden id="renameBtn" style="width:100%; margin-top:8px;">Rename</button>
 		<div class="hint" hidden id="renameHint">Edit the name above and click Rename (or press Enter in the field).</div>
+		<!-- Channel comes first: once connected it determines whether the transport/mode/passphrase below are
+		     editable (changing the channel name = switching to a different room, so a non-owner can pick its
+		     properties; staying on the current channel, only the owner can). -->
+		<label for="channel">Channel</label>
+		<input autocomplete="off" id="channel" value="lobby">
+		<div class="hint" hidden id="channelHint">Global push-to-talk uses one shared channel for everyone — the name is fixed to <code>global</code>. Switch the Channel mode away from global to join a different channel.</div>
 		<label for="transport">Transport</label>
 		<select id="transport">
 			<option value="relay">WebSocket relay (server forwards audio)</option>
@@ -256,20 +270,17 @@
 			<option value="GLOBAL_PTT">Single global push-to-talk</option>
 			<option value="FULL_DUPLEX">Full-duplex conference</option>
 		</select>
-		<label for="channel">Channel</label>
-		<input autocomplete="off" id="channel" value="lobby">
-		<div class="hint" hidden id="channelHint">Global push-to-talk uses one shared channel for everyone — the name is fixed to <code>global</code>.</div>
 		<label style="display:flex; align-items:center; gap:8px; margin-top:10px;">
 			<input id="hifi" style="width:auto;" type="checkbox"> High fidelity (disable mic processing)
 		</label>
 		<label id="startMutedRow" style="display:none; align-items:center; gap:8px; margin-top:10px;">
 			<input id="startMuted" style="width:auto;" type="checkbox"> Connect muted
 		</label>
-		<label for="passphrase">Encryption passphrase (optional, relay)</label>
+		<label for="passphrase" id="passphraseLabel">Encryption passphrase (optional, relay)</label>
 		<input autocomplete="off" id="passphrase" placeholder="shared secret — leave blank for none" type="password">
 		<div class="hint" hidden id="passphraseHint">The global channel is the server's unencrypted broadcast room — encryption isn't available there.</div>
 		<button id="connectBtn">Connect</button>
-		<button class="secondary" disabled id="disconnectBtn" style="width:100%; margin-top:8px;">Disconnect</button>
+		<button class="secondary" hidden id="disconnectBtn" style="width:100%; margin-top:8px;">Disconnect</button>
 		<label for="ownerSelect" hidden id="ownerLabel" style="margin-top:8px;">Channel owner</label>
 		<select hidden id="ownerSelect"></select>
 		<button hidden id="applyBtn" style="width:100%; margin-top:8px;">Apply changes</button>
@@ -277,6 +288,9 @@
 			A new channel name switches rooms (carrying the chosen properties); otherwise the change applies to the
 			current channel — mode and passphrase are owner-only, and changing the transport reconnects. Clear the
 			passphrase and Apply to turn encryption off.</div>
+		<label hidden id="shareRekeyRow" style="align-items:center; gap:8px; margin-top:8px;">
+			<input checked id="shareRekey" style="width:auto;" type="checkbox"> <span id="shareRekeyText">Share new passphrase with current members (uncheck to require everyone to re-enter it)</span>
+		</label>
 		<div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Disconnected</span></div>
 	</section>
 

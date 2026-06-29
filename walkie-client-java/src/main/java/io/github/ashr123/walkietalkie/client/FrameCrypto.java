@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HexFormat;
 
 /// End-to-end encryption for relay audio frames (AES-256-GCM).
@@ -36,8 +37,8 @@ final class FrameCrypto {
 	// OWASP's PBKDF2-HMAC-SHA512 floor (210k). It must match the browser's WebCrypto iteration count exactly —
 	// it's part of the cross-platform key-derivation contract.
 	private static final int PBKDF2_ITERATIONS = 600_000;
-	private static final int KEY_BITS = 256;
-	private static final int KCV_BITS = 128;          // 16-byte key-check value, derived alongside the AES key
+	private static final int KEY_BITS = 32 * Byte.SIZE;
+	private static final int KCV_BITS = 16 * Byte.SIZE;          // 16-byte key-check value, derived alongside the AES key
 	private static final String SALT_PREFIX = "walkie-talkie:e2ee:";
 
 	private final SecretKey key;
@@ -119,6 +120,20 @@ final class FrameCrypto {
 	/// no scheme/IV envelope) — only for the cross-platform known-answer test, which pins the bare crypto.
 	byte[] encryptWithIv(byte[] iv, byte[] plaintext) throws GeneralSecurityException {
 		return cipher(Cipher.ENCRYPT_MODE, iv).doFinal(plaintext);
+	}
+
+	/// Wrap a passphrase under THIS key for an owner-initiated re-key: base64 of the frame envelope around the
+	/// passphrase's UTF-8 bytes. A member that still holds this (old) key unwraps it to adopt the new passphrase
+	/// automatically; the server relays the blob without ever seeing the passphrase. Same crypto/format as an
+	/// audio frame, so it is byte-compatible with the browser's `wrapPassphrase` (and pinned by the same KAT).
+	String wrap(String passphrase) throws GeneralSecurityException {
+		return Base64.getEncoder().encodeToString(encrypt(passphrase.getBytes(StandardCharsets.UTF_8)));
+	}
+
+	/// Inverse of [#wrap]: recover the passphrase from a base64 wrapped blob. Throws if it was not wrapped under
+	/// this key (a different/rotated key, or a tampered blob), so the caller falls back to a manual re-entry.
+	String unwrap(String wrapped) throws GeneralSecurityException {
+		return new String(decrypt(Base64.getDecoder().decode(wrapped)), StandardCharsets.UTF_8);
 	}
 
 	private Cipher cipher(int mode, byte[] iv) throws GeneralSecurityException {

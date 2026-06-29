@@ -83,17 +83,32 @@ export function decryptFrame(frame, key) {
 		);
 }
 
-// The pure outbound transmit-gate decision, given the key we currently hold and the channel's announced
-// key-check. Returns 'encrypt' (send ciphertext), 'plaintext' (genuinely unencrypted channel — send as-is), or
-// 'drop' (the channel announces encryption but we hold no matching key — stay SILENT rather than leak plaintext;
-// this is the plaintext→encrypted enable transition for a not-yet-rekeyed member). Mirrors the Java client's
-// WalkieClient.outboundFrame.
-export function frameDisposition(cryptoKey, channelKeyCheck) {
-	return cryptoKey ?
-		'encrypt' :
-		channelKeyCheck ?
-			'drop' :
-			'plaintext';
+// Wrap a passphrase under `key` for an owner-initiated re-key: base64 of the frame envelope around the
+// passphrase's UTF-8 bytes (same crypto/format as an audio frame, so byte-compatible with the Java client's
+// FrameCrypto.wrap). A member that still holds the old key unwraps it to adopt the new passphrase automatically;
+// the server relays the blob without ever seeing the passphrase.
+export async function wrapPassphrase(passphrase, key) {
+	return btoa(String.fromCharCode(...(await encryptFrame(new TextEncoder().encode(passphrase), key))));
+}
+
+// Inverse of wrapPassphrase: recover the passphrase from a base64 wrapped blob, decrypting with `key`. Rejects
+// if the blob was not wrapped under this key (a different/rotated key, or tampered) — caller then falls back to
+// a manual re-entry.
+export async function unwrapPassphrase(wrapped, key) {
+	return new TextDecoder().decode(await decryptFrame(
+		Uint8Array.from(atob(wrapped), (c) => c.charCodeAt(0)),
+		key
+	));
+}
+
+// The pure outbound transmit-gate decision, given the key-check of the key we currently HOLD and the channel's
+// announced key-check. Returns 'plaintext' (unencrypted channel — send as-is), 'encrypt' (our key matches the
+// channel's announced one — send ciphertext), or 'drop' (the channel announces encryption but our key-check
+// doesn't match — stay SILENT). 'drop' covers BOTH a member with no key (the plaintext→encrypted enable, never
+// leak plaintext) AND a member holding a STALE key after a rotation it hasn't adopted (don't emit undecodable
+// audio; a straggler is muted until it adopts). Mirrors the Java client's WalkieClient.outboundFrame.
+export function frameDisposition(heldKeyCheck, channelKeyCheck) {
+	return channelKeyCheck == null ? 'plaintext' : heldKeyCheck === channelKeyCheck ? 'encrypt' : 'drop';
 }
 
 // The pure decision for an announced passphrase change, given the channel's announced key-check and the

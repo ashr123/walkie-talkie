@@ -65,13 +65,18 @@ public sealed interface ServerMessage {
 	}
 
 	/// The channel owner changed the end-to-end-encryption passphrase. `keyCheck` is the new key-check value, or
-	/// `null` if the channel is now unencrypted. Every member — including the owner who initiated it — re-derives
-	/// its AES key from the new passphrase and verifies the derived key-check against this one. The passphrase
-	/// itself is shared out-of-band; the server never sees it. A member that doesn't yet have the new passphrase
-	/// stays in the channel but can't decrypt or encrypt audio until it enters it (and a client must NOT fall back
-	/// to sending plaintext into a still-encrypted channel).
+	/// `null` if the channel is now unencrypted. Every member — including the owner who initiated it — adopts the
+	/// new key and verifies its derived key-check against this one. The passphrase itself is never sent in clear;
+	/// the server never sees it.
+	///
+	/// `wrappedKey` (relayed verbatim from [ClientMessage.ChangePassphrase#wrappedKey()], or `null`) is the new
+	/// passphrase encrypted under the channel's OLD key: a member that still holds the old key decrypts it and
+	/// adopts the new passphrase **automatically**, verifying the result against `keyCheck`. When it is absent (the
+	/// owner opted out, an enable transition, or a tampered/undecryptable blob) the member must obtain the new
+	/// passphrase out-of-band and apply it. Until a member holds a key matching `keyCheck` it is muted — it neither
+	/// transmits (no plaintext, no stale-key audio) nor can decode others.
 	@JsonTypeName("passphraseChanged")
-	record PassphraseChanged(String keyCheck) implements ServerMessage {
+	record PassphraseChanged(String keyCheck, String wrappedKey) implements ServerMessage {
 	}
 
 	/// WebRTC: an SDP offer relayed from another member.

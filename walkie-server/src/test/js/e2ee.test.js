@@ -17,6 +17,8 @@ import {
 	decryptFrame,
 	frameDisposition,
 	rekeyAction,
+	wrapPassphrase,
+	unwrapPassphrase,
 } from '../../main/resources/static/assets/e2ee.js';
 
 // Fixed inputs shared with FrameCryptoTest (Java). If the browser's PBKDF2/AES-GCM ever drifts from the Java
@@ -71,22 +73,32 @@ test('decrypt rejects a plaintext peer frame (no scheme byte), even with the rig
 	await assert.rejects(() => decryptFrame(frame, key));
 });
 
-// --- the transmit-gate invariant: never emit plaintext into an announced-encrypted channel ---------
+// --- the transmit-gate invariant: only put on the wire what the channel's current key-check matches ------
 
 test('a genuinely unencrypted channel sends in the clear', () => {
 	assert.equal(frameDisposition(null, null), 'plaintext');
 });
 
 test('ENABLE transition: a member with no key into an announced-encrypted channel is DROPPED', () => {
-	// The leak case the round-1 review caught: cryptoKey is null (channel was plaintext) but the owner just
-	// announced a non-null key-check. Must NOT fall back to plaintext.
+	// The leak case the round-1 review caught: no key held (channel was plaintext) but the owner just announced a
+	// non-null key-check. Must NOT fall back to plaintext.
 	assert.equal(frameDisposition(null, 'non-null-kcv'), 'drop');
 });
 
-test('a held key always produces ciphertext (seamless re-key AND old-key rotation)', () => {
-	const fakeKey = {};   // frameDisposition only checks truthiness of the key, not its type
-	assert.equal(frameDisposition(fakeKey, 'new-kcv-we-cannot-match'), 'encrypt');
-	assert.equal(frameDisposition(fakeKey, null), 'encrypt');
+test('frameDisposition: a matching held key-check encrypts; a stale one is muted', () => {
+	assert.equal(frameDisposition('kcv-X', 'kcv-X'), 'encrypt');     // our key matches the channel -> send ciphertext
+	assert.equal(frameDisposition('kcv-OLD', 'kcv-NEW'), 'drop');    // stale key after a rotation we haven't adopted -> muted
+	assert.equal(frameDisposition('kcv-X', null), 'plaintext');      // channel is unencrypted
+});
+
+test('wrapPassphrase round-trips under the same key, and only that key can unwrap', async () => {
+	// Owner-initiated auto-distribution: the new passphrase is wrapped under the OLD key; a member holding it
+	// recovers it (and one who doesn't, can't). Cross-checked against the Java FrameCrypto.wrap/unwrap.
+	const {key: oldKey} = await deriveKey('old-secret', 'team');
+	const wrapped = await wrapPassphrase('the-new-passphrase', oldKey);
+	assert.equal(await unwrapPassphrase(wrapped, oldKey), 'the-new-passphrase');
+	const {key: otherKey} = await deriveKey('a-different-old-secret', 'team');
+	await assert.rejects(() => unwrapPassphrase(wrapped, otherKey), 'only the wrapping key can unwrap');
 });
 
 test('the AES key + key-check are salted per channel (switching rooms re-keys)', async () => {

@@ -101,7 +101,8 @@ public class ConnectionService {
 			case ClientMessage.RequestFloor _ -> handleRequestFloor(session);
 			case ClientMessage.ReleaseFloor _ -> handleReleaseFloor(session);
 			case ClientMessage.ChangeMode(ChannelMode mode) -> handleChangeMode(session, mode);
-			case ClientMessage.ChangePassphrase(String keyCheck) -> handleChangePassphrase(session, keyCheck);
+			case ClientMessage.ChangePassphrase(String keyCheck, String wrappedKey) ->
+					handleChangePassphrase(session, keyCheck, wrappedKey);
 			case ClientMessage.TransferOwnership(String newOwnerId) -> handleTransferOwnership(session, newOwnerId);
 			case ClientMessage.Rename(String displayName) -> handleRename(session, displayName);
 			case ClientMessage.Offer(String target, String sdp) ->
@@ -533,7 +534,7 @@ public class ConnectionService {
 	/// key-check the channel no longer uses. The audio relay path needs no change — it forwards frames opaquely,
 	/// so a brief transition where some members hold the new key and others the old just drops a few GCM-failing
 	/// frames, exactly as a channel switch does.
-	private void handleChangePassphrase(ClientSession session, String keyCheck) {
+	private void handleChangePassphrase(ClientSession session, String keyCheck, String wrappedKey) {
 		String channelName = session.channelName();
 		if (channelName == null) {
 			sendError(session, "not_in_channel", "Join a channel first");
@@ -546,10 +547,14 @@ public class ConnectionService {
 			case OK -> {
 				Channel channel = result.channel();
 				synchronized (channel) {
-					ServerMessage passphraseChanged = new ServerMessage.PassphraseChanged(channel.keyCheck());
+					// Broadcast the LIVE key-check (convergence) plus this request's wrappedKey relayed verbatim —
+					// the server never inspects or stores it; members that hold the old key decrypt it to adopt the
+					// new passphrase automatically (and re-verify against the live key-check, so a stale/tampered
+					// blob just falls back to a manual re-entry).
+					ServerMessage passphraseChanged = new ServerMessage.PassphraseChanged(channel.keyCheck(), wrappedKey);
 					channel.forEach(member -> safeSend(member, passphraseChanged));
 				}
-				// Log the encrypted/plaintext STATUS only — never the key-check token itself.
+				// Log the encrypted/plaintext STATUS only — never the key-check token or the wrapped blob.
 				log.info("changed passphrase on channel={} (now {})", channelName,
 						keyCheck == null ? "unencrypted" : "encrypted");
 			}
@@ -612,6 +617,14 @@ public class ConnectionService {
 			return;
 		}
 		String previous = session.displayName();   // the old label, for the transition logged below (before overwrite)
+		if (displayName.equals(previous)) {
+			// A no-op rename (same name): do nothing — don't broadcast a pointless MemberRenamed (no churn for the
+			// other members) and don't treat it as an error (a no-op is not a failure). The reference clients already
+			// prevent a same-name rename locally (the browser disables Rename, the Java client skips it); this just
+			// guards any client that doesn't, the same way a duplicate Join to the current channel is handled
+			// harmlessly rather than rejected.
+			return;
+		}
 		String channelName = session.channelName();
 		if (channelName != null && channelRegistry.find(channelName) instanceof Some(Channel channel)) {
 			synchronized (channel) {

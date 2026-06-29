@@ -60,7 +60,7 @@ class ConcurrencyStressTest {
 									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, "n-" + seed, null));
 							case 1 -> service.onMessage(me, new ClientMessage.RequestFloor());
 							case 2 -> service.onMessage(me, new ClientMessage.ReleaseFloor());
-							case 3 -> service.onMessage(me, new ClientMessage.Rename("n-" + seed + "-" + (i % 40)));
+							case 3 -> service.onMessage(me, new ClientMessage.Rename("n-" + seed + "-" + i % 40));
 							case 4 -> service.onAudio(me, frame);
 							case 5 -> service.onMessage(me, new ClientMessage.Leave());
 							// Passphrase rotation races joins/leaves on the SAME channel: only the channel's current
@@ -68,7 +68,7 @@ class ConcurrencyStressTest {
 							// stay serialized with join validation under the channel-name bin lock. A null key-check
 							// flips the channel back to unencrypted, keeping joins (which present null) succeeding.
 							case 6 -> service.onMessage(me, new ClientMessage.ChangePassphrase(
-									rnd.nextInt(3) == 0 ? null : "kcv-" + (i % 4)));
+									rnd.nextInt(3) == 0 ? null : "kcv-" + i % 4, null));
 							// Ownership transfer races the auto-election a concurrent leave performs AND the case-6
 							// rotation (both write under the same channel-name bin lock). Half the time target SELF —
 							// guaranteed a current member, so when this worker currently owns its channel the OK
@@ -142,7 +142,7 @@ class ConcurrencyStressTest {
 						// Owner-only ops: each succeeds only while THIS member is the owner, so the owner and the
 						// key-check change from whichever thread currently owns — concurrent broadcasts race.
 						if (rnd.nextBoolean()) {
-							service.onMessage(me, new ClientMessage.ChangePassphrase("kcv-" + seed + "-" + i));
+							service.onMessage(me, new ClientMessage.ChangePassphrase("kcv-" + seed + "-" + i, null));
 						} else {
 							service.onMessage(me, new ClientMessage.TransferOwnership("m-" + rnd.nextInt(members)));
 						}
@@ -166,10 +166,10 @@ class ConcurrencyStressTest {
 		String finalKeyCheck = team.keyCheck();
 		for (FakeClientSession s : sessions) {
 			s.sent.stream().filter(ServerMessage.OwnerChanged.class::isInstance).map(ServerMessage.OwnerChanged.class::cast)
-					.reduce((a, b) -> b).ifPresent(last -> assertEquals(finalOwner, last.ownerId(),
+					.reduce((_, b) -> b).ifPresent(last -> assertEquals(finalOwner, last.ownerId(),
 							"member " + s.id() + "'s last OwnerChanged must converge on the channel's final owner"));
 			s.sent.stream().filter(ServerMessage.PassphraseChanged.class::isInstance).map(ServerMessage.PassphraseChanged.class::cast)
-					.reduce((a, b) -> b).ifPresent(last -> assertEquals(finalKeyCheck, last.keyCheck(),
+					.reduce((_, b) -> b).ifPresent(last -> assertEquals(finalKeyCheck, last.keyCheck(),
 							"member " + s.id() + "'s last PassphraseChanged must converge on the channel's final key-check"));
 		}
 	}

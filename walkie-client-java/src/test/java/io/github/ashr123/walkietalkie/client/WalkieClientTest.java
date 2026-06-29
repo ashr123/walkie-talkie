@@ -34,14 +34,13 @@ class WalkieClientTest {
 	}
 
 	@Test
-	void rotatingBetweenPassphrasesStillSendsCiphertextUnderTheOldKey() throws GeneralSecurityException {
-		// encrypted -> encrypted rotation: we still hold the OLD key, so we keep sending ciphertext (peers on the
-		// new key just can't decode it) — but we NEVER fall back to plaintext.
-		FrameCrypto oldKey = FrameCrypto.fromPassphrase("old-secret", "team");
-		byte[] out = WalkieClient.outboundFrame(FRAME, oldKey, "new-kcv-we-cannot-match");
-		assertNotNull(out);
-		assertFalse(Arrays.equals(FRAME, out), "must be ciphertext, not the plaintext frame");
-		assertEquals(E2EE_SCHEME, out[0], "an encrypted frame carries the E2EE scheme byte");
+	void aStaleKeyAfterARotationIsMuted() throws GeneralSecurityException {
+		// encrypted -> encrypted rotation: we still hold the OLD key, which no longer matches the channel's
+		// announced key-check. We must stay SILENT (not emit stale-key audio the rekeyed channel can't decode and
+		// not desync) until we adopt the new key — symmetric with everyone else.
+		FrameCrypto staleKey = FrameCrypto.fromPassphrase("old-secret", "team");
+		assertNull(WalkieClient.outboundFrame(FRAME, staleKey, "new-kcv-we-cannot-match"),
+				"a member holding a stale key after a rotation it hasn't adopted must be muted");
 	}
 
 	@Test
@@ -85,5 +84,17 @@ class WalkieClientTest {
 		FrameCrypto wrong = FrameCrypto.fromPassphrase("the-wrong-secret", "team");
 		assertEquals(WalkieClient.RekeyAction.KEEP, WalkieClient.rekeyAction("announced-kcv-we-cannot-match", wrong));
 		assertEquals(WalkieClient.RekeyAction.KEEP, WalkieClient.rekeyAction("announced-kcv", null));
+	}
+
+	@Test
+	void wrapRoundTripsThePassphraseAndOnlyTheKeyHolderCanUnwrap() throws GeneralSecurityException {
+		// Owner-initiated auto-distribution: the new passphrase is wrapped under the OLD key; a member holding
+		// that key recovers it, a member who doesn't can't.
+		FrameCrypto oldKey = FrameCrypto.fromPassphrase("old-secret", "team");
+		String wrapped = oldKey.wrap("the-new-passphrase");
+		assertEquals("the-new-passphrase", oldKey.unwrap(wrapped), "the old key recovers the wrapped passphrase");
+		FrameCrypto differentKey = FrameCrypto.fromPassphrase("some-other-key", "team");
+		assertThrows(GeneralSecurityException.class, () -> differentKey.unwrap(wrapped),
+				"only a holder of the wrapping (old) key can unwrap the new passphrase");
 	}
 }

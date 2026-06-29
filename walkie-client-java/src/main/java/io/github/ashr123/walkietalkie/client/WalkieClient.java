@@ -133,9 +133,10 @@ public final class WalkieClient implements AutoCloseable {
 	private static void printHelp() {
 		System.out.println("""
 				--------------------------------------------------------------------------------------------------
-				 Commands:  t = talk/stop   w = who's here   m <ptt|global|duplex> = mode
+				 Commands:  t = talk/stop   w = who's here   m <ptt|global|duplex> = mode (owner)
 				            c <channel> [mode] [key] = switch channel   n <name> = rename
-				            p [passphrase] = change passphrase (owner; blank turns encryption off)
+				            p [passphrase] = owner: change passphrase (blank = off; members auto-adopt) | member: adopt the owner's new one
+				            p! [passphrase] = owner: change passphrase WITHOUT auto-sharing (members must re-enter it)
 				            o <#id> = give ownership to a member (owner)   f = hi-fi on/off   q = quit   h = help
 				--------------------------------------------------------------------------------------------------""");
 	}
@@ -206,19 +207,18 @@ public final class WalkieClient implements AutoCloseable {
 	/// key-check: returns the bytes to put on the wire, or `null` to **drop** (stay silent). Pure (no field
 	/// access) so the invariant below is unit-testable without a live socket.
 	///
-	/// Invariant — **never transmit plaintext into a channel the owner has declared encrypted:**
-	/// - key present → send ciphertext under that key (covers the owner's seamless re-key AND an
-	///   encrypted→encrypted rotation where a member still holds only the *old* key — others can't decode it, but
-	///   nothing leaks in the clear);
-	/// - no key + the channel announces a key-check (`announcedKeyCheck != null`) → **drop**. This is the
-	///   plaintext→encrypted *enable* transition for a not-yet-rekeyed member: it has no old key, so "keep the old
-	///   key" would mean staying plaintext — instead it goes silent until it applies the new passphrase;
-	/// - no key + no announced key-check → a genuinely unencrypted channel: send as-is.
+	/// Invariant — **only ever put on the wire what the channel's CURRENT key-check matches:**
+	/// - channel unencrypted (`announcedKeyCheck == null`) → send the frame in the clear;
+	/// - we hold the matching key (`key.keyCheck().equals(announcedKeyCheck)`) → send ciphertext;
+	/// - otherwise → **drop** (stay silent). This covers both a member with NO key (the plaintext→encrypted
+	///   *enable* — never leak plaintext) AND a member still holding a STALE key after a rotation it hasn't
+	///   adopted (don't emit audio the rekeyed channel can't decode, and don't desync — a straggler is muted until
+	///   it adopts the new key, so the experience is symmetric for everyone).
 	static byte[] outboundFrame(byte[] frame, FrameCrypto key, String announcedKeyCheck) throws GeneralSecurityException {
-		if (key != null) {
-			return key.encrypt(frame);
+		if (announcedKeyCheck == null) {
+			return frame;
 		}
-		return announcedKeyCheck == null ? frame : null;
+		return key != null && announcedKeyCheck.equals(key.keyCheck()) ? key.encrypt(frame) : null;
 	}
 
 	// --- Server messages --------------------------------------------------------------------------
@@ -301,7 +301,7 @@ public final class WalkieClient implements AutoCloseable {
 					log("[owner] note: your key doesn't match the channel — as owner, 'p <passphrase>' now ROTATES it for everyone, so set one you actually hold instead of re-typing a stale one.");
 				}
 			}
-			case ServerMessage.PassphraseChanged(String keyCheck) -> handlePassphraseChanged(keyCheck);
+			case ServerMessage.PassphraseChanged(String keyCheck, String wrappedKey) -> handlePassphraseChanged(keyCheck, wrappedKey);
 			case ServerMessage.SignalOffer _, ServerMessage.SignalAnswer _,
 			     ServerMessage.SignalIce _ -> { /* WebRTC: not used by the relay client */ }
 			case ServerMessage.ErrorMessage(String code, String message) -> {
@@ -397,7 +397,8 @@ public final class WalkieClient implements AutoCloseable {
 					case "t", "talk" -> toggleTalk();
 					case "m", "mode" -> changeMode(parts.length > 1 ? parts[1] : "");
 					case "c", "channel" -> switchChannel(parts.length > 1 ? parts[1] : "");
-					case "p", "passphrase" -> changePassphrase(parts.length > 1 ? parts[1] : "");
+					case "p", "passphrase" -> changePassphrase(parts.length > 1 ? parts[1] : "", true);
+					case "p!" -> changePassphrase(parts.length > 1 ? parts[1] : "", false);
 					case "o", "owner" -> transferOwnership(parts.length > 1 ? parts[1] : "");
 					case "n", "name" -> rename(parts.length > 1 ? parts[1] : "");
 					case "f", "fidelity" -> toggleFidelity();
@@ -452,13 +453,17 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	/// `p [passphrase]` — change the channel's end-to-end-encryption passphrase. For the OWNER this rotates it for
-	/// everyone (a blank passphrase turns encryption off); the new key is applied only when the server echoes
-	/// [ServerMessage.PassphraseChanged], so a rejected request leaves the old key intact. For a MEMBER it applies
-	/// the owner's already-announced new passphrase LOCALLY (no server round-trip — the server never carries the
-	/// passphrase), verifying it against the channel's announced key-check so a wrong one is caught rather than
-	/// silently desyncing.
-	private void changePassphrase(String arg) {
+	/// `p [passphrase]` / `p! [passphrase]` — change the channel's end-to-end-encryption passphrase. For the OWNER
+	/// this rotates it for everyone (a blank passphrase turns encryption off); the new key is applied only when the
+	/// server echoes [ServerMessage.PassphraseChanged], so a rejected request leaves the old key intact. With `p`
+	/// (when this is an encrypted→encrypted rotation, so an OLD key exists) the new passphrase is also wrapped under
+	/// that old key and relayed so connected members ADOPT it automatically (the server still never sees it); `p!`
+	/// opts out of auto-distribution for a revocation-style rotation, leaving members to re-enter the new secret
+	/// out-of-band. A non-owner CANNOT rotate the shared key — `p` is accepted only to ADOPT an owner's
+	/// already-announced rotation ([#memberRekeyPending]), applied LOCALLY (no server round-trip) and verified
+	/// against the channel's announced key-check. To use a different passphrase otherwise, a non-owner switches
+	/// channels with `c`. (Mirrors the web client's owner-only passphrase field + "share with members" box.)
+	private void changePassphrase(String arg, boolean share) {
 		String passphrase = arg.strip();
 		if (currentMode == ChannelMode.GLOBAL_PTT) {
 			log("[passphrase] the global room is the server's unencrypted broadcast channel — encryption isn't available there.");
@@ -467,18 +472,42 @@ public final class WalkieClient implements AutoCloseable {
 		if (selfId.equals(ownerId)) {
 			try {
 				FrameCrypto next = deriveCrypto(passphrase, currentMode, currentChannel);   // blank -> null -> no encryption
+				FrameCrypto old = crypto;   // the key we currently hold — read once off the volatile
+				// Auto-distribution: wrap the new passphrase under the OLD key so connected members adopt it
+				// automatically. Only for an encrypted→encrypted rotation (an old key must exist) and only when
+				// sharing — a plaintext→encrypted ENABLE has no old key to wrap under (first secret goes out-of-band),
+				// disabling carries nothing, and `p!` deliberately withholds it (revocation-style). Server relays the
+				// blob blindly; only an old-key holder can unwrap it.
+				String wrappedKey = (share && old != null && next != null) ? old.wrap(passphrase) : null;
 				pendingPassphrase = next == null ? null : passphrase;
 				rekeyInFlight = true;
-				enqueue(new ClientMessage.ChangePassphrase(next == null ? null : next.keyCheck()));
-				log(next == null
-						? "[passphrase] requested encryption OFF for everyone..."
-						: "[passphrase] requested a re-key for everyone (share the new passphrase out-of-band)...");
+				enqueue(new ClientMessage.ChangePassphrase(next == null ? null : next.keyCheck(), wrappedKey));
+				log(next == null ?
+						"[passphrase] requested encryption OFF for everyone..."
+						: wrappedKey == null
+						  ? "[passphrase] requested a re-key for everyone (members must enter the new passphrase out-of-band)..."
+						  : "[passphrase] requested a re-key — connected members will adopt it automatically...");
 			} catch (GeneralSecurityException e) {
 				log("[passphrase] key derivation failed: " + e.getMessage());
 			}
+		} else if (memberRekeyPending()) {
+			applyMemberPassphrase(passphrase);   // adopt the owner's announced rotation (the only non-owner use)
 		} else {
-			applyMemberPassphrase(passphrase);
+			log("[denied] only the channel owner can change this channel's passphrase — use 'c <channel> [mode] [key]' to switch to a channel with a different one.");
 		}
+	}
+
+	/// Whether the channel announces an encryption state this (non-owner) member does not currently match — i.e.
+	/// the owner rotated or enabled the passphrase and we still hold the wrong key (or none). Only then may a
+	/// member set the CURRENT channel's passphrase (to adopt the announced one); otherwise changing it is the
+	/// owner's prerogative.
+	private boolean memberRekeyPending() {
+		// Read each volatile ONCE into a local: the listener thread can null both fields (a disable rotation)
+		// concurrently with this console-thread call, so re-reading `crypto`/`currentChannelKeyCheck` between the
+		// null-check and the deref would risk an NPE on `crypto.keyCheck()` / `currentChannelKeyCheck.equals(...)`.
+		String announced = currentChannelKeyCheck;
+		FrameCrypto held = crypto;
+		return announced != null && (held == null || !announced.equals(held.keyCheck()));
 	}
 
 	/// The decision for an announced passphrase change, given the channel's announced key-check and the key a
@@ -526,12 +555,34 @@ public final class WalkieClient implements AutoCloseable {
 	/// user re-enters the new one with `p`. On a mismatch we KEEP the old key (no plaintext fallback). The
 	/// volatile `crypto` swap is read once by the capture/listener threads, so the worst a transition does is drop
 	/// a few frames on a failed GCM tag.
-	private void handlePassphraseChanged(String keyCheck) {
+	private void handlePassphraseChanged(String keyCheck, String wrappedKey) {
 		currentChannelKeyCheck = keyCheck;
-		boolean initiating = rekeyInFlight;
-		String passphrase = initiating ? pendingPassphrase : currentPassphrase;
+		// A new key era — re-arm the one-shot decrypt-failure warning (set on the first failure in onBinary and
+		// otherwise never cleared) so a member who misses THIS rotation still gets a fresh cue to re-key. Same WS
+		// listener thread as onBinary, so no extra synchronization is needed.
+		warnedDecrypt = false;
+		String passphrase = rekeyInFlight ? pendingPassphrase : currentPassphrase;
 		rekeyInFlight = false;
 		pendingPassphrase = null;
+		// Auto-adopt: if the owner shared the new passphrase wrapped under the OLD key (which we still hold),
+		// unwrap it, confirm it derives the announced key-check, and adopt automatically — seamless for everyone
+		// who held the old key (the owner echoing its own rotation included). A missing/foreign/superseded blob
+		// (different key, tampered, or a later rotation) throws or mismatches and falls through to the manual path.
+		FrameCrypto held = crypto;   // read once off the volatile
+		if (keyCheck != null && wrappedKey != null && held != null) {
+			try {
+				String unwrapped = held.unwrap(wrappedKey);
+				FrameCrypto candidate = deriveCrypto(unwrapped, currentMode, currentChannel);
+				if (candidate != null && keyCheck.equals(candidate.keyCheck())) {
+					crypto = candidate;
+					currentPassphrase = unwrapped;
+					log("[passphrase] channel re-keyed automatically — end-to-end encryption updated.");
+					return;
+				}
+			} catch (GeneralSecurityException _) {
+				// not wrapped under our (old) key, or tampered/superseded — fall back to the manual path below
+			}
+		}
 		try {
 			FrameCrypto candidate = keyCheck == null ? null : deriveCrypto(passphrase, currentMode, currentChannel);
 			switch (rekeyAction(keyCheck, candidate)) {
@@ -609,6 +660,10 @@ public final class WalkieClient implements AutoCloseable {
 	private void rename(String newName) {
 		if (!DISPLAY_NAME.matcher(newName).matches()) {
 			System.out.println("Usage: n <new-name>  (1-32 chars of letters, digits, _ . or -)");
+			return;
+		}
+		if (newName.equals(memberNames.get(selfId))) {
+			System.out.println("[name] that is already your display name.");   // a no-op the server would reject anyway
 			return;
 		}
 		enqueue(new ClientMessage.Rename(newName));

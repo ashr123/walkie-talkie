@@ -51,7 +51,7 @@ class ConnectionServiceTest {
 	/// The LAST message of a type a session received — the value it would currently believe, given a recipient's
 	/// strictly-ordered (FIFO) mailbox. Used to assert convergence after multiple owner/passphrase changes.
 	private static <T extends ServerMessage> T lastOf(FakeClientSession session, Class<T> type) {
-		return session.sent.stream().filter(type::isInstance).map(type::cast).reduce((a, b) -> b).orElseThrow();
+		return session.sent.stream().filter(type::isInstance).map(type::cast).reduce((_, b) -> b).orElseThrow();
 	}
 
 	private Channel channel(String name) {
@@ -122,6 +122,22 @@ class ConnectionServiceTest {
 		assertEquals("alice", alice.displayName(), "the label is unchanged on rejection");
 		assertFalse(bob.sent.stream().anyMatch(ServerMessage.MemberRenamed.class::isInstance),
 				"no rename is broadcast for an invalid name");
+	}
+
+	@Test
+	void aNoOpRenameToTheSameNameIsIgnoredWithoutChurnOrError() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+
+		service.onMessage(alice, new ClientMessage.Rename("alice"));   // already the current name — a no-op
+
+		assertEquals("alice", alice.displayName(), "the label is unchanged");
+		assertFalse(bob.sent.stream().anyMatch(ServerMessage.MemberRenamed.class::isInstance),
+				"a same-name rename broadcasts no MemberRenamed to other members (no churn)");
+		assertFalse(alice.sent.stream().anyMatch(ServerMessage.MemberRenamed.class::isInstance),
+				"and none back to the requester either");
+		assertFalse(alice.sent.stream().anyMatch(ServerMessage.ErrorMessage.class::isInstance),
+				"a no-op is handled gracefully, not as an error");
 	}
 
 	@Test
@@ -243,7 +259,7 @@ class ConnectionServiceTest {
 		alice.sent.clear();
 		bob.sent.clear();
 
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 
 		assertEquals("kcv-B", firstOf(alice, ServerMessage.PassphraseChanged.class).keyCheck(), "the owner is notified too");
 		assertEquals("kcv-B", firstOf(bob, ServerMessage.PassphraseChanged.class).keyCheck());
@@ -258,7 +274,7 @@ class ConnectionServiceTest {
 		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
 		bob.sent.clear();
 
-		service.onMessage(bob, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(bob, new ClientMessage.ChangePassphrase("kcv-B", null));
 
 		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertEquals("kcv-A", channel("team").keyCheck(), "a non-owner cannot rotate the key");
@@ -267,7 +283,7 @@ class ConnectionServiceTest {
 	@Test
 	void changingThePassphraseBeforeJoiningIsRejected() {
 		FakeClientSession session = session("sess-1");
-		service.onMessage(session, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(session, new ClientMessage.ChangePassphrase("kcv-B", null));
 		assertEquals("not_in_channel", firstOf(session, ServerMessage.ErrorMessage.class).code());
 	}
 
@@ -275,7 +291,7 @@ class ConnectionServiceTest {
 	void afterARekeyANewJoinerMustPresentTheNewKeyCheck() {
 		FakeClientSession alice = session("alice");
 		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 
 		// The old passphrase no longer works...
 		FakeClientSession stale = session("stale");
@@ -295,7 +311,7 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
 		alice.sent.clear();
 
-		service.onMessage(alice, new ClientMessage.ChangePassphrase(null));   // null key-check = make it plaintext
+		service.onMessage(alice, new ClientMessage.ChangePassphrase(null, null));   // null key-check = make it plaintext
 
 		assertNull(firstOf(alice, ServerMessage.PassphraseChanged.class).keyCheck(), "null key-check announces 'unencrypted'");
 		assertNull(channel("team").keyCheck(), "the channel is now unencrypted");
@@ -314,7 +330,7 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.Join("global", ChannelMode.GLOBAL_PTT, "alice", null));
 		alice.sent.clear();
 
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 
 		// The global room is server-owned (sentinel owner), so no participant can rotate it — it stays unencrypted.
 		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
@@ -325,8 +341,8 @@ class ConnectionServiceTest {
 	void theOwnerCanReEnableEncryptionAfterClearingIt() {
 		FakeClientSession alice = session("alice");
 		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
-		service.onMessage(alice, new ClientMessage.ChangePassphrase(null));      // disable encryption
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));   // re-enable with a new key
+		service.onMessage(alice, new ClientMessage.ChangePassphrase(null, null));      // disable encryption
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));   // re-enable with a new key
 		assertEquals("kcv-B", channel("team").keyCheck());
 		// A plaintext joiner is now rejected again; one with the new key-check is accepted.
 		FakeClientSession plain = session("plain");
@@ -341,8 +357,8 @@ class ConnectionServiceTest {
 	void aSecondRotationReplacesTheKeyCheckAgain() {
 		FakeClientSession alice = session("alice");
 		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-C"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-C", null));
 		assertEquals("kcv-C", channel("team").keyCheck(), "the latest rotation wins");
 		List<ServerMessage.PassphraseChanged> announced = alice.sent.stream()
 				.filter(ServerMessage.PassphraseChanged.class::isInstance)
@@ -406,14 +422,14 @@ class ConnectionServiceTest {
 		bob.sent.clear();
 
 		// The NEW owner (bob) can rotate; everyone — including the old owner — is notified.
-		service.onMessage(bob, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(bob, new ClientMessage.ChangePassphrase("kcv-B", null));
 		assertEquals("kcv-B", channel("team").keyCheck());
 		assertEquals("kcv-B", firstOf(bob, ServerMessage.PassphraseChanged.class).keyCheck());
 		assertEquals("kcv-B", firstOf(alice, ServerMessage.PassphraseChanged.class).keyCheck());
 
 		// The OLD owner (alice) no longer can — authority moved with ownership.
 		alice.sent.clear();
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-C"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-C", null));
 		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("kcv-B", channel("team").keyCheck(), "the rejected rotation leaves the key unchanged");
 	}
@@ -425,7 +441,7 @@ class ConnectionServiceTest {
 		FakeClientSession bob = session("bob");
 		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
 
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
 
 		// Both writes go through the same channel-name bin lock; the composed result keeps both.
@@ -480,7 +496,7 @@ class ConnectionServiceTest {
 		carol.sent.clear();
 
 		// Both broadcasts fan out to the WHOLE channel (forEach), so the bystander must receive them.
-		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B"));
+		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 		assertEquals("kcv-B", firstOf(carol, ServerMessage.PassphraseChanged.class).keyCheck(), "bystander hears the rotation");
 		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
 		assertEquals("bob", firstOf(carol, ServerMessage.OwnerChanged.class).ownerId(), "bystander hears the transfer");
