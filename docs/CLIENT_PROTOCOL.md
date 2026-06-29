@@ -89,16 +89,19 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 
 ### Client → server
 
-| `type`         | Fields                                           | Meaning                                       |
-|----------------|--------------------------------------------------|-----------------------------------------------|
-| `join`         | `channel`, `mode`, `displayName`, `keyCheck`     | Join/create a channel (see §7 for `keyCheck`) |
-| `leave`        | —                                                | Leave the current channel (keep the socket)   |
-| `requestFloor` | —                                                | Ask for the talk floor (PTT modes)            |
-| `releaseFloor` | —                                                | Release the floor                             |
-| `changeMode`   | `mode`                                           | Owner-only: change the channel mode           |
-| `offer`        | `target`, `sdp`                                  | WebRTC (see §3a)                              |
-| `answer`       | `target`, `sdp`                                  | WebRTC                                        |
-| `ice`          | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                        |
+| `type`         | Fields                                           | Meaning                                                       |
+|----------------|--------------------------------------------------|---------------------------------------------------------------|
+| `join`         | `channel`, `mode`, `displayName`, `keyCheck`     | Join/create — or **switch** channel in place when re-sent on a live socket (§3c); `keyCheck` per §7 |
+| `leave`        | —                                                | Leave the current channel (keep the socket)                   |
+| `requestFloor` | —                                                | Ask for the talk floor (PTT modes)                            |
+| `releaseFloor` | —                                                | Release the floor                                             |
+| `changeMode`   | `mode`                                           | Owner-only: change the channel mode                           |
+| `rename`       | `displayName`                                    | Change your own display name in place (→ `memberRenamed`, §3c)|
+| `changePassphrase` | `keyCheck`                                   | Owner-only: rotate/clear the channel passphrase; `keyCheck` = the new one's KCV, or `null` to make it plaintext (→ `passphraseChanged`, §3c) |
+| `transferOwnership` | `newOwnerId`                                | Owner-only: hand ownership to another current member (→ `ownerChanged`, §3c) |
+| `offer`        | `target`, `sdp`                                  | WebRTC (see §3a)                                              |
+| `answer`       | `target`, `sdp`                                  | WebRTC                                                        |
+| `ice`          | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                                        |
 
 ### Server → client
 
@@ -113,6 +116,8 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `floorIdle`     | —                                                                       | The floor is free (also sent to a holder force-released by max-hold — §3b) |
 | `modeChanged`   | `mode`                                                                  | The channel mode changed; reset talk state        |
 | `ownerChanged`  | `ownerId`                                                               | New owner (e.g. previous owner left)              |
+| `memberRenamed` | `memberId`, `displayName`                                               | A member changed its display name (incl. you — §3c) |
+| `passphraseChanged` | `keyCheck`                                                          | The owner changed/cleared the channel passphrase (`null` = now unencrypted); re-derive your key and verify it (§3c) |
 | `signalOffer`   | `from`, `sdp`                                                           | WebRTC (see §3a)                                  |
 | `signalAnswer`  | `from`, `sdp`                                                           | WebRTC                                            |
 | `signalIce`     | `from`, `candidate`, `sdpMid`, `sdpMLineIndex`                          | WebRTC                                            |
@@ -121,7 +126,7 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 `MemberInfo` = `{ id, displayName, streamId }` (see §4).
 
 Typical flow: `login` → open `/ws/audio?token=…` → send `join` → receive `joined` (snapshot) → exchange
-floor/audio → `leave`/close.
+floor/audio → `leave`/close. (Re-send `join` any time to **switch** channels without reconnecting — §3c.)
 
 ---
 
@@ -161,6 +166,71 @@ per-frame activity signal that peer-to-peer WebRTC media doesn't give the server
 is **never** idle-released: it transmits continuously while holding (the mic sends a frame every 20 ms, even
 through speech pauses), which refreshes the activity mark on every frame — so idle auto-release only catches a
 holder that genuinely went silent on the wire without releasing.
+
+---
+
+## 3c. Live channel changes (switch, rename, re-key, ownership)
+
+None of these needs a new socket — they all reuse the live connection (and its session id).
+
+**Switch channel** — re-send `join` with a different `channel` / `mode` / `keyCheck` (and the right
+`displayName`). The server handles it as *leave the old channel, then join the new one* on the **same
+`WebSocketSession`**, so:
+
+- `selfId` is **unchanged** — it *is* the session id and the socket is the same, unlike a reconnect (which
+  gets a new one).
+- The new `joined` is a full snapshot of the **new** channel: a new roster, mode, owner, and a **fresh
+  `streamId` for every member** (stream indices are per-channel). Treat it exactly like the self-reconnect
+  case (§9): **discard every decoder lane and all per-channel state, then rebuild** from `members[].streamId`.
+- On the relay path, **re-derive the E2EE key for the new channel before sending `join`** — the key salts on
+  the channel name (§7), so the key changes with the channel. Re-sending `join` for the channel you are
+  **already** in is idempotent (the server just re-sends the snapshot); do **not** re-key in that case — to
+  change the passphrase of the channel you're in, the owner uses `changePassphrase` (below), not a `join`.
+- **Validation happens before the leave**, so a bad target — `invalid_channel`, `invalid_display_name`,
+  `reserved_channel`, `encryption_not_allowed` — is refused and you **stay** in your current channel. The one
+  exception is **`passphrase_mismatch`**: it is only detectable while joining the target (after the leave), so
+  a wrong passphrase for the target channel **does** drop you from the old one — supply the correct passphrase.
+- **Transport** (relay ↔ WebRTC) **cannot** switch in place — it is a different endpoint and audio pipeline; to
+  change it a client must reconnect (a new socket, hence a new `selfId`). The reference browser client does
+  this transparently on a transport change.
+
+**Rename** — send `rename` with a new `displayName` (same `[A-Za-z0-9_.-]{1,32}` rule as `join`,
+§13). The server updates your label and broadcasts `memberRenamed { memberId, displayName }` to the channel
+**including you** — that echo, not local optimism, is the authority for your own roster label. Rename never
+touches channel membership, the floor, or stream indices.
+
+**Change the passphrase (owner)** — the channel **owner** rotates the E2EE key for everyone with
+`changePassphrase`, whose `keyCheck` is the KCV (§7) of the **new** passphrase, or `null` to make the channel
+plaintext. The server records the new key-check and broadcasts `passphraseChanged { keyCheck }` to **all**
+members (including the owner). The passphrase itself is **never** sent — members obtain it out-of-band, exactly
+as they got the original. On `passphraseChanged`:
+
+- If `keyCheck` is `null`, the channel is now plaintext: drop your key and send/receive in the clear.
+- Otherwise re-derive your AES key from the new passphrase and check it against the announced `keyCheck`. If it
+  matches, swap your key. If you don't have the new passphrase yet (or it doesn't match), you are **muted**:
+  **suppress transmission** and don't transmit plaintext — you stay in the channel but can't be heard and can't
+  decode others until you enter the new passphrase. **Critical:** this includes the *enable* transition
+  (plaintext → encrypted), where you have **no** old key — a conformant client MUST gate its send path on
+  "channel announces a key-check but I have no matching key" and stay silent, never falling back to the
+  plaintext path. The reference clients re-derive from the passphrase field / `p` command and apply only on a
+  KCV match.
+- The owner applies the new key on the **echoed** `passphraseChanged`, not optimistically — so a rejected
+  request (`not_owner`, e.g. ownership was just lost) leaves the old key in place.
+
+Notes: only the owner may rotate (`not_owner` otherwise; `not_in_channel` before joining). The server-managed
+`global` room is owned by a sentinel, so a rotation there is refused — it stays unencrypted. Broadcasting the
+key-check leaks nothing new (it is brute-force-equivalent to the ciphertext the relay already carries, §7), and
+the audio relay is opaque, so a brief window where members hold different keys just drops a few GCM-failing
+frames — there is no atomic cross-client key swap, and no forward secrecy.
+
+**Transfer ownership (owner)** — the owner hands ownership to another **current member** with
+`transferOwnership { newOwnerId }` (a session id). The server validates that you own the channel (`not_owner`
+otherwise) and that the target is a member (`unknown_target` otherwise), reassigns the owner, and broadcasts
+`ownerChanged { ownerId }` to the whole channel — the very same message a departure-triggered auto-election
+sends, so clients need no new handling; the new owner simply gains the owner-only abilities (mode/passphrase
+changes, further transfers). The global room's sentinel owner makes a transfer there `not_owner`. The browser
+exposes this as a **Channel owner** dropdown; the Java client as `o <#id-prefix>` (the prefix shown next to
+each member).
 
 ---
 
@@ -254,6 +324,13 @@ body becomes `[0xE2][IV(12)][AES-256-GCM ciphertext+tag]`. Must be **byte-identi
 - **Key-check:** send the hex KCV in `Join.keyCheck`. The server enforces a **uniform** channel (all members
   same passphrase or all plaintext) and rejects a mismatch with `error: passphrase_mismatch` — comparing the
   KCV without ever learning the passphrase.
+- **Rotation:** the channel **owner** may change the passphrase mid-session with `changePassphrase` (§3c),
+  whose `keyCheck` is the KCV of the **new** passphrase (or `null` to make the channel plaintext). The server
+  swaps the recorded KCV and broadcasts `passphraseChanged`; it still never sees the passphrase. Every member
+  re-derives the key from the new passphrase (obtained out-of-band, like the original) and verifies it against
+  the announced KCV; a member that can't match it **keeps its old key and never sends plaintext** into a
+  still-encrypted channel. No automatic key distribution, no forward secrecy — it is the same pre-shared key
+  model, rotated by hand.
 
 **Known-answer vectors** (pin these in your tests; passphrase/channel per `FrameCryptoTest`):
 
@@ -319,8 +396,10 @@ decrypt chain.
   lane holds, **drop** that lane's buffered frames and **rebuild** it (fresh decoder) before accepting more.
 - **Age-out** — close a lane idle longer than `SILENCE_TTL_MS` (§11).
 - **Leave** — on `memberLeft`, resolve that member's SID from the roster and **close its lane immediately**.
-- **Self-reconnect** — on a fresh `joined` (your own reconnect/re-sync), the server reassigns `selfId` and
-  **every** `streamId`; **discard all lanes** and rebuild from the new `members[].streamId` set.
+- **Self-reconnect or channel switch** — on **any** fresh `joined` (a reconnect/re-sync, or an in-place
+  channel switch — §3c), **every** `streamId` changes; **discard all lanes** and rebuild from the new
+  `members[].streamId` set. (On a reconnect the server also reassigns `selfId`; on an in-place switch the
+  socket — and thus `selfId` — is unchanged.)
 - **Decrypt ordering** — keep decryption serialized **per SID** (a per-SID promise chain in the browser; the
   Java client decrypts synchronously on the listener thread), so a slow decrypt for one sender can't reorder
   *that* sender's frames or head-of-line-block another.
@@ -389,12 +468,14 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 |-----------------------|-----------------------------------------------------------------------|
 | `bad_message`         | Unparseable / unknown-type control frame                              |
 | `invalid_channel`     | `join` with a channel name not matching the pattern                   |
-| `invalid_display_name`| `join` with a display name not matching the pattern                   |
+| `invalid_display_name`| `join` or `rename` with a display name not matching the pattern       |
 | `invalid_mode`        | `changeMode` to `GLOBAL_PTT` outside the `global` channel             |
-| `not_in_channel`      | `requestFloor` / `releaseFloor` / `changeMode` / signal before `join` |
-| `not_owner`           | `changeMode` by a non-owner                                           |
-| `passphrase_mismatch` | `join` with a `keyCheck` differing from the channel's (E2EE §7)       |
-| `unknown_target`      | WebRTC signal to an id not in the channel                             |
+| `reserved_channel`    | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode |
+| `encryption_not_allowed`| a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext) |
+| `not_in_channel`      | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / signal before `join` |
+| `not_owner`           | `changeMode`, `changePassphrase` or `transferOwnership` by a non-owner |
+| `passphrase_mismatch` | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel |
+| `unknown_target`      | WebRTC signal — or `transferOwnership` — to an id not in the channel  |
 
 ---
 

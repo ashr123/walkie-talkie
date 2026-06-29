@@ -126,6 +126,13 @@ once, for Bob.)
 JAVA_OPTS= ./gradlew build      # compiles all modules and runs the test suite
 ```
 
+The suite includes the **browser client's** tests: plain ES-module tests under
+[`walkie-server/src/test/js/`](walkie-server/src/test/js) that run on **Node's built-in test runner** (no npm
+dependencies). They pin the relay end-to-end-encryption to the same known-answer vectors as the Java
+`FrameCryptoTest`, so both clients stay byte-for-byte interoperable, and assert the no-plaintext transmit gate.
+`./gradlew build` runs them via the `:walkie-server:jsTest` task when `node` is on `PATH` (it logs a skip if
+not). To run them directly: `node --test walkie-server/src/test/js/e2ee.test.js`.
+
 ### Run the server
 
 ```bash
@@ -207,9 +214,35 @@ throughout.
    stateless and self-expiring, so there's nothing to revoke.
 
 A channel's mode belongs to whoever **created** it: a later joiner adopts the existing mode (the server
-sends it), and only the creator can change it. When you own the channel the **Mode** selector stays
-enabled while connected — changing it switches the mode live for everyone (everyone's controls update);
-for non-owners it's disabled. If the owner leaves, ownership passes to another member.
+sends it), and only the owner can change it (for non-owners the **Mode** selector is disabled). If the owner
+leaves, ownership passes to another member — and the owner can also **hand ownership over** deliberately (see
+below).
+
+**Channel properties, applied in one click.** Think of **Transport**, **Mode**, **Channel** and **Encryption
+passphrase** as the channel's properties. While connected, change any of them in the form and click the single
+adaptive button:
+
+- It reads **Switch channel** when you've changed the channel name — it moves you to that room *without
+  dropping the session* (the same WebSocket, session id, microphone and audio context are reused; the server
+  leaves your old channel and joins the new one, carrying the chosen mode/passphrase), and the fresh roster
+  snapshot re-syncs everything.
+- It reads **Apply changes** when the channel name is unchanged — it applies your **mode**, **passphrase** and
+  **transport** changes to the *current* channel in one click (mode and passphrase are owner-only). Changing
+  the **transport** can't be done in place (a different endpoint + audio pipeline), so it reconnects
+  transparently as a new session.
+- It's **disabled** when nothing has changed.
+
+The owner rotating the **passphrase** (or clearing it to turn encryption off) never reaches the server as a
+secret — the client only sends the new *key-check*, and every member re-derives the key from the new
+passphrase, obtained **out-of-band** exactly as they got the original. Every change is announced (no silent
+downgrade). A member who doesn't yet have the new passphrase stays in the channel but is **muted** — it can't
+be heard and can't decode others, and **never falls back to sending audio in the clear** — until it types the
+new passphrase and clicks **Apply changes**.
+
+**Hand over ownership.** When connected, a **Channel owner** dropdown lists the members; the current owner can
+pick another member to make them the owner (everyone's owner-only controls update). The connected-only
+**Rename** button changes just your display name in place (everyone's roster updates); it leaves the channel
+untouched.
 
 Open the page in two tabs (or two machines) to talk between them.
 
@@ -241,8 +274,11 @@ All flags are optional (run with `--args="--help"` for the full list):
 > `--input` (e.g. `--input "USB"`).
 
 **Interactive commands** (type at the prompt): `t` talk/stop · `w` list who's in the channel · `m
-<ptt|global|duplex>` change the mode (owner only) · `f` toggle hi-fi (music/voice) live · `q` quit (closes the
-socket, ending the session) · `h` help.
+<ptt|global|duplex>` change the mode (owner only) · `c <channel> [mode] [key]` switch channel without dropping
+the session (mode/key default to the current ones) · `p [passphrase]` change the passphrase (owner; blank turns
+encryption off — a member uses it to apply the owner's new passphrase) · `o <#id>` hand ownership to another
+member (owner; `<#id>` is the prefix shown next to a member) · `n <name>` rename · `f` toggle hi-fi
+(music/voice) live · `q` quit (closes the socket, ending the session) · `h` help.
 
 The client encodes Opus at 48 kHz with in-band FEC (Concentus) — stereo when the audio device supports it,
 otherwise mono — and interoperates with relay-mode browser clients.
@@ -270,7 +306,15 @@ otherwise mono — and interoperates with relay-mode browser clients.
   derivation also yields a **key-check value** the client sends at join, letting the server **reject a
   member whose passphrase doesn't match** the channel's (`passphrase_mismatch`) — without ever seeing the
   passphrase or the key. Browser E2EE needs a secure context (HTTPS or `localhost`). This is confidentiality
-  between participants on top of transport security, not a replacement for serving over WSS/HTTPS.
+  between participants on top of transport security, not a replacement for serving over WSS/HTTPS. The channel
+  **owner** can rotate that passphrase — or toggle encryption on/off — live, via a `ChangePassphrase` →
+  `PassphraseChanged` flow that carries only the new key-check (never the passphrase); every member re-derives
+  from the new secret, obtained out-of-band, and the change is always announced (no silent downgrade). A member
+  that can't match the new key is **muted** — the client suppresses transmission rather than ever sending
+  plaintext into the now-encrypted channel — until it applies the new passphrase. There is still no automatic
+  key distribution and no forward secrecy (a pre-shared key, rotated by hand). Ownership can likewise be handed
+  to another member (`TransferOwnership` → `OwnerChanged`); the server validates the requester owns the channel
+  and the target is a current member.
 - Stateless, CSRF-free token model; static client, health check and login are the only public routes.
 - Input is validated (display-name + channel-name patterns, audio-frame size caps). The browser renders
   member names with `textContent` to avoid markup injection.
@@ -327,5 +371,7 @@ default build stays preview-free.
   no forward secrecy, no per-sender keys, and frame *metadata* (who is transmitting, when, and frame
   sizes) stays visible to the server. A channel is **uniformly** encrypted or plaintext: a joiner whose
   passphrase doesn't match the channel's is **rejected at join** (`passphrase_mismatch`) via a key-check
-  value the server compares without ever learning the passphrase. It covers the **relay** transport;
-  WebRTC media is already end-to-end via DTLS-SRTP.
+  value the server compares without ever learning the passphrase. The **owner** can rotate that passphrase
+  (or toggle encryption on/off) live, but there is **no automatic key distribution** — the new passphrase is
+  shared out-of-band just like the original, and members who don't have it yet can't hear or be heard until
+  they enter it. It covers the **relay** transport; WebRTC media is already end-to-end via DTLS-SRTP.
