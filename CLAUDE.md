@@ -144,15 +144,26 @@ rotate/enable/disable flexibility). The write goes through `ChannelRegistry.chan
 `channels.computeIfPresent(name, …)` span, so it shares the **bin lock** that `joinOrCreate`'s `channels.compute`
 validates a key-check under — a rotation is therefore atomic w.r.t. every concurrent join (which sees the old
 value and is then told, or sees the new value) and w.r.t. a concurrent ownership transfer (`leave` also runs
-under that lock); `Channel.keyCheck` is consequently a plain mutable field, *only* touched inside that span (no
-`volatile`). The broadcast then runs lock-free over **the channel the registry returns** (the mutated instance,
-not a fresh `find()` — mirroring `handleLeave`'s same-object discipline so a drop-and-recreate can't misroute
-it). The audio relay path is unchanged (opaque forwarding), so the cross-key transition just drops a few
-GCM-failing frames. Clients re-derive from the new passphrase **out-of-band** (the server never carries it); a
-member that can't match the announced key-check is **muted** — both clients gate the transmit path on
-"announced-encrypted but no usable key" (`sendTagged` / `sendAudioFrame`) so a not-yet-rekeyed member (incl. the
-plaintext→encrypted *enable* case, where it has no old key) **never emits plaintext** into the now-encrypted
-channel. Global stays unencrypted — its sentinel owner makes any rotation there `not_owner`. **Ownership
+under that lock). The broadcast then runs **under the channel monitor (`synchronized(channel)`) reading the
+channel's LIVE `keyCheck`** — over the mutated instance the registry returns, not a fresh `find()` (mirroring
+`handleLeave`'s same-object discipline so a drop-and-recreate can't misroute it). Reading the live value under
+the monitor (rather than fanning out the request's captured key-check lock-free) makes two rotations that
+straddle an ownership change CONVERGE — a delayed broadcast carries the current key-check, so no member is left
+gating against a stale one; `Channel.keyCheck` is `volatile` for that lock-free hot-path gate read with a
+monitor-guarded broadcast write. The audio relay path is unchanged (opaque forwarding), so the cross-key
+transition just drops a few GCM-failing frames. **Key distribution:** the owner may **auto-distribute** the new
+passphrase by sending `wrappedKey` = the new passphrase encrypted under the *old* channel key (base64 AES-GCM
+blob, same crypto as a frame — `FrameCrypto.wrap`/`unwrap`, `wrapPassphrase`/`unwrapPassphrase`); the server
+relays it opaquely (never sees the passphrase) and any member still holding the old key unwraps it, verifies the
+result against the announced key-check, and adopts **automatically** (browser `onPassphraseChanged`; Java
+`handlePassphraseChanged`). The owner opts out (`wrappedKey: null` — browser "share with members" checkbox off,
+Java `p!`) for a **revocation-style** rotation that forces out-of-band re-entry; an *enable* (plaintext→encrypted)
+has no old key to wrap under, so it is always manual. **Rotation is a transition, not revocation** — the new key
+is wrapped under the old, so it is only as secret as the old; to truly exclude a member, move to a fresh channel.
+A member that can't match the announced key-check is **muted**: both clients gate the transmit path on "the
+key-check of the key I hold equals the channel's announced one" (`frameDisposition` / `outboundFrame`), so a
+not-yet-rekeyed member **never emits plaintext** (the *enable* case, no old key) **and a stale-key straggler**
+(an un-adopted rotation) emits no undecodable audio either — both stay silent until they adopt the new key. Global stays unencrypted — its sentinel owner makes any rotation there `not_owner`. **Ownership
 transfer:** the owner can hand ownership to a named current member (`TransferOwnership` → broadcast
 `OwnerChanged`, `handleTransferOwnership` via `ChannelRegistry.transferOwnership`), validated and written inside
 the same `computeIfPresent` bin lock so it can't race `leave`'s auto-election or target a leaving member; the

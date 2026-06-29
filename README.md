@@ -218,31 +218,41 @@ sends it), and only the owner can change it (for non-owners the **Mode** selecto
 leaves, ownership passes to another member — and the owner can also **hand ownership over** deliberately (see
 below).
 
-**Channel properties, applied in one click.** Think of **Transport**, **Mode**, **Channel** and **Encryption
-passphrase** as the channel's properties. While connected, change any of them in the form and click the single
-adaptive button:
+**Channel properties, applied in one click.** Think of **Channel**, **Transport**, **Mode** and **Encryption
+passphrase** as the channel's properties (the form lists the **Channel** first, because it gates the rest while
+connected). Change any of them and click the single adaptive button:
 
 - It reads **Switch channel** when you've changed the channel name — it moves you to that room *without
   dropping the session* (the same WebSocket, session id, microphone and audio context are reused; the server
   leaves your old channel and joins the new one, carrying the chosen mode/passphrase), and the fresh roster
   snapshot re-syncs everything.
-- It reads **Apply changes** when the channel name is unchanged — it applies your **mode**, **passphrase** and
-  **transport** changes to the *current* channel in one click (mode and passphrase are owner-only). Changing
-  the **transport** can't be done in place (a different endpoint + audio pipeline), so it reconnects
-  transparently as a new session.
+- It reads **Apply changes** when the channel name is unchanged — it applies your **transport**, **mode** and
+  **passphrase** changes to the *current* channel in one click. While connected, those three are editable **only
+  by the channel owner** on the current channel; for a non-owner the Transport and Mode selectors are disabled
+  and the Encryption passphrase field is read-only. They all re-enable the moment you change the **channel name**
+  (you're switching to a different room, so you pick its properties like a fresh connect), and the passphrase
+  field also re-enables to adopt an owner's announced re-key. Changing the **transport** can't be done in place
+  (a different endpoint + audio pipeline), so it reconnects transparently as a new session.
 - It's **disabled** when nothing has changed.
 
 The owner rotating the **passphrase** (or clearing it to turn encryption off) never reaches the server as a
-secret — the client only sends the new *key-check*, and every member re-derives the key from the new
-passphrase, obtained **out-of-band** exactly as they got the original. Every change is announced (no silent
-downgrade). A member who doesn't yet have the new passphrase stays in the channel but is **muted** — it can't
-be heard and can't decode others, and **never falls back to sending audio in the clear** — until it types the
-new passphrase and clicks **Apply changes**.
+secret — the client only sends the new *key-check*. By default the owner also **auto-shares** the new
+passphrase: it's wrapped (encrypted) under the channel's *old* key and relayed, so connected members decrypt it
+with the key they already hold and **adopt it automatically** — the server still never sees the passphrase. The
+**Share new passphrase with current members** checkbox (shown to the owner during an encrypted→encrypted
+rotation) turns that off for a **revocation-style** rotation, where members must re-enter the new secret
+**out-of-band**; the very first time you enable encryption is always out-of-band too (there's no old key to wrap
+under). Every change is announced (no silent downgrade). A member that doesn't yet hold a key matching the new
+key-check stays in the channel but is **muted** — it can't be heard and can't decode others, and **never falls
+back to sending audio in the clear** (nor stale-key audio the re-keyed channel can't decode) — until it adopts
+the new key (automatically, or by typing the new passphrase and clicking **Apply changes**). Note this means
+**rotation is a transition, not revocation**: the new key is only as secret as the old one it's wrapped under —
+to genuinely lock someone out, move to a fresh channel.
 
-**Hand over ownership.** When connected, a **Channel owner** dropdown lists the members; the current owner can
-pick another member to make them the owner (everyone's owner-only controls update). The connected-only
-**Rename** button changes just your display name in place (everyone's roster updates); it leaves the channel
-untouched.
+**Hand over ownership.** The **Channel owner** dropdown is shown **only to the current owner** (everyone else
+already sees who owns the channel from the 👑 crown in the members list); the owner picks another member to make
+them the owner, and everyone's owner-only controls update. The connected-only **Rename** button changes just
+your display name in place (everyone's roster updates); it leaves the channel untouched.
 
 Open the page in two tabs (or two machines) to talk between them.
 
@@ -276,8 +286,10 @@ All flags are optional (run with `--args="--help"` for the full list):
 **Interactive commands** (type at the prompt): `t` talk/stop · `w` list who's in the channel · `m
 <ptt|global|duplex>` change the mode (owner only) · `c <channel> [mode] [key]` switch channel without dropping
 the session (mode/key default to the current ones) · `p [passphrase]` change the passphrase (owner; blank turns
-encryption off — a member uses it to apply the owner's new passphrase) · `o <#id>` hand ownership to another
-member (owner; `<#id>` is the prefix shown next to a member) · `n <name>` rename · `f` toggle hi-fi
+encryption off; auto-shares the new passphrase so members adopt it automatically — a member uses `p` to apply
+the owner's new passphrase) · `p! [passphrase]` rotate **without** auto-sharing (revocation-style; members must
+re-enter it) · `o <#id>` hand ownership to another member (owner; `<#id>` is the prefix shown next to a member)
+· `n <name>` rename · `f` toggle hi-fi
 (music/voice) live · `q` quit (closes the socket, ending the session) · `h` help.
 
 The client encodes Opus at 48 kHz with in-band FEC (Concentus) — stereo when the audio device supports it,
@@ -308,13 +320,19 @@ otherwise mono — and interoperates with relay-mode browser clients.
   passphrase or the key. Browser E2EE needs a secure context (HTTPS or `localhost`). This is confidentiality
   between participants on top of transport security, not a replacement for serving over WSS/HTTPS. The channel
   **owner** can rotate that passphrase — or toggle encryption on/off — live, via a `ChangePassphrase` →
-  `PassphraseChanged` flow that carries only the new key-check (never the passphrase); every member re-derives
-  from the new secret, obtained out-of-band, and the change is always announced (no silent downgrade). A member
-  that can't match the new key is **muted** — the client suppresses transmission rather than ever sending
-  plaintext into the now-encrypted channel — until it applies the new passphrase. There is still no automatic
-  key distribution and no forward secrecy (a pre-shared key, rotated by hand). Ownership can likewise be handed
-  to another member (`TransferOwnership` → `OwnerChanged`); the server validates the requester owns the channel
-  and the target is a current member.
+  `PassphraseChanged` flow that carries only the new key-check (never the passphrase). By default the owner
+  **auto-distributes** the new passphrase: it wraps it (encrypts it) under the channel's *old* key and the
+  server relays that blob opaquely, so any member still holding the old key unwraps it and adopts the new
+  passphrase **automatically** — convenient key distribution that still keeps the server blind. The owner can
+  opt out (browser checkbox / `p!` on the Java client) for a **revocation-style** rotation where members must
+  re-enter the new secret out-of-band; the first *enable* of encryption is always out-of-band (no old key to
+  wrap under). Every change is announced (no silent downgrade). A member that can't match the new key-check is
+  **muted** — the client suppresses transmission rather than ever sending plaintext (the enable case) or
+  stale-key audio (a not-yet-rekeyed straggler) into the channel — until it adopts the new key. Because the
+  wrapped key is encrypted under the old one, **rotation is a transition, not revocation** (the new key is only
+  as secret as the old); there is no forward secrecy. Ownership can likewise be handed to another member
+  (`TransferOwnership` → `OwnerChanged`); the server validates the requester owns the channel and the target is
+  a current member.
 - Stateless, CSRF-free token model; static client, health check and login are the only public routes.
 - Input is validated (display-name + channel-name patterns, audio-frame size caps). The browser renders
   member names with `textContent` to avoid markup injection.
@@ -372,6 +390,11 @@ default build stays preview-free.
   sizes) stays visible to the server. A channel is **uniformly** encrypted or plaintext: a joiner whose
   passphrase doesn't match the channel's is **rejected at join** (`passphrase_mismatch`) via a key-check
   value the server compares without ever learning the passphrase. The **owner** can rotate that passphrase
-  (or toggle encryption on/off) live, but there is **no automatic key distribution** — the new passphrase is
-  shared out-of-band just like the original, and members who don't have it yet can't hear or be heard until
-  they enter it. It covers the **relay** transport; WebRTC media is already end-to-end via DTLS-SRTP.
+  (or toggle encryption on/off) live and, by default, **auto-distribute** it by wrapping the new key under
+  the old one so members adopt it automatically (the server stays blind) — but because the new key is wrapped
+  under the old, **rotation is a transition, not revocation**: it is only as secret as the old key, so to
+  exclude a member you move to a fresh channel. The owner can opt out of auto-distribution for a
+  revocation-style rotation (members then re-enter the new secret out-of-band), and the first time encryption
+  is enabled is always out-of-band (no old key to wrap under). Members who don't yet hold a matching key can't
+  hear or be heard until they adopt it. It covers the **relay** transport; WebRTC media is already end-to-end
+  via DTLS-SRTP.

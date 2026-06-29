@@ -89,39 +89,39 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 
 ### Client → server
 
-| `type`         | Fields                                           | Meaning                                                       |
-|----------------|--------------------------------------------------|---------------------------------------------------------------|
-| `join`         | `channel`, `mode`, `displayName`, `keyCheck`     | Join/create — or **switch** channel in place when re-sent on a live socket (§3c); `keyCheck` per §7 |
-| `leave`        | —                                                | Leave the current channel (keep the socket)                   |
-| `requestFloor` | —                                                | Ask for the talk floor (PTT modes)                            |
-| `releaseFloor` | —                                                | Release the floor                                             |
-| `changeMode`   | `mode`                                           | Owner-only: change the channel mode                           |
-| `rename`       | `displayName`                                    | Change your own display name in place (→ `memberRenamed`, §3c)|
-| `changePassphrase` | `keyCheck`                                   | Owner-only: rotate/clear the channel passphrase; `keyCheck` = the new one's KCV, or `null` to make it plaintext (→ `passphraseChanged`, §3c) |
-| `transferOwnership` | `newOwnerId`                                | Owner-only: hand ownership to another current member (→ `ownerChanged`, §3c) |
-| `offer`        | `target`, `sdp`                                  | WebRTC (see §3a)                                              |
-| `answer`       | `target`, `sdp`                                  | WebRTC                                                        |
-| `ice`          | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                                        |
+| `type`              | Fields                                           | Meaning                                                                                                                                                                                                                                                      |
+|---------------------|--------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `join`              | `channel`, `mode`, `displayName`, `keyCheck`     | Join/create — or **switch** channel in place when re-sent on a live socket (§3c); `keyCheck` per §7                                                                                                                                                          |
+| `leave`             | —                                                | Leave the current channel (keep the socket)                                                                                                                                                                                                                  |
+| `requestFloor`      | —                                                | Ask for the talk floor (PTT modes)                                                                                                                                                                                                                           |
+| `releaseFloor`      | —                                                | Release the floor                                                                                                                                                                                                                                            |
+| `changeMode`        | `mode`                                           | Owner-only: change the channel mode                                                                                                                                                                                                                          |
+| `rename`            | `displayName`                                    | Change your own display name in place (→ `memberRenamed`, §3c)                                                                                                                                                                                               |
+| `changePassphrase`  | `keyCheck`, `wrappedKey`                         | Owner-only: rotate/clear the channel passphrase; `keyCheck` = the new one's KCV, or `null` to make it plaintext. Optional `wrappedKey` = the new passphrase encrypted under the OLD key so members auto-adopt; `null` opts out (§3c) (→ `passphraseChanged`) |
+| `transferOwnership` | `newOwnerId`                                     | Owner-only: hand ownership to another current member (→ `ownerChanged`, §3c)                                                                                                                                                                                 |
+| `offer`             | `target`, `sdp`                                  | WebRTC (see §3a)                                                                                                                                                                                                                                             |
+| `answer`            | `target`, `sdp`                                  | WebRTC                                                                                                                                                                                                                                                       |
+| `ice`               | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                                                                                                                                                                                                                                       |
 
 ### Server → client
 
-| `type`          | Fields                                                                  | Meaning                                           |
-|-----------------|-------------------------------------------------------------------------|---------------------------------------------------|
-| `joined`        | `selfId`, `channel`, `mode`, `ownerId`, `members[]`                      | Join ack + full snapshot (re-sync on every join)  |
-| `memberJoined`  | `member` (`MemberInfo`)                                                  | A participant joined                              |
-| `memberLeft`    | `memberId`                                                              | A participant left/disconnected                   |
-| `floorGranted`  | —                                                                       | You hold the floor; you may transmit              |
-| `floorDenied`   | `currentHolderId`                                                       | Floor request refused; names the current holder   |
-| `floorTaken`    | `holderId`                                                              | Another member holds the floor (sent on join; also to a holder preempted by idle auto-release — §3b) |
-| `floorIdle`     | —                                                                       | The floor is free (also sent to a holder force-released by max-hold — §3b) |
-| `modeChanged`   | `mode`                                                                  | The channel mode changed; reset talk state        |
-| `ownerChanged`  | `ownerId`                                                               | New owner (e.g. previous owner left)              |
-| `memberRenamed` | `memberId`, `displayName`                                               | A member changed its display name (incl. you — §3c) |
-| `passphraseChanged` | `keyCheck`                                                          | The owner changed/cleared the channel passphrase (`null` = now unencrypted); re-derive your key and verify it (§3c) |
-| `signalOffer`   | `from`, `sdp`                                                           | WebRTC (see §3a)                                  |
-| `signalAnswer`  | `from`, `sdp`                                                           | WebRTC                                            |
-| `signalIce`     | `from`, `candidate`, `sdpMid`, `sdpMLineIndex`                          | WebRTC                                            |
-| `error`         | `code`, `message`                                                       | A request failed (see §13 for codes)              |
+| `type`              | Fields                                              | Meaning                                                                                                                                                                                                                                 |
+|---------------------|-----------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `joined`            | `selfId`, `channel`, `mode`, `ownerId`, `members[]` | Join ack + full snapshot (re-sync on every join)                                                                                                                                                                                        |
+| `memberJoined`      | `member` (`MemberInfo`)                             | A participant joined                                                                                                                                                                                                                    |
+| `memberLeft`        | `memberId`                                          | A participant left/disconnected                                                                                                                                                                                                         |
+| `floorGranted`      | —                                                   | You hold the floor; you may transmit                                                                                                                                                                                                    |
+| `floorDenied`       | `currentHolderId`                                   | Floor request refused; names the current holder                                                                                                                                                                                         |
+| `floorTaken`        | `holderId`                                          | Another member holds the floor (sent on join; also to a holder preempted by idle auto-release — §3b)                                                                                                                                    |
+| `floorIdle`         | —                                                   | The floor is free (also sent to a holder force-released by max-hold — §3b)                                                                                                                                                              |
+| `modeChanged`       | `mode`                                              | The channel mode changed; reset talk state                                                                                                                                                                                              |
+| `ownerChanged`      | `ownerId`                                           | New owner (e.g. previous owner left)                                                                                                                                                                                                    |
+| `memberRenamed`     | `memberId`, `displayName`                           | A member changed its display name (incl. you — §3c)                                                                                                                                                                                     |
+| `passphraseChanged` | `keyCheck`, `wrappedKey`                            | The owner changed/cleared the channel passphrase (`null` = now unencrypted). If `wrappedKey` is present, decrypt it with your old key to auto-adopt; else re-derive from the out-of-band passphrase and verify against `keyCheck` (§3c) |
+| `signalOffer`       | `from`, `sdp`                                       | WebRTC (see §3a)                                                                                                                                                                                                                        |
+| `signalAnswer`      | `from`, `sdp`                                       | WebRTC                                                                                                                                                                                                                                  |
+| `signalIce`         | `from`, `candidate`, `sdpMid`, `sdpMLineIndex`      | WebRTC                                                                                                                                                                                                                                  |
+| `error`             | `code`, `message`                                   | A request failed (see §13 for codes)                                                                                                                                                                                                    |
 
 `MemberInfo` = `{ id, displayName, streamId }` (see §4).
 
@@ -201,27 +201,41 @@ touches channel membership, the floor, or stream indices.
 
 **Change the passphrase (owner)** — the channel **owner** rotates the E2EE key for everyone with
 `changePassphrase`, whose `keyCheck` is the KCV (§7) of the **new** passphrase, or `null` to make the channel
-plaintext. The server records the new key-check and broadcasts `passphraseChanged { keyCheck }` to **all**
-members (including the owner). The passphrase itself is **never** sent — members obtain it out-of-band, exactly
-as they got the original. On `passphraseChanged`:
+plaintext. The server records the new key-check and broadcasts `passphraseChanged { keyCheck, wrappedKey }` to
+**all** members (including the owner). The passphrase itself is **never** sent to the server in clear. On
+`passphraseChanged`:
 
 - If `keyCheck` is `null`, the channel is now plaintext: drop your key and send/receive in the clear.
-- Otherwise re-derive your AES key from the new passphrase and check it against the announced `keyCheck`. If it
-  matches, swap your key. If you don't have the new passphrase yet (or it doesn't match), you are **muted**:
-  **suppress transmission** and don't transmit plaintext — you stay in the channel but can't be heard and can't
-  decode others until you enter the new passphrase. **Critical:** this includes the *enable* transition
-  (plaintext → encrypted), where you have **no** old key — a conformant client MUST gate its send path on
-  "channel announces a key-check but I have no matching key" and stay silent, never falling back to the
-  plaintext path. The reference clients re-derive from the passphrase field / `p` command and apply only on a
-  KCV match.
+- Otherwise adopt the new passphrase — two ways:
+  - **Auto-adopt (when `wrappedKey` is present).** `wrappedKey` is the new passphrase encrypted under the
+    channel's **OLD** key (base64 of an AES-256-GCM blob, the same wire crypto as a frame; §7). A member that
+    still holds the old key decrypts it, re-derives the AES key from the recovered passphrase, verifies that
+    against `keyCheck`, and swaps — **no out-of-band step**. The server relays the blob opaquely and never learns
+    the passphrase. A blob you can't decrypt (you hold a different/older key, it was tampered, or a newer rotation
+    superseded it) simply falls through to the manual path.
+  - **Manual (when `wrappedKey` is absent or undecryptable).** Re-derive your AES key from the new passphrase
+    obtained out-of-band and check it against `keyCheck`; swap on a match. The owner withholds `wrappedKey` for a
+    **revocation-style** rotation (see the caveat below); the very first *enable* (plaintext → encrypted) has no
+    old key to wrap under, so it is always manual.
+- **Until you hold a key whose KCV equals the announced `keyCheck`, you are muted:** suppress transmission (send
+  neither plaintext nor stale-key ciphertext) and you can't decode others. This covers BOTH the *enable*
+  transition (you have **no** old key) AND a **stale-key straggler** after a rotation you haven't adopted (your
+  old key no longer matches). A conformant client MUST gate its send path on "the KCV of the key I hold equals
+  the channel's announced `keyCheck`" — not merely "I hold *some* key" — so a straggler can't emit audio the
+  re-keyed channel can't decode and an enable can't leak plaintext. The reference clients implement this as a
+  pure decision (`frameDisposition` / `outboundFrame`).
 - The owner applies the new key on the **echoed** `passphraseChanged`, not optimistically — so a rejected
   request (`not_owner`, e.g. ownership was just lost) leaves the old key in place.
 
 Notes: only the owner may rotate (`not_owner` otherwise; `not_in_channel` before joining). The server-managed
 `global` room is owned by a sentinel, so a rotation there is refused — it stays unencrypted. Broadcasting the
-key-check leaks nothing new (it is brute-force-equivalent to the ciphertext the relay already carries, §7), and
-the audio relay is opaque, so a brief window where members hold different keys just drops a few GCM-failing
-frames — there is no atomic cross-client key swap, and no forward secrecy.
+key-check (and the wrapped blob) leaks nothing new to the server: both are brute-force-equivalent to the
+ciphertext the relay already carries (§7), and the audio relay is opaque, so a brief window where members hold
+different keys just drops a few GCM-failing frames — there is no atomic cross-client key swap, and no forward
+secrecy. **Rotation is a transition, not revocation:** auto-distribution wraps the new key under the *old* one,
+so the new passphrase is only as secret as the old — anyone who held the old key (or captured the wrapped blob)
+can recover it. Withholding `wrappedKey` forces out-of-band re-entry but still can't claw the old key back from
+someone who already had it; to genuinely exclude a member, move to a fresh channel.
 
 **Transfer ownership (owner)** — the owner hands ownership to another **current member** with
 `transferOwnership { newOwnerId }` (a session id). The server validates that you own the channel (`not_owner`
@@ -326,11 +340,15 @@ body becomes `[0xE2][IV(12)][AES-256-GCM ciphertext+tag]`. Must be **byte-identi
   KCV without ever learning the passphrase.
 - **Rotation:** the channel **owner** may change the passphrase mid-session with `changePassphrase` (§3c),
   whose `keyCheck` is the KCV of the **new** passphrase (or `null` to make the channel plaintext). The server
-  swaps the recorded KCV and broadcasts `passphraseChanged`; it still never sees the passphrase. Every member
-  re-derives the key from the new passphrase (obtained out-of-band, like the original) and verifies it against
-  the announced KCV; a member that can't match it **keeps its old key and never sends plaintext** into a
-  still-encrypted channel. No automatic key distribution, no forward secrecy — it is the same pre-shared key
-  model, rotated by hand.
+  swaps the recorded KCV and broadcasts `passphraseChanged`; it still never sees the passphrase. Members adopt
+  the new key one of two ways: **auto** — the owner may include `wrappedKey`, the new passphrase encrypted under
+  the OLD key (same frame crypto), which any old-key holder decrypts and adopts with no out-of-band step (the
+  server relays it opaquely); or **manual** — re-derive from the new passphrase obtained out-of-band. Either way
+  the result is verified against the announced KCV, and **until a member holds a key whose KCV matches it that
+  member is muted** — sending neither plaintext (the *enable* case, no old key) nor stale-key ciphertext (a
+  straggler whose old key no longer matches). Auto-distribution is **not** revocation: the new key is wrapped
+  under the old, so it is only as secret as the old key — the owner opts out (`wrappedKey: null`) for a
+  revocation-style rotation, but truly excluding a member means moving to a fresh channel. No forward secrecy.
 
 **Known-answer vectors** (pin these in your tests; passphrase/channel per `FrameCryptoTest`):
 
@@ -464,18 +482,18 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
   holder after `walkie.floor-idle-release-seconds` (default 5; on contention); each `0`-disables (§3b).
 - **Error codes** (`error.code`):
 
-| Code                  | Triggered by                                                          |
-|-----------------------|-----------------------------------------------------------------------|
-| `bad_message`         | Unparseable / unknown-type control frame                              |
-| `invalid_channel`     | `join` with a channel name not matching the pattern                   |
-| `invalid_display_name`| `join` or `rename` with a display name not matching the pattern       |
-| `invalid_mode`        | `changeMode` to `GLOBAL_PTT` outside the `global` channel             |
-| `reserved_channel`    | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode |
-| `encryption_not_allowed`| a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext) |
-| `not_in_channel`      | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / signal before `join` |
-| `not_owner`           | `changeMode`, `changePassphrase` or `transferOwnership` by a non-owner |
-| `passphrase_mismatch` | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel |
-| `unknown_target`      | WebRTC signal — or `transferOwnership` — to an id not in the channel  |
+| Code                     | Triggered by                                                                                                                        |
+|--------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+| `bad_message`            | Unparseable / unknown-type control frame                                                                                            |
+| `invalid_channel`        | `join` with a channel name not matching the pattern                                                                                 |
+| `invalid_display_name`   | `join` or `rename` with a display name not matching the pattern                                                                     |
+| `invalid_mode`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel                                                                           |
+| `reserved_channel`       | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode                                                |
+| `encryption_not_allowed` | a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext)                                          |
+| `not_in_channel`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / signal before `join`                    |
+| `not_owner`              | `changeMode`, `changePassphrase` or `transferOwnership` by a non-owner                                                              |
+| `passphrase_mismatch`    | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel |
+| `unknown_target`         | WebRTC signal — or `transferOwnership` — to an id not in the channel                                                                |
 
 ---
 
