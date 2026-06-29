@@ -21,26 +21,27 @@ two reference clients, and three channel modes.
         │  POST /api/auth/login   → mint a signed bearer token (no input)
         │  WSS  (token via Authorization header, or ?token= on the WebSocket handshake)
         ▼
-  ┌─ walkie-server (Spring Boot 4.1) ────────────────────────────────────────────────────────────────┐
-  │                                                                                                  │
-  │  TokenAuthenticationFilter ─► Spring Security      (the token is the Authentication credential)  │
-  │                                                                                                  │
-  │  /ws/audio   (binary) ─► AudioRelayHandler ┐                                                     │
-  │  /ws/signal  (text)   ─► SignalingHandler  ┴─► ConnectionService                                 │
-  │                                                 ├─ ChannelRegistry ── Channel                    │
-  │                                                 ├─ FloorControlService (push-to-talk floor)      │
-  │                                                 └─ audio fan-out · WebRTC signaling relay        │
-  │                                                                                                  │
-  │  stateless signed token, verified at the handshake (no store); a session ends when its WS closes │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘ 
+  ┌─ walkie-server (Spring Boot 4.1) ───────────────────────────────────────────────────┐
+  │                                                                                     │
+  │  TokenAuthenticationFilter ─► Spring Security  (token = Authentication cred.)       │
+  │                                                                                     │
+  │  /ws/audio  (binary) ─► AudioRelayHandler ┐                                         │
+  │  /ws/signal (text)   ─► SignalingHandler  ┴─► ConnectionService                     │
+  │                                               ├─ ChannelRegistry ── Channel         │
+  │                                               ├─ FloorControl (push-to-talk floor)  │
+  │                                               └─ audio fan-out · WebRTC signaling   │
+  │                                                                                     │
+  │  stateless signed token, verified at the handshake (no store); WS close ends it     │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
 
-  Control plane: JSON text frames (sealed ClientMessage / ServerMessage records, Jackson 3 polymorphic)
-  Media plane (relay):  48 kHz, 20 ms frames (mono, or stereo from the Java client) — Opus via WebCodecs
-                        (FEC) or PCM fallback, each frame prefixed with a 1-byte codec tag. The server
-                        fans frames out opaquely (codec-agnostic, never inspecting the payload); clients
-                        may additionally end-to-end encrypt each frame (AES-256-GCM from a shared
-                        passphrase) before sending — the server relays the ciphertext blindly, no key
-  Media plane (webrtc): Opus 48 kHz fullband, tuned (high bitrate + FEC), peer-to-peer
+  Control plane: JSON text frames — sealed ClientMessage / ServerMessage records
+    (Jackson 3 polymorphic).
+  Media plane (relay): 48 kHz, 20 ms frames (mono, or stereo from the Java client),
+    Opus via WebCodecs (FEC) or PCM fallback, each frame prefixed with a 1-byte codec
+    tag. The server fans frames out opaquely (codec-agnostic, never inspecting the
+    payload); clients may additionally end-to-end encrypt each frame (AES-256-GCM
+    from a shared passphrase) before sending — the server relays ciphertext blindly.
+  Media plane (webrtc): Opus 48 kHz fullband, tuned (high bitrate + FEC), peer-to-peer.
 ```
 
 ### Relay data flow
