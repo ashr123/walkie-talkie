@@ -165,13 +165,11 @@ async function connect() {
 			? `Relay codec: ${OPUS_SUPPORTED ? 'Opus 48 kHz + FEC' : 'PCM 48 kHz (no WebCodecs)'}`
 			: 'WebRTC: Opus 48 kHz (tuned)');
 
-		// End-to-end encryption applies to the relay path only (WebRTC media is already peer-to-peer).
+		// End-to-end encryption applies to the relay path only (WebRTC media is already peer-to-peer). The E2EE
+		// status is logged once, uniformly, in onJoined (covering this initial join and any later switch).
 		await deriveJoinKey(state.transport, passphrase, state.mode, channel);
 		state.txChain = Promise.resolve();
 		state.warnedDecrypt = false;
-		if (state.transport === 'relay') {
-			log(state.cryptoKey ? 'End-to-end encryption: ON (AES-256-GCM)' : 'End-to-end encryption: off');
-		}
 
 		const path = state.transport === 'webrtc' ? '/ws/signal' : '/ws/audio';
 		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -262,11 +260,8 @@ async function applyOrSwitch() {
 			return;
 		}
 		await deriveJoinKey(transport, passphrase, mode, channel);
-		if (transport === 'relay') {
-			log(state.cryptoKey ? 'Re-keyed for the new channel: E2EE ON' : 'E2EE off for the new channel');
-		}
 		sendCtrl({type: 'join', channel, mode, displayName: display, keyCheck: state.keyCheck});
-		log(`Switching to "${effectiveChannel}" (${mode})…`);
+		log(`Switching to "${effectiveChannel}" (${mode})…`);   // E2EE status follows in onJoined once confirmed
 		updateApplyControls();
 		return;
 	}
@@ -695,6 +690,12 @@ function onJoined(msg) {
 		: state.selfId === state.ownerId
 			? 'You own this channel — change mode/passphrase and click Apply, or pick a new owner.'
 			: 'Owner: ' + (state.members.get(state.ownerId) || state.ownerId));
+	// Report the channel's E2EE status on every confirmed room entry — initial join AND in-place switch, whether
+	// we created the channel or joined an existing one — reflecting the key we actually hold for it. (The global
+	// room already states "no encryption" in the owner line above, so skip the redundant line there.)
+	if (state.transport === 'relay' && state.ownerId !== SERVER_OWNER) {
+		log(state.cryptoKey ? 'End-to-end encryption: ON (AES-256-GCM)' : 'End-to-end encryption: off');
+	}
 
 	if (state.transport === 'webrtc') {
 		msg.members
