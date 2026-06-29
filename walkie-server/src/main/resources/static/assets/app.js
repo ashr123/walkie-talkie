@@ -8,10 +8,10 @@
 // 1-byte codec tag so receivers can decode whatever the sender used. The WebRTC path uses the
 // browser's native Opus, tuned up via SDP + sender bitrate.
 
-import {E2EE_SCHEME, deriveKey, encryptFrame, decryptFrame, frameDisposition, rekeyAction} from './e2ee.js';
+import {decryptFrame, deriveKey, E2EE_SCHEME, encryptFrame, frameDisposition, rekeyAction} from './e2ee.js';
 
 // Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
-const byId = (id) => document.getElementById(id);
+const byId = id => document.getElementById(id);
 const STUN = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
 
 const SAMPLE_RATE = 48000;
@@ -20,7 +20,7 @@ const MONO_BITRATE = 64000;      // fullband voice, high quality
 const STEREO_BITRATE = 128000;   // stereo needs ~2x for equivalent quality
 const CODEC_OPUS = 1;
 const CODEC_PCM = 2;
-const OPUS_SUPPORTED = (typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined');
+const OPUS_SUPPORTED = typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined';
 const DISPLAY_NAME = /^[A-Za-z0-9_.-]{1,32}$/;   // must match the server's display-name validation
 const SERVER_OWNER = 'server';   // ownerId the server stamps on the server-managed "global" room (matches ConnectionService.GLOBAL_CHANNEL_OWNER); no participant owns it
 const MAX_ACTIVE_DECODERS = 8;   // cap on per-sender decoders we mix at once (O(N^2) fan-out guard); evict longest-silent
@@ -98,7 +98,7 @@ async function deriveJoinKey(transport, passphrase, mode, channel) {
 	// (encryption_not_allowed). So drop the key for GLOBAL_PTT regardless of any passphrase still sitting in the
 	// field (e.g. when switching INTO global from an encrypted channel), mirroring the Java client's deriveCrypto;
 	// otherwise the join would carry a non-null keyCheck and be refused, silently failing the switch.
-	const derived = (transport === 'relay' && passphrase && mode !== 'GLOBAL_PTT')
+	const derived = transport === 'relay' && passphrase && mode !== 'GLOBAL_PTT'
 		? await deriveKey(passphrase, channel)
 		: null;
 	state.cryptoKey = derived ? derived.key : null;
@@ -183,7 +183,7 @@ async function connect() {
 			// (they need the roster + owner), via updateApplyControls() / renderOwnerSelect() in onJoined.
 		};
 		ws.onmessage = onWsMessage;
-		ws.onclose = (ev) => {
+		ws.onclose = ev => {
 			log('WebSocket closed (' + ev.code + ')');
 			const reconnecting = state.pendingReconnect;
 			state.pendingReconnect = false;
@@ -271,8 +271,7 @@ async function applyOrSwitch() {
 			await initiatePassphraseChange();   // rotate for everyone; applied on the echo
 		} else if (state.channelKeyCheck) {
 			// Non-owner adopting the owner's announced rotation: re-derive and verify against the announced KCV.
-			const ok = await applyAnnouncedPassphrase();
-			log(ok
+			log(await applyAnnouncedPassphrase()
 				? 'Applied the channel passphrase — you can be heard again.'
 				: 'That passphrase does not match the channel — get the owner’s new passphrase and try again.');
 		} else {
@@ -304,14 +303,13 @@ function updateApplyControls() {
 	hint.hidden = false;
 	const transport = byId('transport').value;
 	const mode = byId('mode').value;
-	const channel = byId('channel').value.trim() || 'lobby';
-	const effectiveChannel = mode === 'GLOBAL_PTT' ? 'global' : channel;
-	const passphrase = byId('passphrase').value;
+	const effectiveChannel = mode === 'GLOBAL_PTT' ? 'global' : byId('channel').value.trim() || 'lobby';
 	const channelChanged = effectiveChannel !== state.channel;
 	const changed = channelChanged
 		|| transport !== state.transport
 		|| mode !== state.mode
-		|| (transport === 'relay' && passphrase !== (state.passphrase || ''));
+		|| transport === 'relay'
+		&& byId('passphrase').value !== (state.passphrase || '');
 	btn.textContent = channelChanged ? 'Switch channel' : 'Apply changes';
 	btn.disabled = !changed && !state.rekeyPending;
 }
@@ -404,26 +402,30 @@ async function applyAnnouncedPassphrase() {
 	if (state.channelKeyCheck != null && passphrase && window.isSecureContext && window.crypto && crypto.subtle) {
 		derived = await deriveKey(passphrase, state.mode === 'GLOBAL_PTT' ? 'global' : state.channel);
 	}
-	switch (rekeyAction(state.channelKeyCheck, derived ? derived.keyCheck : null)) {
-		case 'disable':
-			state.cryptoKey = null;
-			state.keyCheck = null;
-			state.passphrase = '';
-			state.rekeyPending = false;
-			updateApplyControls();
-			return true;
-		case 'apply':
-			state.cryptoKey = derived.key;
-			state.keyCheck = derived.keyCheck;
-			state.passphrase = passphrase;
-			state.rekeyPending = false;
-			updateApplyControls();
-			return true;
-		default:   // 'keep' — we hold no matching key yet; stay muted (sendTagged drops) until the user re-keys
-			state.rekeyPending = true;
-			updateApplyControls();
-			return false;
+	const action = rekeyAction(state.channelKeyCheck, derived ? derived.keyCheck : null);
+	// `derived` is non-null whenever rekeyAction returns 'apply' (it only does so for a non-null, matching
+	// derived.keyCheck). Gate the dereference on `derived` anyway, so it is provably safe to a reader / static
+	// analysis and stays safe if rekeyAction ever changes.
+	if (action === 'apply' && derived) {
+		state.cryptoKey = derived.key;
+		state.keyCheck = derived.keyCheck;
+		state.passphrase = passphrase;
+		state.rekeyPending = false;
+		updateApplyControls();
+		return true;
 	}
+	if (action === 'disable') {
+		state.cryptoKey = null;
+		state.keyCheck = null;
+		state.passphrase = '';
+		state.rekeyPending = false;
+		updateApplyControls();
+		return true;
+	}
+	// 'keep' — we hold no matching key yet; stay muted (sendTagged drops) until the user re-keys.
+	state.rekeyPending = true;
+	updateApplyControls();
+	return false;
 }
 
 // Server told us (and everyone) the channel's passphrase changed. Record the new key-check and try to apply it
@@ -528,16 +530,16 @@ function onWsMessage(ev) {
 			onOwnerChanged(msg.ownerId);
 			break;
 		case 'passphraseChanged':
-			onPassphraseChanged(msg.keyCheck).catch((err) => log('Passphrase change error: ' + err.message));
+			onPassphraseChanged(msg.keyCheck).catch(err => log('Passphrase change error: ' + err.message));
 			break;
 		case 'signalOffer':
-			onOffer(msg.from, msg.sdp).catch((err) => log('Offer error: ' + err.message));
+			onOffer(msg.from, msg.sdp).catch(err => log('Offer error: ' + err.message));
 			break;
 		case 'signalAnswer':
-			onAnswer(msg.from, msg.sdp).catch((err) => log('Answer error: ' + err.message));
+			onAnswer(msg.from, msg.sdp).catch(err => log('Answer error: ' + err.message));
 			break;
 		case 'signalIce':
-			onIce(msg.from, msg.candidate, msg.sdpMid, msg.sdpMLineIndex).catch((err) => log('ICE error: ' + err.message));
+			onIce(msg.from, msg.candidate, msg.sdpMid, msg.sdpMLineIndex).catch(err => log('ICE error: ' + err.message));
 			break;
 		case 'error':
 			log('Server error [' + msg.code + ']: ' + msg.message);
@@ -584,8 +586,8 @@ function onJoined(msg) {
 
 	if (state.transport === 'webrtc') {
 		msg.members
-			.filter((m) => m.id !== state.selfId)
-			.forEach((m) => offerTo(m.id).catch((err) => log('Offer error: ' + err.message)));
+			.filter(m => m.id !== state.selfId)
+			.forEach(m => offerTo(m.id).catch(err => log('Offer error: ' + err.message)));
 	}
 
 	if (state.mode === 'FULL_DUPLEX' && !state.startMuted) {
@@ -733,9 +735,7 @@ function endTransmit() {
 function enableLocalTracks(on) {
 	// WebRTC: gate the outgoing track. Relay: gating happens where frames are sent.
 	if (state.micStream) {
-		state.micStream.getAudioTracks().forEach((t) => {
-			t.enabled = state.transport === 'webrtc' ? on : true;
-		});
+		state.micStream.getAudioTracks().forEach(t => t.enabled = state.transport === 'webrtc' ? on : true);
 	}
 }
 
@@ -768,7 +768,7 @@ async function setupAudio() {
 	// PCM fallback stays mono.
 	state.micStream = await navigator.mediaDevices.getUserMedia({audio: captureConstraints()});
 	const micSettings = state.micStream.getAudioTracks()[0].getSettings();
-	state.channels = (OPUS_SUPPORTED && micSettings.channelCount === 2) ? 2 : 1;
+	state.channels = OPUS_SUPPORTED && micSettings.channelCount === 2 ? 2 : 1;
 	log('Audio ready — context ' + ctx.state + ' @ ' + ctx.sampleRate + ' Hz, '
 		+ (state.channels === 2 ? 'stereo' : 'mono') + ', transport ' + state.transport);
 
@@ -788,7 +788,7 @@ async function setupAudio() {
 			processorOptions: {channels: state.channels},
 		});
 		source.connect(capture);
-		capture.port.onmessage = (e) => onCapturedFrame(e.data);
+		capture.port.onmessage = e => onCapturedFrame(e.data);
 		state.captureNode = capture;
 	}
 }
@@ -798,8 +798,12 @@ function setupRelayCodec() {
 		return; // PCM fallback path; no codec objects needed
 	}
 	state.opusEncoder = new AudioEncoder({
-		output: (chunk) => sendEncoded(chunk),
-		error: (e) => log('Opus encoder error: ' + e.message),
+		output(chunk) {
+			return sendEncoded(chunk);
+		},
+		error(e) {
+			return log('Opus encoder error: ' + e.message);
+		},
 	});
 	state.opusEncoder.configure({
 		codec: 'opus',
@@ -870,12 +874,12 @@ function sendTagged(tag, payloadBytes) {
 	// under whatever key is current when it runs.
 	state.txChain = state.txChain
 		.then(() => encryptFrame(out, state.cryptoKey))
-		.then((enc) => {
+		.then(enc => {
 			if (isOpen()) {
 				state.ws.send(enc.buffer);
 			}
 		})
-		.catch((err) => log('Encrypt error: ' + err.message));
+		.catch(err => log('Encrypt error: ' + err.message));
 }
 
 // --- end-to-end encryption (relay path) -----------------------------------------------------------
@@ -906,7 +910,7 @@ function handleAudioFrame(arrayBuffer) {
 	// can't reorder that sender's frames or head-of-line-block another.
 	lane.rxChain = lane.rxChain
 		.then(() => decryptFrame(body, state.cryptoKey))
-		.then((plaintext) => processFrame(lane, new Uint8Array(plaintext)))
+		.then(plaintext => processFrame(lane, new Uint8Array(plaintext)))
 		.catch(() => {
 			if (!state.warnedDecrypt) {
 				state.warnedDecrypt = true;
@@ -926,7 +930,7 @@ function processFrame(lane, body) {
 			// The Opus TOC byte's stereo flag (0x04) gives the stream's channel count, which may differ from
 			// ours (e.g. a stereo Concentus/Java sender into a mono browser). Configure THIS lane's decoder to
 			// match the stream — otherwise WebCodecs decodes to silence — and reconfigure if it changes.
-			const streamChannels = (payload[0] & 0x04) ? 2 : 1;
+			const streamChannels = payload[0] & 0x04 ? 2 : 1;
 			if (lane.decoderChannels !== streamChannels) {
 				lane.decoder.configure({codec: 'opus', sampleRate: SAMPLE_RATE, numberOfChannels: streamChannels});
 				lane.decoderChannels = streamChannels;
@@ -946,7 +950,7 @@ function processFrame(lane, body) {
 		}
 	} else if (tag === CODEC_PCM) {
 		// Raw Int16 LE, mono (the PCM fallback is always mono), starting at body offset 1.
-		const count = (body.length - 1) >> 1;
+		const count = body.length - 1 >> 1;
 		const view = new DataView(body.buffer, body.byteOffset + 1, body.length - 1);
 		const f32 = new Float32Array(count);
 		for (let i = 0; i < count; i++) {
@@ -1062,8 +1066,12 @@ function createLane(memberId) {
 	};
 	if (OPUS_SUPPORTED) {
 		lane.decoder = new AudioDecoder({
-			output: (audioData) => playbackDecoded(lane, audioData),
-			error: (e) => log('Opus decoder error: ' + e.message),
+			output(audioData) {
+				return playbackDecoded(lane, audioData);
+			},
+			error(e) {
+				return log('Opus decoder error: ' + e.message);
+			},
 		});
 	}
 	return lane;
@@ -1116,11 +1124,11 @@ function sweepLanes() {
 
 function createPeer(remoteId) {
 	const pc = new RTCPeerConnection(STUN);
-	state.micStream.getAudioTracks().forEach((track) => {
+	state.micStream.getAudioTracks().forEach(track => {
 		track.enabled = state.mode === 'FULL_DUPLEX' || state.transmitting;
 		pc.addTrack(track, state.micStream);
 	});
-	pc.onicecandidate = (e) => {
+	pc.onicecandidate = e => {
 		if (e.candidate) {
 			sendCtrl({
 				type: 'ice', target: remoteId,
@@ -1128,7 +1136,7 @@ function createPeer(remoteId) {
 			});
 		}
 	};
-	pc.ontrack = (e) => attachRemoteAudio(remoteId, e.streams[0]);
+	pc.ontrack = e => attachRemoteAudio(remoteId, e.streams[0]);
 	state.peers.set(remoteId, pc);
 	return pc;
 }
@@ -1181,8 +1189,8 @@ function tuneOpusSdp(sdp) {
 
 function setSenderBitrate(pc, bitsPerSecond) {
 	pc.getSenders()
-		.filter((sender) => sender.track && sender.track.kind === 'audio')
-		.forEach(async (sender) => {
+		.filter(sender => sender.track && sender.track.kind === 'audio')
+		.forEach(async sender => {
 			const params = sender.getParameters();
 			if (!params.encodings || params.encodings.length === 0) {
 				params.encodings = [{}];
@@ -1207,7 +1215,7 @@ function attachRemoteAudio(remoteId, stream) {
 	el.srcObject = stream;
 	// autoplay should start it, but call play() explicitly so a blocked autoplay surfaces a hint
 	// instead of failing silently.
-	el.play().catch((e) => log('Browser blocked audio autoplay (click the page to enable): ' + e.message));
+	el.play().catch(e => log('Browser blocked audio autoplay (click the page to enable): ' + e.message));
 }
 
 function closePeer(remoteId) {
@@ -1310,37 +1318,37 @@ function renderMembers() {
 	state.memberLis.clear();
 	// Always append a short session-id prefix after the display name (the session id is the real identity —
 	// names aren't unique); the full id is on hover. Lexicographic (case-insensitive) by name, then by id.
-	const sorted = [...state.members.entries()].sort(([idA, nameA], [idB, nameB]) =>
-		nameA.localeCompare(nameB, undefined, {sensitivity: 'base'}) || (idA < idB ? -1 : idA > idB ? 1 : 0));
-	sorted.forEach(([id, name]) => {
-		let label = `${name} (#${id.slice(0, 8)})`;
-		if (id === state.selfId) {
-			label += ' (you)';
-		}
-		const li = document.createElement('li');
-		li.title = id;
-		// The channel owner gets a crown so it's clear at a glance who owns the channel (no need to scan the
-		// log). The server-managed global room has no participant owner, so it gets no crown.
-		if (id === state.ownerId && state.ownerId !== SERVER_OWNER) {
-			li.classList.add('owner');
-			const crown = document.createElement('span');
-			crown.className = 'owner-badge';
-			crown.textContent = '\u{1F451}';   // 👑
-			crown.title = 'Channel owner';
-			li.appendChild(crown);
-		}
-		const nameSpan = document.createElement('span');
-		if (id === state.selfId) {
-			nameSpan.className = 'self';
-		}
-		// textContent (not innerHTML) so a crafted display name can't inject markup.
-		nameSpan.textContent = label;
-		li.appendChild(nameSpan);
-		// Re-apply the live speaking highlight (state.speaking is authoritative across re-renders).
-		li.classList.toggle('speaking', state.speaking.has(id));
-		state.memberLis.set(id, li);
-		ul.appendChild(li);
-	});
+	[...state.members.entries()]
+		.sort(([idA, nameA], [idB, nameB]) => nameA.localeCompare(nameB, undefined, {sensitivity: 'base'}) || (idA < idB ? -1 : idA > idB ? 1 : 0))
+		.forEach(([id, name]) => {
+			let label = `${name} (#${id.slice(0, 8)})`;
+			if (id === state.selfId) {
+				label += ' (you)';
+			}
+			const li = document.createElement('li');
+			li.title = id;
+			// The channel owner gets a crown so it's clear at a glance who owns the channel (no need to scan the
+			// log). The server-managed global room has no participant owner, so it gets no crown.
+			if (id === state.ownerId && state.ownerId !== SERVER_OWNER) {
+				li.classList.add('owner');
+				const crown = document.createElement('span');
+				crown.className = 'owner-badge';
+				crown.textContent = '👑';
+				crown.title = 'Channel owner';
+				li.appendChild(crown);
+			}
+			const nameSpan = document.createElement('span');
+			if (id === state.selfId) {
+				nameSpan.className = 'self';
+			}
+			// textContent (not innerHTML) so a crafted display name can't inject markup.
+			nameSpan.textContent = label;
+			li.appendChild(nameSpan);
+			// Re-apply the live speaking highlight (state.speaking is authoritative across re-renders).
+			li.classList.toggle('speaking', state.speaking.has(id));
+			state.memberLis.set(id, li);
+			ul.appendChild(li);
+		});
 	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
 }
 
@@ -1351,11 +1359,13 @@ function enableTalkButton(enabled) {
 function updateTalkButton() {
 	const btn = byId('talkBtn');
 	btn.classList.toggle('live', state.transmitting);
-	if (state.mode === 'FULL_DUPLEX') {
-		btn.textContent = state.transmitting ? 'Mic ON (click to mute)' : 'Mic OFF (click to talk)';
-	} else {
-		btn.textContent = state.transmitting ? 'LIVE — release to stop' : 'Hold to talk';
-	}
+	btn.textContent = state.mode === 'FULL_DUPLEX' ?
+		state.transmitting ?
+			'Mic ON (click to mute)' :
+			'Mic OFF (click to talk)' :
+		state.transmitting ?
+			'LIVE — release to stop' :
+			'Hold to talk';
 }
 
 // Resets everything tied to the CURRENT channel — peers, decode lanes, roster, and floor/speaking highlights —
@@ -1398,7 +1408,7 @@ function cleanup() {
 	state.warnedDecrypt = false;
 	state.warnedEncryptedNoKey = false;
 	if (state.micStream) {
-		state.micStream.getTracks().forEach((t) => t.stop());
+		state.micStream.getTracks().forEach(t => t.stop());
 		state.micStream = null;
 	}
 	if (state.audioContext) {
@@ -1453,7 +1463,7 @@ window.addEventListener('DOMContentLoaded', () => {
 	// The Connect fields aren't wrapped in a <form>, so Enter in one does nothing by default. Treat Enter in
 	// the Connect panel as "Connect" when a connect is possible (button enabled, i.e. disconnected); once
 	// connected, Enter in the Display name field instead renames (the Connect button is then disabled).
-	byId('setup').addEventListener('keydown', (e) => {
+	byId('setup').addEventListener('keydown', e => {
 		if (e.key !== 'Enter' || e.isComposing) {
 			return;
 		}
@@ -1470,8 +1480,7 @@ window.addEventListener('DOMContentLoaded', () => {
 	// is disabled for others via updateModeControl), and the change is applied by the adaptive Apply button —
 	// not live on select — so mode/passphrase/transport apply together in one click. Pre-connect it just picks
 	// the initial mode for the next Connect.
-	const modeSelect = byId('mode');
-	modeSelect.addEventListener('change', () => {
+	byId('mode').addEventListener('change', () => {
 		updateGlobalModeLocks(); // reflect the global-mode channel lock immediately (pre- and post-connect)
 		updateApplyControls();   // enable/relabel the Apply button to reflect the pending mode change
 	});
@@ -1487,7 +1496,7 @@ window.addEventListener('DOMContentLoaded', () => {
 		}
 		const dsp = !state.hifi;
 		try {
-			await Promise.all(state.micStream.getAudioTracks().map((t) =>
+			await Promise.all(state.micStream.getAudioTracks().map(t =>
 				t.applyConstraints({echoCancellation: dsp, noiseSuppression: dsp, autoGainControl: dsp})));
 			log('Mic processing ' + (dsp ? 'on (clean speech)' : 'off (hi-fi)'));
 		} catch (err) {
@@ -1501,23 +1510,23 @@ window.addEventListener('DOMContentLoaded', () => {
 	talk.addEventListener('mouseleave', () => {
 		if (state.mode !== 'FULL_DUPLEX') releaseTalk();
 	});
-	talk.addEventListener('touchstart', (e) => {
+	talk.addEventListener('touchstart', e => {
 		e.preventDefault();
 		pressTalk();
 	}, {passive: false});
-	talk.addEventListener('touchend', (e) => {
+	talk.addEventListener('touchend', e => {
 		e.preventDefault();
 		releaseTalk();
 	}, {passive: false});
 
 	// Hold Space as a push-to-talk key.
-	window.addEventListener('keydown', (e) => {
+	window.addEventListener('keydown', e => {
 		if (e.code === 'Space' && !e.repeat && !talk.disabled && state.mode !== 'FULL_DUPLEX' && document.activeElement.tagName !== 'INPUT') {
 			e.preventDefault();
 			pressTalk();
 		}
 	});
-	window.addEventListener('keyup', (e) => {
+	window.addEventListener('keyup', e => {
 		if (e.code === 'Space' && !talk.disabled && state.mode !== 'FULL_DUPLEX' && document.activeElement.tagName !== 'INPUT') {
 			e.preventDefault();
 			releaseTalk();

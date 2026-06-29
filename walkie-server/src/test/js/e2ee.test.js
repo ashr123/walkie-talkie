@@ -30,7 +30,7 @@ const EXPECTED_KEY_HEX = '43321a28736472e94ff819ef9364476d5324b8fa550115409047f7
 const EXPECTED_KCV = 'c9ea045aeadb2254fff7fa0efeb4d18a';
 const EXPECTED_CIPHERTEXT_HEX = '64d66fb60c1fe48c515bb15362b5bcd63cca8d0a48';
 
-const hex = (bytes) => [...bytes].map((b) => Number(b).toString(16).padStart(2, '0')).join('');
+const hex = bytes => [...bytes].map(b => Number(b).toString(16).padStart(2, '0')).join('');
 
 test('derives the same AES key as the Java client (PBKDF2-HMAC-SHA512, 600k iters)', async () => {
 	assert.equal(await deriveKeyBytesHex(PASSPHRASE, CHANNEL), EXPECTED_KEY_HEX);

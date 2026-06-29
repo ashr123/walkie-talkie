@@ -15,7 +15,7 @@ const FRAME_SAMPLES = 960; // 20 ms @ 48 kHz mono
 class CaptureProcessor extends AudioWorkletProcessor {
 	constructor(options) {
 		super();
-		this._channels = (options && options.processorOptions && options.processorOptions.channels) || 1;
+		this._channels = options && options.processorOptions && options.processorOptions.channels || 1;
 		this._pcm = new ArrayBuffer(FRAME_SAMPLES * this._channels * 2);
 		this._view = new DataView(this._pcm);
 		this._offset = 0; // per-channel sample index into the current frame
@@ -50,11 +50,11 @@ class CaptureProcessor extends AudioWorkletProcessor {
 class PlaybackProcessor extends AudioWorkletProcessor {
 	constructor(options) {
 		super();
-		this._channels = (options && options.processorOptions && options.processorOptions.channels) || 1;
+		this._channels = options && options.processorOptions && options.processorOptions.channels || 1;
 		this._queue = [];
 		this._current = null;
 		this._pos = 0; // per-channel sample index into the current (interleaved) frame
-		this.port.onmessage = (event) => {
+		this.port.onmessage = event => {
 			// event.data is interleaved Float32 already matched to the output channel count.
 			const frame = new Float32Array(event.data);
 			// Bound the buffer so a fast sender can't grow playback latency without limit.
