@@ -284,10 +284,11 @@
 		<label for="ownerSelect" hidden id="ownerLabel" style="margin-top:8px;">Channel owner</label>
 		<select hidden id="ownerSelect"></select>
 		<button hidden id="applyBtn" style="width:100%; margin-top:8px;">Apply changes</button>
-		<div class="hint" hidden id="applyHint">Change the transport, mode, channel or passphrase above, then click.
-			A new channel name switches rooms (carrying the chosen properties); otherwise the change applies to the
-			current channel — mode and passphrase are owner-only, and changing the transport reconnects. Clear the
-			passphrase and Apply to turn encryption off.</div>
+		<button class="secondary" hidden id="resetBtn" style="width:100%; margin-top:8px;">Reset</button>
+		<div class="hint" hidden id="applyHint">Change the transport, mode, channel, passphrase, or owner above, then
+			Apply — or Reset to discard the pending changes. A new channel name switches rooms (carrying the chosen
+			properties); otherwise the change applies to the current channel — mode, passphrase and ownership are
+			owner-only, and changing the transport reconnects. Clear the passphrase and Apply to turn encryption off.</div>
 		<label hidden id="shareRekeyRow" style="align-items:center; gap:8px; margin-top:8px;">
 			<input checked id="shareRekey" style="width:auto;" type="checkbox"> <span id="shareRekeyText">Share new passphrase with current members (uncheck to require everyone to re-enter it)</span>
 		</label>

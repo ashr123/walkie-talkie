@@ -291,10 +291,38 @@ async function applyOrSwitch() {
 		}
 		acted = true;
 	}
+	// Ownership transfer is an in-place change too — applied here (not live on dropdown selection), and LAST so any
+	// mode/passphrase change above is processed while we still own the channel, before we hand it off.
+	if (iAmOwner && byId('ownerSelect').value !== state.ownerId) {
+		const newOwnerId = byId('ownerSelect').value;
+		sendCtrl({type: 'transferOwnership', newOwnerId});
+		log('Transferring ownership to ' + (state.members.get(newOwnerId) || newOwnerId) + '…');
+		acted = true;
+	}
 	if (!acted) {
 		log('Nothing to apply.');
 	}
 	updateApplyControls();
+}
+
+// Reset (cancel): restore every editable channel-property field — transport, mode, channel, passphrase, and the
+// owner dropdown — to its current live value, so nothing is pending and the Apply/Switch + Reset buttons (and the
+// hint) disappear together. Mirrors exactly the fields updateApplyControls compares against state.
+function resetApplyControls() {
+	if (!isOpen()) {
+		return;
+	}
+	byId('transport').value = state.transport;
+	byId('mode').value = state.mode;
+	byId('ownerSelect').value = state.ownerId;
+	// Restore the channel directly, discarding any stashed pre-global value so updateGlobalModeLocks' global lock
+	// can't repopulate it with a stale name; then re-apply the restored mode's locks/visibility below.
+	const channelInput = byId('channel');
+	delete channelInput.dataset.userValue;
+	channelInput.value = state.channel;
+	byId('passphrase').value = state.passphrase || '';
+	updateGlobalModeLocks();   // re-apply the restored mode's channel/passphrase locks + visibility
+	updateApplyControls();     // nothing pending now → Apply/Switch + Reset + hint hide
 }
 
 // Reflects whether the adaptive button can act and what it does. Shown only while connected; labeled
@@ -305,6 +333,7 @@ function updateApplyControls() {
 	const hint = byId('applyHint');
 	if (!isOpen()) {
 		btn.hidden = true;
+		byId('resetBtn').hidden = true;
 		hint.hidden = true;
 		byId('shareRekeyRow').hidden = true;   // a rotation control — meaningless until connected
 		byId('shareRekey').checked = true;     // back to the default-checked (auto-share) state
@@ -320,16 +349,23 @@ function updateApplyControls() {
 	const channelValid = mode === 'GLOBAL_PTT' || CHANNEL_NAME.test(channelField);
 	const passphraseValue = byId('passphrase').value;
 	const passphraseChanged = passphraseValue !== (state.passphrase || '');
+	const iAmOwner = state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	// A pending OWNERSHIP transfer: the owner picked a different member in the dropdown. It's an in-place action
+	// (you can't hand off a channel you're switching away from), so it counts only when the channel is unchanged;
+	// it is applied — not sent live on selection — by the adaptive button, alongside any mode/passphrase change.
+	const ownerSelectChanged = iAmOwner && !channelChanged && byId('ownerSelect').value !== state.ownerId;
 	const changed = channelChanged
 		|| transport !== state.transport
 		|| mode !== state.mode
-		|| transport === 'relay' && passphraseChanged;
+		|| transport === 'relay' && passphraseChanged
+		|| ownerSelectChanged;
 	// No disabled state: the button — and its explanatory hint — appear ONLY when there's something to do (a
 	// pending property change, or a member re-key to adopt) AND the channel name is valid, and are hidden
 	// otherwise. The label switches between "Switch channel" (the channel name changed → a fresh join) and
 	// "Apply changes" (in-place edit).
 	const actionable = (changed && channelValid) || state.rekeyPending;
 	btn.hidden = !actionable;
+	byId('resetBtn').hidden = !actionable;   // Reset (cancel) appears and disappears together with Apply/Switch
 	hint.hidden = !actionable;
 	btn.textContent = channelChanged ? 'Switch channel' : 'Apply changes';
 
@@ -338,7 +374,6 @@ function updateApplyControls() {
 	// pick its properties). A non-owner staying on the current channel can change none of them — the passphrase
 	// is the one exception, re-enabling to ADOPT an owner's announced re-key (rekeyPending). In GLOBAL_PTT the
 	// passphrase stays locked by updateGlobalModeLocks (encryption isn't allowed there), so leave it alone here.
-	const iAmOwner = state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
 	const inGlobalRoom = state.ownerId === SERVER_OWNER;
 	const lockedForMember = !iAmOwner && !channelChanged;
 	// The Mode selector is ALSO the only way to LEAVE the server-managed global room: its channel field is locked
@@ -382,10 +417,11 @@ function updateApplyControls() {
 	// (rotation + canAutoShare: leave .checked alone, so a manual uncheck isn't undone on the next keystroke)
 }
 
-// The owner dropdown: lists members and lets the current owner hand ownership to another (selecting a different
-// member sends transferOwnership; the echoed ownerChanged is what actually moves the controls). Shown ONLY to
-// the current owner — everyone else already sees who owns the channel via the crown in the members list, so a
-// disabled dropdown would just be confusing noise. Rebuilt with the roster (called from renderMembers).
+// The owner dropdown: lists members and lets the current owner hand ownership to another. Selecting a different
+// member is a PENDING change applied via "Apply changes" (not sent live); the echoed ownerChanged is what
+// actually moves the controls. Shown ONLY to the current owner — everyone else already sees who owns the channel
+// via the crown in the members list, so a disabled dropdown would just be confusing noise. Rebuilt with the
+// roster (called from renderMembers), which resets the selection to the current owner.
 function renderOwnerSelect() {
 	const select = byId('ownerSelect');
 	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
@@ -394,6 +430,7 @@ function renderOwnerSelect() {
 	if (!iAmOwner) {
 		return;
 	}
+	const pendingPick = select.value;   // the owner's in-progress (un-Applied) selection, captured before the rebuild
 	select.replaceChildren(...[...state.members.entries()]
 		.sort(([, a], [, b]) => a.localeCompare(b, undefined, {sensitivity: 'base'}))
 		.map(([id, name]) => {
@@ -403,19 +440,14 @@ function renderOwnerSelect() {
 			opt.textContent = `${name} (#${id.slice(0, 8)})` + (id === state.selfId ? ' (you)' : '');
 			return opt;
 		}));
-	select.value = state.ownerId;
+	// Preserve a pending transfer target across a roster rebuild if that member is still present; fall back to the
+	// current owner only when there was no pick yet or the picked member has left. Reverting unconditionally would
+	// silently discard an in-progress transfer on any unrelated join/leave/rename. (renderMembers re-runs
+	// updateApplyControls after this, so the Apply/Reset buttons re-settle if the pick was dropped.)
+	select.value = state.members.has(pendingPick) ? pendingPick : state.ownerId;
 	select.disabled = false;   // we are the owner
 }
 
-function onOwnerSelectChange() {
-	const newOwnerId = byId('ownerSelect').value;
-	if (!isOpen() || state.selfId !== state.ownerId || newOwnerId === state.ownerId) {
-		byId('ownerSelect').value = state.ownerId;   // revert a stray change (non-owner / no-op)
-		return;
-	}
-	sendCtrl({type: 'transferOwnership', newOwnerId});
-	log('Transferring ownership to ' + (state.members.get(newOwnerId) || newOwnerId) + '…');
-}
 
 function sendCtrl(obj) {
 	if (isOpen()) {
@@ -655,8 +687,10 @@ function onWsMessage(ev) {
 				disconnect();
 			} else if (msg.code === 'not_owner' || msg.code === 'unknown_target') {
 				// A rejected ownership transfer leaves the dropdown showing the failed target — snap it back to the
-				// real owner (state.ownerId is unchanged on a rejection).
+				// real owner (state.ownerId is unchanged on a rejection) and settle the Apply button (the pending
+				// transfer is gone, so it should hide unless something else is still pending).
 				renderOwnerSelect();
+				updateApplyControls();
 			}
 			break;
 		default:
@@ -1491,6 +1525,7 @@ function renderMembers() {
 			ul.appendChild(li);
 		});
 	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
+	updateApplyControls(); // re-settle Apply/Reset: a rebuild may have dropped a now-departed pending owner pick
 }
 
 function enableTalkButton(enabled) {
@@ -1569,6 +1604,7 @@ function cleanup() {
 	byId('renameBtn').hidden = true;
 	byId('renameHint').hidden = true;
 	byId('applyBtn').hidden = true;
+	byId('resetBtn').hidden = true;
 	byId('applyHint').hidden = true;
 	byId('ownerSelect').hidden = true;
 	byId('ownerLabel').hidden = true;
@@ -1599,7 +1635,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
 	byId('renameBtn').addEventListener('click', rename);
 	byId('applyBtn').addEventListener('click', applyOrSwitch);
-	byId('ownerSelect').addEventListener('change', onOwnerSelectChange);
+	byId('resetBtn').addEventListener('click', resetApplyControls);
+	byId('ownerSelect').addEventListener('change', updateApplyControls);   // a pending transfer; applied via the button
 	// Re-evaluate the adaptive Switch/Apply button as the form fields change (mode is handled in its own listener).
 	byId('channel').addEventListener('input', updateApplyControls);
 	byId('passphrase').addEventListener('input', updateApplyControls);
