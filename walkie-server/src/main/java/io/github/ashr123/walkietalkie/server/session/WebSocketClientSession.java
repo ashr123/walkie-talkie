@@ -57,7 +57,7 @@ public final class WebSocketClientSession implements ClientSession {
 
 	private final BlockingQueue<Runnable> controlOut = new LinkedBlockingQueue<>(CONTROL_CAPACITY);
 	private final BlockingQueue<Runnable> audioOut = new LinkedBlockingQueue<>(AUDIO_CAPACITY);
-	private final AtomicBoolean closed = new AtomicBoolean(false);
+	private final AtomicBoolean closed = new AtomicBoolean();
 	// volatile so stopPump()/close() on another thread reliably observes the drainer assigned by start()
 	// (their only happens-before edge is the session's publication, which precedes the drainer write).
 	private volatile Thread drainer;   // the single consumer; started by start() after the session is registered

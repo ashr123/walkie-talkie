@@ -70,7 +70,7 @@ public final class WalkieClient implements AutoCloseable {
 	private final HttpClient httpClient;
 
 	private final AtomicBoolean running = new AtomicBoolean(true);
-	private final AtomicBoolean closed = new AtomicBoolean(false);   // guards close() so it is idempotent
+	private final AtomicBoolean closed = new AtomicBoolean();   // guards close() so it is idempotent
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
 	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
 	private final AudioEngine audio;

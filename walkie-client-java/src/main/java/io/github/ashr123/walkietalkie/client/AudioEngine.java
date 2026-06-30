@@ -44,11 +44,12 @@ final class AudioEngine implements AutoCloseable {
 
 	private final ClientOptions options;
 	private final Consumer<byte[]> frameSink;            // captured [tag][opus] frames -> caller (encrypt + send)
-	private final AtomicBoolean running = new AtomicBoolean(true);
-	private final AtomicBoolean closed = new AtomicBoolean(false);   // guards close() so it is idempotent
-	private final AtomicBoolean transmitting = new AtomicBoolean(false);
-	/// Toggled live ('f' on the console); the capture thread rebuilds the encoder when it changes.
-	private final AtomicBoolean highFidelity;
+	// get/set only (a stop flag and two toggles) — visibility is all that's needed, so a volatile boolean suffices.
+	private volatile boolean running = true;
+	private final AtomicBoolean closed = new AtomicBoolean();   // guards close() so it is idempotent (atomic test-and-set)
+	private volatile boolean transmitting;
+	/// Toggled live ('f' on the console — single writer); the capture thread rebuilds the encoder when it changes.
+	private volatile boolean highFidelity;
 	/// Per-sender decode/playback lanes (relay full-duplex), keyed by the server-assigned stream index. The
 	/// playback thread mixes one 20 ms frame from each lane per tick; each lane owns its decoder + jitter buffer.
 	private final Map<Integer, Lane> lanes = new ConcurrentHashMap<>();
@@ -65,7 +66,7 @@ final class AudioEngine implements AutoCloseable {
 	AudioEngine(ClientOptions options, Consumer<byte[]> frameSink) {
 		this.options = options;
 		this.frameSink = frameSink;
-		this.highFidelity = new AtomicBoolean(options.highFidelity());
+		this.highFidelity = options.highFidelity();
 	}
 
 	private static boolean lineSupported(Mixer.Info mixerInfo, DataLine.Info lineInfo) {
@@ -100,7 +101,7 @@ final class AudioEngine implements AutoCloseable {
 		if (!closed.compareAndSet(false, true)) {
 			return;   // already closed
 		}
-		running.set(false);
+		running = false;
 		if (mic != null) {
 			mic.stop();
 			mic.close();
@@ -117,7 +118,7 @@ final class AudioEngine implements AutoCloseable {
 	/// A human-readable summary for the startup banner, e.g. `Opus 48 kHz + FEC, mono (voice profile)`.
 	String description() {
 		return "Opus 48 kHz + FEC, " + (channels == 2 ? "stereo" : "mono")
-				+ " (" + (highFidelity.get() ? "music" : "voice") + " profile)";
+				+ " (" + (highFidelity ? "music" : "voice") + " profile)";
 	}
 
 	/// Queues an already-decrypted `[codec tag][payload]` frame from the sender with stream index `sid` for
@@ -133,18 +134,18 @@ final class AudioEngine implements AutoCloseable {
 
 	/// Whether captured audio is currently being emitted to the sink (mic is "live").
 	boolean isTransmitting() {
-		return transmitting.get();
+		return transmitting;
 	}
 
 	void setTransmitting(boolean on) {
-		transmitting.set(on);
+		transmitting = on;
 	}
 
 	/// Flips the hi-fi (Opus music vs voice) profile; the capture thread rebuilds the encoder on its next
 	/// transmitted frame, so the change applies without reconnecting. Returns the new state.
 	boolean toggleHiFi() {
-		boolean hifi = !highFidelity.get();
-		highFidelity.set(hifi);
+		boolean hifi = !highFidelity;
+		highFidelity = hifi;
 		return hifi;
 	}
 
@@ -243,7 +244,7 @@ final class AudioEngine implements AutoCloseable {
 	/// the setting is toggled live, so it is only ever touched from that one thread (the encoder is confined
 	/// to it). The Opus *application* mode is fixed at construction, so a live switch rebuilds the encoder.
 	private void configureEncoder() throws OpusException {
-		boolean hifi = highFidelity.get();
+		boolean hifi = highFidelity;
 		encoder = new OpusEncoder(
 				(int) SAMPLE_RATE,
 				channels,
@@ -262,17 +263,17 @@ final class AudioEngine implements AutoCloseable {
 		byte[] buffer = new byte[pcmFrameBytes];
 		short[] pcm = new short[frameSamples];
 		byte[] packet = new byte[MAX_PACKET_BYTES];
-		boolean appliedHifi = highFidelity.get();
-		while (running.get()) {
+		boolean appliedHifi = highFidelity;
+		while (running) {
 			// keep the mic flowing but don't transmit unless live; re-check running after a drained/closed line
-			if (!readFully(buffer) || !transmitting.get()) {
+			if (!readFully(buffer) || !transmitting) {
 				continue;
 			}
 			// Apply a live hi-fi toggle: rebuild the encoder (music vs voice profile) when it changed.
-			if (highFidelity.get() != appliedHifi) {
+			if (highFidelity != appliedHifi) {
 				try {
 					configureEncoder();
-					appliedHifi = highFidelity.get();
+					appliedHifi = highFidelity;
 				} catch (OpusException _) {
 					// keep the existing encoder if the rebuild fails
 				}
@@ -293,7 +294,7 @@ final class AudioEngine implements AutoCloseable {
 
 	private boolean readFully(byte[] buffer) {
 		int read = 0;
-		while (read < buffer.length && running.get()) {
+		while (read < buffer.length && running) {
 			int n = mic.read(buffer, read, buffer.length - read);
 			if (n <= 0) {
 				return false;
@@ -312,7 +313,7 @@ final class AudioEngine implements AutoCloseable {
 		int[] mix = new int[frameSamples];
 		short[] decoded = new short[frameSamples];
 		byte[] out = new byte[pcmFrameBytes];
-		while (running.get()) {
+		while (running) {
 			sweepLanes();
 			Arrays.fill(mix, 0);
 			for (Lane lane : lanes.values()) {
