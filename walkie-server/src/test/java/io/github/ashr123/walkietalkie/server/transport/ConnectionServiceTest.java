@@ -54,8 +54,19 @@ class ConnectionServiceTest {
 		return session.sent.stream().filter(type::isInstance).map(type::cast).reduce((_, b) -> b).orElseThrow();
 	}
 
+	/// The channel with `name`, which the caller expects to exist — fails the test with a clear message if it
+	/// doesn't, so callers can dereference the result without a null check (a missing channel surfaces as a
+	/// readable assertion, not a bare NPE). Use [#channelExists] to assert a channel is absent.
 	private Channel channel(String name) {
-		return channelRegistry.find(name) instanceof Some(Channel channel) ? channel : null;
+		return channelRegistry.find(name) instanceof Some(Channel channel)
+				? channel
+				: fail("expected channel '" + name + "' to exist");
+	}
+
+	/// Whether a channel with `name` currently exists — the absence counterpart to [#channel], for asserting a
+	/// channel was never created or was dropped once empty (where [#channel] would instead fail the test).
+	private boolean channelExists(String name) {
+		return channelRegistry.find(name) instanceof Some(Channel _);
 	}
 
 	private FakeClientSession join(String id, String channelName, ChannelMode mode) {
@@ -165,7 +176,7 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
 
 		assertEquals("other", firstOf(alice, ServerMessage.Joined.class).channel(), "joining a different channel switches");
-		assertNull(channel("team"), "the previous channel is left (and dropped once empty)");
+		assertFalse(channelExists("team"), "the previous channel is left (and dropped once empty)");
 		assertEquals(1, channel("other").size());
 	}
 
@@ -226,7 +237,7 @@ class ConnectionServiceTest {
 		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "has spaces", null));
 
 		assertEquals("invalid_display_name", firstOf(session, ServerMessage.ErrorMessage.class).code());
-		assertNull(channel("team"), "the channel is not created when the join is rejected");
+		assertFalse(channelExists("team"), "the channel is not created when the join is rejected");
 	}
 
 	@Test
@@ -482,7 +493,7 @@ class ConnectionServiceTest {
 
 		assertEquals("passphrase_mismatch", firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertNull(alice.channelName(), "a wrong-passphrase switch drops the client from BOTH channels");
-		assertNull(channel("team"), "the old channel was left (and dropped once empty)");
+		assertFalse(channelExists("team"), "the old channel was left (and dropped once empty)");
 		assertEquals(1, channel("other").size(), "the mismatched switcher was not added to the target");
 	}
 
@@ -568,7 +579,7 @@ class ConnectionServiceTest {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
 		assertEquals("reserved_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
-		assertNull(channel("global"), "the global channel is not created by a reserved-name rejection");
+		assertFalse(channelExists("global"), "the global channel is not created by a reserved-name rejection");
 	}
 
 	@Test
@@ -576,7 +587,7 @@ class ConnectionServiceTest {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.FULL_DUPLEX, "alice", null));
 		assertEquals("reserved_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
-		assertNull(channel("global"));
+		assertFalse(channelExists("global"));
 	}
 
 	@Test
@@ -584,7 +595,7 @@ class ConnectionServiceTest {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.GLOBAL_PTT, "alice", "kcv-X"));
 		assertEquals("encryption_not_allowed", firstOf(s, ServerMessage.ErrorMessage.class).code());
-		assertNull(channel("global"), "an encrypted join never creates the global channel");
+		assertFalse(channelExists("global"), "an encrypted join never creates the global channel");
 	}
 
 	@Test
@@ -631,7 +642,7 @@ class ConnectionServiceTest {
 	void theGlobalChannelIsRecreatedServerOwnedAfterEmptying() {
 		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
 		service.onClose(alice, "test close");
-		assertNull(channel("global"), "the global channel is dropped once empty");
+		assertFalse(channelExists("global"), "the global channel is dropped once empty");
 		FakeClientSession bob = join("bob", null, ChannelMode.GLOBAL_PTT);
 		assertEquals("server", firstOf(bob, ServerMessage.Joined.class).ownerId(),
 				"the recreated global channel is server-owned again");
@@ -718,7 +729,7 @@ class ConnectionServiceTest {
 		FakeClientSession s = session("orphan");
 		s.joinedChannel("ghost");
 		assertDoesNotThrow(() -> service.onMessage(s, new ClientMessage.Leave()));
-		assertNull(channel("ghost"), "no channel is resurrected");
+		assertFalse(channelExists("ghost"), "no channel is resurrected");
 		assertTrue(s.sent.isEmpty(), "a vanished-channel leave broadcasts nothing");
 	}
 
@@ -1076,7 +1087,7 @@ class ConnectionServiceTest {
 		// the synchronized acquire. A single-threaded mute-before-request only exercises the entry gate; this test
 		// drives the RE-CHECK by muting bob in the window AFTER it passed the entry gate but BEFORE it holds the
 		// monitor — the concurrent race the re-check exists to close.
-		FakeClientSession alice = join("alice", "floor-race", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		join("alice", "floor-race", ChannelMode.MULTI_CHANNEL_PTT);   // owner
 		FakeClientSession bob = join("bob", "floor-race", ChannelMode.MULTI_CHANNEL_PTT);
 		Channel channel = channel("floor-race");
 
@@ -1219,7 +1230,9 @@ class ConnectionServiceTest {
 		assertFalse(channel("mute-xfer").isMuted("bob"),
 				"the new owner is never muted — otherwise it could never talk and could not unmute itself");
 		assertTrue(bob.sent.stream().anyMatch(m ->
-						m instanceof ServerMessage.MemberMuted mm && mm.memberId().equals("bob") && !mm.muted()),
+						m instanceof ServerMessage.MemberMuted(
+								String memberId, boolean muted
+						) && memberId.equals("bob") && !muted),
 				"the channel is told the new owner was unmuted");
 		byte[] frame = {1, 2, 3};
 		alice.audio.clear();
@@ -1240,7 +1253,9 @@ class ConnectionServiceTest {
 		assertFalse(channel("mute-elect").isMuted("bob"),
 				"a departure-triggered auto-election of a muted member unmutes it (no muted-owner deadlock)");
 		assertTrue(bob.sent.stream().anyMatch(m ->
-						m instanceof ServerMessage.MemberMuted mm && mm.memberId().equals("bob") && !mm.muted()),
+						m instanceof ServerMessage.MemberMuted(
+								String memberId, boolean muted
+						) && memberId.equals("bob") && !muted),
 				"bob is told it was unmuted on promotion");
 	}
 
