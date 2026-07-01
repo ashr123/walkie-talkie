@@ -1071,6 +1071,42 @@ class ConnectionServiceTest {
 	}
 
 	@Test
+	void aMemberMutedBetweenTheFloorEntryGateAndTheMonitorIsStillRefused() throws InterruptedException {
+		// The floor-request mute check has TWO layers: a lock-free entry gate and an authoritative re-check inside
+		// the synchronized acquire. A single-threaded mute-before-request only exercises the entry gate; this test
+		// drives the RE-CHECK by muting bob in the window AFTER it passed the entry gate but BEFORE it holds the
+		// monitor — the concurrent race the re-check exists to close.
+		FakeClientSession alice = join("alice", "floor-race", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "floor-race", ChannelMode.MULTI_CHANNEL_PTT);
+		Channel channel = channel("floor-race");
+
+		Thread requester = new Thread(() -> service.onMessage(bob, new ClientMessage.RequestFloor()), "floor-race-requester");
+		synchronized (channel) {
+			// Hold the channel monitor, then start bob's request. bob passes the entry-gate mute check (it is NOT
+			// muted yet) and then blocks entering handleRequestFloor's synchronized acquire. A BLOCKED thread state
+			// requires contention, and this monitor is the ONLY one anyone contends (bob's rate-limit bucket is
+			// per-session and untouched here), so BLOCKED unambiguously means "parked here, past the entry gate" —
+			// no arbitrary sleep needed.
+			requester.start();
+			long deadlineNanos = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+			while (requester.getState() != Thread.State.BLOCKED && System.nanoTime() < deadlineNanos) {
+				Thread.onSpinWait();
+			}
+			assertEquals(Thread.State.BLOCKED, requester.getState(),
+					"bob's request must reach the synchronized floor acquire (past the lock-free entry gate)");
+			// Mute bob NOW, while it waits: the entry gate already saw it unmuted, so only the under-monitor
+			// re-check can catch it. setMuted is called under the monitor, honoring its contract.
+			channel.setMuted("bob", true);
+		}   // releasing the monitor lets bob proceed into the synchronized block and hit the re-check
+		requester.join(Duration.ofSeconds(5));
+
+		assertFalse(channel.holdsFloor("bob"),
+				"a member muted after passing the entry gate must STILL be refused by the under-monitor re-check");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
+				"no FloorGranted reaches the member muted mid-request");
+	}
+
+	@Test
 	void muteAllMutesEveryoneExceptTheOwner() {
 		FakeClientSession alice = join("alice", "mute-all", ChannelMode.FULL_DUPLEX);   // owner
 		FakeClientSession bob = join("bob", "mute-all", ChannelMode.FULL_DUPLEX);

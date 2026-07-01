@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.client;
 
+import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import org.junit.jupiter.api.Test;
 
 import java.security.GeneralSecurityException;
@@ -96,5 +97,34 @@ class WalkieClientTest {
 		FrameCrypto differentKey = FrameCrypto.fromPassphrase("some-other-key", "team");
 		assertThrows(GeneralSecurityException.class, () -> differentKey.unwrap(wrapped),
 				"only a holder of the wrapping (old) key can unwrap the new passphrase");
+	}
+
+	// --- full-duplex mic auto-open policy (shouldAutoOpenMic) ---------------------------------------
+
+	@Test
+	void fullDuplexAutoOpensTheMicByDefault() {
+		// Full-duplex, no --muted, not owner-muted: the mic goes live as soon as you join (or switch to full-duplex).
+		assertTrue(WalkieClient.shouldAutoOpenMic(ChannelMode.FULL_DUPLEX, false, false));
+	}
+
+	@Test
+	void pushToTalkModesNeverAutoOpenTheMic() {
+		// PTT/global require an explicit 't' to grab the floor — the mic never auto-opens, mute or not.
+		assertFalse(WalkieClient.shouldAutoOpenMic(ChannelMode.MULTI_CHANNEL_PTT, false, false));
+		assertFalse(WalkieClient.shouldAutoOpenMic(ChannelMode.GLOBAL_PTT, false, false));
+	}
+
+	@Test
+	void startMutedKeepsTheMicClosedInFullDuplex() {
+		// --muted: join full-duplex with the mic off until the user types 't'.
+		assertFalse(WalkieClient.shouldAutoOpenMic(ChannelMode.FULL_DUPLEX, true, false));
+	}
+
+	@Test
+	void ownerMutedKeepsTheMicClosedInFullDuplex() {
+		// THE FIX: an owner-muted member's mic must NOT auto-open on a full-duplex join or mode change — otherwise
+		// the client would report "mic is live" while the server drops every frame. Guards the Joined re-snapshot
+		// (a muted member re-joining its current channel) and the ModeChanged-to-full-duplex path.
+		assertFalse(WalkieClient.shouldAutoOpenMic(ChannelMode.FULL_DUPLEX, false, true));
 	}
 }

@@ -397,13 +397,20 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	/// Whether the mic should auto-open on a full-duplex join or mode change: full-duplex, not `--muted`, and not
-	/// currently owner-muted. The mute check keeps a muted member's mic closed — a member re-joining its current
-	/// channel re-snapshots itself as muted, and a switch to full-duplex must not open a muted member's mic —
-	/// mirroring the browser's `beginTransmit` mute guard. Frames would be dropped by [#sendAudioFrame] anyway, but
-	/// this keeps the local transmit state and the "mic is live" hint honest.
+	/// Whether the mic should auto-open on a full-duplex join or mode change, for the current session — reads our
+	/// `--muted` option and our own owner-mute state, then defers to the pure [#shouldAutoOpenMic(ChannelMode, boolean, boolean)].
 	private boolean shouldAutoOpenMic(ChannelMode mode) {
-		return mode == ChannelMode.FULL_DUPLEX && !options.startMuted() && !mutedMembers.contains(selfId);
+		return shouldAutoOpenMic(mode, options.startMuted(), mutedMembers.contains(selfId));
+	}
+
+	/// Pure decision behind the full-duplex mic auto-open: open only when the mode is full-duplex, the user did not
+	/// pass `--muted`, and the owner has not muted us (`selfMuted`). The mute term keeps a muted member's mic closed
+	/// — a member re-joining its current channel re-snapshots itself as muted, and a switch to full-duplex must not
+	/// open a muted member's mic — mirroring the browser's `beginTransmit` guard. Frames would be dropped by
+	/// [#sendAudioFrame] anyway, but this keeps the local transmit state and the "mic is live" hint honest.
+	/// Extracted static (like [#outboundFrame]) so this policy is unit-testable without a live socket.
+	static boolean shouldAutoOpenMic(ChannelMode mode, boolean startMuted, boolean selfMuted) {
+		return mode == ChannelMode.FULL_DUPLEX && !startMuted && !selfMuted;
 	}
 
 	/// A member changed its display name (its session id — the routing identity — is unchanged). Update the
