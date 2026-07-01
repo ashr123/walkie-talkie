@@ -960,6 +960,269 @@ class ConnectionServiceTest {
 				"the control message past the per-session rate cap is dropped before dispatch");
 	}
 
+	// --- owner-enforced mute -----------------------------------------------------------------------
+
+	@Test
+	void theOwnerMutesAMemberAndTheServerDropsThatMembersAudio() {
+		FakeClientSession alice = join("alice", "mute", ChannelMode.FULL_DUPLEX);   // alice is the owner
+		FakeClientSession bob = join("bob", "mute", ChannelMode.FULL_DUPLEX);
+
+		byte[] frame = {1, 2, 3};
+		service.onAudio(bob, frame);
+		assertEquals(1, alice.audio.size(), "before muting, bob's audio is relayed");
+
+		alice.sent.clear();
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+
+		assertTrue(channel("mute").isMuted("bob"), "the server records bob as muted");
+		// MemberMuted is broadcast to the whole channel, including the muted member (so its client can stop).
+		assertEquals("bob", firstOf(bob, ServerMessage.MemberMuted.class).memberId());
+		assertTrue(firstOf(bob, ServerMessage.MemberMuted.class).muted());
+		assertTrue(firstOf(alice, ServerMessage.MemberMuted.class).muted(), "the owner is notified too");
+
+		alice.audio.clear();
+		service.onAudio(bob, frame);
+		assertEquals(0, alice.audio.size(), "a muted member's audio is dropped server-side, not relayed");
+	}
+
+	@Test
+	void unmutingReenablesTheMembersAudio() {
+		FakeClientSession alice = join("alice", "unmute", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "unmute", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+
+		byte[] frame = {1, 2, 3};
+		service.onAudio(bob, frame);
+		assertEquals(0, alice.audio.size(), "while muted, bob's audio is dropped");
+
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", false));
+		assertFalse(channel("unmute").isMuted("bob"));
+		service.onAudio(bob, frame);
+		assertEquals(1, alice.audio.size(), "after unmuting, bob's audio is relayed again");
+	}
+
+	@Test
+	void aNonOwnerCannotMuteAnotherMember() {
+		join("alice", "nomute", ChannelMode.FULL_DUPLEX);   // alice owns it
+		FakeClientSession bob = join("bob", "nomute", ChannelMode.FULL_DUPLEX);
+
+		service.onMessage(bob, new ClientMessage.MuteMember("alice", true));
+		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertFalse(channel("nomute").isMuted("alice"), "a non-owner's mute request has no effect");
+	}
+
+	@Test
+	void mutingAnUnknownTargetOrTheOwnerItselfIsRejected() {
+		FakeClientSession alice = join("alice", "badtarget", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "badtarget", ChannelMode.FULL_DUPLEX);
+
+		service.onMessage(alice, new ClientMessage.MuteMember("ghost", true));
+		assertEquals("unknown_target", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+
+		alice.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteMember("alice", true));   // the owner can't mute itself
+		assertEquals("unknown_target", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertFalse(channel("badtarget").isMuted("alice"), "the owner is never muted");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MemberMuted.class::isInstance),
+				"a rejected mute (unknown target or the owner itself) broadcasts no MemberMuted to the channel");
+	}
+
+	@Test
+	void mutingTheFloorHolderFreesTheFloorAndTellsEveryone() {
+		FakeClientSession alice = join("alice", "mute-floor", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "mute-floor", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(bob, new ClientMessage.RequestFloor());
+		assertTrue(channel("mute-floor").holdsFloor("bob"), "bob is talking");
+
+		alice.sent.clear();
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+
+		assertFalse(channel("mute-floor").holdsFloor("bob"), "muting the floor holder frees the floor");
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+				"the muted (ex-)holder is told the floor is idle so its client stops transmitting");
+		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+				"the other members learn the floor reopened");
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.MemberMuted mm && mm.muted()),
+				"bob is also told it was muted");
+	}
+
+	@Test
+	void aMutedMemberIsRefusedTheFloor() {
+		FakeClientSession alice = join("alice", "muted-floor-req", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "muted-floor-req", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+
+		bob.sent.clear();
+		service.onMessage(bob, new ClientMessage.RequestFloor());
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
+				"a muted member is refused the floor, so it can't seize and hold it");
+		assertFalse(channel("muted-floor-req").holdsFloor("bob"), "the muted member never acquires the floor");
+
+		// Positive control: once unmuted, the SAME request in the SAME channel succeeds — proving the refusal above
+		// was the mute (not an unrelated floor bug), and that unmuting restores floor eligibility.
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", false));
+		bob.sent.clear();
+		service.onMessage(bob, new ClientMessage.RequestFloor());
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorGranted.class::isInstance),
+				"an unmuted member is granted the floor");
+		assertTrue(channel("muted-floor-req").holdsFloor("bob"));
+	}
+
+	@Test
+	void muteAllMutesEveryoneExceptTheOwner() {
+		FakeClientSession alice = join("alice", "mute-all", ChannelMode.FULL_DUPLEX);   // owner
+		FakeClientSession bob = join("bob", "mute-all", ChannelMode.FULL_DUPLEX);
+		FakeClientSession carol = join("carol", "mute-all", ChannelMode.FULL_DUPLEX);
+
+		service.onMessage(alice, new ClientMessage.MuteAll(true));
+
+		Channel channel = channel("mute-all");
+		assertFalse(channel.isMuted("alice"), "the owner is never muted by mute-all");
+		assertTrue(channel.isMuted("bob"));
+		assertTrue(channel.isMuted("carol"));
+
+		byte[] frame = {1, 2, 3};
+		alice.audio.clear();
+		service.onAudio(bob, frame);
+		service.onAudio(carol, frame);
+		assertEquals(0, alice.audio.size(), "both muted members' audio is dropped");
+
+		bob.audio.clear();
+		carol.audio.clear();
+		service.onAudio(alice, frame);   // the owner is not muted and can still be heard
+		assertEquals(1, bob.audio.size(), "the owner can still talk");
+		assertEquals(1, carol.audio.size());
+	}
+
+	@Test
+	void muteIsIdempotentAndDoesNotReBroadcastAnUnchangedState() {
+		FakeClientSession alice = join("alice", "mute-idem", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "mute-idem", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));   // already muted -> no-op
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MemberMuted.class::isInstance),
+				"re-muting an already-muted member broadcasts nothing");
+	}
+
+	@Test
+	void theRosterSnapshotReportsEachMembersMuteState() {
+		FakeClientSession alice = join("alice", "mute-roster", ChannelMode.FULL_DUPLEX);
+		join("bob", "mute-roster", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+
+		// A later joiner's Joined snapshot must carry bob's muted state so its client renders it correctly.
+		FakeClientSession carol = join("carol", "mute-roster", ChannelMode.FULL_DUPLEX);
+		ServerMessage.Joined joined = firstOf(carol, ServerMessage.Joined.class);
+		assertTrue(joined.members().stream().anyMatch(m -> m.id().equals("bob") && m.muted()),
+				"the roster marks bob muted");
+		assertTrue(joined.members().stream().anyMatch(m -> m.id().equals("carol") && !m.muted()),
+				"a fresh joiner is not muted");
+	}
+
+	@Test
+	void leavingClearsTheMuteStateSoARejoinStartsUnmuted() {
+		FakeClientSession alice = join("alice", "mute-leave", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "mute-leave", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+		assertTrue(channel("mute-leave").isMuted("bob"));
+
+		service.onMessage(bob, new ClientMessage.Leave());
+		assertFalse(channel("mute-leave").isMuted("bob"), "leaving scrubs the mute state");
+
+		FakeClientSession bobAgain = join("bob", "mute-leave", ChannelMode.FULL_DUPLEX);   // same id reconnects
+		assertFalse(channel("mute-leave").isMuted("bob"), "the rejoining id is not muted");
+		byte[] frame = {1, 2, 3};
+		alice.audio.clear();
+		service.onAudio(bobAgain, frame);
+		assertEquals(1, alice.audio.size(), "the rejoined member is heard again");
+	}
+
+	@Test
+	void muteAllFreesTheFloorOfAMutedHolderInPtt() {
+		FakeClientSession alice = join("alice", "mute-all-floor", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "mute-all-floor", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(bob, new ClientMessage.RequestFloor());
+		assertTrue(channel("mute-all-floor").holdsFloor("bob"), "bob is talking");
+
+		alice.sent.clear();
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteAll(true));
+
+		assertFalse(channel("mute-all-floor").holdsFloor("bob"),
+				"mute-all frees the muted holder's floor too (via the same broadcastMute path as single mute)");
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+				"the muted ex-holder is told the floor is idle");
+	}
+
+	@Test
+	void unmutingAnAlreadyUnmutedMemberBroadcastsNothing() {
+		FakeClientSession alice = join("alice", "unmute-idem", ChannelMode.FULL_DUPLEX);
+		FakeClientSession bob = join("bob", "unmute-idem", ChannelMode.FULL_DUPLEX);   // never muted
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", false));   // no-op unmute
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MemberMuted.class::isInstance),
+				"unmuting an already-unmuted member is a no-op that broadcasts nothing");
+	}
+
+	@Test
+	void transferringOwnershipToAMutedMemberUnmutesTheNewOwner() {
+		FakeClientSession alice = join("alice", "mute-xfer", ChannelMode.FULL_DUPLEX);   // owner
+		FakeClientSession bob = join("bob", "mute-xfer", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+		assertTrue(channel("mute-xfer").isMuted("bob"));
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
+
+		assertEquals("bob", channel("mute-xfer").ownerId(), "bob is now the owner");
+		assertFalse(channel("mute-xfer").isMuted("bob"),
+				"the new owner is never muted — otherwise it could never talk and could not unmute itself");
+		assertTrue(bob.sent.stream().anyMatch(m ->
+						m instanceof ServerMessage.MemberMuted mm && mm.memberId().equals("bob") && !mm.muted()),
+				"the channel is told the new owner was unmuted");
+		byte[] frame = {1, 2, 3};
+		alice.audio.clear();
+		service.onAudio(bob, frame);
+		assertEquals(1, alice.audio.size(), "the new (unmuted) owner can be heard");
+	}
+
+	@Test
+	void autoElectingAMutedMemberAsOwnerUnmutesIt() {
+		FakeClientSession alice = join("alice", "mute-elect", ChannelMode.FULL_DUPLEX);   // owner
+		FakeClientSession bob = join("bob", "mute-elect", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+
+		bob.sent.clear();
+		service.onClose(alice, "owner disconnects");   // bob is the only member left -> auto-elected owner
+
+		assertEquals("bob", channel("mute-elect").ownerId(), "bob is auto-elected owner");
+		assertFalse(channel("mute-elect").isMuted("bob"),
+				"a departure-triggered auto-election of a muted member unmutes it (no muted-owner deadlock)");
+		assertTrue(bob.sent.stream().anyMatch(m ->
+						m instanceof ServerMessage.MemberMuted mm && mm.memberId().equals("bob") && !mm.muted()),
+				"bob is told it was unmuted on promotion");
+	}
+
+	@Test
+	void theGlobalRoomCannotBeMuted() {
+		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
+		join("bob", null, ChannelMode.GLOBAL_PTT);
+
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code(),
+				"no participant owns the server-managed global room, so no one can mute in it");
+		assertFalse(channel("global").isMuted("bob"));
+
+		alice.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteAll(true));
+		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+	}
+
 	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a
 	/// single failing recipient and still delivers to the others.
 	private static final class ThrowingSession implements ClientSession {

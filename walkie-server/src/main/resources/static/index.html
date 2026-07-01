@@ -191,6 +191,10 @@
             background: #0e151c;
             margin-bottom: 6px;
             font-size: 13px;
+            /* Flex row so the owner's per-member mute toggle can sit at the right edge (margin-left:auto). */
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
 
         /* .self is added at runtime by app.js (the "you" marker on your own roster entry). */
@@ -211,6 +215,43 @@
         ul#members li.speaking {
             background: #16321d;
             box-shadow: inset 3px 0 0 var(--ok);
+        }
+
+        /* A member the owner has muted: dim the row and show a speaker-off marker. Added at runtime by app.js. */
+        /*noinspection CssUnusedSymbol*/
+        ul#members li.muted {
+            opacity: 0.65;
+        }
+        /*noinspection CssUnusedSymbol*/
+        ul#members li .muted-badge {
+            color: var(--muted);
+        }
+
+        /* Owner-only moderation. The per-member mute/unmute toggle sits at the right edge of its roster row;
+           the "Mute all" toggle lives in the Members panel header. Both are hidden for non-owners (app.js). */
+        /*noinspection CssUnusedSymbol*/
+        ul#members li .member-mute {
+            margin-left: auto;
+            width: auto;
+            padding: 3px 9px;
+            font-size: 12px;
+        }
+
+        .members-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .members-header h2 {
+            margin: 0;
+        }
+
+        #muteAllBtn {
+            width: auto;
+            padding: 5px 11px;
+            font-size: 12px;
         }
 
         #log {
@@ -305,7 +346,10 @@
 		</div>
 		<div class="row" style="gap:20px; flex:1; min-height:0;">
 			<div class="panel" style="flex:1;">
-				<h2>Members</h2>
+				<div class="members-header">
+					<h2>Members</h2>
+					<button class="secondary" hidden id="muteAllBtn" type="button">Mute all</button>
+				</div>
 				<ul id="members"></ul>
 			</div>
 			<div class="panel" style="flex:2; display:flex; flex-direction:column;">

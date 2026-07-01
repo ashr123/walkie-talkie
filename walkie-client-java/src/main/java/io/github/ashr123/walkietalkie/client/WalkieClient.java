@@ -26,6 +26,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -73,6 +74,9 @@ public final class WalkieClient implements AutoCloseable {
 	private final AtomicBoolean closed = new AtomicBoolean();   // guards close() so it is idempotent
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
 	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
+	// Session ids the owner has muted (server-authoritative — the server also DROPS their relay audio). Read on the
+	// capture thread's frame sink (a lock-free concurrent set), mutated on the single listener thread from MemberMuted.
+	private final Set<String> mutedMembers = ConcurrentHashMap.newKeySet();
 	private final AudioEngine audio;
 	private final WebSocket webSocket;
 	// AES-256-GCM E2EE for the current channel, or null when no passphrase. Volatile + reassigned on an in-place
@@ -137,7 +141,9 @@ public final class WalkieClient implements AutoCloseable {
 				            c <channel> [mode] [key] = switch channel   n <name> = rename
 				            p [passphrase] = owner: change passphrase (blank = off; members auto-adopt) | member: adopt the owner's new one
 				            p! [passphrase] = owner: change passphrase WITHOUT auto-sharing (members must re-enter it)
-				            o <#id> = give ownership to a member (owner)   f = hi-fi on/off   q = quit   h = help
+				            o <#id> = give ownership to a member (owner)
+				            mute <#id|all> / unmute <#id|all> = mute/unmute members (owner)
+				            f = hi-fi on/off   q = quit   h = help
 				--------------------------------------------------------------------------------------------------""");
 	}
 
@@ -193,6 +199,12 @@ public final class WalkieClient implements AutoCloseable {
 	/// `currentChannelKeyCheck` *before* `crypto`, so the no-plaintext gate engages the instant encryption is
 	/// announced — it does not depend on us having derived the new key yet.
 	private void sendAudioFrame(byte[] frame) {
+		if (mutedMembers.contains(selfId)) {
+			// Owner-muted: drop before the wire. We also stop the mic on MemberMuted, so this only closes the brief
+			// window where a frame captured just before the mute lands here — the server drops it anyway, this is the
+			// authoritative local stop. A lock-free concurrent-set read, cheap on the per-frame path.
+			return;
+		}
 		try {
 			byte[] out = outboundFrame(frame, crypto, currentChannelKeyCheck);
 			if (out != null) {
@@ -240,11 +252,19 @@ public final class WalkieClient implements AutoCloseable {
 					// it either (it would clobber a pending rotation), mirroring the browser's onJoined.
 					currentChannelKeyCheck = crypto == null ? null : crypto.keyCheck();
 				}
-				// Full-duplex: the mic is live as soon as you join, unless --muted was passed; PTT/global start
-				// muted and require 't' to grab the floor. (Full-duplex transmit needs no floor request.)
-				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX && !options.startMuted());
 				memberNames.clear();
-				members.forEach(member -> memberNames.put(member.id(), member.displayName()));
+				mutedMembers.clear();
+				members.forEach(member -> {
+					memberNames.put(member.id(), member.displayName());
+					if (member.muted()) {
+						mutedMembers.add(member.id());   // seed the mute state so a member joining a channel with someone already muted renders it
+					}
+				});
+				// Full-duplex: the mic is live as soon as you join, unless --muted was passed; PTT/global start
+				// muted and require 't' to grab the floor. (Full-duplex transmit needs no floor request.) Done AFTER
+				// seeding mutedMembers so a member re-joining its current channel while muted keeps its mic closed —
+				// shouldAutoOpenMic checks the mute.
+				audio.setTransmitting(shouldAutoOpenMic(mode));
 				String ownerLine = SERVER_OWNER.equals(ownerId)
 						? "server-managed room — no owner, unencrypted"
 						: selfId.equals(ownerId)
@@ -261,6 +281,7 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.MemberJoined(MemberInfo member) -> announceJoin(member);
 			case ServerMessage.MemberLeft(String memberId) -> announceLeave(memberId);
 			case ServerMessage.MemberRenamed(String memberId, String displayName) -> announceRename(memberId, displayName);
+			case ServerMessage.MemberMuted(String memberId, boolean muted) -> handleMuteChange(memberId, muted);
 			case ServerMessage.FloorGranted _ -> {
 				audio.setTransmitting(true);
 				log("[floor granted] talking — type 't' to stop");
@@ -281,8 +302,10 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.FloorIdle _ -> log("[floor free]");
 			case ServerMessage.ModeChanged(ChannelMode mode) -> {
 				currentMode = mode;
-				// Match the browser: switching to full-duplex opens the mic (unless --muted); else it mutes.
-				audio.setTransmitting(mode == ChannelMode.FULL_DUPLEX && !options.startMuted());
+				// Match the browser: switching to full-duplex opens the mic (unless --muted or owner-muted); else it
+				// mutes. The mute check keeps a muted member's mic closed (and its "mic is live" hint honest) across
+				// a mode change — otherwise setTransmitting would report live while onAudio/sendAudioFrame drop it.
+				audio.setTransmitting(shouldAutoOpenMic(mode));
 				log("[mode changed] now " + mode + System.lineSeparator()
 						+ modeHint(mode, audio.isTransmitting()));
 			}
@@ -336,12 +359,51 @@ public final class WalkieClient implements AutoCloseable {
 
 	private void announceJoin(MemberInfo member) {
 		memberNames.put(member.id(), member.displayName());
+		if (member.muted()) {
+			mutedMembers.add(member.id());   // a fresh joiner is never pre-muted, but honor the flag defensively
+		}
 		log("[+] " + name(member.id()));
 	}
 
 	private void announceLeave(String memberId) {
 		log("[-] " + name(memberId));
 		memberNames.remove(memberId);
+		mutedMembers.remove(memberId);   // a mute never outlives the member (mirrors the server's Channel.remove)
+	}
+
+	/// The owner muted or unmuted a member. Server-authoritative: the server also DROPS a muted member's relay
+	/// audio, so this reflects enforcement rather than being it. Tracks the mute set for the roster; if WE are the
+	/// target, stops the mic at once and (in PTT) releases the floor so we don't hold it silently, and says why.
+	/// Runs on the single listener thread, so the read-then-act on `audio.isTransmitting()` needs no extra guard.
+	private void handleMuteChange(String memberId, boolean muted) {
+		if (muted) {
+			mutedMembers.add(memberId);
+		} else {
+			mutedMembers.remove(memberId);
+		}
+		if (!memberId.equals(selfId)) {
+			log("[" + (muted ? "muted" : "unmuted") + "] " + name(memberId) + " (by the owner)");
+			return;
+		}
+		if (muted) {
+			boolean wasTransmitting = audio.isTransmitting();
+			audio.setTransmitting(false);   // stop the mic immediately — best-effort locally; the server drops us regardless
+			if (wasTransmitting && currentMode != ChannelMode.FULL_DUPLEX) {
+				enqueue(new ClientMessage.ReleaseFloor());   // don't keep holding the PTT floor while muted
+			}
+			log("[muted] the channel owner muted you — you can't talk until unmuted.");
+		} else {
+			log("[unmuted] the channel owner unmuted you — type 't' to talk again.");
+		}
+	}
+
+	/// Whether the mic should auto-open on a full-duplex join or mode change: full-duplex, not `--muted`, and not
+	/// currently owner-muted. The mute check keeps a muted member's mic closed — a member re-joining its current
+	/// channel re-snapshots itself as muted, and a switch to full-duplex must not open a muted member's mic —
+	/// mirroring the browser's `beginTransmit` mute guard. Frames would be dropped by [#sendAudioFrame] anyway, but
+	/// this keeps the local transmit state and the "mic is live" hint honest.
+	private boolean shouldAutoOpenMic(ChannelMode mode) {
+		return mode == ChannelMode.FULL_DUPLEX && !options.startMuted() && !mutedMembers.contains(selfId);
 	}
 
 	/// A member changed its display name (its session id — the routing identity — is unchanged). Update the
@@ -373,11 +435,12 @@ public final class WalkieClient implements AutoCloseable {
 						.thenComparing(Map.Entry.comparingByKey()))   // lexicographic by name, then id
 				.map(entry -> {
 					String id = entry.getKey();
-					return name(id) + (id.equals(selfId)
+					String role = id.equals(selfId)
 							? " (you)"
 							: id.equals(ownerId)
 							  ? " (owner)"
-							  : "");
+							  : "";
+					return name(id) + role + (mutedMembers.contains(id) ? " [muted]" : "");
 				})
 				.collect(Collectors.joining(
 						System.lineSeparator() + "  - ",
@@ -400,6 +463,8 @@ public final class WalkieClient implements AutoCloseable {
 					case "p", "passphrase" -> changePassphrase(parts.length > 1 ? parts[1] : "", true);
 					case "p!" -> changePassphrase(parts.length > 1 ? parts[1] : "", false);
 					case "o", "owner" -> transferOwnership(parts.length > 1 ? parts[1] : "");
+					case "mute" -> muteMember(parts.length > 1 ? parts[1] : "", true);
+					case "unmute" -> muteMember(parts.length > 1 ? parts[1] : "", false);
 					case "n", "name" -> rename(parts.length > 1 ? parts[1] : "");
 					case "f", "fidelity" -> toggleFidelity();
 					case "w", "who", "members" -> listMembers();
@@ -407,7 +472,7 @@ public final class WalkieClient implements AutoCloseable {
 					case "h", "help" -> printHelp();
 					case "" -> { /* ignore blank lines */ }
 					default ->
-							System.out.println("Commands: 't' talk/stop, 'w' who's here, 'm <ptt|global|duplex>' mode, 'c <channel> [mode] [key]' switch channel, 'p [passphrase]' change passphrase, 'o <#id>' give ownership, 'n <name>' rename, 'f' hi-fi, 'q' quit, 'h' help.");
+							System.out.println("Commands: 't' talk/stop, 'w' who's here, 'm <ptt|global|duplex>' mode, 'c <channel> [mode] [key]' switch channel, 'p [passphrase]' change passphrase, 'o <#id>' give ownership, 'mute <#id|all>'/'unmute <#id|all>' moderate, 'n <name>' rename, 'f' hi-fi, 'q' quit, 'h' help.");
 				}
 			}
 		} catch (IOException _) {
@@ -416,6 +481,12 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	private void toggleTalk() {
+		if (mutedMembers.contains(selfId)) {
+			// Owner-muted: refuse. We already stopped the mic on MemberMuted, so we're not transmitting here; this
+			// just tells a user who tries to talk why they can't (the server would drop us and refuse us the floor).
+			log("[muted] you are muted by the channel owner — you can't talk until unmuted.");
+			return;
+		}
 		if (audio.isTransmitting()) {
 			audio.setTransmitting(false);
 			if (currentMode != ChannelMode.FULL_DUPLEX) {
@@ -686,18 +757,60 @@ public final class WalkieClient implements AutoCloseable {
 			System.out.println("Usage: o <id-prefix>  (the #id shown next to a member in 'w')");
 			return;
 		}
-		String needle = prefix;
-		List<String> matches = memberNames.keySet().stream()
-				.filter(id -> !id.equals(selfId) && id.startsWith(needle))
-				.toList();
+		List<String> matches = otherMembersMatching(prefix);
 		switch (matches.size()) {
-			case 0 -> log("[transfer] no other member's id starts with \"" + needle + "\" — use 'w' to list members.");
+			case 0 -> log("[transfer] no other member's id starts with \"" + prefix + "\" — use 'w' to list members.");
 			case 1 -> {
 				String target = matches.getFirst();
 				enqueue(new ClientMessage.TransferOwnership(target));
 				log("[transfer] handing ownership to " + name(target) + "...");
 			}
-			default -> log("[transfer] \"" + needle + "\" matches " + matches.size() + " members — use more of the id.");
+			default -> log("[transfer] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
+		}
+	}
+
+	/// The other members (never ourself) whose session id starts with `needle` — the shared resolution for the
+	/// id-prefix targeting used by `o` (transfer ownership) and `mute`/`unmute`. Ourself is excluded because none
+	/// of those actions apply to it (you can't transfer to, or mute, yourself).
+	private List<String> otherMembersMatching(String needle) {
+		return memberNames.keySet().stream()
+				.filter(id -> !id.equals(selfId) && id.startsWith(needle))
+				.toList();
+	}
+
+	/// `mute <#id|all>` / `unmute <#id|all>` — owner-only moderation. `all` mutes (or unmutes) every OTHER member at
+	/// once; otherwise the target is identified by the start of its session id (the `#`-prefix shown in 'w', a
+	/// leading `#` optional). Gated locally to the owner (the server enforces it too, and never trusts the client);
+	/// the resulting [ServerMessage.MemberMuted] broadcast is what actually updates the roster and stops a muted
+	/// member's mic. Applies immediately — there is no staged apply for moderation.
+	private void muteMember(String arg, boolean muted) {
+		String verb = muted ? "mute" : "unmute";
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can " + verb + " members");
+			return;
+		}
+		String prefix = arg.strip();
+		if (prefix.equalsIgnoreCase("all")) {
+			enqueue(new ClientMessage.MuteAll(muted));
+			log("[" + verb + "] " + verb + "-ing all other members...");
+			return;
+		}
+		if (prefix.startsWith("#")) {
+			prefix = prefix.substring(1);
+		}
+		if (prefix.isBlank()) {
+			System.out.println("Usage: " + verb + " <#id|all>  (the #id shown next to a member in 'w', or 'all')");
+			return;
+		}
+		List<String> matches = otherMembersMatching(prefix);
+		switch (matches.size()) {
+			case 0 -> log("[" + verb + "] no other member's id starts with \"" + prefix + "\" — use 'w' to list members.");
+			case 1 -> {
+				String target = matches.getFirst();
+				enqueue(new ClientMessage.MuteMember(target, muted));
+				log("[" + verb + "] " + verb + "-ing " + name(target) + "...");
+			}
+			default -> log("[" + verb + "] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
 		}
 	}
 

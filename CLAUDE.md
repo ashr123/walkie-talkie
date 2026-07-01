@@ -81,6 +81,24 @@ participant owns it** — its mode can't be changed (`not_owner`) and ownership 
 dropped when empty and recreated server-owned + unencrypted on the next join; clients render its owner as
 "server-managed".
 
+**Owner-enforced mute.** The owner can mute members (`MuteMember` for one, `MuteAll` for everyone but the owner
+→ broadcast `MemberMuted`, `ConnectionService.handleMuteMember` / `handleMuteAll`); the muted set is per-`Channel`
+state (`Channel.mutedMembers`, a `ConcurrentHashMap.newKeySet()`) surfaced in `MemberInfo.muted`. Enforcement is
+**server-side and does not trust the client**: `onAudio` drops a muted sender's frame (`Channel.isMuted`, a
+lock-free volatile-set read on the hot path, alongside the `holdsFloor` gate), and `handleRequestFloor` refuses a
+muted member the floor so it can't seize-and-hold it (blocking PTT) even though its audio would be dropped. Muting
+the current floor holder frees the floor (`releaseFloor` + broadcast `FloorIdle`) so a talking-then-muted member
+stops. **Enforcement is relay-only** — WebRTC media is peer-to-peer (DTLS-SRTP), so a WebRTC talker's mute is
+best-effort at its own client (it still gets `MemberMuted` and stops), matching the E2EE relay-only boundary.
+Only the owner may mute (`not_owner` otherwise); the owner can't mute itself and an unknown/left id is
+`unknown_target`; the ownerless `global` room can't be muted (`not_owner` via its sentinel owner). Concurrency
+mirrors the floor discipline: the mute flip + floor release + `MemberMuted` broadcast run under
+`synchronized(channel)`, and `Channel.remove` scrubs `mutedMembers` **under that same monitor** (with a
+membership re-check in the handler) so a leave can't race a mute into a ghost entry that outlives the member. Both
+clients reflect it: a muted member is shown 🔇/`[muted]`, and being muted disables the talk control ("Muted by
+owner" / refuses `t`) and stops the mic. Web mute buttons live in the Members column and apply immediately (not
+via the Apply/Reset flow); the Java client exposes `mute`/`unmute <#id|all>`.
+
 **In-place channel switch & rename.** A client changes channel/mode/passphrase **without a new socket**:
 re-sending `Join` on the live connection is handled as "leave the old channel, join the new one" on the same
 `WebSocketSession`, so the **session id (identity) and the audio loops survive** — only per-channel state

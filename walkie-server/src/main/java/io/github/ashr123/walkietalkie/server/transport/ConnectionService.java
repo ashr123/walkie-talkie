@@ -105,6 +105,8 @@ public class ConnectionService {
 					handleChangePassphrase(session, keyCheck, wrappedKey);
 			case ClientMessage.TransferOwnership(String newOwnerId) -> handleTransferOwnership(session, newOwnerId);
 			case ClientMessage.Rename(String displayName) -> handleRename(session, displayName);
+			case ClientMessage.MuteMember(String memberId, boolean muted) -> handleMuteMember(session, memberId, muted);
+			case ClientMessage.MuteAll(boolean muted) -> handleMuteAll(session, muted);
 			case ClientMessage.Offer(String target, String sdp) ->
 					relaySignal(session, target, new ServerMessage.SignalOffer(session.id(), sdp));
 			case ClientMessage.Answer(String target, String sdp) ->
@@ -215,7 +217,7 @@ public class ConnectionService {
 		// Tell the OTHER members about the joiner. This is intentionally OUTSIDE the registry lock: it concerns
 		// the joiner's visibility to others, not the joiner's own floor view, so it needs no floor serialization.
 		ServerMessage notice = new ServerMessage.MemberJoined(
-				new MemberInfo(session.id(), session.displayName(), channel.streamIndexOf(session.id())));
+				new MemberInfo(session.id(), session.displayName(), channel.streamIndexOf(session.id()), false));
 		channel.forEachOther(session.id(), other -> safeSend(other, notice));
 
 		// Identity (session + name) and the channel are carried by the MDC prefix now (the name advanced above,
@@ -258,6 +260,9 @@ public class ConnectionService {
 					// believing it is a member who has already left.
 					ServerMessage ownerMsg = new ServerMessage.OwnerChanged(channel.ownerId());
 					channel.forEachOther(session.id(), other -> safeSend(other, ownerMsg));
+					// Auto-election can promote a muted member (it picks any remaining member): the new owner is
+					// never muted, so unmute it if needed — else it would be a muted owner nobody can unmute.
+					unmuteOwnerIfMuted(channel);
 					log.info("ownership transferred to session={}", channel.ownerId());
 				}
 			}
@@ -272,6 +277,15 @@ public class ConnectionService {
 		if (channel == null) {
 			return;
 		}
+		if (channel.isMuted(session.id())) {
+			// The owner muted this member: refuse the floor outright so a muted member can't seize and HOLD it
+			// (which would block everyone else in a PTT channel even though onAudio drops the muted member's frames).
+			// A conforming client never asks — its talk control is disabled on MemberMuted — so this is the server
+			// enforcement boundary against a client that ignores its mute. Silent, like the onAudio frame drop.
+			// (Fast-path/full-duplex gate; the PTT acquire below re-checks under the monitor to close the race.)
+			log.debug("refused the floor to a muted member");
+			return;
+		}
 		if (channel.mode() == ChannelMode.FULL_DUPLEX) {
 			session.send(new ServerMessage.FloorGranted());
 			return;
@@ -280,6 +294,15 @@ public class ConnectionService {
 		// Acquire/preempt AND the grant broadcast happen under the floor monitor so the FloorGranted/FloorTaken
 		// can't interleave with a concurrent release's FloorIdle (which would otherwise reach the new holder).
 		synchronized (channel) {
+			// Re-check the mute UNDER the monitor: the entry-gate isMuted read above is lock-free and can be stale
+			// (a concurrent mute can have landed since). setMuted runs under this same monitor, so this read is
+			// authoritative — without it a member muted between the gate and here would still acquire (or preempt
+			// into) the single PTT floor and hold it, blocking the channel until the max-hold sweep (and, for a
+			// WebRTC holder, idle auto-release can never reclaim it). Mirrors the holdsFloor re-check in onAudio.
+			if (channel.isMuted(session.id())) {
+				log.debug("refused the floor to a member muted concurrently with its request");
+				return;
+			}
 			if (channel.tryAcquireFloor(session.id(), now)) {
 				grantFloor(channel, session);
 				log.debug("acquired the floor");
@@ -367,15 +390,19 @@ public class ConnectionService {
 	}
 
 	/// Relays a raw audio frame to the other relay-capable members of the sender's channel. The frame
-	/// is dropped when the sender is not currently authorized to talk (push-to-talk floor not held) or
-	/// when it violates the configured size bounds.
+	/// is dropped when the sender is not currently authorized to talk (push-to-talk floor not held), when
+	/// the owner has muted the sender, or when it violates the configured size bounds.
 	public void onAudio(ClientSession session, byte[] audio) {
 		if (!session.supportsAudioRelay()
 				|| audio.length == 0
 				|| audio.length > properties.maxAudioFrameBytes()
 				|| session.channelName() == null
 				|| !(channelRegistry.find(session.channelName()) instanceof Some(Channel channel))
-				|| !channel.holdsFloor(session.id())) {
+				|| !channel.holdsFloor(session.id())
+				// Owner-enforced mute: drop the frame server-side so a muted member (PTT holder or any
+				// full-duplex talker) can't route audio around a client that ignores its own mute. This is a
+				// lock-free volatile-set read on the hot path, mirroring the holdsFloor gate above.
+				|| channel.isMuted(session.id())) {
 			return;
 		}
 		// Push-to-talk hold limits (no-op in full-duplex, which has no single holder). The sender is the floor
@@ -595,9 +622,116 @@ public class ConnectionService {
 				synchronized (channel) {
 					ServerMessage ownerChanged = new ServerMessage.OwnerChanged(channel.ownerId());
 					channel.forEach(member -> safeSend(member, ownerChanged));
+					// The new owner is never muted: if the previous owner had muted this member before handing it
+					// ownership, unmute it now — otherwise it would be a muted owner with no way to unmute itself.
+					unmuteOwnerIfMuted(channel);
 				}
 				log.info("transferred ownership to {}", newOwnerId);
 			}
+		}
+	}
+
+	/// Mutes or unmutes one member's relay audio, on the owner's request only. This is server-ENFORCED: while a
+	/// member is muted, [#onAudio] drops its frames, so a client that ignores its own mute still can't be heard —
+	/// the trust boundary is the relay, not the sender. A non-owner gets `not_owner`; a target that isn't a current
+	/// member, or the owner itself (which can never be muted), gets `unknown_target`.
+	///
+	/// Concurrency: the membership re-check, the mute flip, the floor release (when the muted member was the one
+	/// talking) and the `MemberMuted` broadcast all run under the channel monitor — the same monitor every floor
+	/// transition and the mode/owner/passphrase broadcasts take — so the mute state, a freed floor and the notice
+	/// everyone sees stay consistent, and a member muted mid-transmission is dropped from the floor and told in one
+	/// atomic step. Enforcement engages within one frame: for a PTT floor holder the floor release above drops its
+	/// next frame at [#onAudio]'s under-monitor `holdsFloor` re-check, and [#handleRequestFloor] re-checks the mute
+	/// under the monitor so a just-muted member can't reacquire the floor. The [#onAudio] gate itself is a lock-free
+	/// hot-path read, so in FULL_DUPLEX a single frame already in flight when the mute lands may still be relayed
+	/// (bounded, real-time) — the mute is authoritative from the following frame. Enforcement is relay-only: WebRTC
+	/// media is peer-to-peer, so a WebRTC talker's mute is best-effort at its own client (it still gets `MemberMuted`
+	/// and stops).
+	///
+	/// The owner check reads the live `ownerId`; if a concurrent ownership transfer demotes the requester in the
+	/// window between the check and the mutation, its (already-authorized) mute may still land — harmless and
+	/// reversible moderation by the new owner, not a privilege leak (the requester WAS owner when it acted).
+	private void handleMuteMember(ClientSession session, String memberId, boolean muted) {
+		Channel channel = requireChannel(session);
+		if (channel == null) {
+			return;
+		}
+		String ownerId = channel.ownerId();
+		if (!session.id().equals(ownerId)) {
+			sendError(session, "not_owner", "Only the channel owner can mute members");
+			return;
+		}
+		// The owner can't mute itself, and only a current member can be muted. This is the friendly fast-path error;
+		// the authoritative membership test is re-done under the monitor below (a member can leave in between).
+		if (memberId == null || memberId.equals(ownerId) || !(channel.member(memberId) instanceof Some(ClientSession _))) {
+			sendError(session, "unknown_target", "No member '" + memberId + "' to mute in this channel");
+			return;
+		}
+		synchronized (channel) {
+			// Re-check membership under the monitor: leave scrubs the mute set under this same monitor after
+			// removing the member, so a target that left since the fast-path check is skipped here rather than
+			// leaving a ghost mute id that would outlive it (see Channel.remove). A silent no-op is right — the
+			// member is already gone (it got a MemberLeft), so there is nothing to mute and no error to report.
+			if (!(channel.member(memberId) instanceof Some(ClientSession _))) {
+				return;
+			}
+			if (!channel.setMuted(memberId, muted)) {
+				return;   // already in that state: nothing to free, nothing to broadcast
+			}
+			broadcastMute(channel, memberId, muted);
+		}
+		log.info("{} member {}", muted ? "muted" : "unmuted", memberId);
+	}
+
+	/// Mutes or unmutes EVERY other member of the channel at once, on the owner's request. The owner is never
+	/// muted. Same server enforcement and per-member `MemberMuted` broadcast (one for each member whose state
+	/// actually changed) as [#handleMuteMember]; a non-owner gets `not_owner`. If the current floor holder is among
+	/// those muted, its floor is freed too (via [#broadcastMute]).
+	private void handleMuteAll(ClientSession session, boolean muted) {
+		Channel channel = requireChannel(session);
+		if (channel == null) {
+			return;
+		}
+		String ownerId = channel.ownerId();
+		if (!session.id().equals(ownerId)) {
+			sendError(session, "not_owner", "Only the channel owner can mute members");
+			return;
+		}
+		synchronized (channel) {
+			// setMutedForAllExcept flips the whole roster under the monitor and returns only the ids that changed,
+			// so we broadcast exactly one MemberMuted per genuine transition (idempotent for members already in-state).
+			for (String memberId : channel.setMutedForAllExcept(ownerId, muted)) {
+				broadcastMute(channel, memberId, muted);
+			}
+		}
+		log.info("{} all members", muted ? "muted" : "unmuted");
+	}
+
+	/// Broadcasts one member's new mute state to the whole channel (so everyone renders it and the affected member
+	/// learns to disable its own talk control). MUST be called while holding the channel monitor. When muting takes
+	/// the floor from the muted member, the floor is freed first and a `FloorIdle` announced — so a member muted
+	/// mid-transmission stops talking and the floor reopens for others; unmuting never touches the floor.
+	private static void broadcastMute(Channel channel, String memberId, boolean muted) {
+		if (muted && channel.releaseFloor(memberId)) {
+			ServerMessage floorIdle = new ServerMessage.FloorIdle();
+			channel.forEach(member -> safeSend(member, floorIdle));
+		}
+		ServerMessage memberMuted = new ServerMessage.MemberMuted(memberId, muted);
+		channel.forEach(member -> safeSend(member, memberMuted));
+	}
+
+	/// Restores the "the channel owner is never muted" invariant after an ownership change — a deliberate
+	/// [#handleTransferOwnership] or the leave-triggered auto-election in [#handleLeave]. If the new owner had been
+	/// muted by the previous owner it would otherwise be **permanently locked out**: [#onAudio] drops its audio,
+	/// [#handleRequestFloor] refuses it the floor, and it can't unmute ITSELF ([#handleMuteMember] rejects the owner
+	/// as a mute target) with no one else owner to do it. So unmute it and tell the channel. MUST be called under
+	/// the channel monitor, after the ownership write. The global room's sentinel owner is never in the mute set,
+	/// so this is a no-op there.
+	private static void unmuteOwnerIfMuted(Channel channel) {
+		String owner = channel.ownerId();
+		if (channel.setMuted(owner, false)) {   // true only if the new owner really was muted — else no spurious notice
+			ServerMessage memberMuted = new ServerMessage.MemberMuted(owner, false);
+			channel.forEach(member -> safeSend(member, memberMuted));
 		}
 	}
 

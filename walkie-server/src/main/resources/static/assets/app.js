@@ -61,6 +61,7 @@ const state = {
 	warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
 	peers: new Map(),       // remoteId -> RTCPeerConnection (WebRTC)
 	members: new Map(),     // id -> displayName
+	mutedMembers: new Set(), // ids the owner has muted (server-authoritative; the server also DROPS their relay audio)
 	// Relay full-duplex: one decode/playback "lane" per sender, keyed by the server-assigned stream index,
 	// mixed natively by ctx.destination. The maps relate stream indices to member ids for lifecycle/binding.
 	lanes: new Map(),        // stream id (uint8) -> {node, decoder, decoderChannels, decodeTs, rxChain, memberId, lastSeen}
@@ -625,6 +626,9 @@ function onWsMessage(ev) {
 		case 'memberRenamed':
 			renameMember(msg.memberId, msg.displayName);
 			break;
+		case 'memberMuted':
+			onMemberMuted(msg.memberId, msg.muted);
+			break;
 		case 'floorGranted':
 			log('Floor granted — you are live');
 			beginTransmit();
@@ -773,6 +777,10 @@ function onModeChanged(mode) {
 function onOwnerChanged(ownerId) {
 	const becameOwner = state.selfId === ownerId && state.ownerId !== ownerId;
 	state.ownerId = ownerId;
+	// Re-render the roster so the crown moves to the new owner AND the owner-only moderation controls (per-member
+	// Mute/Unmute + "Mute all") appear for a just-promoted owner and vanish for the demoted one. An explicit
+	// TransferOwnership broadcasts only OwnerChanged (no membership churn), so nothing else would refresh them.
+	renderMembers();
 	updateModeControl();
 	// updateModeControl may have snapped the selector back to the live mode (e.g. ownership moved away while a
 	// pending GLOBAL_PTT pick was open); re-run the global locks so the channel/passphrase show/hide can't lag the
@@ -793,6 +801,38 @@ function onOwnerChanged(ownerId) {
 		updateApplyControls();
 		log('You became owner while your passphrase was unmatched — it was cleared. Type a passphrase you hold and click Apply to re-key the channel.');
 	}
+}
+
+// The owner muted or unmuted a member (server-authoritative — the server also DROPS a muted member's relay audio,
+// so this is enforcement we merely reflect, not the enforcement itself). Update the roster mark; if WE are the one
+// affected, stop transmitting immediately and lock/unlock our talk control so the UI matches what the relay does.
+function onMemberMuted(memberId, muted) {
+	if (muted) {
+		state.mutedMembers.add(memberId);
+	} else {
+		state.mutedMembers.delete(memberId);
+	}
+	if (memberId === state.selfId) {
+		if (muted) {
+			// We were muted. Stop our mic right now (best-effort on WebRTC, whose media is peer-to-peer and can't be
+			// relay-enforced; authoritative on the relay path, where onCapturedFrame also gates on state.transmitting).
+			// This covers PTT/global (drop the floor locally) and full-duplex (close the always-open mic) alike.
+			if (state.transmitting) {
+				endTransmit();
+				if (state.mode !== 'FULL_DUPLEX') {
+					sendCtrl({type: 'releaseFloor'});   // let the floor go so it isn't held idle in our name
+				}
+			}
+			log('You were muted by the channel owner — you cannot talk until unmuted.');
+		} else {
+			log('You were unmuted by the channel owner — tap Talk to speak again.');
+		}
+		updateTalkButton();   // re-render the talk control's disabled state + label for the new mute state
+	} else {
+		log((state.members.get(memberId) || memberId) + (muted ? ' was muted' : ' was unmuted') + ' by the owner');
+	}
+	// Re-render the roster: the muted mark and (for the owner) each row's Mute/Unmute label follow state.mutedMembers.
+	renderMembers();
 }
 
 // Reflects the live mode in the selector and lets only the owner change it while connected; when
@@ -864,6 +904,9 @@ function lockInGlobalMode(input, hint, lockedValue, global) {
 // --- talk control ---------------------------------------------------------------------------------
 
 function pressTalk() {
+	if (state.mutedMembers.has(state.selfId)) {
+		return;   // owner-muted — the button is disabled too; this also guards the hold-Space path
+	}
 	if (state.mode === 'FULL_DUPLEX') {
 		if (state.transmitting) {
 			endTransmit();
@@ -889,6 +932,13 @@ function releaseTalk() {
 }
 
 function beginTransmit() {
+	if (state.mutedMembers.has(state.selfId)) {
+		// Owner-muted: never open the mic — guards the full-duplex auto-open on join and any stray floorGranted.
+		state.transmitting = false;
+		enableLocalTracks(false);
+		updateTalkButton();
+		return;
+	}
 	state.transmitting = true;
 	enableLocalTracks(true);
 	// PTT/global: holding the floor = "speaking". In full-duplex the mic is always open, so it's driven by
@@ -1408,6 +1458,13 @@ function closePeer(remoteId) {
 
 function addMember(member) {
 	state.members.set(member.id, member.displayName);
+	// Seed the owner-mute state from the roster snapshot, so a member joining a channel where someone is already
+	// muted renders that correctly (and, if it is us, our talk control starts disabled — see updateTalkButton).
+	if (member.muted) {
+		state.mutedMembers.add(member.id);
+	} else {
+		state.mutedMembers.delete(member.id);
+	}
 	if (member.streamId !== undefined && member.streamId !== null) {
 		state.streamOf.set(member.id, member.streamId);
 		state.memberOfStream.set(member.streamId, member.id);
@@ -1436,6 +1493,7 @@ function removeMember(id) {
 		state.floorSpeaker = null;
 	}
 	state.members.delete(id);
+	state.mutedMembers.delete(id);   // a mute never outlives the member (mirrors the server's Channel.remove)
 	const sid = state.streamOf.get(id);
 	if (sid !== undefined) {
 		closeLane(sid);   // free the departed member's decoder immediately
@@ -1491,6 +1549,9 @@ function renderMembers() {
 	const ul = byId('members');
 	ul.replaceChildren();
 	state.memberLis.clear();
+	// Only the channel owner sees the moderation controls (per-member Mute/Unmute + "Mute all"); the server
+	// enforces the same rule, so this is UI convenience, not the security boundary. Never for the ownerless global room.
+	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
 	// Always append a short session-id prefix after the display name (the session id is the real identity —
 	// names aren't unique); the full id is on hover. Lexicographic (case-insensitive) by name, then by id.
 	[...state.members.entries()]
@@ -1519,13 +1580,51 @@ function renderMembers() {
 			// textContent (not innerHTML) so a crafted display name can't inject markup.
 			nameSpan.textContent = label;
 			li.appendChild(nameSpan);
+			// Muted members are dimmed and flagged with a speaker-off marker, so everyone (not just the owner) can
+			// see who the owner has silenced. The badge's margin-left:auto right-aligns it (and the button after it).
+			const muted = state.mutedMembers.has(id);
+			if (muted) {
+				li.classList.add('muted');
+				const badge = document.createElement('span');
+				badge.className = 'muted-badge';
+				badge.textContent = '🔇';
+				badge.title = 'Muted by the owner';
+				li.appendChild(badge);
+			}
+			// The owner gets a per-member Mute/Unmute toggle (never on its own row — the owner can't mute itself).
+			// It applies immediately, without the Apply/Reset flow the mode/passphrase/owner changes use.
+			if (iAmOwner && id !== state.selfId) {
+				const muteBtn = document.createElement('button');
+				muteBtn.type = 'button';
+				muteBtn.className = 'secondary member-mute';
+				muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+				muteBtn.addEventListener('click', () => sendCtrl({type: 'muteMember', memberId: id, muted: !muted}));
+				li.appendChild(muteBtn);
+			}
 			// Re-apply the live speaking highlight (state.speaking is authoritative across re-renders).
 			li.classList.toggle('speaking', state.speaking.has(id));
 			state.memberLis.set(id, li);
 			ul.appendChild(li);
 		});
+	updateMuteAllButton(); // show/hide + relabel the owner's "Mute all" toggle to match the roster's mute state
 	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
 	updateApplyControls(); // re-settle Apply/Reset: a rebuild may have dropped a now-departed pending owner pick
+}
+
+// Shows the owner's "Mute all" toggle (hidden for everyone else and in the ownerless global room) and labels it
+// "Unmute all" when every other member is already muted, else "Mute all". Disabled when the owner is alone —
+// there is no one to mute. The click handler recomputes the mute-vs-unmute intent from the live roster.
+function updateMuteAllButton() {
+	const btn = byId('muteAllBtn');
+	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	btn.hidden = !iAmOwner;
+	if (!iAmOwner) {
+		return;
+	}
+	const others = [...state.members.keys()].filter(id => id !== state.ownerId);
+	const allMuted = others.length > 0 && others.every(id => state.mutedMembers.has(id));
+	btn.textContent = allMuted ? 'Unmute all' : 'Mute all';
+	btn.disabled = others.length === 0;
 }
 
 function enableTalkButton(enabled) {
@@ -1535,6 +1634,15 @@ function enableTalkButton(enabled) {
 function updateTalkButton() {
 	const btn = byId('talkBtn');
 	btn.classList.toggle('live', state.transmitting);
+	// Owner-muted: the control is disabled and says why. The server drops our audio (and refuses us the floor)
+	// regardless, but disabling here stops us talking into a closed door and makes the reason plain. This runs only
+	// while connected (every caller is post-join), so it owns the connected disabled state alongside the mute.
+	if (state.mutedMembers.has(state.selfId)) {
+		btn.disabled = true;
+		btn.textContent = 'Muted by owner';
+		return;
+	}
+	btn.disabled = false;
 	btn.textContent = state.mode === 'FULL_DUPLEX' ?
 		state.transmitting ?
 			'Mic ON (click to mute)' :
@@ -1559,6 +1667,7 @@ function resetChannelState() {
 	state.speaking.clear();
 	state.floorSpeaker = null;
 	state.members.clear();
+	state.mutedMembers.clear();
 }
 
 function cleanup() {
@@ -1608,6 +1717,7 @@ function cleanup() {
 	byId('applyHint').hidden = true;
 	byId('ownerSelect').hidden = true;
 	byId('ownerLabel').hidden = true;
+	byId('muteAllBtn').hidden = true;      // owner-only moderation control; renderMembers only re-shows it while connected
 	byId('shareRekeyRow').hidden = true;   // owner-only rotation control; updateApplyControls only runs while connected
 	byId('shareRekey').checked = true;     // back to the default-checked (auto-share) state for the next session
 	setStatus(false, 'Disconnected');
@@ -1636,6 +1746,13 @@ window.addEventListener('DOMContentLoaded', () => {
 	byId('renameBtn').addEventListener('click', rename);
 	byId('applyBtn').addEventListener('click', applyOrSwitch);
 	byId('resetBtn').addEventListener('click', resetApplyControls);
+	// Owner-only "Mute all" toggle: mute every other member if any is still unmuted, else unmute everyone. Recompute
+	// the intent at click time (not from the label) so it stays correct against the live roster. Applies immediately.
+	byId('muteAllBtn').addEventListener('click', () => {
+		const others = [...state.members.keys()].filter(id => id !== state.ownerId);
+		const allMuted = others.length > 0 && others.every(id => state.mutedMembers.has(id));
+		sendCtrl({type: 'muteAll', muted: !allMuted});
+	});
 	byId('ownerSelect').addEventListener('change', updateApplyControls);   // a pending transfer; applied via the button
 	// Re-evaluate the adaptive Switch/Apply button as the form fields change (mode is handled in its own listener).
 	byId('channel').addEventListener('input', updateApplyControls);

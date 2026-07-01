@@ -254,6 +254,18 @@ already sees who owns the channel from the 👑 crown in the members list); the 
 them the owner, and everyone's owner-only controls update. The connected-only **Rename** button changes just
 your display name in place (everyone's roster updates); it leaves the channel untouched.
 
+**Mute participants.** The channel owner can silence a member: each member row in the **Members** list gets a
+**Mute**/**Unmute** button (shown only to the owner), and a **Mute all** toggle in the panel header mutes (or
+un-mutes) everyone else at once. These apply **immediately** — there's no Apply step. A muted member is shown
+dimmed with a 🔇 marker for everyone. Enforcement is on the **server**, which does not trust the clients: it
+**drops a muted member's relayed audio** and refuses it the talk floor, so a member can't talk around a mute by
+tampering with its client. If the owner mutes someone who is *currently* talking, their floor is freed at once
+and their client stops transmitting and shows **Muted by owner** on a disabled talk button (re-enabled on
+unmute). The mute is per-channel — it's cleared when the member leaves — and the ownerless `global` room can't be
+muted. (Caveat: on the **WebRTC** transport, media is peer-to-peer, so the server can't enforce the mute on the
+audio itself; the muted client still stops sending as a courtesy, but the guarantee holds only on the relay
+transport.)
+
 Open the page in two tabs (or two machines) to talk between them.
 
 ### Java desktop client
@@ -289,7 +301,9 @@ the session (mode/key default to the current ones) · `p [passphrase]` change th
 encryption off; auto-shares the new passphrase so members adopt it automatically — a member uses `p` to apply
 the owner's new passphrase) · `p! [passphrase]` rotate **without** auto-sharing (revocation-style; members must
 re-enter it) · `o <#id>` hand ownership to another member (owner; `<#id>` is the prefix shown next to a member)
-· `n <name>` rename · `f` toggle hi-fi
+· `mute <#id|all>` / `unmute <#id|all>` mute or unmute a member — or everyone but yourself — as the owner (the
+server enforces it: a muted member's audio is dropped and it's shown `[muted]` in `w`; being muted stops your
+mic and refuses `t` until you're unmuted) · `n <name>` rename · `f` toggle hi-fi
 (music/voice) live · `q` quit (closes the socket, ending the session) · `h` help.
 
 The client encodes Opus at 48 kHz with in-band FEC (Concentus) — stereo when the audio device supports it,

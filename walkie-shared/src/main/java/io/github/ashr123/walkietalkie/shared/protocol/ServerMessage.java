@@ -32,6 +32,14 @@ public sealed interface ServerMessage {
 	record MemberRenamed(String memberId, String displayName) implements ServerMessage {
 	}
 
+	/// The owner muted or unmuted a member. Broadcast to the whole channel so everyone can render the state, and so
+	/// the affected member itself learns it is muted and stops transmitting (its audio is dropped server-side
+	/// regardless, but a well-behaved client also disables its talk control). `memberId` is the session id; `muted`
+	/// is the new state.
+	@JsonTypeName("memberMuted")
+	record MemberMuted(String memberId, boolean muted) implements ServerMessage {
+	}
+
 	/// The floor was granted to you; you may transmit.
 	@JsonTypeName("floorGranted")
 	record FloorGranted() implements ServerMessage {

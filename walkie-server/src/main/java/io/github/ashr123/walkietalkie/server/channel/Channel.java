@@ -8,6 +8,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
@@ -57,6 +58,13 @@ public final class Channel {
 	private final Map<String, Integer> streamIndices = new ConcurrentHashMap<>();
 	private final boolean[] indexInUse = new boolean[STREAM_INDEX_RANGE];
 	private int rotation;
+
+	/// Session ids the owner has muted. Their relayed audio is dropped in `ConnectionService.onAudio` before
+	/// fan-out, so a mute is enforced by the server rather than trusted to the client. A concurrent set so the
+	/// per-frame [#isMuted] read is lock-free; the mute/unmute mutations run under this channel's monitor when they
+	/// must be atomic with the `MemberMuted` broadcast and with freeing the floor of a member being muted —
+	/// mirroring the floor discipline. Entries are dropped on [#remove], so a member's mute never outlives it.
+	private final Set<String> mutedMembers = ConcurrentHashMap.newKeySet();
 
 	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck) {
 		this.name = name;
@@ -110,6 +118,12 @@ public final class Channel {
 			if (sessionId.equals(floorHolder)) {
 				floorHolder = null;
 			}
+			// Scrub the mute UNDER the monitor too, so a leave can't race a concurrent owner mute
+			// (setMuted / setMutedForAllExcept run under this same monitor): whichever runs second wins, and since
+			// members.remove above precedes this block, a mute handler that ran first sees the member gone and skips
+			// it while one that runs after us re-checks membership under the monitor — so no muted-id ever outlives
+			// its member (a leak that would otherwise linger for the channel's lifetime, session ids being unique).
+			mutedMembers.remove(sessionId);
 			freeStreamIndex(sessionId);   // reentrant — also synchronized(this)
 		}
 	}
@@ -163,17 +177,36 @@ public final class Channel {
 
 	public List<MemberInfo> memberInfos() {
 		return members.values().stream()
-				.map(session -> new MemberInfo(session.id(), session.displayName(), streamIndexOf(session.id())))
+				.map(session -> new MemberInfo(session.id(), session.displayName(), streamIndexOf(session.id()), isMuted(session.id())))
+				.toList();
+	}
+
+	/// Whether `sessionId` is currently owner-muted (lock-free — read on the per-frame audio fan-out path).
+	public boolean isMuted(String sessionId) {
+		return mutedMembers.contains(sessionId);
+	}
+
+	/// Sets one member's mute state; returns whether it actually changed (so the caller only broadcasts a real
+	/// transition). Call under this channel's monitor when the change must be atomic with the `MemberMuted`
+	/// broadcast and any floor release.
+	public boolean setMuted(String sessionId, boolean muted) {
+		return muted ? mutedMembers.add(sessionId) : mutedMembers.remove(sessionId);
+	}
+
+	/// Mutes or unmutes every current member EXCEPT `exceptId` (the owner, who is never muted), returning the ids
+	/// whose state actually changed so the caller broadcasts one `MemberMuted` per real transition. Call under the
+	/// monitor.
+	public List<String> setMutedForAllExcept(String exceptId, boolean muted) {
+		return members.keySet().stream()
+				.filter(id -> !id.equals(exceptId) && setMuted(id, muted))
 				.toList();
 	}
 
 	/// Applies an action to every member except the one with `excludeSessionId`.
 	public void forEachOther(String excludeSessionId, Consumer<? super ClientSession> action) {
-		for (ClientSession session : members.values()) {
-			if (!session.id().equals(excludeSessionId)) {
-				action.accept(session);
-			}
-		}
+		members.values().stream()
+				.filter(session -> !session.id().equals(excludeSessionId))
+				.forEach(action);
 	}
 
 	/// Applies an action to **every** member (including any current floor holder) — used to broadcast a floor

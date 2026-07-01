@@ -99,6 +99,8 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `rename`            | `displayName`                                    | Change your own display name in place (→ `memberRenamed`, §3c)                                                                                                                                                                                               |
 | `changePassphrase`  | `keyCheck`, `wrappedKey`                         | Owner-only: rotate/clear the channel passphrase; `keyCheck` = the new one's KCV, or `null` to make it plaintext. Optional `wrappedKey` = the new passphrase encrypted under the OLD key so members auto-adopt; `null` opts out (§3c) (→ `passphraseChanged`) |
 | `transferOwnership` | `newOwnerId`                                     | Owner-only: hand ownership to another current member (→ `ownerChanged`, §3c)                                                                                                                                                                                 |
+| `muteMember`        | `memberId`, `muted`                              | Owner-only: mute/unmute one member's relay audio; server-enforced (→ `memberMuted`, §3d)                                                                                                                                                                     |
+| `muteAll`           | `muted`                                          | Owner-only: mute/unmute every member but the owner at once (→ one `memberMuted` per changed member, §3d)                                                                                                                                                     |
 | `offer`             | `target`, `sdp`                                  | WebRTC (see §3a)                                                                                                                                                                                                                                             |
 | `answer`            | `target`, `sdp`                                  | WebRTC                                                                                                                                                                                                                                                       |
 | `ice`               | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                                                                                                                                                                                                                                       |
@@ -117,13 +119,15 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `modeChanged`       | `mode`                                              | The channel mode changed; reset talk state                                                                                                                                                                                              |
 | `ownerChanged`      | `ownerId`                                           | New owner (e.g. previous owner left)                                                                                                                                                                                                    |
 | `memberRenamed`     | `memberId`, `displayName`                           | A member changed its display name (incl. you — §3c)                                                                                                                                                                                     |
+| `memberMuted`       | `memberId`, `muted`                                 | The owner muted/unmuted a member (broadcast to all, incl. the muted member — §3d)                                                                                                                                                       |
 | `passphraseChanged` | `keyCheck`, `wrappedKey`                            | The owner changed/cleared the channel passphrase (`null` = now unencrypted). If `wrappedKey` is present, decrypt it with your old key to auto-adopt; else re-derive from the out-of-band passphrase and verify against `keyCheck` (§3c) |
 | `signalOffer`       | `from`, `sdp`                                       | WebRTC (see §3a)                                                                                                                                                                                                                        |
 | `signalAnswer`      | `from`, `sdp`                                       | WebRTC                                                                                                                                                                                                                                  |
 | `signalIce`         | `from`, `candidate`, `sdpMid`, `sdpMLineIndex`      | WebRTC                                                                                                                                                                                                                                  |
 | `error`             | `code`, `message`                                   | A request failed (see §13 for codes)                                                                                                                                                                                                    |
 
-`MemberInfo` = `{ id, displayName, streamId }` (see §4).
+`MemberInfo` = `{ id, displayName, streamId, muted }` (see §4; `muted` = whether the owner has muted this
+member — §3d).
 
 Typical flow: `login` → open `/ws/audio?token=…` → send `join` → receive `joined` (snapshot) → exchange
 floor/audio → `leave`/close. (Re-send `join` any time to **switch** channels without reconnecting — §3c.)
@@ -245,6 +249,37 @@ sends, so clients need no new handling; the new owner simply gains the owner-onl
 changes, further transfers). The global room's sentinel owner makes a transfer there `not_owner`. The browser
 exposes this as a **Channel owner** dropdown; the Java client as `o <#id-prefix>` (the prefix shown next to
 each member).
+
+---
+
+## 3d. Owner-enforced mute
+
+The channel owner can silence members. `muteMember { memberId, muted }` mutes (or unmutes) one member;
+`muteAll { muted }` mutes/unmutes **every member but the owner** at once. On each state change the server
+broadcasts `memberMuted { memberId, muted }` to the whole channel — **including the muted member itself**, so its
+client learns to disable its own talk control; `muteAll` emits one `memberMuted` per member whose state actually
+flipped. A member's mute state also rides in `MemberInfo.muted` in every `joined` snapshot and `memberJoined`, so
+a late joiner renders who's muted.
+
+- **Server-enforced, client not trusted.** While a member is muted the server **drops its relayed audio**
+  (the `onAudio` fan-out gate, alongside the floor check) and **refuses it the talk floor** (`requestFloor` is
+  silently denied), so a tampered client can neither be heard nor seize-and-hold the floor to block a PTT
+  channel. A muted member's transmit path is stopped best-effort at the client too (mic off, talk control
+  disabled with a "muted" label), but that is courtesy — the guarantee is the server drop.
+- **Relay path only.** WebRTC media is peer-to-peer (DTLS-SRTP), so the server cannot drop it; a WebRTC talker
+  still receives `memberMuted` and stops as a courtesy, but the hard guarantee holds only on the relay
+  transport — the same boundary as the E2EE payload encryption (§7).
+- **Muting a talker frees the floor.** If the muted member currently holds the PTT floor, the server releases
+  it and broadcasts `floorIdle` (§3b), so the ex-holder's client stops transmitting and the floor reopens.
+- **Scope & lifetime.** Mute is per-channel state and is cleared when the member leaves (a re-used id does not
+  inherit it). It is **not** related to the E2EE "muted straggler" of §3c/§7 (a member whose key doesn't match),
+  which is a client-side transmit gate, not an owner action.
+- **Authorization.** Only the owner may mute (`not_owner` otherwise); the owner can't mute itself and an
+  unknown/left target is `unknown_target`. The server-managed `global` room has a sentinel owner, so muting
+  there is `not_owner`.
+
+The browser exposes per-member **Mute**/**Unmute** buttons and a **Mute all** toggle in the Members list (owner
+only, applied immediately); the Java client uses `mute <#id|all>` / `unmute <#id|all>`.
 
 ---
 
@@ -490,10 +525,10 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 | `invalid_mode`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel                                                                           |
 | `reserved_channel`       | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode                                                |
 | `encryption_not_allowed` | a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext)                                          |
-| `not_in_channel`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / signal before `join`                    |
-| `not_owner`              | `changeMode`, `changePassphrase` or `transferOwnership` by a non-owner                                                              |
+| `not_in_channel`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / signal before `join` |
+| `not_owner`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember` or `muteAll` by a non-owner                                     |
 | `passphrase_mismatch`    | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel |
-| `unknown_target`         | WebRTC signal — or `transferOwnership` — to an id not in the channel                                                                |
+| `unknown_target`         | WebRTC signal, `transferOwnership`, or `muteMember` (unknown/left id, or the owner itself) — a target not mutable in the channel     |
 
 ---
 
@@ -505,6 +540,8 @@ un-prefixed mode — a client that doesn't strip the prefix will decode **noise*
 
 - **`MemberInfo.streamId`** (`int`, `0..254`) carries each member's stream index, announced in `joined` /
   `memberJoined` so a client can pre-bind a lane (and its display name) before the first frame arrives.
+- **`MemberInfo.muted`** (`boolean`) carries the owner-mute state (§3d) in every `joined` / `memberJoined`, so a
+  late joiner renders who's muted without waiting for a `memberMuted`.
 - The E2EE known-answer vectors (§7) are independent of the framing — the encrypted **body** is byte-unchanged;
   the stream-index prefix sits outside it (and outside the GCM envelope, §7).
 

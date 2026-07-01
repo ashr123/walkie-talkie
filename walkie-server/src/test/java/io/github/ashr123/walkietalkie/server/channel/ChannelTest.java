@@ -62,4 +62,43 @@ class ChannelTest {
 		assertTrue(channel.holdsFloor("anyone"), "everyone may transmit in full-duplex");
 		assertInstanceOf(None.class, channel.floorHolder(), "no single holder is tracked");
 	}
+
+	@Test
+	void setMutedReportsWhetherItChangedAndIsMutedReflectsIt() {
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null);
+		channel.add(session("bob"));
+
+		assertFalse(channel.isMuted("bob"), "a member starts unmuted");
+		assertTrue(channel.setMuted("bob", true), "the first mute is a real change");
+		assertTrue(channel.isMuted("bob"));
+		assertFalse(channel.setMuted("bob", true), "re-muting an already-muted member is a no-op change");
+		assertTrue(channel.setMuted("bob", false), "unmuting a muted member is a real change");
+		assertFalse(channel.isMuted("bob"));
+		assertFalse(channel.setMuted("bob", false), "unmuting an already-unmuted member is a no-op change");
+	}
+
+	@Test
+	void setMutedForAllExceptSkipsTheOwnerAndReturnsOnlyTheChangedIds() {
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null);
+		channel.add(session("alice"));
+		channel.add(session("bob"));
+		channel.add(session("carol"));
+		channel.setMuted("bob", true);   // bob is already muted, so a mute-all shouldn't report bob as changed
+
+		assertEquals(java.util.List.of("carol"), channel.setMutedForAllExcept("alice", true),
+				"mute-all skips the excepted owner and reports only the members whose state actually flipped");
+		assertFalse(channel.isMuted("alice"), "the owner is never muted by mute-all");
+		assertTrue(channel.isMuted("bob"));
+		assertTrue(channel.isMuted("carol"));
+	}
+
+	@Test
+	void removeClearsAMembersMuteState() {
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null);
+		channel.add(session("bob"));
+		channel.setMuted("bob", true);
+
+		channel.remove("bob");
+		assertFalse(channel.isMuted("bob"), "a mute never outlives the member (a re-used id would not inherit it)");
+	}
 }

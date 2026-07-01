@@ -79,6 +79,23 @@ public sealed interface ClientMessage {
 	record Rename(String displayName) implements ClientMessage {
 	}
 
+	/// Owner-only moderation: mute or unmute one member's relay audio. `memberId` is a current member's session id;
+	/// `muted` is true to mute, false to unmute. A non-owner gets `not_owner`; an unknown target — or the owner
+	/// itself, which can't be muted — gets `unknown_target`. On success the server records the state, DROPS that
+	/// member's relayed audio while muted (enforced server-side, so a client can't talk its way around it), frees
+	/// the floor if the muted member was holding it, and broadcasts a [ServerMessage.MemberMuted]. Enforcement is
+	/// relay-only — WebRTC media is peer-to-peer, so mute there is best-effort at the muted client.
+	@JsonTypeName("muteMember")
+	record MuteMember(String memberId, boolean muted) implements ClientMessage {
+	}
+
+	/// Owner-only moderation: mute or unmute EVERY other member of the channel at once (the owner is never muted).
+	/// Same server enforcement and per-member [ServerMessage.MemberMuted] broadcast (one for each member whose
+	/// state actually changed) as [MuteMember]. A non-owner gets `not_owner`.
+	@JsonTypeName("muteAll")
+	record MuteAll(boolean muted) implements ClientMessage {
+	}
+
 	/// WebRTC: an SDP offer aimed at another member, relayed by the server.
 	@JsonTypeName("offer")
 	record Offer(String target, String sdp) implements ClientMessage {
