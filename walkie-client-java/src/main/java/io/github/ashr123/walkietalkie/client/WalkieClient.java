@@ -530,8 +530,10 @@ public final class WalkieClient implements AutoCloseable {
 					case "q", "quit", "exit" -> running.set(false);
 					case "h", "help" -> printHelp();
 					case "" -> { /* ignore blank lines */ }
+					// Point at the single, role-aware source of truth ('h' -> printHelp) rather than repeating the
+					// command list here — a third copy would drift and would advertise owner commands to non-owners.
 					default ->
-							System.out.println("Commands: 't' talk/stop, 'w' who's here, 'm <ptt|global|duplex>' mode, 'c <channel> [mode] [key]' switch channel, 'p [passphrase]' change passphrase, 'o <#id>' give ownership, 'mute <#id|all>'/'unmute <#id|all>' moderate, 'n <name>' rename, 'f' hi-fi, 'q' quit, 'h' help.");
+							System.out.println("Unrecognized command '" + parts[0] + "' — press 'h' for the list of commands.");
 				}
 			}
 		} catch (IOException _) {
