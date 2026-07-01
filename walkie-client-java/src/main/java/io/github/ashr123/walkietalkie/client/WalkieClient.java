@@ -22,11 +22,7 @@ import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -64,12 +60,40 @@ public final class WalkieClient implements AutoCloseable {
 	/// it — to drain gracefully before forcing termination, so quitting can never hang on a slow or vanished
 	/// server. Two seconds is ample for a localhost/LAN close handshake while still feeling instant to a user.
 	private static final Duration HTTP_SHUTDOWN_GRACE = Duration.ofSeconds(2);
-
+	/// Fixed width of the help box's horizontal rule — a cosmetic frame (some command lines run longer than this).
+	private static final int HELP_RULE_WIDTH = 98;
+	private static final String HELP_RULE = "-".repeat(HELP_RULE_WIDTH);
+	/// The commands available to everyone, owner or not. A non-owner additionally sees [#MEMBER_PASSPHRASE_COMMAND];
+	/// the owner instead sees [#OWNER_COMMANDS]. (`p` is role-split: a member ADOPTS a shared passphrase, an owner
+	/// CHANGES it.)
+	private static final String COMMON_COMMANDS = """
+			Commands:  t = talk/stop
+			           w = who's here
+			           c <channel> [mode] [key] = switch channel
+			           n <name> = rename
+			           f = hi-fi on/off
+			           q = quit
+			           h = help""";
+	/// The owner-only command block — shown in the help ONLY to the current channel owner, and announced verbatim
+	/// the instant a member is promoted (see the [ServerMessage.OwnerChanged] handler) so it learns the abilities it
+	/// just gained. One source of truth, so the help and the promotion notice can't drift; the server also rejects
+	/// these from a non-owner, so hiding them is UI honesty, not the security boundary.
+	private static final String OWNER_COMMANDS = """
+			Owner:     m <ptt|global|duplex> = change the mode for everyone
+			           p [passphrase] = change the passphrase (blank = turn encryption off; members auto-adopt)
+			           p! [passphrase] = change the passphrase WITHOUT auto-sharing (members must re-enter it)
+			           o <#id> = give ownership to another member
+			           mute <#id|all> / unmute <#id|all> = mute or unmute members""";
+	/// The one passphrase command a NON-owner has: adopt a rotation the owner announced but didn't auto-share (an
+	/// owner instead changes the passphrase with `p`/`p!` — see [#OWNER_COMMANDS]). The 11 leading spaces align its
+	/// `p` under the command column of [#COMMON_COMMANDS] / [#OWNER_COMMANDS] after their text-block indent is
+	/// stripped (their " Commands:" / " Owner:" label lines set that margin one space in from the frame).
+	private static final String MEMBER_PASSPHRASE_COMMAND =
+			"           p [passphrase] = adopt the owner's new passphrase (only needed if you weren't auto-updated)";
 	private final ClientOptions options;
 	// Per-instance: its SSLContext trusts the system CAs plus (on localhost) the server's dev cert or a
 	// --tls-truststore, so HTTPS + WSS verify against the target server — verification is never disabled.
 	private final HttpClient httpClient;
-
 	private final AtomicBoolean running = new AtomicBoolean(true);
 	private final AtomicBoolean closed = new AtomicBoolean();   // guards close() so it is idempotent
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
@@ -82,7 +106,6 @@ public final class WalkieClient implements AutoCloseable {
 	// AES-256-GCM E2EE for the current channel, or null when no passphrase. Volatile + reassigned on an in-place
 	// channel switch (the `c` command), since the capture/playback loops read it from other threads.
 	private volatile FrameCrypto crypto;
-
 	private volatile String selfId = "";
 	private volatile String ownerId;
 	private volatile ChannelMode currentMode;
@@ -90,8 +113,11 @@ public final class WalkieClient implements AutoCloseable {
 	private volatile String currentPassphrase;   // passphrase backing the current channel's key (for switch defaults)
 	private volatile String currentChannelKeyCheck;   // the channel's currently-announced key-check (null = unencrypted); the yardstick a member re-keys against
 	private volatile boolean rekeyInFlight;      // true between sending our own ChangePassphrase (owner) and its echoed PassphraseChanged
+
+	// --- HTTP login + WebSocket -------------------------------------------------------------------
 	private volatile String pendingPassphrase;   // the new passphrase we (as owner) submitted, applied when the echo arrives
 	private volatile boolean warnedDecrypt; // listener thread only today, but volatile so the warn-once intent survives a threading refactor
+	private volatile boolean welcomeShown;  // print the role-aware help once, after the first Joined reveals our role (same listener-thread-only-but-volatile rationale as warnedDecrypt)
 
 	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
 		this.options = options;
@@ -132,35 +158,6 @@ public final class WalkieClient implements AutoCloseable {
 				: "Push-to-talk: type 't' to grab/release the floor.";
 	}
 
-	// --- HTTP login + WebSocket -------------------------------------------------------------------
-
-	private static void printHelp() {
-		System.out.println("""
-				--------------------------------------------------------------------------------------------------
-				 Commands:  t = talk/stop   w = who's here   m <ptt|global|duplex> = mode (owner)
-				            c <channel> [mode] [key] = switch channel   n <name> = rename
-				            p [passphrase] = owner: change passphrase (blank = off; members auto-adopt) | member: adopt the owner's new one
-				            p! [passphrase] = owner: change passphrase WITHOUT auto-sharing (members must re-enter it)
-				            o <#id> = give ownership to a member (owner)
-				            mute <#id|all> / unmute <#id|all> = mute/unmute members (owner)
-				            f = hi-fi on/off   q = quit   h = help
-				--------------------------------------------------------------------------------------------------""");
-	}
-
-	private String login() throws IOException, InterruptedException {
-		// Login takes no input: it just mints a signed, short-lived token. The token is an opaque string.
-		HttpResponse<String> response = httpClient.send(
-				HttpRequest.newBuilder(URI.create(options.server() + "/api/auth/login"))
-						.POST(HttpRequest.BodyPublishers.noBody())
-						.build(),
-				HttpResponse.BodyHandlers.ofString()
-		);
-		if (response.statusCode() != 200) {
-			throw new IOException("Login failed: HTTP " + response.statusCode() + " " + response.body());
-		}
-		return JSON_MAPPER.readValue(response.body(), LoginResponse.class).token();
-	}
-
 	/// Builds the AES-256-GCM frame cipher from `--key` (or the WALKIE_KEY env var), or null to disable
 	/// E2EE. Salted with the effective channel (the server forces "global" for global mode), so every
 	/// client in the channel derives the same key.
@@ -175,6 +172,78 @@ public final class WalkieClient implements AutoCloseable {
 			return null;
 		}
 		return FrameCrypto.fromPassphrase(passphrase, channel);
+	}
+
+	/// Decides what to send for a captured frame, given the key we currently hold and the channel's announced
+	/// key-check: returns the bytes to put on the wire, or `null` to **drop** (stay silent). Pure (no field
+	/// access) so the invariant below is unit-testable without a live socket.
+	///
+	/// Invariant — **only ever put on the wire what the channel's CURRENT key-check matches:**
+	/// - channel unencrypted (`announcedKeyCheck == null`) → send the frame in the clear;
+	/// - we hold the matching key (`key.keyCheck().equals(announcedKeyCheck)`) → send ciphertext;
+	/// - otherwise → **drop** (stay silent). This covers both a member with NO key (the plaintext→encrypted
+	///   *enable* — never leak plaintext) AND a member still holding a STALE key after a rotation it hasn't
+	///   adopted (don't emit audio the rekeyed channel can't decode, and don't desync — a straggler is muted until
+	///   it adopts the new key, so the experience is symmetric for everyone).
+	static byte[] outboundFrame(byte[] frame, FrameCrypto key, String announcedKeyCheck) throws GeneralSecurityException {
+		if (announcedKeyCheck == null) {
+			return frame;
+		}
+		return key != null && announcedKeyCheck.equals(key.keyCheck()) ? key.encrypt(frame) : null;
+	}
+
+	/// Pure decision behind the full-duplex mic auto-open: open only when the mode is full-duplex, the user did not
+	/// pass `--muted`, and the owner has not muted us (`selfMuted`). The mute term keeps a muted member's mic closed
+	/// — a member re-joining its current channel re-snapshots itself as muted, and a switch to full-duplex must not
+	/// open a muted member's mic — mirroring the browser's `beginTransmit` guard. Frames would be dropped by
+	/// [#sendAudioFrame] anyway, but this keeps the local transmit state and the "mic is live" hint honest.
+	/// Extracted static (like [#outboundFrame]) so this policy is unit-testable without a live socket.
+	static boolean shouldAutoOpenMic(ChannelMode mode, boolean startMuted, boolean selfMuted) {
+		return mode == ChannelMode.FULL_DUPLEX && !startMuted && !selfMuted;
+	}
+
+	static RekeyAction rekeyAction(String announcedKeyCheck, FrameCrypto candidate) {
+		if (announcedKeyCheck == null) {
+			return RekeyAction.DISABLE;
+		}
+		return candidate != null && announcedKeyCheck.equals(candidate.keyCheck()) ? RekeyAction.APPLY : RekeyAction.KEEP;
+	}
+
+	private static ChannelMode parseMode(String arg, ChannelMode fallback) {
+		return switch (arg.toLowerCase(Locale.ROOT)) {
+			case "ptt", "multi" -> ChannelMode.MULTI_CHANNEL_PTT;
+			case "global" -> ChannelMode.GLOBAL_PTT;
+			case "duplex", "full" -> ChannelMode.FULL_DUPLEX;
+			default -> fallback;
+		};
+	}
+
+	/// Prints the command help for the caller's CURRENT role: the [#COMMON_COMMANDS] everyone has, then either the
+	/// non-owner's [#MEMBER_PASSPHRASE_COMMAND] or — when our session id currently owns the channel — the full
+	/// [#OWNER_COMMANDS]. The role is read live (not cached at connect), so pressing `h` right after being promoted
+	/// shows the owner commands; the sentinel-owned `global` room has no participant owner, so no one there is shown
+	/// the owner set.
+	private void printHelp() {
+		System.out.println(HELP_RULE + System.lineSeparator()
+				+ COMMON_COMMANDS + System.lineSeparator()
+				+ (selfId.equals(ownerId) ? OWNER_COMMANDS : MEMBER_PASSPHRASE_COMMAND) + System.lineSeparator()
+				+ HELP_RULE);
+	}
+
+	// --- Server messages --------------------------------------------------------------------------
+
+	private String login() throws IOException, InterruptedException {
+		// Login takes no input: it just mints a signed, short-lived token. The token is an opaque string.
+		HttpResponse<String> response = httpClient.send(
+				HttpRequest.newBuilder(URI.create(options.server() + "/api/auth/login"))
+						.POST(HttpRequest.BodyPublishers.noBody())
+						.build(),
+				HttpResponse.BodyHandlers.ofString()
+		);
+		if (response.statusCode() != 200) {
+			throw new IOException("Login failed: HTTP " + response.statusCode() + " " + response.body());
+		}
+		return JSON_MAPPER.readValue(response.body(), LoginResponse.class).token();
 	}
 
 	private void senderLoop() {
@@ -214,26 +283,6 @@ public final class WalkieClient implements AutoCloseable {
 			// drop this frame; keep going
 		}
 	}
-
-	/// Decides what to send for a captured frame, given the key we currently hold and the channel's announced
-	/// key-check: returns the bytes to put on the wire, or `null` to **drop** (stay silent). Pure (no field
-	/// access) so the invariant below is unit-testable without a live socket.
-	///
-	/// Invariant — **only ever put on the wire what the channel's CURRENT key-check matches:**
-	/// - channel unencrypted (`announcedKeyCheck == null`) → send the frame in the clear;
-	/// - we hold the matching key (`key.keyCheck().equals(announcedKeyCheck)`) → send ciphertext;
-	/// - otherwise → **drop** (stay silent). This covers both a member with NO key (the plaintext→encrypted
-	///   *enable* — never leak plaintext) AND a member still holding a STALE key after a rotation it hasn't
-	///   adopted (don't emit audio the rekeyed channel can't decode, and don't desync — a straggler is muted until
-	///   it adopts the new key, so the experience is symmetric for everyone).
-	static byte[] outboundFrame(byte[] frame, FrameCrypto key, String announcedKeyCheck) throws GeneralSecurityException {
-		if (announcedKeyCheck == null) {
-			return frame;
-		}
-		return key != null && announcedKeyCheck.equals(key.keyCheck()) ? key.encrypt(frame) : null;
-	}
-
-	// --- Server messages --------------------------------------------------------------------------
 
 	private void handleServerMessage(String json) {
 		switch (JSON_MAPPER.readValue(json, ServerMessage.class)) {
@@ -277,6 +326,13 @@ public final class WalkieClient implements AutoCloseable {
 				log("[joined] channel=" + channel + " mode=" + mode + modeNote + " members=" + members.size()
 						+ System.lineSeparator() + "[owner] " + ownerLine
 						+ System.lineSeparator() + modeHint(mode, audio.isTransmitting()));
+				if (!welcomeShown) {
+					// Now that this first Joined has set our role, print the role-aware command help — deferred from
+					// consoleLoop's start, where the role wasn't known yet. Once only, so a later channel switch
+					// (another Joined) doesn't reprint the whole help box.
+					welcomeShown = true;
+					printHelp();
+				}
 			}
 			case ServerMessage.MemberJoined(MemberInfo member) -> announceJoin(member);
 			case ServerMessage.MemberLeft(String memberId) -> announceLeave(memberId);
@@ -312,9 +368,15 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.OwnerChanged(String ownerId) -> {
 				boolean becameOwner = selfId.equals(ownerId) && !selfId.equals(this.ownerId);
 				this.ownerId = ownerId;
-				log(selfId.equals(ownerId)
-						? "[owner] you are now the owner — 'm <ptt|global|duplex>' to change the mode"
-						: "[owner] channel owner is now " + name(ownerId));
+				if (becameOwner) {
+					// On promotion, show the commands we just gained (so the user needn't press 'h' to discover
+					// them) — the same block the role-aware help prints for an owner.
+					log("[owner] you are now the channel owner. You can now also:" + System.lineSeparator() + OWNER_COMMANDS);
+				} else {
+					log(selfId.equals(ownerId)
+							? "[owner] you own this channel"
+							: "[owner] channel owner is now " + name(ownerId));
+				}
 				// Mirror the browser: if we were promoted while still holding a key that doesn't match the channel
 				// (a rotation we never reconciled), warn that 'p' now ROTATES for everyone — so a user must not
 				// just re-type the stale passphrase (it would re-key the whole channel to it).
@@ -403,16 +465,6 @@ public final class WalkieClient implements AutoCloseable {
 		return shouldAutoOpenMic(mode, options.startMuted(), mutedMembers.contains(selfId));
 	}
 
-	/// Pure decision behind the full-duplex mic auto-open: open only when the mode is full-duplex, the user did not
-	/// pass `--muted`, and the owner has not muted us (`selfMuted`). The mute term keeps a muted member's mic closed
-	/// — a member re-joining its current channel re-snapshots itself as muted, and a switch to full-duplex must not
-	/// open a muted member's mic — mirroring the browser's `beginTransmit` guard. Frames would be dropped by
-	/// [#sendAudioFrame] anyway, but this keeps the local transmit state and the "mic is live" hint honest.
-	/// Extracted static (like [#outboundFrame]) so this policy is unit-testable without a live socket.
-	static boolean shouldAutoOpenMic(ChannelMode mode, boolean startMuted, boolean selfMuted) {
-		return mode == ChannelMode.FULL_DUPLEX && !startMuted && !selfMuted;
-	}
-
 	/// A member changed its display name (its session id — the routing identity — is unchanged). Update the
 	/// id→name map; everything else (floor, audio, ownership) is keyed by id and so is unaffected.
 	///
@@ -455,10 +507,10 @@ public final class WalkieClient implements AutoCloseable {
 						"")));
 	}
 
-	// --- Console control --------------------------------------------------------------------------
-
 	private void consoleLoop() {
-		printHelp();
+		// The command help is printed from the first Joined handler, not here: at this point we haven't received
+		// our role (selfId/ownerId are still ""/null), so a role-aware help printed now would always show the
+		// non-owner set even for a channel creator. Deferring it until Joined makes the very first help correct.
 		try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
 			String line;
 			while (running.get() && (line = reader.readLine()) != null) {
@@ -588,20 +640,6 @@ public final class WalkieClient implements AutoCloseable {
 		return announced != null && (held == null || !announced.equals(held.keyCheck()));
 	}
 
-	/// The decision for an announced passphrase change, given the channel's announced key-check and the key a
-	/// client derived from the passphrase it currently holds. Pure (no field access) so the security rule — NEVER
-	/// adopt a key whose key-check doesn't match the announced one, and only clear the key on an explicit disable
-	/// — is unit-testable without a live socket. `APPLY`: adopt `candidate`. `KEEP`: hold the current key (we
-	/// don't have the new passphrase yet, or it mismatched). `DISABLE`: the owner turned encryption off.
-	enum RekeyAction {APPLY, KEEP, DISABLE}
-
-	static RekeyAction rekeyAction(String announcedKeyCheck, FrameCrypto candidate) {
-		if (announcedKeyCheck == null) {
-			return RekeyAction.DISABLE;
-		}
-		return candidate != null && announcedKeyCheck.equals(candidate.keyCheck()) ? RekeyAction.APPLY : RekeyAction.KEEP;
-	}
-
 	/// A member adopting the owner's new passphrase locally. Re-derives the key and applies it only if it matches
 	/// the channel's announced key-check ([#rekeyAction]); on a mismatch it warns and KEEPS the current key —
 	/// never falling back to plaintext, which would broadcast in the clear into a still-encrypted channel.
@@ -723,15 +761,6 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	private static ChannelMode parseMode(String arg, ChannelMode fallback) {
-		return switch (arg.toLowerCase(Locale.ROOT)) {
-			case "ptt", "multi" -> ChannelMode.MULTI_CHANNEL_PTT;
-			case "global" -> ChannelMode.GLOBAL_PTT;
-			case "duplex", "full" -> ChannelMode.FULL_DUPLEX;
-			default -> fallback;
-		};
-	}
-
 	/// Asks the server to change our display name. Validated locally for a fast no, but the server validates
 	/// authoritatively and the resulting [ServerMessage.MemberRenamed] (broadcast back to us) is what actually
 	/// updates the roster — so a rejected name surfaces as an `[error]` line instead.
@@ -830,8 +859,6 @@ public final class WalkieClient implements AutoCloseable {
 				.join();
 	}
 
-	// --- helpers ----------------------------------------------------------------------------------
-
 	private void enqueue(ClientMessage message) {
 		sendQueue.offer(new Outbound.Text(JSON_MAPPER.writeValueAsString(message)));
 	}
@@ -888,6 +915,13 @@ public final class WalkieClient implements AutoCloseable {
 			System.exit(0);
 		}
 	}
+
+	/// The decision for an announced passphrase change, given the channel's announced key-check and the key a
+	/// client derived from the passphrase it currently holds. Pure (no field access) so the security rule — NEVER
+	/// adopt a key whose key-check doesn't match the announced one, and only clear the key on an explicit disable
+	/// — is unit-testable without a live socket. `APPLY`: adopt `candidate`. `KEEP`: hold the current key (we
+	/// don't have the new passphrase yet, or it mismatched). `DISABLE`: the owner turned encryption off.
+	enum RekeyAction {APPLY, KEEP, DISABLE}
 
 	private sealed interface Outbound {
 		record Text(String json) implements Outbound {
