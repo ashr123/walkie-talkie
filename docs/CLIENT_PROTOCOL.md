@@ -101,6 +101,7 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `transferOwnership` | `newOwnerId`                                     | Owner-only: hand ownership to another current member (→ `ownerChanged`, §3c)                                                                                                                                                                                 |
 | `muteMember`        | `memberId`, `muted`                              | Owner-only: mute/unmute one member's relay audio; server-enforced (→ `memberMuted`, §3d)                                                                                                                                                                     |
 | `muteAll`           | `muted`                                          | Owner-only: mute/unmute every member but the owner at once (→ one `memberMuted` per changed member, §3d)                                                                                                                                                     |
+| `setLocked`         | `locked`                                         | Owner-only: lock/unlock the channel to NEW members (→ `channelLocked`, §3e); existing members unaffected                                                                                                                                                     |
 | `offer`             | `target`, `sdp`                                  | WebRTC (see §3a)                                                                                                                                                                                                                                             |
 | `answer`            | `target`, `sdp`                                  | WebRTC                                                                                                                                                                                                                                                       |
 | `ice`               | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                                                                                                                                                                                                                                       |
@@ -109,7 +110,7 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 
 | `type`              | Fields                                              | Meaning                                                                                                                                                                                                                                 |
 |---------------------|-----------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `joined`            | `selfId`, `channel`, `mode`, `ownerId`, `members[]` | Join ack + full snapshot (re-sync on every join)                                                                                                                                                                                        |
+| `joined`            | `selfId`, `channel`, `mode`, `ownerId`, `locked`, `members[]` | Join ack + full snapshot (re-sync on every join); `locked` = channel locked to new members (§3e)                                                                                                                              |
 | `memberJoined`      | `member` (`MemberInfo`)                             | A participant joined                                                                                                                                                                                                                    |
 | `memberLeft`        | `memberId`                                          | A participant left/disconnected                                                                                                                                                                                                         |
 | `floorGranted`      | —                                                   | You hold the floor; you may transmit                                                                                                                                                                                                    |
@@ -120,6 +121,7 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `ownerChanged`      | `ownerId`                                           | New owner (e.g. previous owner left)                                                                                                                                                                                                    |
 | `memberRenamed`     | `memberId`, `displayName`                           | A member changed its display name (incl. you — §3c)                                                                                                                                                                                     |
 | `memberMuted`       | `memberId`, `muted`                                 | The owner muted/unmuted a member (broadcast to all, incl. the muted member — §3d)                                                                                                                                                       |
+| `channelLocked`     | `locked`                                            | The owner locked/unlocked the channel to new members (broadcast to all — §3e)                                                                                                                                                           |
 | `passphraseChanged` | `keyCheck`, `wrappedKey`                            | The owner changed/cleared the channel passphrase (`null` = now unencrypted). If `wrappedKey` is present, decrypt it with your old key to auto-adopt; else re-derive from the out-of-band passphrase and verify against `keyCheck` (§3c) |
 | `signalOffer`       | `from`, `sdp`                                       | WebRTC (see §3a)                                                                                                                                                                                                                        |
 | `signalAnswer`      | `from`, `sdp`                                       | WebRTC                                                                                                                                                                                                                                  |
@@ -280,6 +282,31 @@ a late joiner renders who's muted.
 
 The browser exposes per-member **Mute**/**Unmute** buttons and a **Mute all** toggle in the Members list (owner
 only, applied immediately); the Java client uses `mute <#id|all>` / `unmute <#id|all>`.
+
+---
+
+## 3e. Owner-locked channel
+
+The owner locks/unlocks the channel to NEW members with `setLocked { locked }`; the server broadcasts
+`channelLocked { locked }` to the whole channel and carries the current state in `Joined.locked` (so a
+re-snapshot renders it). Locking blocks only **new joins** — existing members are unaffected.
+
+- **Server-enforced in the atomic join.** While locked, `join` (or an in-place switch, §3c) from a member not
+  already in the channel is refused with `channel_locked` — checked **before** the key-check, so it applies
+  even with the correct passphrase. The check runs inside the same `ConcurrentHashMap` bin lock as the
+  key-check validation, so a `setLocked` toggle is atomic with respect to every concurrent join.
+- **Only newcomers.** An existing member re-joining its **current** channel (the idempotent re-snapshot, §3c)
+  is never blocked. But a member who **leaves** a locked channel can't rejoin until it's unlocked (it's a
+  newcomer again).
+- **Same drop semantics as `passphrase_mismatch`.** Both are detectable only inside the atomic join, so a
+  switch INTO a locked channel drops you from your current one; an initial connect just fails. The reference
+  clients handle `channel_locked` like `passphrase_mismatch` (browser disconnects with a message, Java exits).
+- **Authorization & lifetime.** Only the owner may lock (`not_owner` otherwise; `not_in_channel` before
+  joining). The lock persists across a departure-triggered ownership change — the new owner inherits it and can
+  unlock. The server-managed `global` room has a sentinel owner, so locking there is `not_owner`.
+
+The browser exposes an owner-only **Lock/Unlock channel** toggle in the Members header and a **🔒 Locked** badge
+shown to everyone; the Java client uses `lock` / `unlock` and shows a 🔒 marker in `w` and the join line.
 
 ---
 
@@ -525,9 +552,10 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 | `invalid_mode`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel                                                                           |
 | `reserved_channel`       | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode                                                |
 | `encryption_not_allowed` | a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext)                                          |
-| `not_in_channel`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / signal before `join` |
-| `not_owner`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember` or `muteAll` by a non-owner                                     |
+| `not_in_channel`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / `setLocked` / signal before `join` |
+| `not_owner`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember`, `muteAll` or `setLocked` by a non-owner                        |
 | `passphrase_mismatch`    | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel |
+| `channel_locked`         | `join` (or in-place switch) to a channel the owner has locked to new members (§3e); like `passphrase_mismatch`, a locked switch drops you |
 | `unknown_target`         | WebRTC signal, `transferOwnership`, or `muteMember` (unknown/left id, or the owner itself) — a target not mutable in the channel     |
 
 ---

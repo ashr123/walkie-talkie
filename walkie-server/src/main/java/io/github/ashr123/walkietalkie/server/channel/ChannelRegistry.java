@@ -65,6 +65,14 @@ public class ChannelRegistry {
 		AtomicReference<JoinResult> joined = new AtomicReference<>();
 		channels.compute(name, (key, existing) -> {
 			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck) : existing;
+			// A channel its owner LOCKED admits no new members — refuse before the key-check (a locked door doesn't
+			// care about the key). Only reachable for a NEWCOMER: a re-join to the member's CURRENT channel
+			// short-circuits in ConnectionService.handleJoin and never gets here. This read is under the bin lock,
+			// so it is atomic with a concurrent setLocked/leave/join. `joined` stays null; the caller attributes the
+			// rejection to channel_locked (a freshly created channel is never locked, so this only affects joins).
+			if (existing != null && channel.isLocked()) {
+				return channel;   // keep the channel; do not add the joiner
+			}
 			if (Objects.equals(channel.keyCheck(), keyCheck)) {
 				// Add the joiner, snapshot its view, AND let the caller emit that view to it — all ATOMICALLY under
 				// the channel monitor (bin→monitor, the established lock order — never the reverse). Doing the
@@ -110,14 +118,18 @@ public class ChannelRegistry {
 		return Option.of(newOwner.get());
 	}
 
-	/// The outcome of a [#changePassphrase] attempt: `OK` (the key-check was replaced), `NOT_OWNER` (the
-	/// requester does not own the channel), or `NOT_FOUND` (no such channel — e.g. it emptied and was dropped).
-	public enum RekeyOutcome {OK, NOT_OWNER, NOT_FOUND}
-
-	/// A [#changePassphrase] result: the `outcome` and, on `OK`, the exact `Channel` instance whose key-check was
-	/// rotated. The caller broadcasts over **that** object — never a fresh `find()`-by-name, which could resolve a
+	/// The result of a [#changePassphrase] attempt. `Ok` carries the exact `Channel` whose key-check was rotated —
+	/// the caller broadcasts over **that** object, never a fresh `find()`-by-name, which could resolve a
 	/// dropped-and-recreated same-named channel and misroute the notice (the same-object discipline [#leave] uses).
-	public record RekeyResult(RekeyOutcome outcome, Channel channel) {
+	/// `NotOwner` = the requester doesn't own the channel; `NotFound` = no such channel (e.g. it emptied and was
+	/// dropped). A sealed hierarchy so the caller's `switch` is exhaustive and the `Channel` is present only on the
+	/// success variant (never a null field).
+	public sealed interface RekeyResult {
+		record Ok(Channel channel) implements RekeyResult {}
+
+		record NotOwner() implements RekeyResult {}
+
+		record NotFound() implements RekeyResult {}
 	}
 
 	/// Rotates (sets/clears) a channel's key-check on the owner's request. The owner check and the key-check
@@ -125,50 +137,87 @@ public class ChannelRegistry {
 	/// lock that [#joinOrCreate]'s `channels.compute` validates a joiner's key-check under — so a rotation is
 	/// atomic with respect to every concurrent join (a joiner either validates against the old value and is then
 	/// told of the change, or validates against the new value), and with respect to the ownership transfer a
-	/// concurrent [#leave] performs (also under this bin lock). On `OK` the result carries the mutated channel so
+	/// concurrent [#leave] performs (also under this bin lock). On `Ok` the result carries the mutated channel so
 	/// the caller broadcasts [io.github.ashr123.walkietalkie.shared.protocol.ServerMessage.PassphraseChanged] over
 	/// that exact instance; any member present at the rotation is still in its (concurrent) member view when the
 	/// broadcast iterates, and any member that joins afterwards already used the new key-check.
 	public RekeyResult changePassphrase(String name, String requesterId, String newKeyCheck) {
-		AtomicReference<RekeyResult> result = new AtomicReference<>(new RekeyResult(RekeyOutcome.NOT_FOUND, null));
+		AtomicReference<RekeyResult> result = new AtomicReference<>(new RekeyResult.NotFound());
 		channels.computeIfPresent(name, (_, channel) -> {
 			if (requesterId.equals(channel.ownerId())) {
 				channel.setKeyCheck(newKeyCheck);
-				result.set(new RekeyResult(RekeyOutcome.OK, channel));
+				result.set(new RekeyResult.Ok(channel));
 			} else {
-				result.set(new RekeyResult(RekeyOutcome.NOT_OWNER, null));
+				result.set(new RekeyResult.NotOwner());
 			}
 			return channel;
 		});
 		return result.get();
 	}
 
-	/// The outcome of a [#transferOwnership] attempt: `OK`, `NOT_OWNER` (the requester does not own the channel),
-	/// `NOT_A_MEMBER` (the target id is not a member here), or `NOT_FOUND` (no such channel).
-	public enum TransferOutcome {OK, NOT_OWNER, NOT_A_MEMBER, NOT_FOUND}
+	/// The result of a [#transferOwnership] attempt. `Ok` carries the `Channel` whose owner changed — the caller
+	/// broadcasts over that exact instance (see [RekeyResult] for why a fresh `find()` would be unsafe). `NotOwner`
+	/// = the requester doesn't own the channel; `NotAMember` = the target id is not a member here; `NotFound` = no
+	/// such channel. Sealed, so the caller's `switch` is exhaustive and the `Channel` is present only on success.
+	public sealed interface TransferResult {
+		record Ok(Channel channel) implements TransferResult {}
 
-	/// A [#transferOwnership] result: the `outcome` and, on `OK`, the `Channel` whose owner changed — so the
-	/// caller broadcasts over that exact instance (see [RekeyResult] for why a fresh `find()` would be unsafe).
-	public record TransferResult(TransferOutcome outcome, Channel channel) {
+		record NotOwner() implements TransferResult {}
+
+		record NotAMember() implements TransferResult {}
+
+		record NotFound() implements TransferResult {}
 	}
 
 	/// Hands ownership to another current member on the owner's request. The owner check, the membership check
 	/// and the owner write all happen **inside** `channels.computeIfPresent(name, …)` — the same bin lock under
 	/// which [#leave] performs its departure-triggered auto-election — so an explicit transfer can't race that
 	/// election (one wins the lock, then the other observes the result) and can't hand ownership to a member who
-	/// is concurrently leaving (the membership check and the write are one atomic step). On `OK` the result
+	/// is concurrently leaving (the membership check and the write are one atomic step). On `Ok` the result
 	/// carries the channel so the caller broadcasts
 	/// [io.github.ashr123.walkietalkie.shared.protocol.ServerMessage.OwnerChanged] over that exact instance.
 	public TransferResult transferOwnership(String name, String requesterId, String newOwnerId) {
-		AtomicReference<TransferResult> result = new AtomicReference<>(new TransferResult(TransferOutcome.NOT_FOUND, null));
+		AtomicReference<TransferResult> result = new AtomicReference<>(new TransferResult.NotFound());
 		channels.computeIfPresent(name, (_, channel) -> {
 			if (!requesterId.equals(channel.ownerId())) {
-				result.set(new TransferResult(TransferOutcome.NOT_OWNER, null));
+				result.set(new TransferResult.NotOwner());
 			} else if (channel.member(newOwnerId) instanceof Some(ClientSession _)) {
 				channel.setOwner(newOwnerId);
-				result.set(new TransferResult(TransferOutcome.OK, channel));
+				result.set(new TransferResult.Ok(channel));
 			} else {
-				result.set(new TransferResult(TransferOutcome.NOT_A_MEMBER, null));
+				result.set(new TransferResult.NotAMember());
+			}
+			return channel;
+		});
+		return result.get();
+	}
+
+	/// The result of a [#setLocked] attempt. `Ok` carries the `Channel` whose lock state changed — the caller
+	/// broadcasts over that exact instance (see [RekeyResult] for why a fresh `find()` would be unsafe). `NotOwner`
+	/// = the requester doesn't own the channel; `NotFound` = no such channel. Sealed, so the caller's `switch` is
+	/// exhaustive and the `Channel` is present only on success.
+	public sealed interface LockResult {
+		record Ok(Channel channel) implements LockResult {}
+
+		record NotOwner() implements LockResult {}
+
+		record NotFound() implements LockResult {}
+	}
+
+	/// Locks or unlocks a channel to new members on the owner's request. The owner check and the lock write happen
+	/// **inside** `channels.computeIfPresent(name, …)` — the same bin lock [#joinOrCreate] reads the lock under — so
+	/// a toggle is atomic w.r.t. every concurrent join (a joiner sees consistently either the locked or the
+	/// unlocked state) and w.r.t. the ownership transfer a concurrent [#leave] performs. On `Ok` the result carries
+	/// the mutated channel so the caller broadcasts
+	/// [io.github.ashr123.walkietalkie.shared.protocol.ServerMessage.ChannelLocked] over that exact instance.
+	public LockResult setLocked(String name, String requesterId, boolean locked) {
+		AtomicReference<LockResult> result = new AtomicReference<>(new LockResult.NotFound());
+		channels.computeIfPresent(name, (_, channel) -> {
+			if (requesterId.equals(channel.ownerId())) {
+				channel.setLocked(locked);
+				result.set(new LockResult.Ok(channel));
+			} else {
+				result.set(new LockResult.NotOwner());
 			}
 			return channel;
 		});

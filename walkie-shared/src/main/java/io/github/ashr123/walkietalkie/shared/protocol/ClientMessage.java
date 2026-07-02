@@ -96,6 +96,16 @@ public sealed interface ClientMessage {
 	record MuteAll(boolean muted) implements ClientMessage {
 	}
 
+	/// Owner-only: lock or unlock the channel to NEW members. `locked` is true to lock, false to unlock. A non-owner
+	/// gets `not_owner`; sending it before joining gets `not_in_channel`. While locked, the server refuses any join
+	/// from a member not already in the channel with `channel_locked` — enforced in the atomic join under the same
+	/// bin lock as the passphrase-mismatch check, so it can't race a concurrent join. Existing members are
+	/// unaffected (locking blocks only new joins); on success the server broadcasts a [ServerMessage.ChannelLocked].
+	/// The server-managed `global` room has a sentinel owner, so a lock there is refused.
+	@JsonTypeName("setLocked")
+	record SetLocked(boolean locked) implements ClientMessage {
+	}
+
 	/// WebRTC: an SDP offer aimed at another member, relayed by the server.
 	@JsonTypeName("offer")
 	record Offer(String target, String sdp) implements ClientMessage {

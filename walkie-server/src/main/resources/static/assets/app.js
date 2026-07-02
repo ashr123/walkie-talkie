@@ -62,6 +62,7 @@ const state = {
 	peers: new Map(),       // remoteId -> RTCPeerConnection (WebRTC)
 	members: new Map(),     // id -> displayName
 	mutedMembers: new Set(), // ids the owner has muted (server-authoritative; the server also DROPS their relay audio)
+	locked: false,          // owner has locked the channel to new members (server-enforced; existing members unaffected)
 	// Relay full-duplex: one decode/playback "lane" per sender, keyed by the server-assigned stream index,
 	// mixed natively by ctx.destination. The maps relate stream indices to member ids for lifecycle/binding.
 	lanes: new Map(),        // stream id (uint8) -> {node, decoder, decoderChannels, decodeTs, rxChain, memberId, lastSeen}
@@ -629,6 +630,9 @@ function onWsMessage(ev) {
 		case 'memberMuted':
 			onMemberMuted(msg.memberId, msg.muted);
 			break;
+		case 'channelLocked':
+			onChannelLocked(msg.locked);
+			break;
 		case 'floorGranted':
 			log('Floor granted — you are live');
 			beginTransmit();
@@ -689,6 +693,12 @@ function onWsMessage(ev) {
 			if (msg.code === 'passphrase_mismatch') {
 				log('Disconnecting — this channel needs a different passphrase.');
 				disconnect();
+			} else if (msg.code === 'channel_locked') {
+				// The join was refused because the channel is locked to new members. Like passphrase_mismatch, the
+				// join failed — on an initial connect nothing joined, and a locked switch drops us — so disconnect
+				// cleanly rather than sit half-joined.
+				log('This channel is locked by its owner — you can\'t join it right now.');
+				disconnect();
 			} else if (msg.code === 'not_owner' || msg.code === 'unknown_target') {
 				// A rejected ownership transfer leaves the dropdown showing the failed target — snap it back to the
 				// real owner (state.ownerId is unchanged on a rejection) and settle the Apply button (the pending
@@ -712,6 +722,7 @@ function onJoined(msg) {
 	state.ownerId = msg.ownerId;
 	state.mode = msg.mode;
 	state.channel = msg.channel;
+	state.locked = msg.locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join too)
 	if (channelChanged) {
 		// Baseline the announced key-check to what we joined with, and clear any pending rotation — ONLY on an
 		// actual channel change. A same-channel idempotent re-snapshot must NOT reset these, or it would revert a
@@ -833,6 +844,16 @@ function onMemberMuted(memberId, muted) {
 	}
 	// Re-render the roster: the muted mark and (for the owner) each row's Mute/Unmute label follow state.mutedMembers.
 	renderMembers();
+}
+
+// The owner locked or unlocked the channel to new members (server-enforced at join; existing members, us included,
+// are unaffected). Reflect it: everyone sees the 🔒 indicator, and the owner's toggle button relabels.
+function onChannelLocked(locked) {
+	state.locked = locked;
+	log(locked
+		? 'Channel locked by the owner — new members can\'t join (current members are unaffected).'
+		: 'Channel unlocked by the owner — new members can join again.');
+	updateLockControls();
 }
 
 // Reflects the live mode in the selector and lets only the owner change it while connected; when
@@ -1607,6 +1628,7 @@ function renderMembers() {
 			ul.appendChild(li);
 		});
 	updateMuteAllButton(); // show/hide + relabel the owner's "Mute all" toggle to match the roster's mute state
+	updateLockControls();  // show the 🔒 indicator to everyone + the owner's Lock/Unlock toggle (ownership may have changed)
 	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
 	updateApplyControls(); // re-settle Apply/Reset: a rebuild may have dropped a now-departed pending owner pick
 }
@@ -1625,6 +1647,20 @@ function updateMuteAllButton() {
 	const allMuted = others.length > 0 && others.every(id => state.mutedMembers.has(id));
 	btn.textContent = allMuted ? 'Unmute all' : 'Mute all';
 	btn.disabled = others.length === 0;
+}
+
+// Reflects the channel's lock state: the 🔒 indicator is shown to EVERYONE when locked (so non-owners, who don't
+// see the toggle, still know newcomers are blocked); the "Lock/Unlock channel" toggle is owner-only (hidden for
+// others and in the ownerless global room). The button label follows state.locked, recomputed at click time.
+function updateLockControls() {
+	const badge = byId('lockedBadge');
+	const btn = byId('lockBtn');
+	badge.hidden = !state.locked;
+	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	btn.hidden = !iAmOwner;
+	if (iAmOwner) {
+		btn.textContent = state.locked ? 'Unlock channel' : 'Lock channel';
+	}
 }
 
 function enableTalkButton(enabled) {
@@ -1668,6 +1704,7 @@ function resetChannelState() {
 	state.floorSpeaker = null;
 	state.members.clear();
 	state.mutedMembers.clear();
+	state.locked = false;   // onJoined re-seeds from the snapshot; this keeps a clean baseline for the disconnect path
 }
 
 function cleanup() {
@@ -1718,6 +1755,8 @@ function cleanup() {
 	byId('ownerSelect').hidden = true;
 	byId('ownerLabel').hidden = true;
 	byId('muteAllBtn').hidden = true;      // owner-only moderation control; renderMembers only re-shows it while connected
+	byId('lockBtn').hidden = true;         // owner-only lock toggle; ditto
+	byId('lockedBadge').hidden = true;     // clear the 🔒 indicator on disconnect
 	byId('shareRekeyRow').hidden = true;   // owner-only rotation control; updateApplyControls only runs while connected
 	byId('shareRekey').checked = true;     // back to the default-checked (auto-share) state for the next session
 	setStatus(false, 'Disconnected');
@@ -1753,6 +1792,8 @@ window.addEventListener('DOMContentLoaded', () => {
 		const allMuted = others.length > 0 && others.every(id => state.mutedMembers.has(id));
 		sendCtrl({type: 'muteAll', muted: !allMuted});
 	});
+	// Owner-only "Lock/Unlock channel" toggle: flip the current lock state (recomputed at click time). Immediate.
+	byId('lockBtn').addEventListener('click', () => sendCtrl({type: 'setLocked', locked: !state.locked}));
 	byId('ownerSelect').addEventListener('change', updateApplyControls);   // a pending transfer; applied via the button
 	// Re-evaluate the adaptive Switch/Apply button as the form fields change (mode is handled in its own listener).
 	byId('channel').addEventListener('input', updateApplyControls);

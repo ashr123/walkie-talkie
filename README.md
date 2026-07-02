@@ -266,6 +266,13 @@ muted. (Caveat: on the **WebRTC** transport, media is peer-to-peer, so the serve
 audio itself; the muted client still stops sending as a courtesy, but the guarantee holds only on the relay
 transport.)
 
+**Lock the channel.** The owner can freeze the room to newcomers: a **Lock channel** / **Unlock channel** toggle
+in the **Members** panel header (owner-only, applied immediately) stops anyone else joining — even with the right
+passphrase. Everyone sees a **🔒 Locked** badge while it's on. Enforcement is on the **server** (the join is
+refused with `channel_locked`), so it doesn't rely on the clients. Existing members are unaffected; a member who
+*leaves* a locked channel, though, can't come back until it's unlocked. (The ownerless `global` room can't be
+locked.)
+
 Open the page in two tabs (or two machines) to talk between them.
 
 ### Java desktop client
@@ -303,7 +310,9 @@ the owner's new passphrase) · `p! [passphrase]` rotate **without** auto-sharing
 re-enter it) · `o <#id>` hand ownership to another member (owner; `<#id>` is the prefix shown next to a member)
 · `mute <#id|all>` / `unmute <#id|all>` mute or unmute a member — or everyone but yourself — as the owner (the
 server enforces it: a muted member's audio is dropped and it's shown `[muted]` in `w`; being muted stops your
-mic and refuses `t` until you're unmuted) · `n <name>` rename · `f` toggle hi-fi
+mic and refuses `t` until you're unmuted) · `lock` / `unlock` lock or unlock the channel to new members as the
+owner (server-enforced; a blocked newcomer is refused with `channel_locked`; existing members are unaffected) ·
+`n <name>` rename · `f` toggle hi-fi
 (music/voice) live · `q` quit (closes the socket, ending the session) · `h` help.
 
 The client encodes Opus at 48 kHz with in-band FEC (Concentus) — stereo when the audio device supports it,

@@ -107,6 +107,7 @@ public class ConnectionService {
 			case ClientMessage.Rename(String displayName) -> handleRename(session, displayName);
 			case ClientMessage.MuteMember(String memberId, boolean muted) -> handleMuteMember(session, memberId, muted);
 			case ClientMessage.MuteAll(boolean muted) -> handleMuteAll(session, muted);
+			case ClientMessage.SetLocked(boolean locked) -> handleSetLocked(session, locked);
 			case ClientMessage.Offer(String target, String sdp) ->
 					relaySignal(session, target, new ServerMessage.SignalOffer(session.id(), sdp));
 			case ClientMessage.Answer(String target, String sdp) ->
@@ -142,7 +143,7 @@ public class ConnectionService {
 		if (requested != null && requested.equals(session.channelName())
 				&& channelRegistry.find(requested) instanceof Some(Channel current)) {
 			session.send(new ServerMessage.Joined(
-					session.id(), current.name(), current.mode(), current.ownerId(), current.memberInfos()));
+					session.id(), current.name(), current.mode(), current.ownerId(), current.isLocked(), current.memberInfos()));
 			return;
 		}
 
@@ -193,7 +194,7 @@ public class ConnectionService {
 			Channel joinedChannel = joined.channel();
 			session.joinedChannel(joinedChannel.name());
 			safeSend(session, new ServerMessage.Joined(session.id(), joinedChannel.name(),
-					joinedChannel.mode(), joinedChannel.ownerId(), joined.roster()));
+					joinedChannel.mode(), joinedChannel.ownerId(), joinedChannel.isLocked(), joined.roster()));
 			if (joined.floorHolder() instanceof Some(String holder)) {
 				safeSend(session, new ServerMessage.FloorTaken(holder));
 			}
@@ -205,8 +206,18 @@ public class ConnectionService {
 				? channelRegistry.joinOrCreate(requested, mode, null, session, GLOBAL_CHANNEL_OWNER, emitInitialState)
 				: channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session, emitInitialState);
 		if (joined == null) {
-			sendError(session, "passphrase_mismatch",
-					"This channel is using a different encryption passphrase (or none) — you can't join it.");
+			// The atomic join refused to add us. It rejects a LOCKED channel before the key-check, so attribute the
+			// reason: if the target is (still) locked it was the lock, else a passphrase mismatch. The enforcement
+			// itself was atomic inside joinOrCreate; this re-read only picks the error message to show, so a lock
+			// toggling in the instant after the failed join at worst shows the other of two equally-true "can't
+			// join" messages — never a wrong admit/reject.
+			if (channelRegistry.find(requested) instanceof Some(Channel target) && target.isLocked()) {
+				sendError(session, "channel_locked",
+						"This channel is locked by its owner — you can't join it right now.");
+			} else {
+				sendError(session, "passphrase_mismatch",
+						"This channel is using a different encryption passphrase (or none) — you can't join it.");
+			}
 			return;
 		}
 		Channel channel = joined.channel();
@@ -511,15 +522,30 @@ public class ConnectionService {
 				null;
 	}
 
+	/// The caller's channel IF the caller currently owns it, else `null` after sending the right error: the shared
+	/// owner-gate for the inline owner-only handlers (mode change, mute) — routed here rather than through the
+	/// registry because they act on channel state under the channel monitor, not under the bin lock. Sends
+	/// `not_in_channel` (via [#requireChannel]) when not in a channel and `not_owner` when in one but not its owner;
+	/// `action` completes the "Only the channel owner can …" message. The owner check reads the live `ownerId`, so a
+	/// concurrent ownership transfer just means an already-authorized action may still land — benign and reversible,
+	/// not a privilege leak. The sentinel-owned `global` room is never equal to a session id, so it fails here.
+	private Channel requireOwnedChannel(ClientSession session, String action) {
+		Channel channel = requireChannel(session);
+		if (channel == null) {
+			return null;
+		}
+		if (!session.id().equals(channel.ownerId())) {
+			sendError(session, "not_owner", "Only the channel owner can " + action);
+			return null;
+		}
+		return channel;
+	}
+
 	/// Changes the current channel's mode, but only for its owner. Clears the floor and broadcasts the
 	/// new mode to every member so their controls update; a non-owner gets a `not_owner` error.
 	private void handleChangeMode(ClientSession session, ChannelMode mode) {
-		Channel channel = requireChannel(session);
+		Channel channel = requireOwnedChannel(session, "change the mode");
 		if (channel == null) {
-			return;
-		}
-		if (!session.id().equals(channel.ownerId())) {
-			sendError(session, "not_owner", "Only the channel owner can change the mode");
 			return;
 		}
 		if (mode == ChannelMode.GLOBAL_PTT && !channel.name().equals(GLOBAL_CHANNEL)) {
@@ -570,12 +596,11 @@ public class ConnectionService {
 			sendError(session, "not_in_channel", "Join a channel first");
 			return;
 		}
-		ChannelRegistry.RekeyResult result = channelRegistry.changePassphrase(channelName, session.id(), keyCheck);
-		switch (result.outcome()) {
-			case NOT_FOUND -> sendError(session, "not_in_channel", "Join a channel first");
-			case NOT_OWNER -> sendError(session, "not_owner", "Only the channel owner can change the passphrase");
-			case OK -> {
-				Channel channel = result.channel();
+		switch (channelRegistry.changePassphrase(channelName, session.id(), keyCheck)) {
+			case ChannelRegistry.RekeyResult.NotFound _ -> sendError(session, "not_in_channel", "Join a channel first");
+			case ChannelRegistry.RekeyResult.NotOwner _ ->
+					sendError(session, "not_owner", "Only the channel owner can change the passphrase");
+			case ChannelRegistry.RekeyResult.Ok(Channel channel) -> {
 				synchronized (channel) {
 					// Broadcast the LIVE key-check (convergence) plus this request's wrappedKey relayed verbatim —
 					// the server never inspects or stores it; members that hold the old key decrypt it to adopt the
@@ -611,14 +636,13 @@ public class ConnectionService {
 			sendError(session, "not_in_channel", "Join a channel first");
 			return;
 		}
-		ChannelRegistry.TransferResult result = channelRegistry.transferOwnership(channelName, session.id(), newOwnerId);
-		switch (result.outcome()) {
-			case NOT_FOUND -> sendError(session, "not_in_channel", "Join a channel first");
-			case NOT_OWNER -> sendError(session, "not_owner", "Only the channel owner can transfer ownership");
-			case NOT_A_MEMBER -> sendError(session, "unknown_target",
+		switch (channelRegistry.transferOwnership(channelName, session.id(), newOwnerId)) {
+			case ChannelRegistry.TransferResult.NotFound _ -> sendError(session, "not_in_channel", "Join a channel first");
+			case ChannelRegistry.TransferResult.NotOwner _ ->
+					sendError(session, "not_owner", "Only the channel owner can transfer ownership");
+			case ChannelRegistry.TransferResult.NotAMember _ -> sendError(session, "unknown_target",
 					"No member '" + newOwnerId + "' in this channel");
-			case OK -> {
-				Channel channel = result.channel();
+			case ChannelRegistry.TransferResult.Ok(Channel channel) -> {
 				synchronized (channel) {
 					ServerMessage ownerChanged = new ServerMessage.OwnerChanged(channel.ownerId());
 					channel.forEach(member -> safeSend(member, ownerChanged));
@@ -652,18 +676,13 @@ public class ConnectionService {
 	/// window between the check and the mutation, its (already-authorized) mute may still land — harmless and
 	/// reversible moderation by the new owner, not a privilege leak (the requester WAS owner when it acted).
 	private void handleMuteMember(ClientSession session, String memberId, boolean muted) {
-		Channel channel = requireChannel(session);
+		Channel channel = requireOwnedChannel(session, "mute members");
 		if (channel == null) {
-			return;
-		}
-		String ownerId = channel.ownerId();
-		if (!session.id().equals(ownerId)) {
-			sendError(session, "not_owner", "Only the channel owner can mute members");
 			return;
 		}
 		// The owner can't mute itself, and only a current member can be muted. This is the friendly fast-path error;
 		// the authoritative membership test is re-done under the monitor below (a member can leave in between).
-		if (memberId == null || memberId.equals(ownerId) || !(channel.member(memberId) instanceof Some(ClientSession _))) {
+		if (memberId == null || memberId.equals(channel.ownerId()) || !(channel.member(memberId) instanceof Some(ClientSession _))) {
 			sendError(session, "unknown_target", "No member '" + memberId + "' to mute in this channel");
 			return;
 		}
@@ -688,19 +707,14 @@ public class ConnectionService {
 	/// actually changed) as [#handleMuteMember]; a non-owner gets `not_owner`. If the current floor holder is among
 	/// those muted, its floor is freed too (via [#broadcastMute]).
 	private void handleMuteAll(ClientSession session, boolean muted) {
-		Channel channel = requireChannel(session);
+		Channel channel = requireOwnedChannel(session, "mute members");
 		if (channel == null) {
-			return;
-		}
-		String ownerId = channel.ownerId();
-		if (!session.id().equals(ownerId)) {
-			sendError(session, "not_owner", "Only the channel owner can mute members");
 			return;
 		}
 		synchronized (channel) {
 			// setMutedForAllExcept flips the whole roster under the monitor and returns only the ids that changed,
 			// so we broadcast exactly one MemberMuted per genuine transition (idempotent for members already in-state).
-			for (String memberId : channel.setMutedForAllExcept(ownerId, muted)) {
+			for (String memberId : channel.setMutedForAllExcept(channel.ownerId(), muted)) {
 				broadcastMute(channel, memberId, muted);
 			}
 		}
@@ -732,6 +746,34 @@ public class ConnectionService {
 		if (channel.setMuted(owner, false)) {   // true only if the new owner really was muted — else no spurious notice
 			ServerMessage memberMuted = new ServerMessage.MemberMuted(owner, false);
 			channel.forEach(member -> safeSend(member, memberMuted));
+		}
+	}
+
+	/// Locks or unlocks the channel to NEW members, on the owner's request only. Server-enforced in the atomic join
+	/// (see [ChannelRegistry#joinOrCreate]); existing members are never affected. Routed through
+	/// [ChannelRegistry#setLocked] so the owner check and the flag write share the bin lock a join validates its
+	/// key-check under — a non-owner gets `not_owner`, and the sentinel-owned `global` room can't be locked. On
+	/// success the `ChannelLocked` broadcast runs under the channel monitor over the mutated instance the registry
+	/// returns (not a fresh `find()`, mirroring [#handleChangePassphrase]'s same-object discipline) reading the
+	/// channel's LIVE lock state, so two back-to-back toggles converge — a delayed broadcast carries the current
+	/// value rather than leaving a member gating against a stale one.
+	private void handleSetLocked(ClientSession session, boolean locked) {
+		String channelName = session.channelName();
+		if (channelName == null) {
+			sendError(session, "not_in_channel", "Join a channel first");
+			return;
+		}
+		switch (channelRegistry.setLocked(channelName, session.id(), locked)) {
+			case ChannelRegistry.LockResult.NotFound _ -> sendError(session, "not_in_channel", "Join a channel first");
+			case ChannelRegistry.LockResult.NotOwner _ ->
+					sendError(session, "not_owner", "Only the channel owner can lock the channel");
+			case ChannelRegistry.LockResult.Ok(Channel channel) -> {
+				synchronized (channel) {
+					ServerMessage channelLocked = new ServerMessage.ChannelLocked(channel.isLocked());
+					channel.forEach(member -> safeSend(member, channelLocked));
+				}
+				log.info("channel {}", locked ? "locked" : "unlocked");
+			}
 		}
 	}
 

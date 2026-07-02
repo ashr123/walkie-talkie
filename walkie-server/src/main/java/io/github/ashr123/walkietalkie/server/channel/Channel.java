@@ -50,6 +50,18 @@ public final class Channel {
 	/// Still mutate it only via [#setKeyCheck] from the registry's bin-locked remapping.
 	private volatile String keyCheck;
 
+	/// Whether the owner has LOCKED the channel to new members. While true, [ChannelRegistry#joinOrCreate] refuses a
+	/// join from any session not already a member; existing members are unaffected (locking blocks only new joins).
+	/// Concurrency mirrors [#keyCheck]: the **write** ([#setLocked], from [ChannelRegistry#setLocked]) and the
+	/// enforcement **read** ([ChannelRegistry#joinOrCreate]) both run inside the registry's `channels.compute*(name,
+	/// …)` remapping, so the `ConcurrentHashMap` bin lock for the channel name serializes a lock toggle with every
+	/// join — a joiner sees either the locked or the unlocked state, never a torn one. It is also read **live**
+	/// under the channel monitor when `ConnectionService.handleSetLocked` announces the change (a *different* lock),
+	/// and lock-free by the in-place re-join re-snapshot, so it is `volatile` for that cross-lock visibility;
+	/// back-to-back toggles converge on the current value like the passphrase/owner broadcasts. Mutate it only via
+	/// [#setLocked] from the registry's bin-locked remapping.
+	private volatile boolean locked;
+
 	/// Per-channel stream-index allocator: maps each member's session id to a uint8 routing index (0..254).
 	/// The server prefixes this index onto a member's relayed audio so multi-stream receivers can demultiplex
 	/// talkers. A monotonic rotating cursor that skips live indices avoids reusing a just-freed index until it
@@ -94,6 +106,17 @@ public final class Channel {
 
 	public void setMode(ChannelMode mode) {
 		this.mode = mode;
+	}
+
+	public boolean isLocked() {
+		return locked;
+	}
+
+	/// Locks or unlocks the channel to new members. Call **only** from [ChannelRegistry#setLocked], i.e. inside the
+	/// channel-name `channels.computeIfPresent(…)` span, so it serializes with join enforcement (see the `locked`
+	/// field's concurrency note).
+	public void setLocked(boolean locked) {
+		this.locked = locked;
 	}
 
 	public String ownerId() {

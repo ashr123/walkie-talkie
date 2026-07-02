@@ -248,10 +248,25 @@
             margin: 0;
         }
 
-        #muteAllBtn {
+        /* Right-aligned owner moderation controls (lock toggle + mute-all) and the everyone-visible lock badge. */
+        .members-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        #muteAllBtn, #lockBtn {
             width: auto;
             padding: 5px 11px;
             font-size: 12px;
+        }
+
+        /* Shown to ALL members when the channel is locked (added at runtime by app.js). */
+        /*noinspection CssUnusedSymbol*/
+        #lockedBadge {
+            font-size: 12px;
+            color: var(--bad);
+            white-space: nowrap;
         }
 
         #log {
@@ -348,7 +363,11 @@
 			<div class="panel" style="flex:1;">
 				<div class="members-header">
 					<h2>Members</h2>
-					<button class="secondary" hidden id="muteAllBtn" type="button">Mute all</button>
+					<div class="members-controls">
+						<span hidden id="lockedBadge" title="The owner locked this channel — new members can't join">🔒 Locked</span>
+						<button class="secondary" hidden id="lockBtn" type="button">Lock channel</button>
+						<button class="secondary" hidden id="muteAllBtn" type="button">Mute all</button>
+					</div>
 				</div>
 				<ul id="members"></ul>
 			</div>

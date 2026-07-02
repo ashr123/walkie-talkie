@@ -9,11 +9,18 @@ import java.util.List;
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "type")
 public sealed interface ServerMessage {
 
-	/// Acknowledges a successful join and snapshots the current channel mode, owner and membership.
-	/// When joining an existing channel, `mode` is the channel's actual mode (the joiner adopts it).
+	/// Acknowledges a successful join and snapshots the current channel mode, owner, membership and lock state.
+	/// When joining an existing channel, `mode` is the channel's actual mode (the joiner adopts it). `locked` is
+	/// whether the owner has locked the channel to new members — carried here so a re-snapshot (an in-place
+	/// re-join) renders the state without waiting for a [ChannelLocked].
 	@JsonTypeName("joined")
-	record Joined(String selfId, String channel, ChannelMode mode, String ownerId, List<MemberInfo> members)
-			implements ServerMessage {
+	record Joined(String selfId,
+	              String channel,
+	              ChannelMode mode,
+	              String ownerId,
+	              boolean locked,
+	              List<MemberInfo> members
+	) implements ServerMessage {
 	}
 
 	/// A new participant joined the channel.
@@ -38,6 +45,12 @@ public sealed interface ServerMessage {
 	/// is the new state.
 	@JsonTypeName("memberMuted")
 	record MemberMuted(String memberId, boolean muted) implements ServerMessage {
+	}
+
+	/// The owner locked or unlocked the channel to new members. Broadcast to the whole channel so everyone renders
+	/// the state (existing members are unaffected — locking only blocks NEW joins). `locked` is the new state.
+	@JsonTypeName("channelLocked")
+	record ChannelLocked(boolean locked) implements ServerMessage {
 	}
 
 	/// The floor was granted to you; you may transmit.

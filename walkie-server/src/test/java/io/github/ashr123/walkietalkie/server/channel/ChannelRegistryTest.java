@@ -111,9 +111,9 @@ class ChannelRegistryTest {
 	@Test
 	void changePassphraseRotatesForTheOwnerAndReturnsTheSameChannel() {
 		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a")).channel();
-		ChannelRegistry.RekeyResult result = registry.changePassphrase("team", "a", "kcv-B");
-		assertEquals(ChannelRegistry.RekeyOutcome.OK, result.outcome());
-		assertSame(created, result.channel(), "OK returns the exact mutated channel instance (not a fresh find())");
+		ChannelRegistry.RekeyResult.Ok result = assertInstanceOf(ChannelRegistry.RekeyResult.Ok.class,
+				registry.changePassphrase("team", "a", "kcv-B"));
+		assertSame(created, result.channel(), "Ok carries the exact mutated channel instance (not a fresh find())");
 		assertEquals("kcv-B", created.keyCheck(), "the key-check is rotated in place");
 	}
 
@@ -121,27 +121,24 @@ class ChannelRegistryTest {
 	void changePassphraseRefusesANonOwnerAndLeavesTheKeyCheck() {
 		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a")).channel();
 		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("b"));
-		ChannelRegistry.RekeyResult result = registry.changePassphrase("team", "b", "kcv-B");
-		assertEquals(ChannelRegistry.RekeyOutcome.NOT_OWNER, result.outcome());
-		assertNull(result.channel(), "a non-OK result carries no channel");
+		// NotOwner carries no channel by construction (sealed), so there's nothing to null-check.
+		assertInstanceOf(ChannelRegistry.RekeyResult.NotOwner.class, registry.changePassphrase("team", "b", "kcv-B"));
 		assertEquals("kcv-A", created.keyCheck(), "a refused rotation leaves the key-check unchanged");
 	}
 
 	@Test
 	void changePassphraseOnAMissingChannelIsNotFound() {
-		ChannelRegistry.RekeyResult result = registry.changePassphrase("ghost", "a", "kcv-B");
-		assertEquals(ChannelRegistry.RekeyOutcome.NOT_FOUND, result.outcome());
-		assertNull(result.channel());
+		assertInstanceOf(ChannelRegistry.RekeyResult.NotFound.class, registry.changePassphrase("ghost", "a", "kcv-B"));
 	}
 
-	// --- transferOwnership outcome matrix (OK / NOT_OWNER / NOT_A_MEMBER / NOT_FOUND + same-object channel()) ---
+	// --- transferOwnership outcome matrix (Ok / NotOwner / NotAMember / NotFound + same-object channel on Ok) ---
 
 	@Test
 	void transferOwnershipMovesTheOwnerForTheOwnerAndReturnsTheSameChannel() {
 		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
 		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
-		ChannelRegistry.TransferResult result = registry.transferOwnership("team", "a", "b");
-		assertEquals(ChannelRegistry.TransferOutcome.OK, result.outcome());
+		ChannelRegistry.TransferResult.Ok result = assertInstanceOf(ChannelRegistry.TransferResult.Ok.class,
+				registry.transferOwnership("team", "a", "b"));
 		assertSame(created, result.channel());
 		assertEquals("b", created.ownerId(), "ownership moved to the named member");
 	}
@@ -150,25 +147,46 @@ class ChannelRegistryTest {
 	void transferOwnershipRefusesANonOwner() {
 		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
 		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
-		ChannelRegistry.TransferResult result = registry.transferOwnership("team", "b", "b");
-		assertEquals(ChannelRegistry.TransferOutcome.NOT_OWNER, result.outcome());
-		assertNull(result.channel());
+		assertInstanceOf(ChannelRegistry.TransferResult.NotOwner.class, registry.transferOwnership("team", "b", "b"));
 		assertEquals("a", created.ownerId(), "ownership is unchanged");
 	}
 
 	@Test
 	void transferOwnershipToANonMemberIsRejected() {
 		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
-		ChannelRegistry.TransferResult result = registry.transferOwnership("team", "a", "ghost");
-		assertEquals(ChannelRegistry.TransferOutcome.NOT_A_MEMBER, result.outcome());
-		assertNull(result.channel());
+		assertInstanceOf(ChannelRegistry.TransferResult.NotAMember.class, registry.transferOwnership("team", "a", "ghost"));
 		assertEquals("a", created.ownerId(), "ownership is unchanged");
 	}
 
 	@Test
 	void transferOwnershipOnAMissingChannelIsNotFound() {
-		ChannelRegistry.TransferResult result = registry.transferOwnership("ghost", "a", "b");
-		assertEquals(ChannelRegistry.TransferOutcome.NOT_FOUND, result.outcome());
-		assertNull(result.channel());
+		assertInstanceOf(ChannelRegistry.TransferResult.NotFound.class, registry.transferOwnership("ghost", "a", "b"));
+	}
+
+	@Test
+	void aLockedChannelRefusesANewcomerButNotTheCreate() {
+		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		assertInstanceOf(ChannelRegistry.LockResult.Ok.class, registry.setLocked("team", "a", true));
+		assertTrue(created.isLocked());
+
+		assertNull(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b")),
+				"a locked channel refuses a newcomer (returns null, like a key-check mismatch)");
+		assertEquals(1, created.size(), "the newcomer was not added");
+
+		assertInstanceOf(ChannelRegistry.LockResult.Ok.class, registry.setLocked("team", "a", false));
+		assertNotNull(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("c")),
+				"once unlocked, a newcomer joins");
+		assertEquals(2, created.size());
+	}
+
+	@Test
+	void setLockedIsRejectedForANonOwnerAndMissingChannel() {
+		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
+
+		assertInstanceOf(ChannelRegistry.LockResult.NotOwner.class, registry.setLocked("team", "b", true));
+		assertFalse(created.isLocked(), "a non-owner's lock has no effect");
+
+		assertInstanceOf(ChannelRegistry.LockResult.NotFound.class, registry.setLocked("ghost", "a", true));
 	}
 }

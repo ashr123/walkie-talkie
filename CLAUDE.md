@@ -99,6 +99,24 @@ clients reflect it: a muted member is shown 🔇/`[muted]`, and being muted disa
 owner" / refuses `t`) and stops the mic. Web mute buttons live in the Members column and apply immediately (not
 via the Apply/Reset flow); the Java client exposes `mute`/`unmute <#id|all>`.
 
+**Owner-enforced channel lock.** The owner can lock a channel to NEW members (`SetLocked` → broadcast
+`ChannelLocked`, `ConnectionService.handleSetLocked` via `ChannelRegistry.setLocked`); the flag is
+`Channel.locked` (`volatile`) and rides in `Joined.locked`. Enforcement is in the **atomic join**: a locked
+`Channel` makes `ChannelRegistry.joinOrCreate` refuse to add a member (returns `null`, before the key-check),
+so a newcomer is rejected with `channel_locked` even with the right passphrase. The `setLocked` write and the
+join's lock read share the **same bin lock** as the key-check (both under `channels.compute*`), so a toggle is
+atomic w.r.t. every concurrent join — a joiner sees consistently the locked or the unlocked state. Only
+NEWCOMERS are blocked: an existing member's in-place re-join to its **current** channel short-circuits in
+`handleJoin` before `joinOrCreate` (idempotent re-snapshot, carrying `locked`), so it's never locked out; the
+lock also never removes existing members. `channel_locked` behaves like `passphrase_mismatch` (both are
+detectable only inside the atomic join): an initial connect fails cleanly, and a switch INTO a locked channel
+drops you — the clients handle it the same way (browser disconnects; Java exits). The `ChannelLocked` broadcast
+runs under the channel monitor reading the live `isLocked()` (convergence, like the passphrase/owner
+broadcasts). The lock persists across a departure-triggered ownership change (a new owner inherits it and can
+unlock); the sentinel-owned `global` room can't be locked (`not_owner`). Web: an owner-only Lock/Unlock toggle
+in the Members header + a 🔒 badge shown to everyone; Java: `lock`/`unlock` commands + a 🔒 marker in `w` and
+the join line.
+
 **In-place channel switch & rename.** A client changes channel/mode/passphrase **without a new socket**:
 re-sending `Join` on the live connection is handled as "leave the old channel, join the new one" on the same
 `WebSocketSession`, so the **session id (identity) and the audio loops survive** — only per-channel state

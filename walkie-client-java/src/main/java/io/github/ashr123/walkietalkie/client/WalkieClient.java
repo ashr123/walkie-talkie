@@ -83,7 +83,8 @@ public final class WalkieClient implements AutoCloseable {
 			           p [passphrase] = change the passphrase (blank = turn encryption off; members auto-adopt)
 			           p! [passphrase] = change the passphrase WITHOUT auto-sharing (members must re-enter it)
 			           o <#id> = give ownership to another member
-			           mute <#id|all> / unmute <#id|all> = mute or unmute members""";
+			           mute <#id|all> / unmute <#id|all> = mute or unmute members
+			           lock / unlock = lock or unlock the channel to new members""";
 	/// The one passphrase command a NON-owner has: adopt a rotation the owner announced but didn't auto-share (an
 	/// owner instead changes the passphrase with `p`/`p!` — see [#OWNER_COMMANDS]). The 11 leading spaces align its
 	/// `p` under the command column of [#COMMON_COMMANDS] / [#OWNER_COMMANDS] after their text-block indent is
@@ -118,6 +119,7 @@ public final class WalkieClient implements AutoCloseable {
 	private volatile String pendingPassphrase;   // the new passphrase we (as owner) submitted, applied when the echo arrives
 	private volatile boolean warnedDecrypt; // listener thread only today, but volatile so the warn-once intent survives a threading refactor
 	private volatile boolean welcomeShown;  // print the role-aware help once, after the first Joined reveals our role (same listener-thread-only-but-volatile rationale as warnedDecrypt)
+	private volatile boolean channelLocked; // whether the owner has locked the channel to new members (from Joined/ChannelLocked); volatile — set on the listener thread, read on the console thread for 'w'
 
 	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
 		this.options = options;
@@ -286,14 +288,18 @@ public final class WalkieClient implements AutoCloseable {
 
 	private void handleServerMessage(String json) {
 		switch (JSON_MAPPER.readValue(json, ServerMessage.class)) {
-			case ServerMessage.Joined(
-					String selfId, String channel, ChannelMode mode, String ownerId, List<MemberInfo> members
-			) -> {
+			case ServerMessage.Joined(String selfId,
+									  String channel,
+									  ChannelMode mode,
+									  String ownerId,
+									  boolean locked,
+									  List<MemberInfo> members) -> {
 				boolean channelChanged = !channel.equals(this.currentChannel);
 				this.selfId = selfId;
 				this.ownerId = ownerId;
 				this.currentMode = mode;
 				this.currentChannel = channel;
+				this.channelLocked = locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join)
 				if (channelChanged) {
 					// Baseline the channel's announced key-check from the key we joined with — only on an ACTUAL
 					// channel change (a switch). switchTo deliberately doesn't advance it, so the transmit gate keeps
@@ -324,6 +330,7 @@ public final class WalkieClient implements AutoCloseable {
 						? ""
 						: " (you requested " + options.mode() + ", adopted the channel's existing mode)";
 				log("[joined] channel=" + channel + " mode=" + mode + modeNote + " members=" + members.size()
+						+ (locked ? " 🔒 locked" : "")
 						+ System.lineSeparator() + "[owner] " + ownerLine
 						+ System.lineSeparator() + modeHint(mode, audio.isTransmitting()));
 				if (!welcomeShown) {
@@ -338,6 +345,7 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.MemberLeft(String memberId) -> announceLeave(memberId);
 			case ServerMessage.MemberRenamed(String memberId, String displayName) -> announceRename(memberId, displayName);
 			case ServerMessage.MemberMuted(String memberId, boolean muted) -> handleMuteChange(memberId, muted);
+			case ServerMessage.ChannelLocked(boolean locked) -> handleChannelLocked(locked);
 			case ServerMessage.FloorGranted _ -> {
 				audio.setTransmitting(true);
 				log("[floor granted] talking — type 't' to stop");
@@ -406,6 +414,12 @@ public final class WalkieClient implements AutoCloseable {
 					log("Disconnecting — this channel needs a different --key.");
 					System.exit(0);
 				}
+				// A locked channel refused our join. Like a passphrase mismatch, the join failed (an initial connect
+				// joined nothing; a locked switch dropped us), so there's nothing to do but exit — fire once.
+				if ("channel_locked".equals(code) && running.getAndSet(false)) {
+					log("This channel is locked by its owner — cannot join.");
+					System.exit(0);
+				}
 			}
 		}
 	}
@@ -459,6 +473,15 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
+	/// The owner locked or unlocked the channel to new members (server-enforced at join). Existing members — us
+	/// included — are unaffected; we just track the state (for `w` and the join line) and note the change.
+	private void handleChannelLocked(boolean locked) {
+		channelLocked = locked;
+		log(locked
+				? "[locked] the owner locked this channel — new members can't join (current members are unaffected)."
+				: "[unlocked] the owner unlocked this channel — new members can join again.");
+	}
+
 	/// Whether the mic should auto-open on a full-duplex join or mode change, for the current session — reads our
 	/// `--muted` option and our own owner-mute state, then defers to the pure [#shouldAutoOpenMic(ChannelMode, boolean, boolean)].
 	private boolean shouldAutoOpenMic(ChannelMode mode) {
@@ -503,7 +526,8 @@ public final class WalkieClient implements AutoCloseable {
 				})
 				.collect(Collectors.joining(
 						System.lineSeparator() + "  - ",
-						"[members] " + memberNames.size() + " in this channel:" + System.lineSeparator() + "  - ",
+						"[members] " + memberNames.size() + " in this channel"
+								+ (channelLocked ? " 🔒 locked to new members" : "") + ":" + System.lineSeparator() + "  - ",
 						"")));
 	}
 
@@ -524,6 +548,8 @@ public final class WalkieClient implements AutoCloseable {
 					case "o", "owner" -> transferOwnership(parts.length > 1 ? parts[1] : "");
 					case "mute" -> muteMember(parts.length > 1 ? parts[1] : "", true);
 					case "unmute" -> muteMember(parts.length > 1 ? parts[1] : "", false);
+					case "lock" -> setChannelLock(true);
+					case "unlock" -> setChannelLock(false);
 					case "n", "name" -> rename(parts.length > 1 ? parts[1] : "");
 					case "f", "fidelity" -> toggleFidelity();
 					case "w", "who", "members" -> listMembers();
@@ -850,6 +876,18 @@ public final class WalkieClient implements AutoCloseable {
 			}
 			default -> log("[" + verb + "] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
 		}
+	}
+
+	/// `lock` / `unlock` — owner-only: stop / allow NEW members joining this channel. Gated locally to the owner
+	/// (the server enforces it too and never trusts the client); the resulting [ServerMessage.ChannelLocked] is what
+	/// actually flips everyone's state. Existing members are never affected.
+	private void setChannelLock(boolean locked) {
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can " + (locked ? "lock" : "unlock") + " the channel");
+			return;
+		}
+		enqueue(new ClientMessage.SetLocked(locked));
+		log("[" + (locked ? "lock" : "unlock") + "] requesting to " + (locked ? "lock" : "unlock") + " the channel...");
 	}
 
 	private WebSocket connect(String token) {

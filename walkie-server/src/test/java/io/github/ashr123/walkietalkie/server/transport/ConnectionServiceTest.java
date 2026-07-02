@@ -1274,6 +1274,123 @@ class ConnectionServiceTest {
 		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
 	}
 
+	// --- owner-locked channel ----------------------------------------------------------------------
+
+	@Test
+	void theOwnerLocksTheChannelAndANewcomerIsRefused() {
+		FakeClientSession alice = join("alice", "lockable", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		alice.sent.clear();
+		service.onMessage(alice, new ClientMessage.SetLocked(true));
+		assertTrue(channel("lockable").isLocked());
+		assertTrue(firstOf(alice, ServerMessage.ChannelLocked.class).locked(),
+				"the lock is broadcast to the channel (the owner included)");
+
+		FakeClientSession bob = join("bob", "lockable", ChannelMode.MULTI_CHANNEL_PTT);   // a newcomer
+		assertEquals("channel_locked", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertFalse(bob.sent.stream().anyMatch(ServerMessage.Joined.class::isInstance), "the newcomer never joined");
+		assertNull(bob.channelName(), "the refused joiner is not in the channel");
+		assertEquals(1, channel("lockable").size(), "bob was not added");
+	}
+
+	@Test
+	void unlockingLetsNewMembersJoinAgain() {
+		FakeClientSession alice = join("alice", "relock", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = join("bob", "relock", ChannelMode.FULL_DUPLEX);
+		assertEquals("channel_locked", firstOf(bob, ServerMessage.ErrorMessage.class).code(), "refused while locked");
+
+		service.onMessage(alice, new ClientMessage.SetLocked(false));
+		assertFalse(channel("relock").isLocked());
+		FakeClientSession carol = join("carol", "relock", ChannelMode.FULL_DUPLEX);
+		assertTrue(carol.sent.stream().anyMatch(ServerMessage.Joined.class::isInstance), "a newcomer joins once unlocked");
+		assertEquals(2, channel("relock").size(), "alice + carol (bob never joined)");
+	}
+
+	@Test
+	void aNonOwnerCannotLockTheChannel() {
+		join("alice", "noown-lock", ChannelMode.FULL_DUPLEX);   // alice owns it
+		FakeClientSession bob = join("bob", "noown-lock", ChannelMode.FULL_DUPLEX);
+		service.onMessage(bob, new ClientMessage.SetLocked(true));
+		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertFalse(channel("noown-lock").isLocked(), "a non-owner's lock request has no effect");
+	}
+
+	@Test
+	void anExistingMemberCanReSnapshotALockedChannelAndSeesItLocked() {
+		FakeClientSession alice = join("alice", "relock-snap", ChannelMode.FULL_DUPLEX);   // owner
+		FakeClientSession bob = join("bob", "relock-snap", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.SetLocked(true));
+
+		bob.sent.clear();
+		// bob re-sends Join for its CURRENT channel — an idempotent re-snapshot, allowed despite the lock.
+		service.onMessage(bob, new ClientMessage.Join("relock-snap", ChannelMode.FULL_DUPLEX, "bob", null));
+		ServerMessage.Joined snap = firstOf(bob, ServerMessage.Joined.class);
+		assertTrue(snap.locked(), "the re-snapshot carries the locked state");
+		assertFalse(bob.sent.stream().anyMatch(ServerMessage.ErrorMessage.class::isInstance),
+				"an existing member is never locked out of its own channel");
+		assertEquals(2, channel("relock-snap").size(), "membership is unchanged");
+	}
+
+	@Test
+	void aLockedChannelStaysLockedWhenTheOwnerLeavesAndTheNewOwnerCanUnlock() {
+		FakeClientSession alice = join("alice", "lock-persist", ChannelMode.FULL_DUPLEX);   // owner
+		FakeClientSession bob = join("bob", "lock-persist", ChannelMode.FULL_DUPLEX);
+		service.onMessage(alice, new ClientMessage.SetLocked(true));
+
+		service.onClose(alice, "owner leaves");   // bob is auto-elected owner
+		assertEquals("bob", channel("lock-persist").ownerId());
+		assertTrue(channel("lock-persist").isLocked(), "the lock survives the ownership change");
+
+		FakeClientSession carol = join("carol", "lock-persist", ChannelMode.FULL_DUPLEX);
+		assertEquals("channel_locked", firstOf(carol, ServerMessage.ErrorMessage.class).code(),
+				"the inherited lock still refuses newcomers");
+
+		service.onMessage(bob, new ClientMessage.SetLocked(false));   // the new owner can unlock
+		assertFalse(channel("lock-persist").isLocked());
+		FakeClientSession dave = join("dave", "lock-persist", ChannelMode.FULL_DUPLEX);
+		assertTrue(dave.sent.stream().anyMatch(ServerMessage.Joined.class::isInstance), "the new owner unlocked it");
+	}
+
+	@Test
+	void theGlobalRoomCannotBeLocked() {
+		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
+		service.onMessage(alice, new ClientMessage.SetLocked(true));
+		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code(),
+				"no participant owns the server-managed global room, so no one can lock it");
+		assertFalse(channel("global").isLocked());
+	}
+
+	@Test
+	void lockingBroadcastsToExistingMembersAndDoesNotAffectThem() {
+		FakeClientSession alice = join("alice", "lock-bcast", ChannelMode.FULL_DUPLEX);   // owner
+		FakeClientSession bob = join("bob", "lock-bcast", ChannelMode.FULL_DUPLEX);
+		assertFalse(firstOf(bob, ServerMessage.Joined.class).locked(),
+				"a normal join into an unlocked channel reports locked=false");
+
+		bob.sent.clear();
+		alice.audio.clear();
+		service.onMessage(alice, new ClientMessage.SetLocked(true));
+
+		// The lock reaches an EXISTING member (not just the owner), removes nobody, and doesn't gate their audio.
+		assertTrue(firstOf(bob, ServerMessage.ChannelLocked.class).locked(),
+				"an existing member is told the channel locked");
+		assertEquals(2, channel("lock-bcast").size(), "locking removes no existing members");
+		service.onAudio(bob, new byte[]{1, 2, 3});
+		assertEquals(1, alice.audio.size(), "an existing member's audio still relays while the channel is locked");
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.SetLocked(false));
+		assertFalse(firstOf(bob, ServerMessage.ChannelLocked.class).locked(),
+				"the unlock is broadcast to the channel too");
+	}
+
+	@Test
+	void settingLockBeforeJoiningAChannelIsRejected() {
+		FakeClientSession stray = session("stray");   // never joined a channel
+		service.onMessage(stray, new ClientMessage.SetLocked(true));
+		assertEquals("not_in_channel", firstOf(stray, ServerMessage.ErrorMessage.class).code());
+	}
+
 	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a
 	/// single failing recipient and still delivers to the others.
 	private static final class ThrowingSession implements ClientSession {
