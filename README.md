@@ -142,9 +142,9 @@ java -jar walkie-server/build/libs/walkie-server-0.1.0.jar
 ```
 
 By default the server runs over **HTTPS on `https://localhost:8443`** with an auto-generated self-signed
-certificate (your browser shows a one-time warning) — see *Transport encryption (TLS / WSS)* below. To run
-plain HTTP on `http://localhost:8080` instead, set `walkie.tls.enabled=false`. Open the URL in a browser to
-use the web client.
+certificate (also valid for `https://[::1]:8443`; your browser shows a one-time warning) — see *Transport
+encryption (TLS / WSS)* below. To run plain HTTP on `http://localhost:8080` instead, set
+`walkie.tls.enabled=false`. Open the URL in a browser to use the web client.
 
 #### Signing key (real / multi-instance deployment)
 
@@ -173,7 +173,8 @@ read and act on them.)
 
 **Local dev (zero-config).** With no keystore configured, the server **auto-generates a self-signed localhost
 certificate on first use** (into `~/.walkie-talkie/`) and **reuses it across restarts** (regenerating only if it
-is missing, expired, or the wrong key size), serving `https://localhost:8443`.
+is missing, expired, the wrong key size, or from the older IPv4-only SAN set). It is valid for
+`localhost`, `127.0.0.1`, and `::1`, so both `https://localhost:8443` and `https://[::1]:8443` work.
 The browser shows a one-time "accept the certificate" warning. The **Java client auto-trusts** this dev cert
 on localhost (it reads the exported `~/.walkie-talkie/dev-cert.pem`), so it just works — and TLS verification
 is never disabled.
@@ -200,8 +201,8 @@ throughout.
 
 ### Browser client
 
-1. Open <https://localhost:8443> and accept the one-time self-signed-certificate warning (or
-   <http://localhost:8080> if you started the server with `walkie.tls.enabled=false`).
+1. Open <https://localhost:8443> (or <https://[::1]:8443>) and accept the one-time self-signed-certificate
+   warning (or <http://localhost:8080> if you started the server with `walkie.tls.enabled=false`).
 2. Pick a transport, channel mode, and channel (optionally tick **High fidelity** to disable the mic
    noise-suppression/echo-cancellation DSP — this can be toggled **live** while connected and applies
    immediately). To encrypt audio **end-to-end**, set the same **Encryption

@@ -11,6 +11,7 @@ import org.springframework.context.annotation.Configuration;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetAddress;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -54,12 +55,16 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 	private static final String DEV_EC_CURVE = "secp384r1";
 	/// P-384's prime-field size in bits — uniquely identifies the curve when validating a persisted keystore.
 	private static final int DEV_EC_FIELD_BITS = 384;
+	static final String DEV_SUBJECT_ALT_NAME = "SAN=dns:localhost,ip:127.0.0.1,ip:::1";
+	private static final int DNS_SUBJECT_ALT_NAME = 2;
 	/// SHA-384 with ECDSA — the hash TLS binds to P-384 (`ecdsa_secp384r1_sha384`). ECDSA locks the hash to the
 	/// curve, and SHA-512 ECDSA would require the browser-unsupported P-521; SHA-384 is no practical downgrade.
 	private static final String DEV_SIG_ALG = "SHA384withECDSA";
 	private static final int DEV_CERT_VALIDITY_DAYS = 825;
 	private static final int PASSWORD_BYTES = 24;                 // 192 bits of entropy, Base64url -> 32 chars
 	private static final long KEYTOOL_TIMEOUT_SECONDS = 60;   // EC keygen is instant; this only bounds a wedged keytool process
+	private static final int IP_SUBJECT_ALT_NAME = 7;
+	private static final String DEV_DISTINGUISHED_NAME = "CN=localhost, OU=dev, O=walkie-talkie";
 
 	private static final Path DEV_TLS_DIR = Path.of(System.getProperty("user.home"), ".walkie-talkie");
 	private static final Path DEV_KEYSTORE = DEV_TLS_DIR.resolve("dev-keystore.p12");
@@ -101,21 +106,59 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 	}
 
 	/// Whether the persisted keystore can be reused: openable with `password`, holding an unexpired EC cert on
-	/// the current curve ([#DEV_EC_CURVE]). Any failure (wrong password, expired, a different key algorithm/curve
-	/// from an older cert, corrupt) returns false so a fresh cert is generated instead.
-	private static boolean isReusable(String password) {
-		try (InputStream in = Files.newInputStream(DEV_KEYSTORE)) {
+	/// the current curve ([#DEV_EC_CURVE]) and with the current localhost/loopback SAN set (including IPv6
+	/// loopback). Any failure (wrong password, expired, a different key algorithm/curve from an older cert,
+	/// stale SANs, corrupt) returns false so a fresh cert is generated instead.
+	static boolean isReusable(Path keyStore, String password) {
+		try (InputStream in = Files.newInputStream(keyStore)) {
 			KeyStore store = KeyStore.getInstance("PKCS12");
 			store.load(in, password.toCharArray());
 			if (store.getCertificate(DEV_ALIAS) instanceof X509Certificate cert) {
 				cert.checkValidity();   // throws if expired / not yet valid
 				return cert.getPublicKey() instanceof ECPublicKey ec
-						&& ec.getParams().getCurve().getField().getFieldSize() == DEV_EC_FIELD_BITS;
+						&& ec.getParams().getCurve().getField().getFieldSize() == DEV_EC_FIELD_BITS
+						&& hasExpectedSubjectAlternativeNames(cert);
 			}
 			return false;
 		} catch (GeneralSecurityException | IOException _) {
 			return false;
 		}
+	}
+
+	private static boolean isReusable(String password) {
+		return isReusable(DEV_KEYSTORE, password);
+	}
+
+	/// The dev certificate is valid for both `https://localhost` and direct loopback-IP access, so a browser or
+	/// client can connect via `127.0.0.1` or `::1` without a hostname-mismatch failure. Requiring this in the
+	/// reuse check makes an older IPv4-only cert self-heal on the next server start.
+	private static boolean hasExpectedSubjectAlternativeNames(X509Certificate cert)
+			throws GeneralSecurityException, IOException {
+		Collection<List<?>> subjectAlternativeNames = cert.getSubjectAlternativeNames();
+		if (subjectAlternativeNames == null) {
+			return false;
+		}
+		InetAddress expectedIpv4Loopback = InetAddress.getByName("127.0.0.1");
+		InetAddress expectedIpv6Loopback = InetAddress.getByName("::1");
+		boolean hasLocalhost = false;
+		boolean hasIpv4Loopback = false;
+		boolean hasIpv6Loopback = false;
+		for (List<?> subjectAlternativeName : subjectAlternativeNames) {
+			if (subjectAlternativeName.size() < 2 || !(subjectAlternativeName.get(0) instanceof Integer type)) {
+				continue;
+			}
+			if (type == DNS_SUBJECT_ALT_NAME && "localhost".equalsIgnoreCase(String.valueOf(subjectAlternativeName.get(1)))) {
+				hasLocalhost = true;
+				continue;
+			}
+			if (type != IP_SUBJECT_ALT_NAME || !(subjectAlternativeName.get(1) instanceof String ip)) {
+				continue;
+			}
+			InetAddress address = InetAddress.getByName(ip);
+			hasIpv4Loopback |= expectedIpv4Loopback.equals(address);
+			hasIpv6Loopback |= expectedIpv6Loopback.equals(address);
+		}
+		return hasLocalhost && hasIpv4Loopback && hasIpv6Loopback;
 	}
 
 	/// Returns the dev keystore password, reusing the previously-generated keystore when it is present, valid,
@@ -142,9 +185,10 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 		}
 	}
 
-	/// Generates a fresh self-signed localhost keystore (EC [#DEV_EC_CURVE], signed [#DEV_SIG_ALG]), exports its
-	/// public cert to PEM, and persists the random keystore password — all under `~/.walkie-talkie/`. Uses the
-	/// JDK's own `keytool` with a FIXED argument list (no external/user input reaches the process), per policy.
+	/// Generates a fresh self-signed localhost/loopback keystore (EC [#DEV_EC_CURVE], signed [#DEV_SIG_ALG]),
+	/// exports its public cert to PEM, and persists the random keystore password — all under
+	/// `~/.walkie-talkie/`. Uses the JDK's own `keytool` with a FIXED argument list (no external/user input
+	/// reaches the process), per policy.
 	private String generateDevCertificate() throws IOException, InterruptedException {
 		byte[] entropy = new byte[PASSWORD_BYTES];
 		secureRandom.nextBytes(entropy);
@@ -159,8 +203,8 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 				"-validity", Integer.toString(DEV_CERT_VALIDITY_DAYS),
 				"-storetype", "PKCS12",
 				"-keystore", DEV_KEYSTORE.toString(), "-storepass", password,
-				"-dname", "CN=localhost, OU=dev, O=walkie-talkie",
-				"-ext", "SAN=dns:localhost,ip:127.0.0.1"));
+				"-dname", DEV_DISTINGUISHED_NAME,
+				"-ext", DEV_SUBJECT_ALT_NAME));
 
 		Files.deleteIfExists(DEV_CERT_PEM);
 		runKeytool(List.of(
