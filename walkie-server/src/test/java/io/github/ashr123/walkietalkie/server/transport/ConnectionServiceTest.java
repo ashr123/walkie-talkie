@@ -26,19 +26,21 @@ import static org.junit.jupiter.api.Assertions.*;
 class ConnectionServiceTest {
 
 	private final ChannelRegistry channelRegistry = new ChannelRegistry();
-	// Control rate set effectively-unlimited (1_000_000) so the control-plane flood guard never throttles the
-	// handful of control messages an ordinary test sends; the dedicated control-flood test uses a low rate.
-	private final WalkieProperties properties = new WalkieProperties(
-			new String[]{"*"},
-			8192,
-			65536,
-			100,
-			1_000_000,
-			5,
-			300,
-			null
+	private final ConnectionService service = new ConnectionService(
+			channelRegistry,
+			// Control rate set effectively-unlimited (1_000_000) so the control-plane flood guard never throttles the
+			// handful of control messages an ordinary test sends; the dedicated control-flood test uses a low rate.
+			new WalkieProperties(
+					new String[]{"*"},
+					8192,
+					65536,
+					100,
+					1_000_000,
+					5,
+					300,
+					null
+			)
 	);
-	private final ConnectionService service = new ConnectionService(channelRegistry, properties);
 
 	/// Builds a service over the shared registry but with a hand-driven clock, so the push-to-talk floor
 	/// timers (idle auto-release, max-hold) — and the rate limiters — are all tested against the same deterministic
