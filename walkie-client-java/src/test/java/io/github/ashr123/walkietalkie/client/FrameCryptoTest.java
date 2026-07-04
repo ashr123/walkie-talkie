@@ -38,10 +38,9 @@ class FrameCryptoTest {
 
 	@Test
 	void encryptsToTheSameCiphertextAsWebCrypto() throws GeneralSecurityException {
-		byte[] ciphertext = FrameCrypto.fromPassphrase(PASSPHRASE, CHANNEL).encryptWithIv(IV, PLAINTEXT);
 		assertEquals(
 				"64d66fb60c1fe48c515bb15362b5bcd63cca8d0a48",
-				HEX.formatHex(ciphertext),
+				HEX.formatHex(FrameCrypto.fromPassphrase(PASSPHRASE, CHANNEL).encryptWithIv(IV, PLAINTEXT)),
 				"AES-256-GCM (ciphertext+tag, scheme byte as AAD) must match the browser for the same key/IV/plaintext");
 	}
 

@@ -28,7 +28,7 @@ class ConnectionServiceTest {
 	private final ChannelRegistry channelRegistry = new ChannelRegistry();
 	// Control rate set effectively-unlimited (1_000_000) so the control-plane flood guard never throttles the
 	// handful of control messages an ordinary test sends; the dedicated control-flood test uses a low rate.
-	private final WalkieProperties properties = new WalkieProperties(List.of("*"), 8192, 65536, 100, 1_000_000, 5, 300, null);
+	private final WalkieProperties properties = new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, null);
 	private final ConnectionService service = new ConnectionService(channelRegistry, properties);
 
 	/// Builds a service over the shared registry but with a hand-driven clock, so the push-to-talk floor
@@ -36,8 +36,20 @@ class ConnectionServiceTest {
 	/// clock rather than wall time. Control rate is left effectively-unlimited so a fixed clock (no token refill)
 	/// doesn't throttle the test's own control messages.
 	private ConnectionService serviceWithClock(Clock clock, int idleSeconds, int maxHoldSeconds) {
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1000, 1_000_000, idleSeconds, maxHoldSeconds, null);
-		return new ConnectionService(channelRegistry, props, clock);
+		return new ConnectionService(
+				channelRegistry,
+				new WalkieProperties(
+						new String[]{"*"},
+						8192,
+						65536,
+						1000,
+						1_000_000,
+						idleSeconds,
+						maxHoldSeconds,
+						null
+				),
+				clock
+		);
 	}
 
 	private static FakeClientSession session(String id) {
@@ -918,8 +930,20 @@ class ConnectionServiceTest {
 
 	@Test
 	void aSenderOverItsAudioRateHasFramesDroppedBeforeFanOut() {
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 2, 1_000_000, 0, 0, null);   // audio 2 fps -> burst 2
-		ConnectionService svc = new ConnectionService(channelRegistry, props);
+		// audio 2 fps -> burst 2
+		ConnectionService svc = new ConnectionService(
+				channelRegistry,
+				new WalkieProperties(
+						new String[]{"*"},
+						8192,
+						65536,
+						2,
+						1_000_000,
+						0,
+						0,
+						null
+				)
+		);
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 		svc.onMessage(alice, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, "alice", null));
@@ -935,8 +959,20 @@ class ConnectionServiceTest {
 
 	@Test
 	void onCloseForgetsTheSendersRateBucketSoAReconnectStartsFull() {
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1, 1_000_000, 0, 0, null);   // audio 1 fps -> burst 1
-		ConnectionService svc = new ConnectionService(channelRegistry, props);
+		// audio 1 fps -> burst 1
+		ConnectionService svc = new ConnectionService(
+				channelRegistry,
+				new WalkieProperties(
+						new String[]{"*"},
+						8192,
+						65536,
+						1,
+						1_000_000,
+						0,
+						0,
+						null
+				)
+		);
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "alice", null));
@@ -956,11 +992,23 @@ class ConnectionServiceTest {
 
 	@Test
 	void controlMessagesOverTheRateAreDroppedBeforeDispatch() {
-		MutableClock clock = new MutableClock(Instant.EPOCH);   // fixed -> no token refill, so burst == the rate
+		// fixed -> no token refill, so burst == the rate
 		// control rate 2 -> burst 2: the Join spends the first token and the first Rename the second; the second
 		// Rename is over the cap and dropped before dispatch, so the applied name stays at the first rename.
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1000, 2, 0, 0, null);
-		ConnectionService svc = new ConnectionService(channelRegistry, props, clock);
+		ConnectionService svc = new ConnectionService(
+				channelRegistry,
+				new WalkieProperties(
+						new String[]{"*"},
+						8192,
+						65536,
+						1000,
+						2,
+						0,
+						0,
+						null
+				),
+				new MutableClock(Instant.EPOCH)
+		);
 		FakeClientSession alice = session("alice");
 
 		svc.onMessage(alice, new ClientMessage.Join("flood-ctl", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));   // token 1

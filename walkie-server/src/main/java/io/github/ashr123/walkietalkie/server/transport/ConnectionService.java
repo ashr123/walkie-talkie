@@ -392,9 +392,10 @@ public class ConnectionService {
 					channel.forEach(member -> safeSend(member, idle));
 					// The sweep is a scheduled task, not bound to a session scope, and the holder is some OTHER
 					// session — so log its id + name explicitly rather than relying on the MDC.
-					String holderName = channel.member(holder) instanceof Some(ClientSession held) ? held.displayName() : "?";
 					log.info("session={} ({}) reached the max floor-hold time on channel={}; floor released by sweep",
-							holder, holderName, channel.name());
+							holder, channel.member(holder) instanceof Some(
+									ClientSession held
+							) ? held.displayName() : "?", channel.name());
 				}
 			}
 		}
@@ -452,15 +453,14 @@ public class ConnectionService {
 		// A late frame from a session that left/closed since the entry gate must not resurrect a rate-limiter
 		// bucket after onClose's forget(); re-check liveness before computeIfAbsent. (For PTT the holdsFloor
 		// re-check above already covers it; this also covers full-duplex.)
-		if (session.channelName() == null) {
+		if (session.channelName() == null
+				// Per-sender flood guard: drop frames from a sender exceeding the configured rate BEFORE fan-out, so a
+				// flooder can't amplify cost across the channel (N recipients) or force excess decode work. This counts
+				// frames without inspecting them, so it works on end-to-end-encrypted channels too (see SessionRateLimiter).
+				|| !audioRateLimiter.tryAcquire(session.id())) {
 			return;
 		}
-		// Per-sender flood guard: drop frames from a sender exceeding the configured rate BEFORE fan-out, so a
-		// flooder can't amplify cost across the channel (N recipients) or force excess decode work. This counts
-		// frames without inspecting them, so it works on end-to-end-encrypted channels too (see SessionRateLimiter).
-		if (!audioRateLimiter.tryAcquire(session.id())) {
-			return;
-		}
+
 		// Tag the fan-out with the sender's per-channel stream index so receivers can demultiplex talkers;
 		// every client decodes per sender and mixes locally (see docs/CLIENT_PROTOCOL.md §5).
 		byte[] prefixed = prefixedFrame(channel.streamIndexOf(session.id()), audio);

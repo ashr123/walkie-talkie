@@ -13,14 +13,15 @@ import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Random;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.stream.Collectors;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 /// Adversarial concurrency stress: many sessions hammer a small set of shared channels with interleaved
 /// join / leave / floor / rename / audio / passphrase-rotation / ownership-transfer, to flush out races and deadlocks under contention (the integration
@@ -36,8 +37,19 @@ class ConcurrencyStressTest {
 		ChannelRegistry registry = new ChannelRegistry();
 		// Rates set effectively-unlimited so the flood guards don't drop ops (we want full contention); floor
 		// timers off so behavior depends only on the operations, not wall-clock.
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1_000_000, 1_000_000, 0, 0, null);
-		ConnectionService service = new ConnectionService(registry, props);
+		ConnectionService service = new ConnectionService(
+				registry,
+				new WalkieProperties(
+						new String[]{"*"},
+						8192,
+						65536,
+						1_000_000,
+						1_000_000,
+						0,
+						0,
+						null
+				)
+		);
 
 		int workers = 16;
 		int opsPerWorker = 3_000;
@@ -115,8 +127,19 @@ class ConcurrencyStressTest {
 	@Timeout(60)
 	void concurrentRotationsAndTransfersConvergeOnTheFinalOwnerAndKeyCheck() throws Exception {
 		ChannelRegistry registry = new ChannelRegistry();
-		WalkieProperties props = new WalkieProperties(List.of("*"), 8192, 65536, 1_000_000, 1_000_000, 0, 0, null);
-		ConnectionService service = new ConnectionService(registry, props);
+		ConnectionService service = new ConnectionService(
+				registry,
+				new WalkieProperties(
+						new String[]{"*"},
+						8192,
+						65536,
+						1_000_000,
+						1_000_000,
+						0,
+						0,
+						null
+				)
+		);
 
 		int members = 8;
 		int opsPerWorker = 2_000;

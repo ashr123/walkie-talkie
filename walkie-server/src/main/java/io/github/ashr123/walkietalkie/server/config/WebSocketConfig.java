@@ -33,9 +33,8 @@ public class WebSocketConfig implements WebSocketConfigurer {
 
 	@Override
 	public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
-		String[] origins = properties.allowedOrigins().toArray(String[]::new);
-		registry.addHandler(audioRelayHandler, "/ws/audio").setAllowedOriginPatterns(origins);
-		registry.addHandler(signalingHandler, "/ws/signal").setAllowedOriginPatterns(origins);
+		registry.addHandler(audioRelayHandler, "/ws/audio").setAllowedOriginPatterns(properties.allowedOrigins());
+		registry.addHandler(signalingHandler, "/ws/signal").setAllowedOriginPatterns(properties.allowedOrigins());
 	}
 
 	@Bean

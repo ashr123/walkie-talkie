@@ -2,8 +2,6 @@ package io.github.ashr123.walkietalkie.server.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
-import java.util.List;
-
 /// Tunable server settings, bound from the `walkie.*` configuration namespace.
 ///
 /// @param allowedOrigins         permitted WebSocket origin patterns; permissive by default for local
@@ -34,7 +32,7 @@ import java.util.List;
 ///                               restart or span instances). Never hardcode a real key.
 @ConfigurationProperties(prefix = "walkie")
 public record WalkieProperties(
-		List<String> allowedOrigins,
+		String[] allowedOrigins,
 		int maxAudioFrameBytes,
 		int maxTextMessageBytes,
 		long maxAudioFramesPerSecond,
@@ -49,8 +47,8 @@ public record WalkieProperties(
 	private static final long MAX_RATE_PER_SECOND = 1_000_000_000L;
 
 	public WalkieProperties {
-		if (allowedOrigins == null || allowedOrigins.isEmpty()) {
-			allowedOrigins = List.of("*");
+		if (allowedOrigins == null || allowedOrigins.length == 0) {
+			allowedOrigins = new String[]{"*"};
 		}
 		if (maxAudioFrameBytes <= 0) {
 			maxAudioFrameBytes = 8 * 1024;

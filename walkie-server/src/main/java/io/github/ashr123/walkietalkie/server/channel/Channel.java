@@ -200,7 +200,12 @@ public final class Channel {
 
 	public List<MemberInfo> memberInfos() {
 		return members.values().stream()
-				.map(session -> new MemberInfo(session.id(), session.displayName(), streamIndexOf(session.id()), isMuted(session.id())))
+				.map(session -> new MemberInfo(
+						session.id(),
+						session.displayName(),
+						streamIndexOf(session.id()),
+						isMuted(session.id())
+				))
 				.toList();
 	}
 

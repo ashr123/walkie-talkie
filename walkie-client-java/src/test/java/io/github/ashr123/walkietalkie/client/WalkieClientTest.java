@@ -39,8 +39,7 @@ class WalkieClientTest {
 		// encrypted -> encrypted rotation: we still hold the OLD key, which no longer matches the channel's
 		// announced key-check. We must stay SILENT (not emit stale-key audio the rekeyed channel can't decode and
 		// not desync) until we adopt the new key — symmetric with everyone else.
-		FrameCrypto staleKey = FrameCrypto.fromPassphrase("old-secret", "team");
-		assertNull(WalkieClient.outboundFrame(FRAME, staleKey, "new-kcv-we-cannot-match"),
+		assertNull(WalkieClient.outboundFrame(FRAME, FrameCrypto.fromPassphrase("old-secret", "team"), "new-kcv-we-cannot-match"),
 				"a member holding a stale key after a rotation it hasn't adopted must be muted");
 	}
 
@@ -82,8 +81,13 @@ class WalkieClientTest {
 	void rekeyKeepsTheOldKeyOnAMismatchOrMissingCandidate() throws GeneralSecurityException {
 		// A non-matching derived key, or none at all, must KEEP the current key — never adopt a wrong key and
 		// never (per outboundFrame) fall back to plaintext into an announced-encrypted channel.
-		FrameCrypto wrong = FrameCrypto.fromPassphrase("the-wrong-secret", "team");
-		assertEquals(WalkieClient.RekeyAction.KEEP, WalkieClient.rekeyAction("announced-kcv-we-cannot-match", wrong));
+		assertEquals(
+				WalkieClient.RekeyAction.KEEP,
+				WalkieClient.rekeyAction(
+						"announced-kcv-we-cannot-match",
+						FrameCrypto.fromPassphrase("the-wrong-secret", "team")
+				)
+		);
 		assertEquals(WalkieClient.RekeyAction.KEEP, WalkieClient.rekeyAction("announced-kcv", null));
 	}
 
