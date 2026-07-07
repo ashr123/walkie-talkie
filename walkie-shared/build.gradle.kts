@@ -11,6 +11,7 @@ dependencies {
 	compileOnly(platform("tools.jackson:jackson-bom:3.2.0"))
 
 	// Jackson 3 keeps the annotations module under the legacy group/package for compatibility.
-	// Deliberately version-less: the consuming application selects the version via its own BOM.
-	api("com.fasterxml.jackson.core:jackson-annotations")
+	// This module only needs the annotations jar to compile its protocol types; consumers get their
+	// runtime/compile Jackson modules from the server/client module BOMs instead of from walkie-shared.
+	compileOnly("com.fasterxml.jackson.core:jackson-annotations")
 }

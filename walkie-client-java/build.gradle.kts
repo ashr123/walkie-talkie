@@ -27,6 +27,27 @@ application {
     mainClass.set("io.github.ashr123.walkietalkie.client.WalkieClientLauncher")
 }
 
+val fatJar = tasks.register<Jar>("fatJar") {
+    group = "build"
+    description = "Builds an executable fat jar for the Java desktop client."
+    archiveClassifier.set("all")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes["Main-Class"] = application.mainClass.get()
+    }
+    from(sourceSets.main.get().output)
+    from({
+        configurations.runtimeClasspath.get()
+            .filter { it.name.endsWith(".jar") }
+            .map(::zipTree)
+    })
+    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
+}
+
+tasks.named("assemble") {
+    dependsOn(fatJar)
+}
+
 // Gradle's `run` task does not attach the terminal's stdin to the forked JVM by default, so the
 // interactive console would read EOF immediately and quit ("Goodbye."). Forward stdin so the
 // `t` / `m` / `q` prompt commands work when launched via `:walkie-client-java:run`.

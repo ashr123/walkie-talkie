@@ -193,7 +193,7 @@ WALKIE_TLS_KEYSTORE="file:$PWD/dev-keystore.p12" JAVA_OPTS= ./gradlew :walkie-se
 this for the production model below (a TLS-terminating reverse proxy on a trusted loopback).
 
 **Production — terminate TLS at a reverse proxy.** Run the app with `walkie.tls.enabled=false` (plain HTTP on
-loopback) behind a proxy. Ready-to-edit configs are in [`deploy/`](deploy/): a [`Caddyfile`](deploy/Caddyfile)
+loopback) behind a proxy. Ready-to-edit configs are in [`deploy/`](deploy): a [`Caddyfile`](deploy/Caddyfile)
 (automatic HTTPS via Let's Encrypt) and an [`nginx.conf.example`](deploy/nginx.conf.example) (mind the
 `Upgrade`/`Connection` headers the WebSocket endpoints require). Tighten `walkie.allowed-origins` to your
 HTTPS origin so the handshake's origin check (anti-CSWSH) accepts only your real site. TLS 1.3 / 1.2 only
@@ -284,6 +284,14 @@ through `--args`:
 ```bash
 JAVA_OPTS= ./gradlew :walkie-client-java:run --args="\
   --server https://localhost:8443 --channel team1 --mode ptt --display Alice"
+```
+
+Or build a single runnable fat jar and launch it directly:
+
+```bash
+JAVA_OPTS= ./gradlew :walkie-client-java:fatJar
+java -jar walkie-client-java/build/libs/walkie-client-java-0.1.0-all.jar \
+  --server https://localhost:8443 --channel team1 --mode ptt --display Alice
 ```
 
 All flags are optional (run with `--args="--help"` for the full list):

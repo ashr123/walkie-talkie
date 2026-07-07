@@ -19,8 +19,7 @@ public sealed interface ServerMessage {
 	              ChannelMode mode,
 	              String ownerId,
 	              boolean locked,
-	              List<MemberInfo> members
-	) implements ServerMessage {
+	              List<MemberInfo> members) implements ServerMessage {
 	}
 
 	/// A new participant joined the channel.

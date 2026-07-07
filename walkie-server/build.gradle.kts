@@ -1,10 +1,12 @@
+import org.springframework.boot.gradle.plugin.SpringBootPlugin
+
 plugins {
 	id("walkietalkie.java-conventions")
 	id("org.springframework.boot") version "4.1.0"
 }
 
 dependencies {
-	implementation(platform("org.springframework.boot:spring-boot-dependencies:4.1.0"))
+	implementation(platform(SpringBootPlugin.BOM_COORDINATES))
 
 	implementation(project(":walkie-shared"))
 
