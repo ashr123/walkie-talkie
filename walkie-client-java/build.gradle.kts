@@ -36,6 +36,11 @@ val fatJar = tasks.register<Jar>("fatJar") {
         attributes["Main-Class"] = application.mainClass.get()
     }
     from(sourceSets.main.get().output)
+    // The fat jar bundles the runtime dependencies, including this project's own :walkie-shared jar. The `from({…})`
+    // closure below reads those jars lazily at execution time, but Gradle can't infer the producing tasks from an
+    // opaque closure — so declare the dependency explicitly (Gradle's own validation suggests this) to guarantee
+    // :walkie-shared:jar (and any other jar-producing dependency) is built first, rather than relying on task order.
+    dependsOn(configurations.runtimeClasspath)
     from({
         configurations.runtimeClasspath.get()
             .filter { it.name.endsWith(".jar") }
