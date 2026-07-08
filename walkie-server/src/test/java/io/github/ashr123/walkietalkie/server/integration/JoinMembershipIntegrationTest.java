@@ -2,6 +2,7 @@ package io.github.ashr123.walkietalkie.server.integration;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
@@ -141,7 +142,7 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		try (WebSocketSession sa = connect(AUDIO, a, login())) {
 			send(sa, new ClientMessage.Join("bad name!", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			ServerMessage.ErrorMessage error = awaitType(a.messages, ServerMessage.ErrorMessage.class);
-			assertEquals("invalid_channel", error.code());
+			assertEquals(ErrorCode.INVALID_CHANNEL, error.code());
 			assertNotReceived(a.messages, ServerMessage.Joined.class);
 		}
 	}
@@ -151,7 +152,7 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login())) {
 			sendRaw(sa, "{not valid json");
-			assertEquals("bad_message", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.BAD_MESSAGE, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 
 			// The connection survives a bad frame: a subsequent valid join still works.
 			send(sa, new ClientMessage.Join("recover", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));

@@ -2,6 +2,7 @@ package io.github.ashr123.walkietalkie.server.integration;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.WebSocketSession;
@@ -89,9 +90,9 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			assertEquals("server", joined.ownerId(), "the global channel is server-owned, not owned by the joiner");
 
 			// No participant owns the server-managed global room, so its mode is fixed: a ChangeMode is
-			// rejected as not_owner rather than broadcasting a ModeChanged.
+			// rejected as NOT_OWNER rather than broadcasting a ModeChanged.
 			send(sa, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
-			assertEquals("not_owner", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.NOT_OWNER, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 
@@ -100,7 +101,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login())) {
 			send(sa, new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
-			assertEquals("not_in_channel", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.NOT_IN_CHANNEL, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 
@@ -173,7 +174,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sc, new ClientMessage.Join("reelect", ChannelMode.FULL_DUPLEX, "Carol", null));
 			awaitType(c.messages, ServerMessage.Joined.class);
 			send(sc, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
-			assertEquals("not_owner", awaitType(c.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.NOT_OWNER, awaitType(c.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 

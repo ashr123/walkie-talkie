@@ -192,9 +192,9 @@ None of these needs a new socket — they all reuse the live connection (and its
   the channel name (§7), so the key changes with the channel. Re-sending `join` for the channel you are
   **already** in is idempotent (the server just re-sends the snapshot); do **not** re-key in that case — to
   change the passphrase of the channel you're in, the owner uses `changePassphrase` (below), not a `join`.
-- **Validation happens before the leave**, so a bad target — `invalid_channel`, `invalid_display_name`,
-  `reserved_channel`, `encryption_not_allowed` — is refused and you **stay** in your current channel. The one
-  exception is **`passphrase_mismatch`**: it is only detectable while joining the target (after the leave), so
+- **Validation happens before the leave**, so a bad target — `INVALID_CHANNEL`, `INVALID_DISPLAY_NAME`,
+  `RESERVED_CHANNEL`, `ENCRYPTION_NOT_ALLOWED` — is refused and you **stay** in your current channel. The one
+  exception is **`PASSPHRASE_MISMATCH`**: it is only detectable while joining the target (after the leave), so
   a wrong passphrase for the target channel **does** drop you from the old one — supply the correct passphrase.
 - **Transport** (relay ↔ WebRTC) **cannot** switch in place — it is a different endpoint and audio pipeline; to
   change it a client must reconnect (a new socket, hence a new `selfId`). The reference browser client does
@@ -231,9 +231,9 @@ plaintext. The server records the new key-check and broadcasts `passphraseChange
   re-keyed channel can't decode and an enable can't leak plaintext. The reference clients implement this as a
   pure decision (`frameDisposition` / `outboundFrame`).
 - The owner applies the new key on the **echoed** `passphraseChanged`, not optimistically — so a rejected
-  request (`not_owner`, e.g. ownership was just lost) leaves the old key in place.
+  request (`NOT_OWNER`, e.g. ownership was just lost) leaves the old key in place.
 
-Notes: only the owner may rotate (`not_owner` otherwise; `not_in_channel` before joining). The server-managed
+Notes: only the owner may rotate (`NOT_OWNER` otherwise; `NOT_IN_CHANNEL` before joining). The server-managed
 `global` room is owned by a sentinel, so a rotation there is refused — it stays unencrypted. Broadcasting the
 key-check (and the wrapped blob) leaks nothing new to the server: both are brute-force-equivalent to the
 ciphertext the relay already carries (§7), and the audio relay is opaque, so a brief window where members hold
@@ -244,11 +244,11 @@ can recover it. Withholding `wrappedKey` forces out-of-band re-entry but still c
 someone who already had it; to genuinely exclude a member, move to a fresh channel.
 
 **Transfer ownership (owner)** — the owner hands ownership to another **current member** with
-`transferOwnership { newOwnerId }` (a session id). The server validates that you own the channel (`not_owner`
-otherwise) and that the target is a member (`unknown_target` otherwise), reassigns the owner, and broadcasts
+`transferOwnership { newOwnerId }` (a session id). The server validates that you own the channel (`NOT_OWNER`
+otherwise) and that the target is a member (`UNKNOWN_TARGET` otherwise), reassigns the owner, and broadcasts
 `ownerChanged { ownerId }` to the whole channel — the very same message a departure-triggered auto-election
 sends, so clients need no new handling; the new owner simply gains the owner-only abilities (mode/passphrase
-changes, further transfers). The global room's sentinel owner makes a transfer there `not_owner`. The browser
+changes, further transfers). The global room's sentinel owner makes a transfer there `NOT_OWNER`. The browser
 exposes this as a **Channel owner** dropdown; the Java client as `o <#id-prefix>` (the prefix shown next to
 each member).
 
@@ -276,9 +276,9 @@ a late joiner renders who's muted.
 - **Scope & lifetime.** Mute is per-channel state and is cleared when the member leaves (a re-used id does not
   inherit it). It is **not** related to the E2EE "muted straggler" of §3c/§7 (a member whose key doesn't match),
   which is a client-side transmit gate, not an owner action.
-- **Authorization.** Only the owner may mute (`not_owner` otherwise); the owner can't mute itself and an
-  unknown/left target is `unknown_target`. The server-managed `global` room has a sentinel owner, so muting
-  there is `not_owner`.
+- **Authorization.** Only the owner may mute (`NOT_OWNER` otherwise); the owner can't mute itself and an
+  unknown/left target is `UNKNOWN_TARGET`. The server-managed `global` room has a sentinel owner, so muting
+  there is `NOT_OWNER`.
 
 The browser exposes per-member **Mute**/**Unmute** buttons and a **Mute all** toggle in the Members list (owner
 only, applied immediately); the Java client uses `mute <#id|all>` / `unmute <#id|all>`.
@@ -292,18 +292,18 @@ The owner locks/unlocks the channel to NEW members with `setLocked { locked }`; 
 re-snapshot renders it). Locking blocks only **new joins** — existing members are unaffected.
 
 - **Server-enforced in the atomic join.** While locked, `join` (or an in-place switch, §3c) from a member not
-  already in the channel is refused with `channel_locked` — checked **before** the key-check, so it applies
+  already in the channel is refused with `CHANNEL_LOCKED` — checked **before** the key-check, so it applies
   even with the correct passphrase. The check runs inside the same `ConcurrentHashMap` bin lock as the
   key-check validation, so a `setLocked` toggle is atomic with respect to every concurrent join.
 - **Only newcomers.** An existing member re-joining its **current** channel (the idempotent re-snapshot, §3c)
   is never blocked. But a member who **leaves** a locked channel can't rejoin until it's unlocked (it's a
   newcomer again).
-- **Same drop semantics as `passphrase_mismatch`.** Both are detectable only inside the atomic join, so a
+- **Same drop semantics as `PASSPHRASE_MISMATCH`.** Both are detectable only inside the atomic join, so a
   switch INTO a locked channel drops you from your current one; an initial connect just fails. The reference
-  clients handle `channel_locked` like `passphrase_mismatch` (browser disconnects with a message, Java exits).
-- **Authorization & lifetime.** Only the owner may lock (`not_owner` otherwise; `not_in_channel` before
+  clients handle `CHANNEL_LOCKED` like `PASSPHRASE_MISMATCH` (browser disconnects with a message, Java exits).
+- **Authorization & lifetime.** Only the owner may lock (`NOT_OWNER` otherwise; `NOT_IN_CHANNEL` before
   joining). The lock persists across a departure-triggered ownership change — the new owner inherits it and can
-  unlock. The server-managed `global` room has a sentinel owner, so locking there is `not_owner`.
+  unlock. The server-managed `global` room has a sentinel owner, so locking there is `NOT_OWNER`.
 
 The browser exposes an owner-only **Lock/Unlock channel** toggle in the Members header and a **🔒 Locked** badge
 shown to everyone; the Java client uses `lock` / `unlock` and shows a 🔒 marker in `w` and the join line.
@@ -394,11 +394,11 @@ body becomes `[0xE2][IV(12)][AES-256-GCM ciphertext+tag]`. Must be **byte-identi
   `salt = "walkie-talkie:e2ee:" + effectiveChannel` (`effectiveChannel = "global"` in `GLOBAL_PTT`, else the
   channel name). First **32 bytes** = AES-256 key; next **16 bytes** = **key-check value (KCV)**. (The `global`
   branch is for byte-compatibility only — the server forces the `global` room to be unencrypted, rejecting a
-  `GLOBAL_PTT` join that carries a `keyCheck` with `encryption_not_allowed`, so E2EE never actually runs there.)
+  `GLOBAL_PTT` join that carries a `keyCheck` with `ENCRYPTION_NOT_ALLOWED`, so E2EE never actually runs there.)
 - **Per frame:** AES-256-GCM, **12-byte random IV**, 128-bit tag. The scheme byte `0xE2` is passed as GCM
   **additional authenticated data (AAD)** — and AAD is **only** `{0xE2}`.
 - **Key-check:** send the hex KCV in `Join.keyCheck`. The server enforces a **uniform** channel (all members
-  same passphrase or all plaintext) and rejects a mismatch with `error: passphrase_mismatch` — comparing the
+  same passphrase or all plaintext) and rejects a mismatch with `error: PASSPHRASE_MISMATCH` — comparing the
   KCV without ever learning the passphrase.
 - **Rotation:** the channel **owner** may change the passphrase mid-session with `changePassphrase` (§3c),
   whose `keyCheck` is the KCV of the **new** passphrase (or `null` to make the channel plaintext). The server
@@ -542,21 +542,29 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 - **PTT floor timers:** max-hold force-release of **any** holder after `walkie.floor-max-hold-seconds`
   (default 300; a periodic sweep, plus a relay holder's next frame) and idle auto-release of a silent **relay**
   holder after `walkie.floor-idle-release-seconds` (default 5; on contention); each `0`-disables (§3b).
-- **Error codes** (`error.code`):
+- **Channel size:** ≤ **255 members** (one per stream index, 0..254). A join that would overflow is refused with
+  `CHANNEL_FULL` rather than assigning a colliding index.
+- **Error codes** (`error.code`): the shared `ErrorCode` enum, serialized **as its constant name** (like
+  `ChannelMode`). The code is the machine-readable contract; the accompanying `message` is display-only (the
+  same code can carry different texts). **Tolerate unknown codes** — a newer server may mint codes your client
+  doesn't know: log them and carry on (the reference Java client deserializes them to the `UNKNOWN` fallback via
+  Jackson's read-unknown-enum-values-as-default + `@JsonEnumDefaultValue`; the browser's string matches simply
+  fall through).
 
-| Code                     | Triggered by                                                                                                                        |
-|--------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
-| `bad_message`            | Unparseable / unknown-type control frame                                                                                            |
-| `invalid_channel`        | `join` with a channel name not matching the pattern                                                                                 |
-| `invalid_display_name`   | `join` or `rename` with a display name not matching the pattern                                                                     |
-| `invalid_mode`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel                                                                           |
-| `reserved_channel`       | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode                                                |
-| `encryption_not_allowed` | a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext)                                          |
-| `not_in_channel`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / `setLocked` / signal before `join` |
-| `not_owner`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember`, `muteAll` or `setLocked` by a non-owner                        |
-| `passphrase_mismatch`    | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel |
-| `channel_locked`         | `join` (or in-place switch) to a channel the owner has locked to new members (§3e); like `passphrase_mismatch`, a locked switch drops you |
-| `unknown_target`         | WebRTC signal, `transferOwnership`, or `muteMember` (unknown/left id, or the owner itself) — a target not mutable in the channel     |
+| Code                     | Triggered by                                                                                                                                                                |
+|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `BAD_MESSAGE`            | Unparseable / unknown-type control frame                                                                                                                                    |
+| `INVALID_CHANNEL`        | `join` with a channel name not matching the pattern                                                                                                                         |
+| `INVALID_DISPLAY_NAME`   | `join` or `rename` with a display name not matching the pattern                                                                                                             |
+| `INVALID_MODE`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel                                                                                                                   |
+| `RESERVED_CHANNEL`       | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode                                                                                        |
+| `ENCRYPTION_NOT_ALLOWED` | a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext)                                                                                  |
+| `NOT_IN_CHANNEL`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / `setLocked` / signal before `join`                   |
+| `NOT_OWNER`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember`, `muteAll` or `setLocked` by a non-owner                                                                |
+| `PASSPHRASE_MISMATCH`    | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel                                         |
+| `CHANNEL_LOCKED`         | `join` (or in-place switch) to a channel the owner has locked to new members (§3e); like `PASSPHRASE_MISMATCH`, a locked switch drops you                                   |
+| `CHANNEL_FULL`           | `join` (or in-place switch) to a channel already at its member cap (one stream index per member, 0..254 → 255 members); like `PASSPHRASE_MISMATCH`, a full switch drops you |
+| `UNKNOWN_TARGET`         | WebRTC signal, `transferOwnership`, or `muteMember` (unknown/left id, or the owner itself) — a target not mutable in the channel                                            |
 
 ---
 

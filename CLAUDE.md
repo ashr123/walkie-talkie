@@ -74,10 +74,10 @@ auto-release is relay-only. Both `0`-disable; on a server-initiated release the 
 (`FloorTaken`/`FloorIdle`) so its client stops transmitting. Floor timing uses a `java.time.Clock` + `Instant`
 (injectable for tests). **The `global` channel is special and server-managed:** it is reachable *only*
 via `GLOBAL_PTT` (a `MULTI_CHANNEL_PTT`/`FULL_DUPLEX` join naming `global` is rejected with
-`reserved_channel`); it is **always unencrypted** (a `GLOBAL_PTT` join carrying a `keyCheck` is rejected
-with `encryption_not_allowed`, so anyone can join without knowing a passphrase); and it is created with a
+`RESERVED_CHANNEL`); it is **always unencrypted** (a `GLOBAL_PTT` join carrying a `keyCheck` is rejected
+with `ENCRYPTION_NOT_ALLOWED`, so anyone can join without knowing a passphrase); and it is created with a
 sentinel owner (`ConnectionService.GLOBAL_CHANNEL_OWNER = "server"`, never a session id) so **no
-participant owns it** — its mode can't be changed (`not_owner`) and ownership never transfers. It is
+participant owns it** — its mode can't be changed (`NOT_OWNER`) and ownership never transfers. It is
 dropped when empty and recreated server-owned + unencrypted on the next join; clients render its owner as
 "server-managed".
 
@@ -90,8 +90,8 @@ muted member the floor so it can't seize-and-hold it (blocking PTT) even though 
 the current floor holder frees the floor (`releaseFloor` + broadcast `FloorIdle`) so a talking-then-muted member
 stops. **Enforcement is relay-only** — WebRTC media is peer-to-peer (DTLS-SRTP), so a WebRTC talker's mute is
 best-effort at its own client (it still gets `MemberMuted` and stops), matching the E2EE relay-only boundary.
-Only the owner may mute (`not_owner` otherwise); the owner can't mute itself and an unknown/left id is
-`unknown_target`; the ownerless `global` room can't be muted (`not_owner` via its sentinel owner). Concurrency
+Only the owner may mute (`NOT_OWNER` otherwise); the owner can't mute itself and an unknown/left id is
+`UNKNOWN_TARGET`; the ownerless `global` room can't be muted (`NOT_OWNER` via its sentinel owner). Concurrency
 mirrors the floor discipline: the mute flip + floor release + `MemberMuted` broadcast run under
 `synchronized(channel)`, and `Channel.remove` scrubs `mutedMembers` **under that same monitor** (with a
 membership re-check in the handler) so a leave can't race a mute into a ghost entry that outlives the member. Both
@@ -103,17 +103,17 @@ via the Apply/Reset flow); the Java client exposes `mute`/`unmute <#id|all>`.
 `ChannelLocked`, `ConnectionService.handleSetLocked` via `ChannelRegistry.setLocked`); the flag is
 `Channel.locked` (`volatile`) and rides in `Joined.locked`. Enforcement is in the **atomic join**: a locked
 `Channel` makes `ChannelRegistry.joinOrCreate` refuse to add a member (returns `null`, before the key-check),
-so a newcomer is rejected with `channel_locked` even with the right passphrase. The `setLocked` write and the
+so a newcomer is rejected with `CHANNEL_LOCKED` even with the right passphrase. The `setLocked` write and the
 join's lock read share the **same bin lock** as the key-check (both under `channels.compute*`), so a toggle is
 atomic w.r.t. every concurrent join — a joiner sees consistently the locked or the unlocked state. Only
 NEWCOMERS are blocked: an existing member's in-place re-join to its **current** channel short-circuits in
 `handleJoin` before `joinOrCreate` (idempotent re-snapshot, carrying `locked`), so it's never locked out; the
-lock also never removes existing members. `channel_locked` behaves like `passphrase_mismatch` (both are
+lock also never removes existing members. `CHANNEL_LOCKED` behaves like `PASSPHRASE_MISMATCH` (both are
 detectable only inside the atomic join): an initial connect fails cleanly, and a switch INTO a locked channel
 drops you — the clients handle it the same way (browser disconnects; Java exits). The `ChannelLocked` broadcast
 runs under the channel monitor reading the live `isLocked()` (convergence, like the passphrase/owner
 broadcasts). The lock persists across a departure-triggered ownership change (a new owner inherits it and can
-unlock); the sentinel-owned `global` room can't be locked (`not_owner`). Web: an owner-only Lock/Unlock toggle
+unlock); the sentinel-owned `global` room can't be locked (`NOT_OWNER`). Web: an owner-only Lock/Unlock toggle
 in the Members header + a 🔒 badge shown to everyone; Java: `lock`/`unlock` commands + a 🔒 marker in `w` and
 the join line.
 
@@ -122,9 +122,9 @@ re-sending `Join` on the live connection is handled as "leave the old channel, j
 `WebSocketSession`, so the **session id (identity) and the audio loops survive** — only per-channel state
 (roster, floor, stream indices, E2EE key) turns over. `handleJoin` validates the target **before** leaving: a
 duplicate `Join` for the *current* channel short-circuits to an idempotent re-snapshot (no membership churn),
-and a bad target (`invalid_channel` / `invalid_display_name` / `reserved_channel` / `encryption_not_allowed`)
+and a bad target (`INVALID_CHANNEL` / `INVALID_DISPLAY_NAME` / `RESERVED_CHANNEL` / `ENCRYPTION_NOT_ALLOWED`)
 is refused **without** dropping you — the **only** failure that can still drop a switcher is
-`passphrase_mismatch`, detectable solely inside the atomic `joinOrCreate` (which necessarily runs after the
+`PASSPHRASE_MISMATCH`, detectable solely inside the atomic `joinOrCreate` (which necessarily runs after the
 leave). Transport can't switch in place (different endpoint + audio pipeline), so both clients reconnect for
 it. **Rename** is a separate `Rename` → `setDisplayName` + broadcast `MemberRenamed` (no membership/floor
 churn). Re-key safety: the Java client holds the key in a `volatile FrameCrypto` reassigned on the console
@@ -171,7 +171,7 @@ relays opaquely (the +29-byte envelope stays under `max-audio-frame-bytes`). `Fr
 `deriveKey`/`encryptFrame`/`decryptFrame` trio (`app.js`) **must stay byte-identical**; `FrameCryptoTest`
 pins cross-platform known-answer vectors (key *and* key-check, generated by Node's WebCrypto) so they can't
 drift. **Mismatch enforcement:** the server records the channel creator's key-check and rejects a joiner
-whose key-check differs (`passphrase_mismatch`, in `ChannelRegistry.joinOrCreate`) — so a channel is
+whose key-check differs (`PASSPHRASE_MISMATCH`, in `ChannelRegistry.joinOrCreate`) — so a channel is
 *uniformly* encrypted or plaintext, enforced without the server learning the passphrase (the key-check is
 brute-force-equivalent to the ciphertext it already relays). **Owner rotation:** the channel owner can
 change/clear that key-check live (`ChangePassphrase` → broadcast `PassphraseChanged`,
@@ -199,7 +199,7 @@ is wrapped under the old, so it is only as secret as the old; to truly exclude a
 A member that can't match the announced key-check is **muted**: both clients gate the transmit path on "the
 key-check of the key I hold equals the channel's announced one" (`frameDisposition` / `outboundFrame`), so a
 not-yet-rekeyed member **never emits plaintext** (the *enable* case, no old key) **and a stale-key straggler**
-(an un-adopted rotation) emits no undecodable audio either — both stay silent until they adopt the new key. Global stays unencrypted — its sentinel owner makes any rotation there `not_owner`. **Ownership
+(an un-adopted rotation) emits no undecodable audio either — both stay silent until they adopt the new key. Global stays unencrypted — its sentinel owner makes any rotation there `NOT_OWNER`. **Ownership
 transfer:** the owner can hand ownership to a named current member (`TransferOwnership` → broadcast
 `OwnerChanged`, `handleTransferOwnership` via `ChannelRegistry.transferOwnership`), validated and written inside
 the same `computeIfPresent` bin lock so it can't race `leave`'s auto-election or target a leaving member; the
@@ -228,7 +228,7 @@ carry; clients can't choose or spoof it. (That authority holds only under the tr
 sender is read from the server-stamped, plaintext stream index, which no cryptography binds — so attribution is
 as trustworthy as the relay.) The **display name** is the only human label: the client sends it in `Join`, the server
 validates it
-against `[A-Za-z0-9_.-]{1,32}` (else `invalid_display_name`); clients append a short `#<id-prefix>` when two
+against `[A-Za-z0-9_.-]{1,32}` (else `INVALID_DISPLAY_NAME`); clients append a short `#<id-prefix>` when two
 members share one. The token's short TTL is the only bound on replay — the random nonce only makes each token
 unique/unguessable,
 it is **not** tracked, so a captured token is freely replayable to open new sockets within its ~60 s lifetime (no

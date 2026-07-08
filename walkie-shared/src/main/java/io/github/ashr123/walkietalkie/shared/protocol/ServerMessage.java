@@ -115,8 +115,9 @@ public sealed interface ServerMessage {
 			implements ServerMessage {
 	}
 
-	/// A problem occurred while processing a client request.
+	/// A problem occurred while processing a client request. `code` is the machine-readable reason a client may
+	/// branch on (see [ErrorCode], incl. its unknown-code fallback); `message` is display-only.
 	@JsonTypeName("error")
-	record ErrorMessage(String code, String message) implements ServerMessage {
+	record ErrorMessage(ErrorCode code, String message) implements ServerMessage {
 	}
 }

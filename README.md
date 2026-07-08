@@ -270,7 +270,7 @@ transport.)
 **Lock the channel.** The owner can freeze the room to newcomers: a **Lock channel** / **Unlock channel** toggle
 in the **Members** panel header (owner-only, applied immediately) stops anyone else joining — even with the right
 passphrase. Everyone sees a **🔒 Locked** badge while it's on. Enforcement is on the **server** (the join is
-refused with `channel_locked`), so it doesn't rely on the clients. Existing members are unaffected; a member who
+refused with `CHANNEL_LOCKED`), so it doesn't rely on the clients. Existing members are unaffected; a member who
 *leaves* a locked channel, though, can't come back until it's unlocked. (The ownerless `global` room can't be
 locked.)
 
@@ -320,7 +320,7 @@ re-enter it) · `o <#id>` hand ownership to another member (owner; `<#id>` is th
 · `mute <#id|all>` / `unmute <#id|all>` mute or unmute a member — or everyone but yourself — as the owner (the
 server enforces it: a muted member's audio is dropped and it's shown `[muted]` in `w`; being muted stops your
 mic and refuses `t` until you're unmuted) · `lock` / `unlock` lock or unlock the channel to new members as the
-owner (server-enforced; a blocked newcomer is refused with `channel_locked`; existing members are unaffected) ·
+owner (server-enforced; a blocked newcomer is refused with `CHANNEL_LOCKED`; existing members are unaffected) ·
 `n <name>` rename · `f` toggle hi-fi
 (music/voice) live · `q` quit (closes the socket, ending the session) · `h` help.
 
@@ -348,7 +348,7 @@ otherwise mono — and interoperates with relay-mode browser clients.
   **PBKDF2-HMAC-SHA512** (600 000 iterations, salted per channel); the browser (WebCrypto) and Java client
   (`javax.crypto`) derive byte-identical keys, pinned by a cross-platform known-answer test. The same
   derivation also yields a **key-check value** the client sends at join, letting the server **reject a
-  member whose passphrase doesn't match** the channel's (`passphrase_mismatch`) — without ever seeing the
+  member whose passphrase doesn't match** the channel's (`PASSPHRASE_MISMATCH`) — without ever seeing the
   passphrase or the key. Browser E2EE needs a secure context (HTTPS or `localhost`). This is confidentiality
   between participants on top of transport security, not a replacement for serving over WSS/HTTPS. The channel
   **owner** can rotate that passphrase — or toggle encryption on/off — live, via a `ChangePassphrase` →
@@ -420,7 +420,7 @@ default build stays preview-free.
 - **End-to-end encryption uses one shared passphrase per channel** (a pre-shared key, no key exchange):
   no forward secrecy, no per-sender keys, and frame *metadata* (who is transmitting, when, and frame
   sizes) stays visible to the server. A channel is **uniformly** encrypted or plaintext: a joiner whose
-  passphrase doesn't match the channel's is **rejected at join** (`passphrase_mismatch`) via a key-check
+  passphrase doesn't match the channel's is **rejected at join** (`PASSPHRASE_MISMATCH`) via a key-check
   value the server compares without ever learning the passphrase. The **owner** can rotate that passphrase
   (or toggle encryption on/off) live and, by default, **auto-distribute** it by wrapping the new key under
   the old one so members adopt it automatically (the server stays blind) — but because the new key is wrapped

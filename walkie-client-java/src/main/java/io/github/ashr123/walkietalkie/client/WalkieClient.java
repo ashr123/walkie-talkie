@@ -3,6 +3,7 @@ package io.github.ashr123.walkietalkie.client;
 import io.github.ashr123.walkietalkie.shared.protocol.*;
 import io.github.jaredmdobson.concentus.OpusException;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.cfg.EnumFeature;
 import tools.jackson.databind.json.JsonMapper;
 
 import javax.sound.sampled.LineUnavailableException;
@@ -49,7 +50,13 @@ public final class WalkieClient implements AutoCloseable {
 			Locale.getDefault(Locale.Category.FORMAT)
 	);
 	// Stateless, thread-safe infrastructure with no per-connection input — shared by every client instance.
-	private static final ObjectMapper JSON_MAPPER = JsonMapper.builder().build();
+	// Unknown enum values (an ErrorCode minted by a NEWER server than this client) deserialize to the enum's
+	// @JsonEnumDefaultValue constant (ErrorCode.UNKNOWN) instead of failing the whole message — the forward-
+	// compatibility contract documented on ErrorCode. (Jackson 3 hosts this on EnumFeature, not
+	// DeserializationFeature as in Jackson 2.)
+	private static final ObjectMapper JSON_MAPPER = JsonMapper.builder()
+			.enable(EnumFeature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE)
+			.build();
 	/// Sentinel owner id the server stamps on the server-managed "global" room (mirrors
 	/// `ConnectionService.GLOBAL_CHANNEL_OWNER`); that channel has no participant owner.
 	private static final String SERVER_OWNER = "server";
@@ -397,28 +404,45 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.PassphraseChanged(String keyCheck, String wrappedKey) -> handlePassphraseChanged(keyCheck, wrappedKey);
 			case ServerMessage.SignalOffer _, ServerMessage.SignalAnswer _,
 			     ServerMessage.SignalIce _ -> { /* WebRTC: not used by the relay client */ }
-			case ServerMessage.ErrorMessage(String code, String message) -> {
+			case ServerMessage.ErrorMessage(ErrorCode code, String message) -> {
 				log("[error] " + code + ": " + message);
-				// Abandon an in-flight rekey ONLY when THIS error is the one that rejected our ChangePassphrase
-				// (not_owner if we lost ownership in a race, or not_in_channel) — otherwise a later PassphraseChanged
-				// (from the new owner) would wrongly apply our stashed passphrase. Scope it to those codes so an
-				// UNRELATED error (e.g. a rejected rename/mode we sent just before) can't wipe a legitimately
-				// in-flight rotation and lock us out of our own just-rotated channel.
-				if ("not_owner".equals(code) || "not_in_channel".equals(code)) {
-					rekeyInFlight = false;
-					pendingPassphrase = null;
-				}
-				// A passphrase mismatch is fatal: the channel requires a different --key, so there's nothing
-				// to do but disconnect. getAndSet(false) makes this fire once (mirrors onConnectionLost).
-				if ("passphrase_mismatch".equals(code) && running.getAndSet(false)) {
-					log("Disconnecting — this channel needs a different --key.");
-					System.exit(0);
-				}
-				// A locked channel refused our join. Like a passphrase mismatch, the join failed (an initial connect
-				// joined nothing; a locked switch dropped us), so there's nothing to do but exit — fire once.
-				if ("channel_locked".equals(code) && running.getAndSet(false)) {
-					log("This channel is locked by its owner — cannot join.");
-					System.exit(0);
+				switch (code) {
+					// Abandon an in-flight rekey ONLY when THIS error is the one that rejected our ChangePassphrase
+					// (NOT_OWNER if we lost ownership in a race, or NOT_IN_CHANNEL) — otherwise a later
+					// PassphraseChanged (from the new owner) would wrongly apply our stashed passphrase. Scoped to
+					// these codes so an UNRELATED error (e.g. a rejected rename/mode we sent just before) can't wipe
+					// a legitimately in-flight rotation and lock us out of our own just-rotated channel.
+					case NOT_OWNER, NOT_IN_CHANNEL -> {
+						rekeyInFlight = false;
+						pendingPassphrase = null;
+					}
+					// A passphrase mismatch is fatal: the channel requires a different --key, so there's nothing
+					// to do but disconnect. getAndSet(false) makes this fire once (mirrors onConnectionLost).
+					case PASSPHRASE_MISMATCH -> {
+						if (running.getAndSet(false)) {
+							log("Disconnecting — this channel needs a different --key.");
+							System.exit(0);
+						}
+					}
+					// A locked/full channel refused our join. Like a passphrase mismatch, the join failed (an initial
+					// connect joined nothing; a refused switch dropped us), so there's nothing to do but exit — once.
+					case CHANNEL_LOCKED -> {
+						if (running.getAndSet(false)) {
+							log("This channel is locked by its owner — cannot join.");
+							System.exit(0);
+						}
+					}
+					case CHANNEL_FULL -> {
+						if (running.getAndSet(false)) {
+							log("This channel is full — it has reached its member limit.");
+							System.exit(0);
+						}
+					}
+					// Every other code — including UNKNOWN, the fallback the mapper substitutes for a code a NEWER
+					// server minted (see ErrorCode) — needs no reaction beyond the [error] line already logged. A
+					// deliberate default: future codes must degrade gracefully here, not force client handling.
+					default -> {
+					}
 				}
 			}
 		}

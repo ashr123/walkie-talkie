@@ -45,7 +45,7 @@ class RelayFramingIntegrationTest extends WebSocketIntegrationTestSupport {
 	@Test
 	void aJoinWithTheCanonicalJsonShapeIsAccepted() throws Exception {
 		// Pin the exact wire JSON a client sends: it must deserialize cleanly and produce a Joined snapshot,
-		// not fail with bad_message.
+		// not fail with BAD_MESSAGE.
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login())) {
 			//language=JSON

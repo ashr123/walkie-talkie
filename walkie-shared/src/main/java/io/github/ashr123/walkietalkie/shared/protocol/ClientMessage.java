@@ -45,8 +45,8 @@ public sealed interface ClientMessage {
 	}
 
 	/// Ask the server to change (rotate, set, or clear) the current channel's end-to-end-encryption passphrase.
-	/// Honored only for the channel owner (a non-owner gets `not_owner`; sending it before joining gets
-	/// `not_in_channel`). `keyCheck` is the key-check value derived from the **new** passphrase (see the clients'
+	/// Honored only for the channel owner (a non-owner gets `NOT_OWNER`; sending it before joining gets
+	/// `NOT_IN_CHANNEL`). `keyCheck` is the key-check value derived from the **new** passphrase (see the clients'
 	/// key derivation), or `null` to make the channel unencrypted. As with [Join#keyCheck] the server never sees
 	/// the passphrase itself — it only records the new key-check and broadcasts a [ServerMessage.PassphraseChanged].
 	///
@@ -62,8 +62,8 @@ public sealed interface ClientMessage {
 	}
 
 	/// Ask the server to hand channel ownership to another member. Honored only for the current owner (a
-	/// non-owner gets `not_owner`; sending it before joining gets `not_in_channel`); `newOwnerId` must be the
-	/// session id of a **current member** of the channel (else `unknown_target`). On success the server reassigns
+	/// non-owner gets `NOT_OWNER`; sending it before joining gets `NOT_IN_CHANNEL`); `newOwnerId` must be the
+	/// session id of a **current member** of the channel (else `UNKNOWN_TARGET`). On success the server reassigns
 	/// the owner and broadcasts a [ServerMessage.OwnerChanged] to the whole channel — the same message a
 	/// departure-triggered auto-election sends — so the new owner gains the owner-only controls and the old owner
 	/// loses them. The server-managed `global` room has a sentinel owner, so a transfer there is refused.
@@ -80,8 +80,8 @@ public sealed interface ClientMessage {
 	}
 
 	/// Owner-only moderation: mute or unmute one member's relay audio. `memberId` is a current member's session id;
-	/// `muted` is true to mute, false to unmute. A non-owner gets `not_owner`; an unknown target — or the owner
-	/// itself, which can't be muted — gets `unknown_target`. On success the server records the state, DROPS that
+	/// `muted` is true to mute, false to unmute. A non-owner gets `NOT_OWNER`; an unknown target — or the owner
+	/// itself, which can't be muted — gets `UNKNOWN_TARGET`. On success the server records the state, DROPS that
 	/// member's relayed audio while muted (enforced server-side, so a client can't talk its way around it), frees
 	/// the floor if the muted member was holding it, and broadcasts a [ServerMessage.MemberMuted]. Enforcement is
 	/// relay-only — WebRTC media is peer-to-peer, so mute there is best-effort at the muted client.
@@ -91,14 +91,14 @@ public sealed interface ClientMessage {
 
 	/// Owner-only moderation: mute or unmute EVERY other member of the channel at once (the owner is never muted).
 	/// Same server enforcement and per-member [ServerMessage.MemberMuted] broadcast (one for each member whose
-	/// state actually changed) as [MuteMember]. A non-owner gets `not_owner`.
+	/// state actually changed) as [MuteMember]. A non-owner gets `NOT_OWNER`.
 	@JsonTypeName("muteAll")
 	record MuteAll(boolean muted) implements ClientMessage {
 	}
 
 	/// Owner-only: lock or unlock the channel to NEW members. `locked` is true to lock, false to unlock. A non-owner
-	/// gets `not_owner`; sending it before joining gets `not_in_channel`. While locked, the server refuses any join
-	/// from a member not already in the channel with `channel_locked` — enforced in the atomic join under the same
+	/// gets `NOT_OWNER`; sending it before joining gets `NOT_IN_CHANNEL`. While locked, the server refuses any join
+	/// from a member not already in the channel with `CHANNEL_LOCKED` — enforced in the atomic join under the same
 	/// bin lock as the passphrase-mismatch check, so it can't race a concurrent join. Existing members are
 	/// unaffected (locking blocks only new joins); on success the server broadcasts a [ServerMessage.ChannelLocked].
 	/// The server-managed `global` room has a sentinel owner, so a lock there is refused.

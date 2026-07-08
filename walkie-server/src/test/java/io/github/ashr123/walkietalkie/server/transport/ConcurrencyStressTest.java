@@ -76,7 +76,7 @@ class ConcurrencyStressTest {
 							case 4 -> service.onAudio(me, frame);
 							case 5 -> service.onMessage(me, new ClientMessage.Leave());
 							// Passphrase rotation races joins/leaves on the SAME channel: only the channel's current
-							// owner succeeds (others get not_owner, no throw), so the registry's key-check write must
+							// owner succeeds (others get NOT_OWNER, no throw), so the registry's key-check write must
 							// stay serialized with join validation under the channel-name bin lock. A null key-check
 							// flips the channel back to unencrypted, keeping joins (which present null) succeeding.
 							case 6 -> service.onMessage(me, new ClientMessage.ChangePassphrase(
@@ -85,7 +85,7 @@ class ConcurrencyStressTest {
 							// rotation (both write under the same channel-name bin lock). Half the time target SELF —
 							// guaranteed a current member, so when this worker currently owns its channel the OK
 							// owner-write actually fires and interleaves with concurrent rotations; the other half
-							// target a random id to exercise the not_owner / unknown_target paths. None may throw.
+							// target a random id to exercise the NOT_OWNER / UNKNOWN_TARGET paths. None may throw.
 							case 7 -> service.onMessage(me, new ClientMessage.TransferOwnership(
 									rnd.nextBoolean() ? me.id() : "s-" + rnd.nextInt(workers)));
 						}

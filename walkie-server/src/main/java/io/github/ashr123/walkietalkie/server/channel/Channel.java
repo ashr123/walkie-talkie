@@ -1,6 +1,9 @@
 package io.github.ashr123.walkietalkie.server.channel;
 
+import io.github.ashr123.option.NoneInt;
 import io.github.ashr123.option.Option;
+import io.github.ashr123.option.OptionInt;
+import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
@@ -21,20 +24,31 @@ public final class Channel {
 
 	/// Usable stream indices are 0..254; 255 (0xFF) is reserved as a future "extended id" escape.
 	private static final int STREAM_INDEX_RANGE = 255;
-
 	private final String name;
-	private final Map<String, ClientSession> members = new ConcurrentHashMap<>();
-
+	/// The roster: session id -> [Member]. Membership and the member's stream index live in ONE map value, so
+	/// they are published ([#add]) and retired ([#remove]) atomically — a lock-free reader (the audio fan-out, the
+	/// in-place re-join re-snapshot) sees a member either complete with its index or not at all, never a member
+	/// whose identifier is missing. (They used to live in two maps mutated in separate steps, which let such a
+	/// reader catch a member mid-join/mid-leave without an index.)
+	private final Map<String, Member> members = new ConcurrentHashMap<>();
+	/// Stream-index pool for [#allocateStreamIndex]/[#freeStreamIndex] (both synchronized): a monotonic rotating
+	/// cursor that skips live indices avoids reusing a just-freed index until it has cycled the whole range —
+	/// quarantining recycled indices so a new talker can't inherit a departed member's still-in-flight frames.
+	private final boolean[] indexInUse = new boolean[STREAM_INDEX_RANGE];
+	/// Session ids the owner has muted. Their relayed audio is dropped in `ConnectionService.onAudio` before
+	/// fan-out, so a mute is enforced by the server rather than trusted to the client. A concurrent set so the
+	/// per-frame [#isMuted] read is lock-free; the mute/unmute mutations run under this channel's monitor when they
+	/// must be atomic with the `MemberMuted` broadcast and with freeing the floor of a member being muted —
+	/// mirroring the floor discipline. Entries are dropped on [#remove], so a member's mute never outlives it.
+	private final Set<String> mutedMembers = ConcurrentHashMap.newKeySet();
 	/// The session id currently holding the floor, or `null` when the floor is free. Written only under this
 	/// channel's monitor, so the check-then-set in the acquire/release/preempt paths is atomic; `volatile` so
 	/// the lock-free reads on the hot audio path ([#holdsFloor]) and the join hint ([#floorHolder]) see the
 	/// latest value. (A lock-free read may be momentarily stale — that is why the audio path re-validates under
 	/// the monitor before fanning a frame out.)
 	private volatile String floorHolder;
-
 	private volatile ChannelMode mode;
 	private volatile String ownerId;
-
 	/// The key-check value every member must present to join (a short value derived from the E2EE
 	/// passphrase, or `null` for an unencrypted channel), set by the creator and changed by the owner on a
 	/// passphrase rotation. The server compares it to reject a mismatched passphrase; it is not the key and
@@ -49,35 +63,35 @@ public final class Channel {
 	/// back-to-back rotations converge on the channel's current value (mirroring the `OwnerChanged` discipline).
 	/// Still mutate it only via [#setKeyCheck] from the registry's bin-locked remapping.
 	private volatile String keyCheck;
-
 	/// Whether the owner has LOCKED the channel to new members. While true, [ChannelRegistry#joinOrCreate] refuses a
 	/// join from any session not already a member; existing members are unaffected (locking blocks only new joins).
 	/// Concurrency mirrors [#keyCheck]: the **write** ([#setLocked], from [ChannelRegistry#setLocked]) and the
 	/// enforcement **read** ([ChannelRegistry#joinOrCreate]) both run inside the registry's `channels.compute*(name,
-	/// …)` remapping, so the `ConcurrentHashMap` bin lock for the channel name serializes a lock toggle with every
+    /// …)` remapping, so the `ConcurrentHashMap` bin lock for the channel name serializes a lock toggle with every
 	/// join — a joiner sees either the locked or the unlocked state, never a torn one. It is also read **live**
 	/// under the channel monitor when `ConnectionService.handleSetLocked` announces the change (a *different* lock),
 	/// and lock-free by the in-place re-join re-snapshot, so it is `volatile` for that cross-lock visibility;
 	/// back-to-back toggles converge on the current value like the passphrase/owner broadcasts. Mutate it only via
 	/// [#setLocked] from the registry's bin-locked remapping.
 	private volatile boolean locked;
-
-	/// Per-channel stream-index allocator: maps each member's session id to a uint8 routing index (0..254).
-	/// The server prefixes this index onto a member's relayed audio so multi-stream receivers can demultiplex
-	/// talkers. A monotonic rotating cursor that skips live indices avoids reusing a just-freed index until it
-	/// has cycled the whole range — quarantining recycled indices so a new talker can't inherit a departed
-	/// member's still-in-flight frames. Allocation/free are synchronized; reads go through the concurrent map.
-	private final Map<String, Integer> streamIndices = new ConcurrentHashMap<>();
-	private final boolean[] indexInUse = new boolean[STREAM_INDEX_RANGE];
 	private int rotation;
-
-	/// Session ids the owner has muted. Their relayed audio is dropped in `ConnectionService.onAudio` before
-	/// fan-out, so a mute is enforced by the server rather than trusted to the client. A concurrent set so the
-	/// per-frame [#isMuted] read is lock-free; the mute/unmute mutations run under this channel's monitor when they
-	/// must be atomic with the `MemberMuted` broadcast and with freeing the floor of a member being muted —
-	/// mirroring the floor discipline. Entries are dropped on [#remove], so a member's mute never outlives it.
-	private final Set<String> mutedMembers = ConcurrentHashMap.newKeySet();
-
+	// --- floor hold timing (push-to-talk anti-hogging) --------------------------------------------
+	// Two marks let the server bound how long one member keeps the floor WITHOUT ever inspecting audio content
+	// — so the limits hold on end-to-end-encrypted channels too. `floorAcquiredAt` backs a max-hold cap
+	// (continuous talk time); `floorActivityAt` (the holder's most recent frame) backs idle auto-release. Both
+	// are stamped under the monitor by the acquire / preempt / activity methods and read lock-free via the
+	// getters (volatile); they start at EPOCH and are only read after a real acquire stamps them.
+	//
+	// Serialization contract: the floor-mutating methods here (tryAcquireFloor / releaseFloor / preemptFloorIfIdle /
+	// markFloorActivity / releaseIfExpired) synchronize on THIS Channel instance, so each does its check-then-set
+	// on the plain `floorHolder` field atomically. A caller that must make a floor transition atomic with the
+	// message it broadcasts about it (so a concurrently-acquiring member can't be told the floor is free, or
+	// vice-versa) wraps the whole mutate-and-notify in `synchronized (channel)` — reentrant with these methods.
+	// holdsFloor / floorHolder() stay lock-free (volatile) reads for the per-frame path.
+	// NOTE for such callers: never invoke a ChannelRegistry mutate (joinOrCreate/leave) while holding this
+	// monitor — the registry takes its bin lock then this monitor (via add/remove), so the reverse order deadlocks.
+	private volatile Instant floorAcquiredAt = Instant.EPOCH;
+	private volatile Instant floorActivityAt = Instant.EPOCH;
 	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck) {
 		this.name = name;
 		this.mode = mode;
@@ -127,13 +141,19 @@ public final class Channel {
 		this.ownerId = ownerId;
 	}
 
+	/// Adds a member, allocating its stream index and publishing session + index as ONE map entry — so no reader
+	/// can ever observe a member without its identifier. Call ONLY from [ChannelRegistry#joinOrCreate]'s bin-locked
+	/// remapping (which also holds this channel's monitor): same-channel add/remove are serialized by that bin
+	/// lock, which makes the idempotency check-then-put race-free (a re-add keeps the existing index).
 	public void add(ClientSession session) {
-		members.put(session.id(), session);
-		assignStreamIndex(session.id());
+		if (members.containsKey(session.id())) {
+			return;   // idempotent — the member keeps the index it already has
+		}
+		members.put(session.id(), new Member(session, allocateStreamIndex()));
 	}
 
 	public void remove(String sessionId) {
-		members.remove(sessionId);
+		Member removed = members.remove(sessionId);   // retires the member AND its index in one atomic step
 		synchronized (this) {
 			// Clear the floor under the SAME monitor as tryAcquireFloor/preemptFloorIfIdle/releaseIfExpired, so a
 			// leaver's floor release is serialized with a concurrent grant's holder-swap-and-stamp and can't leave
@@ -147,7 +167,9 @@ public final class Channel {
 			// it while one that runs after us re-checks membership under the monitor — so no muted-id ever outlives
 			// its member (a leak that would otherwise linger for the channel's lifetime, session ids being unique).
 			mutedMembers.remove(sessionId);
-			freeStreamIndex(sessionId);   // reentrant — also synchronized(this)
+			if (removed != null) {
+				freeStreamIndex(removed.streamIndex());   // return the slot to the pool (reentrant — also synchronized)
+			}
 		}
 	}
 
@@ -160,7 +182,7 @@ public final class Channel {
 	}
 
 	public Option<ClientSession> member(String sessionId) {
-		return Option.of(members.get(sessionId));
+		return Option.of(members.get(sessionId)).map(Member::session);
 	}
 
 	/// Any current member, used to elect a new owner after the previous one leaves;
@@ -169,42 +191,63 @@ public final class Channel {
 		return Option.of(members.keySet().stream().findAny());
 	}
 
-	/// The stream index assigned to `sessionId`, or 0 if unknown (defensive; an active member always has one).
-	public int streamIndexOf(String sessionId) {
-		Integer index = streamIndices.get(sessionId);
-		return index == null ? 0 : index;
+	/// The stream index of member `sessionId`, or [NoneInt] for a non-member. `0` is a VALID index (the range is
+	/// 0..254), so a missing session must NOT be treated as index 0 — that would alias its frames onto whoever holds
+	/// index 0 and misroute audio. Because the index lives INSIDE the member entry, this is one atomic read: present
+	/// member -> its index, absent -> [NoneInt] — no in-between. A caller acting on a known-present member uses
+	/// [#requireStreamIndex]; the audio fan-out matches [NoneInt] to DROP a frame whose sender just left (a leave
+	/// racing an in-flight frame), rather than stamp a bogus index.
+	public OptionInt streamIndexOf(String sessionId) {
+		return members.get(sessionId) instanceof Member(ClientSession _, int index) ?
+				new SomeInt(index) :
+				NoneInt.INSTANCE;
 	}
 
-	private synchronized void assignStreamIndex(String sessionId) {
-		if (streamIndices.containsKey(sessionId)) {
-			return;
-		}
+	/// The stream index of a member that MUST have one: every current member is assigned one in [#add], so a
+	/// missing index is an invariant breach, not an expected outcome. Fails fast rather than aliasing onto a valid
+	/// index. Used to build the roster / `MemberJoined`, where the member is known-present.
+	public int requireStreamIndex(String sessionId) {
+		return switch (streamIndexOf(sessionId)) {
+			case SomeInt(int index) -> index;
+			case NoneInt _ -> throw new IllegalStateException("no stream index for active member '" + sessionId + "'");
+		};
+	}
+
+	/// Whether the channel is at capacity — one stream index per member, and the space is 0..254, so a channel
+	/// holds at most [#STREAM_INDEX_RANGE] members. [ChannelRegistry#joinOrCreate] refuses a newcomer here rather
+	/// than letting [#assignStreamIndex] run out of indices.
+	public boolean isFull() {
+		return members.size() >= STREAM_INDEX_RANGE;
+	}
+
+	private synchronized int allocateStreamIndex() {
 		for (int probe = 0; probe < STREAM_INDEX_RANGE; probe++) {
 			int candidate = rotation;
 			rotation = (rotation + 1) % STREAM_INDEX_RANGE;
 			if (!indexInUse[candidate]) {
 				indexInUse[candidate] = true;
-				streamIndices.put(sessionId, candidate);
-				return;
+				return candidate;
 			}
 		}
-		streamIndices.put(sessionId, 0);   // >254 concurrent members (far above any real channel) — tolerate a collision
+		// Unreachable: ChannelRegistry.joinOrCreate refuses a join once the channel isFull(), so add() is never
+		// called without a free index. Fail loud rather than silently reuse index 0 (which would alias this
+		// member's frames onto index 0's owner) if that invariant is ever broken.
+		throw new IllegalStateException("stream-index space exhausted for channel '" + name + "' despite the membership cap");
 	}
 
-	private synchronized void freeStreamIndex(String sessionId) {
-		Integer index = streamIndices.remove(sessionId);
-		if (index != null) {
-			indexInUse[index] = false;
-		}
+	private synchronized void freeStreamIndex(int index) {
+		indexInUse[index] = false;
 	}
 
 	public List<MemberInfo> memberInfos() {
+		// Complete by construction: every Member carries its own index, so even a lock-free point-in-time snapshot
+		// (the in-place re-join re-snapshot) never meets a member without one — nothing to skip, nothing to invent.
 		return members.values().stream()
-				.map(session -> new MemberInfo(
-						session.id(),
-						session.displayName(),
-						streamIndexOf(session.id()),
-						isMuted(session.id())
+				.map(member -> new MemberInfo(
+						member.session().id(),
+						member.session().displayName(),
+						member.streamIndex(),
+						isMuted(member.session().id())
 				))
 				.toList();
 	}
@@ -233,6 +276,7 @@ public final class Channel {
 	/// Applies an action to every member except the one with `excludeSessionId`.
 	public void forEachOther(String excludeSessionId, Consumer<? super ClientSession> action) {
 		members.values().stream()
+				.map(Member::session)
 				.filter(session -> !session.id().equals(excludeSessionId))
 				.forEach(action);
 	}
@@ -240,7 +284,9 @@ public final class Channel {
 	/// Applies an action to **every** member (including any current floor holder) — used to broadcast a floor
 	/// release/reset to the whole channel.
 	public void forEach(Consumer<? super ClientSession> action) {
-		members.values().forEach(action);
+		members.values().stream()
+				.map(Member::session)
+				.forEach(action);
 	}
 
 	/// Attempts to acquire the talk floor, stamping the acquire + activity marks **atomically** with the holder
@@ -283,24 +329,6 @@ public final class Channel {
 	public Option<String> floorHolder() {
 		return Option.of(floorHolder);
 	}
-
-	// --- floor hold timing (push-to-talk anti-hogging) --------------------------------------------
-	// Two marks let the server bound how long one member keeps the floor WITHOUT ever inspecting audio content
-	// — so the limits hold on end-to-end-encrypted channels too. `floorAcquiredAt` backs a max-hold cap
-	// (continuous talk time); `floorActivityAt` (the holder's most recent frame) backs idle auto-release. Both
-	// are stamped under the monitor by the acquire / preempt / activity methods and read lock-free via the
-	// getters (volatile); they start at EPOCH and are only read after a real acquire stamps them.
-	//
-	// Serialization contract: the floor-mutating methods here (tryAcquireFloor / releaseFloor / preemptFloorIfIdle /
-	// markFloorActivity / releaseIfExpired) synchronize on THIS Channel instance, so each does its check-then-set
-	// on the plain `floorHolder` field atomically. A caller that must make a floor transition atomic with the
-	// message it broadcasts about it (so a concurrently-acquiring member can't be told the floor is free, or
-	// vice-versa) wraps the whole mutate-and-notify in `synchronized (channel)` — reentrant with these methods.
-	// holdsFloor / floorHolder() stay lock-free (volatile) reads for the per-frame path.
-	// NOTE for such callers: never invoke a ChannelRegistry mutate (joinOrCreate/leave) while holding this
-	// monitor — the registry takes its bin lock then this monitor (via add/remove), so the reverse order deadlocks.
-	private volatile Instant floorAcquiredAt = Instant.EPOCH;
-	private volatile Instant floorActivityAt = Instant.EPOCH;
 
 	/// Refreshes the activity mark — call when the current holder transmits a frame, so idle auto-release
 	/// measures silence from the last frame, not from acquisition. Synchronized so it can't interleave between
@@ -349,5 +377,12 @@ public final class Channel {
 		}
 		floorHolder = null;
 		return holder;
+	}
+
+	/// A channel member: the session plus its per-channel stream index — the compact `uint8` identity the server
+	/// stamps on the member's relayed audio frames so receivers can demultiplex and decode per talker (a session
+	/// id is a ~36-char UUID, far too big to carry on every 20 ms frame). Held as one immutable record so the
+	/// member and its identifier are inseparable: there is no state in which a member exists without an index.
+	private record Member(ClientSession session, int streamIndex) {
 	}
 }

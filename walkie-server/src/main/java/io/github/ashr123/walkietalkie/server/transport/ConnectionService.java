@@ -1,16 +1,14 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
 import io.github.ashr123.option.Some;
+import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.ratelimit.SessionRateLimiter;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.support.RequestContext;
-import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
-import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
-import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
-import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -28,6 +26,7 @@ import java.util.regex.Pattern;
 /// raw audio frames here; this class owns membership, push-to-talk floor arbitration, audio fan-out
 /// and WebRTC signaling relay. It never touches a `WebSocketSession` directly, which keeps it
 /// unit-testable with fake [ClientSession] instances.
+@SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
 @Service
 public class ConnectionService {
 
@@ -128,7 +127,7 @@ public class ConnectionService {
 	/// Sends a control-plane error to the requester AND logs why the request was refused — so an operator can
 	/// see the reason, and when a client then disconnects (e.g. it closes after a passphrase mismatch) the
 	/// preceding line explains why. Runs in the requester's message scope, so the log carries its id + name.
-	private static void sendError(ClientSession session, String code, String message) {
+	private static void sendError(ClientSession session, ErrorCode code, String message) {
 		log.info("request refused: {} — {}", code, message);
 		safeSend(session, new ServerMessage.ErrorMessage(code, message));
 	}
@@ -152,24 +151,24 @@ public class ConnectionService {
 		// channel it is already in. Only a passphrase mismatch can still drop a switcher — it is detectable only
 		// by the atomic joinOrCreate below, which necessarily runs after the leave.
 		if (requested == null || !CHANNEL_NAME.matcher(requested).matches()) {
-			sendError(session, "invalid_channel",
+			sendError(session, ErrorCode.INVALID_CHANNEL,
 					"Channel name must match " + CHANNEL_NAME.pattern());
 			return;
 		}
 		if (join.displayName() == null || !DISPLAY_NAME.matcher(join.displayName()).matches()) {
-			sendError(session, "invalid_display_name",
+			sendError(session, ErrorCode.INVALID_DISPLAY_NAME,
 					"Display name must match " + DISPLAY_NAME.pattern());
 			return;
 		}
 		// The "global" channel is the server-managed broadcast room: reachable ONLY via global push-to-talk,
 		// and never end-to-end encrypted — so anyone can join it (there is no shared passphrase to know).
 		if (GLOBAL_CHANNEL.equals(requested) && mode != ChannelMode.GLOBAL_PTT) {
-			sendError(session, "reserved_channel",
+			sendError(session, ErrorCode.RESERVED_CHANNEL,
 					"'" + GLOBAL_CHANNEL + "' is reserved — use Single global push-to-talk to join it.");
 			return;
 		}
 		if (mode == ChannelMode.GLOBAL_PTT && join.keyCheck() != null) {
-			sendError(session, "encryption_not_allowed",
+			sendError(session, ErrorCode.ENCRYPTION_NOT_ALLOWED,
 					"The global channel can't be end-to-end encrypted — clear the passphrase to join it.");
 			return;
 		}
@@ -206,16 +205,19 @@ public class ConnectionService {
 				? channelRegistry.joinOrCreate(requested, mode, null, session, GLOBAL_CHANNEL_OWNER, emitInitialState)
 				: channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session, emitInitialState);
 		if (joined == null) {
-			// The atomic join refused to add us. It rejects a LOCKED channel before the key-check, so attribute the
-			// reason: if the target is (still) locked it was the lock, else a passphrase mismatch. The enforcement
-			// itself was atomic inside joinOrCreate; this re-read only picks the error message to show, so a lock
-			// toggling in the instant after the failed join at worst shows the other of two equally-true "can't
-			// join" messages — never a wrong admit/reject.
-			if (channelRegistry.find(requested) instanceof Some(Channel target) && target.isLocked()) {
-				sendError(session, "channel_locked",
+			// The atomic join refused to add us. joinOrCreate checks, in order, lock -> capacity -> key-check, so
+			// attribute the reason by re-reading the target. The enforcement itself was atomic inside joinOrCreate;
+			// this re-read only picks which equally-true "can't join" message to show, so a state change in the
+			// instant after the failed join at worst shows another true reason — never a wrong admit/reject.
+			Channel target = channelRegistry.find(requested) instanceof Some(Channel c) ? c : null;
+			if (target != null && target.isLocked()) {
+				sendError(session, ErrorCode.CHANNEL_LOCKED,
 						"This channel is locked by its owner — you can't join it right now.");
+			} else if (target != null && target.isFull()) {
+				sendError(session, ErrorCode.CHANNEL_FULL,
+						"This channel is full — it has reached its member limit.");
 			} else {
-				sendError(session, "passphrase_mismatch",
+				sendError(session, ErrorCode.PASSPHRASE_MISMATCH,
 						"This channel is using a different encryption passphrase (or none) — you can't join it.");
 			}
 			return;
@@ -227,8 +229,12 @@ public class ConnectionService {
 
 		// Tell the OTHER members about the joiner. This is intentionally OUTSIDE the registry lock: it concerns
 		// the joiner's visibility to others, not the joiner's own floor view, so it needs no floor serialization.
-		ServerMessage notice = new ServerMessage.MemberJoined(
-				new MemberInfo(session.id(), session.displayName(), channel.streamIndexOf(session.id()), false));
+		ServerMessage notice = new ServerMessage.MemberJoined(new MemberInfo(
+				session.id(),
+				session.displayName(),
+				channel.requireStreamIndex(session.id()),
+				false
+		));
 		channel.forEachOther(session.id(), other -> safeSend(other, notice));
 
 		// Identity (session + name) and the channel are carried by the MDC prefix now (the name advanced above,
@@ -392,10 +398,14 @@ public class ConnectionService {
 					channel.forEach(member -> safeSend(member, idle));
 					// The sweep is a scheduled task, not bound to a session scope, and the holder is some OTHER
 					// session — so log its id + name explicitly rather than relying on the MDC.
-					log.info("session={} ({}) reached the max floor-hold time on channel={}; floor released by sweep",
-							holder, channel.member(holder) instanceof Some(
-									ClientSession held
-							) ? held.displayName() : "?", channel.name());
+					log.info(
+							"session={} ({}) reached the max floor-hold time on channel={}; floor released by sweep",
+							holder,
+							channel.member(holder) instanceof Some(ClientSession held) ?
+									held.displayName() :
+									"?",
+							channel.name()
+					);
 				}
 			}
 		}
@@ -461,18 +471,23 @@ public class ConnectionService {
 			return;
 		}
 
-		// Tag the fan-out with the sender's per-channel stream index so receivers can demultiplex talkers;
-		// every client decodes per sender and mixes locally (see docs/CLIENT_PROTOCOL.md §5).
-		byte[] prefixed = prefixedFrame(channel.streamIndexOf(session.id()), audio);
-		channel.forEachOther(session.id(), other -> {
-			if (other.supportsAudioRelay()) {
-				try {
-					other.sendAudio(prefixed);
-				} catch (RuntimeException e) {
-					log.debug("Audio relay to {} failed: {}", other.id(), e.getMessage());
+		// Tag the fan-out with the sender's per-channel stream index so receivers can demultiplex talkers; every
+		// client decodes per sender and mixes locally (see docs/CLIENT_PROTOCOL.md §5). If the sender has no index
+		// — its slot was just freed by a concurrent leave racing this in-flight frame — drop the frame rather than
+		// stamp a bogus index and misroute it into another member's decode lane.
+		if (channel.streamIndexOf(session.id()) instanceof SomeInt(int index)) {
+			byte[] prefixed = prefixedFrame(index, audio);
+			channel.forEachOther(session.id(), other -> {
+				if (other.supportsAudioRelay()) {
+					try {
+						other.sendAudio(prefixed);
+					} catch (RuntimeException e) {
+						log.debug("Audio relay to {} failed: {}", other.id(), e.getMessage());
+					}
 				}
-			}
-		});
+			});
+		}
+		// The sender's stream index was freed (it is leaving) — drop this straggler frame.
 	}
 
 	/// Prepends the 1-byte stream index to a relayed audio frame: `[sid][body]`. The body (plaintext
@@ -507,14 +522,14 @@ public class ConnectionService {
 		if (channel.member(targetId) instanceof Some(ClientSession target))
 			safeSend(target, message);
 		else
-			sendError(session, "unknown_target",
+			sendError(session, ErrorCode.UNKNOWN_TARGET,
 					"No member '" + targetId + "' in this channel");
 	}
 
 	private Channel requireChannel(ClientSession session) {
 		String name = session.channelName();
 		if (name == null) {
-			sendError(session, "not_in_channel", "Join a channel first");
+			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			return null;
 		}
 		return channelRegistry.find(name) instanceof Some(Channel channel) ?
@@ -525,7 +540,7 @@ public class ConnectionService {
 	/// The caller's channel IF the caller currently owns it, else `null` after sending the right error: the shared
 	/// owner-gate for the inline owner-only handlers (mode change, mute) — routed here rather than through the
 	/// registry because they act on channel state under the channel monitor, not under the bin lock. Sends
-	/// `not_in_channel` (via [#requireChannel]) when not in a channel and `not_owner` when in one but not its owner;
+	/// `NOT_IN_CHANNEL` (via [#requireChannel]) when not in a channel and `NOT_OWNER` when in one but not its owner;
 	/// `action` completes the "Only the channel owner can …" message. The owner check reads the live `ownerId`, so a
 	/// concurrent ownership transfer just means an already-authorized action may still land — benign and reversible,
 	/// not a privilege leak. The sentinel-owned `global` room is never equal to a session id, so it fails here.
@@ -535,21 +550,21 @@ public class ConnectionService {
 			return null;
 		}
 		if (!session.id().equals(channel.ownerId())) {
-			sendError(session, "not_owner", "Only the channel owner can " + action);
+			sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can " + action);
 			return null;
 		}
 		return channel;
 	}
 
 	/// Changes the current channel's mode, but only for its owner. Clears the floor and broadcasts the
-	/// new mode to every member so their controls update; a non-owner gets a `not_owner` error.
+	/// new mode to every member so their controls update; a non-owner gets a `NOT_OWNER` error.
 	private void handleChangeMode(ClientSession session, ChannelMode mode) {
 		Channel channel = requireOwnedChannel(session, "change the mode");
 		if (channel == null) {
 			return;
 		}
 		if (mode == ChannelMode.GLOBAL_PTT && !channel.name().equals(GLOBAL_CHANNEL)) {
-			sendError(session, "invalid_mode", "Global PTT applies only to the 'global' channel");
+			sendError(session, ErrorCode.INVALID_MODE, "Global PTT applies only to the 'global' channel");
 			return;
 		}
 		if (channel.mode() == mode) {
@@ -576,9 +591,9 @@ public class ConnectionService {
 	/// learns the passphrase — the request carries only the key-check derived from the new one (or `null` to make
 	/// the channel unencrypted) — so all it does is record the new key-check and broadcast a `PassphraseChanged`
 	/// to every member (including the owner) so each client re-derives its key from the new passphrase, obtained
-	/// out-of-band exactly as the original was. A non-owner gets `not_owner`; a request before joining gets
-	/// `not_in_channel`. The server-managed `global` room has the sentinel owner, so a rotation there is refused
-	/// as `not_owner` — it stays the unencrypted broadcast room.
+	/// out-of-band exactly as the original was. A non-owner gets `NOT_OWNER`; a request before joining gets
+	/// `NOT_IN_CHANNEL`. The server-managed `global` room has the sentinel owner, so a rotation there is refused
+	/// as `NOT_OWNER` — it stays the unencrypted broadcast room.
 	///
 	/// Concurrency: the key-check write happens inside the registry's channel-name `computeIfPresent` span (see
 	/// [ChannelRegistry#changePassphrase]), serializing it with every join's key-check validation. The broadcast
@@ -593,13 +608,13 @@ public class ConnectionService {
 	private void handleChangePassphrase(ClientSession session, String keyCheck, String wrappedKey) {
 		String channelName = session.channelName();
 		if (channelName == null) {
-			sendError(session, "not_in_channel", "Join a channel first");
+			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			return;
 		}
 		switch (channelRegistry.changePassphrase(channelName, session.id(), keyCheck)) {
-			case ChannelRegistry.RekeyResult.NotFound _ -> sendError(session, "not_in_channel", "Join a channel first");
+			case ChannelRegistry.RekeyResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.RekeyResult.NotOwner _ ->
-					sendError(session, "not_owner", "Only the channel owner can change the passphrase");
+					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can change the passphrase");
 			case ChannelRegistry.RekeyResult.Ok(Channel channel) -> {
 				synchronized (channel) {
 					// Broadcast the LIVE key-check (convergence) plus this request's wrappedKey relayed verbatim —
@@ -617,9 +632,9 @@ public class ConnectionService {
 
 	/// Hands channel ownership to another current member, but only on the current owner's request. Broadcasts the
 	/// same `OwnerChanged` that a departure-triggered auto-election sends, so every client re-renders owner-only
-	/// controls. A non-owner gets `not_owner`; a target that is not a member of the channel gets `unknown_target`;
-	/// a request before joining gets `not_in_channel`. The global room's sentinel owner means a transfer there is
-	/// refused as `not_owner`.
+	/// controls. A non-owner gets `NOT_OWNER`; a target that is not a member of the channel gets `UNKNOWN_TARGET`;
+	/// a request before joining gets `NOT_IN_CHANNEL`. The global room's sentinel owner means a transfer there is
+	/// refused as `NOT_OWNER`.
 	///
 	/// Concurrency: the owner check, the target-membership check and the owner write are one atomic step inside
 	/// the registry's channel-name `computeIfPresent` span (see [ChannelRegistry#transferOwnership]), so the
@@ -633,14 +648,14 @@ public class ConnectionService {
 	private void handleTransferOwnership(ClientSession session, String newOwnerId) {
 		String channelName = session.channelName();
 		if (channelName == null) {
-			sendError(session, "not_in_channel", "Join a channel first");
+			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			return;
 		}
 		switch (channelRegistry.transferOwnership(channelName, session.id(), newOwnerId)) {
-			case ChannelRegistry.TransferResult.NotFound _ -> sendError(session, "not_in_channel", "Join a channel first");
+			case ChannelRegistry.TransferResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.TransferResult.NotOwner _ ->
-					sendError(session, "not_owner", "Only the channel owner can transfer ownership");
-			case ChannelRegistry.TransferResult.NotAMember _ -> sendError(session, "unknown_target",
+					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can transfer ownership");
+			case ChannelRegistry.TransferResult.NotAMember _ -> sendError(session, ErrorCode.UNKNOWN_TARGET,
 					"No member '" + newOwnerId + "' in this channel");
 			case ChannelRegistry.TransferResult.Ok(Channel channel) -> {
 				synchronized (channel) {
@@ -657,8 +672,8 @@ public class ConnectionService {
 
 	/// Mutes or unmutes one member's relay audio, on the owner's request only. This is server-ENFORCED: while a
 	/// member is muted, [#onAudio] drops its frames, so a client that ignores its own mute still can't be heard —
-	/// the trust boundary is the relay, not the sender. A non-owner gets `not_owner`; a target that isn't a current
-	/// member, or the owner itself (which can never be muted), gets `unknown_target`.
+	/// the trust boundary is the relay, not the sender. A non-owner gets `NOT_OWNER`; a target that isn't a current
+	/// member, or the owner itself (which can never be muted), gets `UNKNOWN_TARGET`.
 	///
 	/// Concurrency: the membership re-check, the mute flip, the floor release (when the muted member was the one
 	/// talking) and the `MemberMuted` broadcast all run under the channel monitor — the same monitor every floor
@@ -683,7 +698,7 @@ public class ConnectionService {
 		// The owner can't mute itself, and only a current member can be muted. This is the friendly fast-path error;
 		// the authoritative membership test is re-done under the monitor below (a member can leave in between).
 		if (memberId == null || memberId.equals(channel.ownerId()) || !(channel.member(memberId) instanceof Some(ClientSession _))) {
-			sendError(session, "unknown_target", "No member '" + memberId + "' to mute in this channel");
+			sendError(session, ErrorCode.UNKNOWN_TARGET, "No member '" + memberId + "' to mute in this channel");
 			return;
 		}
 		synchronized (channel) {
@@ -704,7 +719,7 @@ public class ConnectionService {
 
 	/// Mutes or unmutes EVERY other member of the channel at once, on the owner's request. The owner is never
 	/// muted. Same server enforcement and per-member `MemberMuted` broadcast (one for each member whose state
-	/// actually changed) as [#handleMuteMember]; a non-owner gets `not_owner`. If the current floor holder is among
+	/// actually changed) as [#handleMuteMember]; a non-owner gets `NOT_OWNER`. If the current floor holder is among
 	/// those muted, its floor is freed too (via [#broadcastMute]).
 	private void handleMuteAll(ClientSession session, boolean muted) {
 		Channel channel = requireOwnedChannel(session, "mute members");
@@ -752,7 +767,7 @@ public class ConnectionService {
 	/// Locks or unlocks the channel to NEW members, on the owner's request only. Server-enforced in the atomic join
 	/// (see [ChannelRegistry#joinOrCreate]); existing members are never affected. Routed through
 	/// [ChannelRegistry#setLocked] so the owner check and the flag write share the bin lock a join validates its
-	/// key-check under — a non-owner gets `not_owner`, and the sentinel-owned `global` room can't be locked. On
+	/// key-check under — a non-owner gets `NOT_OWNER`, and the sentinel-owned `global` room can't be locked. On
 	/// success the `ChannelLocked` broadcast runs under the channel monitor over the mutated instance the registry
 	/// returns (not a fresh `find()`, mirroring [#handleChangePassphrase]'s same-object discipline) reading the
 	/// channel's LIVE lock state, so two back-to-back toggles converge — a delayed broadcast carries the current
@@ -760,13 +775,13 @@ public class ConnectionService {
 	private void handleSetLocked(ClientSession session, boolean locked) {
 		String channelName = session.channelName();
 		if (channelName == null) {
-			sendError(session, "not_in_channel", "Join a channel first");
+			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			return;
 		}
 		switch (channelRegistry.setLocked(channelName, session.id(), locked)) {
-			case ChannelRegistry.LockResult.NotFound _ -> sendError(session, "not_in_channel", "Join a channel first");
+			case ChannelRegistry.LockResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.LockResult.NotOwner _ ->
-					sendError(session, "not_owner", "Only the channel owner can lock the channel");
+					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can lock the channel");
 			case ChannelRegistry.LockResult.Ok(Channel channel) -> {
 				synchronized (channel) {
 					ServerMessage channelLocked = new ServerMessage.ChannelLocked(channel.isLocked());
@@ -790,7 +805,7 @@ public class ConnectionService {
 	/// (the same hazard the post-removal `MemberLeft` ordering avoids for departures).
 	private void handleRename(ClientSession session, String displayName) {
 		if (displayName == null || !DISPLAY_NAME.matcher(displayName).matches()) {
-			sendError(session, "invalid_display_name",
+			sendError(session, ErrorCode.INVALID_DISPLAY_NAME,
 					"Display name must match " + DISPLAY_NAME.pattern());
 			return;
 		}

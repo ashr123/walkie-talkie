@@ -2,6 +2,7 @@ package io.github.ashr123.walkietalkie.server.integration;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.CloseStatus;
@@ -128,9 +129,9 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login())) {
 			send(sa, new ClientMessage.RequestFloor());
-			assertEquals("not_in_channel", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.NOT_IN_CHANNEL, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 			send(sa, new ClientMessage.ReleaseFloor());
-			assertEquals("not_in_channel", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.NOT_IN_CHANNEL, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 

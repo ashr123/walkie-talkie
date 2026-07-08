@@ -10,6 +10,7 @@ import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 
@@ -152,7 +153,7 @@ class ConnectionServiceTest {
 
 		service.onMessage(alice, new ClientMessage.Rename("bad name"));   // a space is not in the allowed charset
 
-		assertEquals("invalid_display_name", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("alice", alice.displayName(), "the label is unchanged on rejection");
 		assertFalse(bob.sent.stream().anyMatch(ServerMessage.MemberRenamed.class::isInstance),
 				"no rename is broadcast for an invalid name");
@@ -211,7 +212,7 @@ class ConnectionServiceTest {
 		// Bad target channel name: validated BEFORE leaving, so the switch is refused without dropping alice.
 		service.onMessage(alice, new ClientMessage.Join("bad name!", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
 
-		assertEquals("invalid_channel", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("team", alice.channelName(), "an invalid switch target must not drop the client from its channel");
 		assertEquals(1, channel("team").size(), "alice is still a member of her channel");
 	}
@@ -238,7 +239,7 @@ class ConnectionServiceTest {
 
 		service.onMessage(bob, new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
 
-		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertEquals(ChannelMode.MULTI_CHANNEL_PTT, channel("team").mode(), "the mode is unchanged");
 	}
 
@@ -259,7 +260,7 @@ class ConnectionServiceTest {
 		FakeClientSession session = session("sess-1");
 		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "has spaces", null));
 
-		assertEquals("invalid_display_name", firstOf(session, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(session, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("team"), "the channel is not created when the join is rejected");
 	}
 
@@ -269,7 +270,7 @@ class ConnectionServiceTest {
 		FakeClientSession bob = session("bob");
 		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-X"));
 
-		assertEquals("passphrase_mismatch", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertEquals(1, channel("team").size(), "the mismatched joiner is not added");
 	}
 
@@ -280,7 +281,7 @@ class ConnectionServiceTest {
 
 		service.onMessage(alice, new ClientMessage.ChangeMode(ChannelMode.GLOBAL_PTT));
 
-		assertEquals("invalid_mode", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_MODE, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals(ChannelMode.MULTI_CHANNEL_PTT, channel("team").mode(), "the mode is unchanged");
 	}
 
@@ -310,7 +311,7 @@ class ConnectionServiceTest {
 
 		service.onMessage(bob, new ClientMessage.ChangePassphrase("kcv-B", null));
 
-		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertEquals("kcv-A", channel("team").keyCheck(), "a non-owner cannot rotate the key");
 	}
 
@@ -318,7 +319,7 @@ class ConnectionServiceTest {
 	void changingThePassphraseBeforeJoiningIsRejected() {
 		FakeClientSession session = session("sess-1");
 		service.onMessage(session, new ClientMessage.ChangePassphrase("kcv-B", null));
-		assertEquals("not_in_channel", firstOf(session, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_IN_CHANNEL, firstOf(session, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
@@ -330,7 +331,7 @@ class ConnectionServiceTest {
 		// The old passphrase no longer works...
 		FakeClientSession stale = session("stale");
 		service.onMessage(stale, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "stale", "kcv-A"));
-		assertEquals("passphrase_mismatch", firstOf(stale, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(stale, ServerMessage.ErrorMessage.class).code());
 
 		// ...but the new one does.
 		FakeClientSession fresh = session("fresh");
@@ -355,7 +356,7 @@ class ConnectionServiceTest {
 		assertEquals("team", firstOf(plain, ServerMessage.Joined.class).channel());
 		FakeClientSession enc = session("enc");
 		service.onMessage(enc, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "enc", "kcv-A"));
-		assertEquals("passphrase_mismatch", firstOf(enc, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(enc, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
@@ -367,7 +368,7 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 
 		// The global room is server-owned (sentinel owner), so no participant can rotate it — it stays unencrypted.
-		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertNull(channel("global").keyCheck());
 	}
 
@@ -381,7 +382,7 @@ class ConnectionServiceTest {
 		// A plaintext joiner is now rejected again; one with the new key-check is accepted.
 		FakeClientSession plain = session("plain");
 		service.onMessage(plain, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "plain", null));
-		assertEquals("passphrase_mismatch", firstOf(plain, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(plain, ServerMessage.ErrorMessage.class).code());
 		FakeClientSession enc = session("enc");
 		service.onMessage(enc, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "enc", "kcv-B"));
 		assertEquals("team", firstOf(enc, ServerMessage.Joined.class).channel());
@@ -423,7 +424,7 @@ class ConnectionServiceTest {
 
 		service.onMessage(bob, new ClientMessage.TransferOwnership("bob"));
 
-		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertEquals("alice", channel("team").ownerId(), "ownership is unchanged");
 	}
 
@@ -434,7 +435,7 @@ class ConnectionServiceTest {
 
 		service.onMessage(alice, new ClientMessage.TransferOwnership("ghost"));
 
-		assertEquals("unknown_target", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.UNKNOWN_TARGET, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("alice", channel("team").ownerId(), "ownership is unchanged");
 	}
 
@@ -442,7 +443,7 @@ class ConnectionServiceTest {
 	void transferringOwnershipBeforeJoiningIsRejected() {
 		FakeClientSession session = session("sess-1");
 		service.onMessage(session, new ClientMessage.TransferOwnership("whoever"));
-		assertEquals("not_in_channel", firstOf(session, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_IN_CHANNEL, firstOf(session, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
@@ -464,7 +465,7 @@ class ConnectionServiceTest {
 		// The OLD owner (alice) no longer can — authority moved with ownership.
 		alice.sent.clear();
 		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-C", null));
-		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("kcv-B", channel("team").keyCheck(), "the rejected rotation leaves the key unchanged");
 	}
 
@@ -514,7 +515,7 @@ class ConnectionServiceTest {
 		// validates the target's key-check, so this is the one switch failure that genuinely drops you.
 		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-WRONG"));
 
-		assertEquals("passphrase_mismatch", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertNull(alice.channelName(), "a wrong-passphrase switch drops the client from BOTH channels");
 		assertFalse(channelExists("team"), "the old channel was left (and dropped once empty)");
 		assertEquals(1, channel("other").size(), "the mismatched switcher was not added to the target");
@@ -548,28 +549,28 @@ class ConnectionServiceTest {
 	void aJoinWithANullChannelNameIsRejectedAsInvalidChannel() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
-		assertEquals("invalid_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void aJoinWithAnEmptyChannelNameIsRejectedAsInvalidChannel() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
-		assertEquals("invalid_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void aJoinWithAnOverlongChannelNameIsRejectedAsInvalidChannel() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("x".repeat(65), ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
-		assertEquals("invalid_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void channelNameValidationHappensBeforeDisplayNameValidation() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("bad name", ChannelMode.MULTI_CHANNEL_PTT, "also bad!!", null));
-		assertEquals("invalid_channel", firstOf(s, ServerMessage.ErrorMessage.class).code(),
+		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code(),
 				"the channel name is validated before the display name");
 	}
 
@@ -577,14 +578,14 @@ class ConnectionServiceTest {
 	void aJoinWithANullDisplayNameIsRejectedAsInvalidDisplayName() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, null));
-		assertEquals("invalid_display_name", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void aJoinWithAnOverlongDisplayNameIsRejected() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "x".repeat(33), null));
-		assertEquals("invalid_display_name", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
@@ -601,7 +602,7 @@ class ConnectionServiceTest {
 	void joiningTheGlobalNameInMultiChannelModeIsReservedRejected() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
-		assertEquals("reserved_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.RESERVED_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("global"), "the global channel is not created by a reserved-name rejection");
 	}
 
@@ -609,7 +610,7 @@ class ConnectionServiceTest {
 	void joiningTheGlobalNameInFullDuplexIsReservedRejected() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.FULL_DUPLEX, "alice", null));
-		assertEquals("reserved_channel", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.RESERVED_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("global"));
 	}
 
@@ -617,7 +618,7 @@ class ConnectionServiceTest {
 	void anEncryptedGlobalPttJoinIsRejected() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.GLOBAL_PTT, "alice", "kcv-X"));
-		assertEquals("encryption_not_allowed", firstOf(s, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.ENCRYPTION_NOT_ALLOWED, firstOf(s, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("global"), "an encrypted join never creates the global channel");
 	}
 
@@ -643,7 +644,7 @@ class ConnectionServiceTest {
 		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
 		alice.sent.clear();
 		service.onMessage(alice, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
-		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code(),
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(alice, ServerMessage.ErrorMessage.class).code(),
 				"no participant owns the server-managed global channel");
 		assertEquals(ChannelMode.GLOBAL_PTT, channel("global").mode(), "the global mode is fixed");
 	}
@@ -773,7 +774,7 @@ class ConnectionServiceTest {
 		service.onAudio(alice, frame);
 
 		byte[] received = bob.audio.getFirst();
-		int aliceSid = channel("fd-sid").streamIndexOf("alice");
+		int aliceSid = channel("fd-sid").requireStreamIndex("alice");
 		assertEquals(aliceSid, received[0] & 0xFF, "the frame is prefixed with the sender's stream index");
 		assertArrayEquals(frame, Arrays.copyOfRange(received, 1, received.length), "the body is the original frame");
 	}
@@ -781,11 +782,11 @@ class ConnectionServiceTest {
 	@Test
 	void membersGetDistinctStreamIndicesAnnouncedInJoinedAndMemberJoined() {
 		FakeClientSession alice = join("alice", "sid-roster", ChannelMode.MULTI_CHANNEL_PTT);
-		int aliceSid = channel("sid-roster").streamIndexOf("alice");
+		int aliceSid = channel("sid-roster").requireStreamIndex("alice");
 		assertEquals(aliceSid, firstOf(alice, ServerMessage.Joined.class).members().getFirst().streamId());
 
 		join("bob", "sid-roster", ChannelMode.MULTI_CHANNEL_PTT);
-		int bobSid = channel("sid-roster").streamIndexOf("bob");
+		int bobSid = channel("sid-roster").requireStreamIndex("bob");
 		assertNotEquals(aliceSid, bobSid, "members get distinct stream indices");
 		assertEquals(bobSid, firstOf(alice, ServerMessage.MemberJoined.class).member().streamId(),
 				"existing members learn the newcomer's index via MemberJoined");
@@ -795,13 +796,30 @@ class ConnectionServiceTest {
 	void aFreedStreamIndexIsNotImmediatelyReused() {
 		FakeClientSession alice = join("alice", "sid-reuse", ChannelMode.MULTI_CHANNEL_PTT);
 		join("bob", "sid-reuse", ChannelMode.MULTI_CHANNEL_PTT);   // keeps the channel alive when Alice leaves
-		int aliceSid = channel("sid-reuse").streamIndexOf("alice");
+		int aliceSid = channel("sid-reuse").requireStreamIndex("alice");
 
 		service.onClose(alice, "test close");
 		join("carol", "sid-reuse", ChannelMode.MULTI_CHANNEL_PTT);
 
-		assertNotEquals(aliceSid, channel("sid-reuse").streamIndexOf("carol"),
+		assertNotEquals(aliceSid, channel("sid-reuse").requireStreamIndex("carol"),
 				"a freed index is quarantined by the rotating allocator, not immediately reused");
+	}
+
+	@Test
+	void aFullChannelRefusesFurtherNewcomersWithChannelFull() {
+		// One stream index per member over the 0..254 space, so a channel holds at most 255. Fill it, then the next
+		// join is refused with CHANNEL_FULL rather than assigning a colliding index.
+		for (int i = 0; i < 255; i++) {
+			join("m" + i, "packed", ChannelMode.FULL_DUPLEX);
+		}
+		assertTrue(channel("packed").isFull());
+		assertEquals(255, channel("packed").size());
+
+		FakeClientSession overflow = join("m255", "packed", ChannelMode.FULL_DUPLEX);
+		assertEquals(ErrorCode.CHANNEL_FULL, firstOf(overflow, ServerMessage.ErrorMessage.class).code());
+		assertFalse(overflow.sent.stream().anyMatch(ServerMessage.Joined.class::isInstance),
+				"the overflow joiner never joined");
+		assertEquals(255, channel("packed").size(), "the overflow joiner was not added");
 	}
 
 	// --- push-to-talk floor anti-hogging (idle auto-release + max-hold), driven with a fake clock ----------
@@ -1078,7 +1096,7 @@ class ConnectionServiceTest {
 		FakeClientSession bob = join("bob", "nomute", ChannelMode.FULL_DUPLEX);
 
 		service.onMessage(bob, new ClientMessage.MuteMember("alice", true));
-		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channel("nomute").isMuted("alice"), "a non-owner's mute request has no effect");
 	}
 
@@ -1088,11 +1106,11 @@ class ConnectionServiceTest {
 		FakeClientSession bob = join("bob", "badtarget", ChannelMode.FULL_DUPLEX);
 
 		service.onMessage(alice, new ClientMessage.MuteMember("ghost", true));
-		assertEquals("unknown_target", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.UNKNOWN_TARGET, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 
 		alice.sent.clear();
 		service.onMessage(alice, new ClientMessage.MuteMember("alice", true));   // the owner can't mute itself
-		assertEquals("unknown_target", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.UNKNOWN_TARGET, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channel("badtarget").isMuted("alice"), "the owner is never muted");
 		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MemberMuted.class::isInstance),
 				"a rejected mute (unknown target or the owner itself) broadcasts no MemberMuted to the channel");
@@ -1324,13 +1342,13 @@ class ConnectionServiceTest {
 		join("bob", null, ChannelMode.GLOBAL_PTT);
 
 		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
-		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code(),
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(alice, ServerMessage.ErrorMessage.class).code(),
 				"no participant owns the server-managed global room, so no one can mute in it");
 		assertFalse(channel("global").isMuted("bob"));
 
 		alice.sent.clear();
 		service.onMessage(alice, new ClientMessage.MuteAll(true));
-		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 	}
 
 	// --- owner-locked channel ----------------------------------------------------------------------
@@ -1345,7 +1363,7 @@ class ConnectionServiceTest {
 				"the lock is broadcast to the channel (the owner included)");
 
 		FakeClientSession bob = join("bob", "lockable", ChannelMode.MULTI_CHANNEL_PTT);   // a newcomer
-		assertEquals("channel_locked", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.CHANNEL_LOCKED, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertFalse(bob.sent.stream().anyMatch(ServerMessage.Joined.class::isInstance), "the newcomer never joined");
 		assertNull(bob.channelName(), "the refused joiner is not in the channel");
 		assertEquals(1, channel("lockable").size(), "bob was not added");
@@ -1356,7 +1374,7 @@ class ConnectionServiceTest {
 		FakeClientSession alice = join("alice", "relock", ChannelMode.FULL_DUPLEX);
 		service.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = join("bob", "relock", ChannelMode.FULL_DUPLEX);
-		assertEquals("channel_locked", firstOf(bob, ServerMessage.ErrorMessage.class).code(), "refused while locked");
+		assertEquals(ErrorCode.CHANNEL_LOCKED, firstOf(bob, ServerMessage.ErrorMessage.class).code(), "refused while locked");
 
 		service.onMessage(alice, new ClientMessage.SetLocked(false));
 		assertFalse(channel("relock").isLocked());
@@ -1370,7 +1388,7 @@ class ConnectionServiceTest {
 		join("alice", "noown-lock", ChannelMode.FULL_DUPLEX);   // alice owns it
 		FakeClientSession bob = join("bob", "noown-lock", ChannelMode.FULL_DUPLEX);
 		service.onMessage(bob, new ClientMessage.SetLocked(true));
-		assertEquals("not_owner", firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channel("noown-lock").isLocked(), "a non-owner's lock request has no effect");
 	}
 
@@ -1401,7 +1419,7 @@ class ConnectionServiceTest {
 		assertTrue(channel("lock-persist").isLocked(), "the lock survives the ownership change");
 
 		FakeClientSession carol = join("carol", "lock-persist", ChannelMode.FULL_DUPLEX);
-		assertEquals("channel_locked", firstOf(carol, ServerMessage.ErrorMessage.class).code(),
+		assertEquals(ErrorCode.CHANNEL_LOCKED, firstOf(carol, ServerMessage.ErrorMessage.class).code(),
 				"the inherited lock still refuses newcomers");
 
 		service.onMessage(bob, new ClientMessage.SetLocked(false));   // the new owner can unlock
@@ -1414,7 +1432,7 @@ class ConnectionServiceTest {
 	void theGlobalRoomCannotBeLocked() {
 		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
 		service.onMessage(alice, new ClientMessage.SetLocked(true));
-		assertEquals("not_owner", firstOf(alice, ServerMessage.ErrorMessage.class).code(),
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(alice, ServerMessage.ErrorMessage.class).code(),
 				"no participant owns the server-managed global room, so no one can lock it");
 		assertFalse(channel("global").isLocked());
 	}
@@ -1447,7 +1465,7 @@ class ConnectionServiceTest {
 	void settingLockBeforeJoiningAChannelIsRejected() {
 		FakeClientSession stray = session("stray");   // never joined a channel
 		service.onMessage(stray, new ClientMessage.SetLocked(true));
-		assertEquals("not_in_channel", firstOf(stray, ServerMessage.ErrorMessage.class).code());
+		assertEquals(ErrorCode.NOT_IN_CHANNEL, firstOf(stray, ServerMessage.ErrorMessage.class).code());
 	}
 
 	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a

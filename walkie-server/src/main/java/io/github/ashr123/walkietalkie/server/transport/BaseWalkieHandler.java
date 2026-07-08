@@ -4,6 +4,7 @@ import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.server.session.WebSocketClientSession;
+import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.jspecify.annotations.NonNull;
 import org.slf4j.Logger;
@@ -46,7 +47,7 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 			connectionService.onMessage(clientSession, codec.decode(message.getPayload()));
 		} catch (RuntimeException e) {
 			getLogger().debug("Bad control message from {}: {}", clientSession.id(), e.getMessage());
-			clientSession.send(new ServerMessage.ErrorMessage("bad_message", "Could not parse control message"));
+			clientSession.send(new ServerMessage.ErrorMessage(ErrorCode.BAD_MESSAGE, "Could not parse control message"));
 		}
 	}
 

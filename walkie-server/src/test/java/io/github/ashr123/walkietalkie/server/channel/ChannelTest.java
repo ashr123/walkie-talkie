@@ -1,7 +1,9 @@
 package io.github.ashr123.walkietalkie.server.channel;
 
 import io.github.ashr123.option.None;
+import io.github.ashr123.option.NoneInt;
 import io.github.ashr123.option.Option;
+import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.FakeClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -100,5 +102,19 @@ class ChannelTest {
 
 		channel.remove("bob");
 		assertFalse(channel.isMuted("bob"), "a mute never outlives the member (a re-used id would not inherit it)");
+	}
+
+	@Test
+	void streamIndexOfIsNoneForAnUnknownSessionAndRequireFailsFast() {
+		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "alice", null);
+		channel.add(session("alice"));
+
+		assertInstanceOf(SomeInt.class, channel.streamIndexOf("alice"), "a current member has an index");
+		assertInstanceOf(NoneInt.class, channel.streamIndexOf("ghost"),
+				"an unknown session is NoneInt — NOT SomeInt(0), which would alias onto index 0's owner");
+		assertEquals(((SomeInt) channel.streamIndexOf("alice")).value(), channel.requireStreamIndex("alice"),
+				"requireStreamIndex returns the assigned index for a present member");
+		assertThrows(IllegalStateException.class, () -> channel.requireStreamIndex("ghost"),
+				"requireStreamIndex fails fast on a missing member (an invariant breach) instead of returning 0");
 	}
 }

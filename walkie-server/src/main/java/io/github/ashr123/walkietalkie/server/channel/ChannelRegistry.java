@@ -69,9 +69,16 @@ public class ChannelRegistry {
 			// care about the key). Only reachable for a NEWCOMER: a re-join to the member's CURRENT channel
 			// short-circuits in ConnectionService.handleJoin and never gets here. This read is under the bin lock,
 			// so it is atomic with a concurrent setLocked/leave/join. `joined` stays null; the caller attributes the
-			// rejection to channel_locked (a freshly created channel is never locked, so this only affects joins).
+			// rejection to CHANNEL_LOCKED (a freshly created channel is never locked, so this only affects joins).
 			if (existing != null && channel.isLocked()) {
 				return channel;   // keep the channel; do not add the joiner
+			}
+			// Refuse a newcomer once the channel is at capacity (one stream index per member, range 0..254) rather
+			// than assign a colliding index. Under the bin lock, so the capacity check + the add are atomic w.r.t.
+			// concurrent joins/leaves. Only newcomers reach here (a current member's re-join short-circuits before
+			// joinOrCreate). `joined` stays null; the caller attributes the rejection to CHANNEL_FULL.
+			if (existing != null && channel.isFull()) {
+				return channel;
 			}
 			if (Objects.equals(channel.keyCheck(), keyCheck)) {
 				// Add the joiner, snapshot its view, AND let the caller emit that view to it — all ATOMICALLY under

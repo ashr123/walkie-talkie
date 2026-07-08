@@ -1,7 +1,11 @@
 package io.github.ashr123.walkietalkie.client;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
+import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
+import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
+import tools.jackson.databind.cfg.EnumFeature;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
@@ -130,5 +134,21 @@ class WalkieClientTest {
 		// the client would report "mic is live" while the server drops every frame. Guards the Joined re-snapshot
 		// (a muted member re-joining its current channel) and the ModeChanged-to-full-duplex path.
 		assertFalse(WalkieClient.shouldAutoOpenMic(ChannelMode.FULL_DUPLEX, false, true));
+	}
+
+	@Test
+	void anUnknownErrorCodeFromANewerServerDeserializesToTheUnknownFallback() {
+		// Pins ErrorCode's forward-compatibility contract: a code this client's enum doesn't know (a NEWER server)
+		// must degrade to the @JsonEnumDefaultValue fallback (UNKNOWN) instead of failing the whole message —
+		// using the same EnumFeature the client's mapper enables (Jackson 3 hosts it there, not on
+		// DeserializationFeature). Without the feature+annotation pair, this would throw and kill the listener.
+		ServerMessage message = JsonMapper.builder()
+				.enable(EnumFeature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE)
+				.build()
+				.readValue("""
+						{"type":"error","code":"SOME_FUTURE_CODE","message":"from a newer server"}""", ServerMessage.class);
+		assertInstanceOf(ServerMessage.ErrorMessage.class, message);
+		assertEquals(ErrorCode.UNKNOWN, ((ServerMessage.ErrorMessage) message).code(),
+				"an unrecognized code must fall back to UNKNOWN, not fail deserialization");
 	}
 }

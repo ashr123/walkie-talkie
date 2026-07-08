@@ -98,7 +98,7 @@ function isOpen() {
 // and applyOrSwitch() so re-keying on a channel switch matches the initial-connect derivation exactly.
 async function deriveJoinKey(transport, passphrase, mode, channel) {
 	// Global is the server-managed, always-unencrypted room — the server rejects an encrypted global join
-	// (encryption_not_allowed). So drop the key for GLOBAL_PTT regardless of any passphrase still sitting in the
+	// (ENCRYPTION_NOT_ALLOWED). So drop the key for GLOBAL_PTT regardless of any passphrase still sitting in the
 	// field (e.g. when switching INTO global from an encrypted channel), mirroring the Java client's deriveCrypto;
 	// otherwise the join would carry a non-null keyCheck and be refused, silently failing the switch.
 	const derived = transport === 'relay' && passphrase && mode !== 'GLOBAL_PTT'
@@ -189,7 +189,7 @@ async function connect() {
 			// The in-channel controls — Rename, the adaptive Apply/Switch button, the owner dropdown — appear only
 			// once the server confirms the join (the Joined snapshot), via onJoined. Revealing them here on a mere
 			// socket-open would flash them for a join the server then rejects (e.g. a wrong passphrase →
-			// passphrase_mismatch closes the socket right after it opened).
+			// PASSPHRASE_MISMATCH closes the socket right after it opened).
 		};
 		ws.onmessage = onWsMessage;
 		ws.onclose = ev => {
@@ -690,16 +690,22 @@ function onWsMessage(ev) {
 			break;
 		case 'error':
 			log('Server error [' + msg.code + ']: ' + msg.message);
-			if (msg.code === 'passphrase_mismatch') {
+			// Codes are the shared ErrorCode enum serialized as its constant names; an unrecognized code (a newer
+			// server) simply falls through — the log line above already showed it.
+			if (msg.code === 'PASSPHRASE_MISMATCH') {
 				log('Disconnecting — this channel needs a different passphrase.');
 				disconnect();
-			} else if (msg.code === 'channel_locked') {
-				// The join was refused because the channel is locked to new members. Like passphrase_mismatch, the
+			} else if (msg.code === 'CHANNEL_LOCKED') {
+				// The join was refused because the channel is locked to new members. Like PASSPHRASE_MISMATCH, the
 				// join failed — on an initial connect nothing joined, and a locked switch drops us — so disconnect
 				// cleanly rather than sit half-joined.
 				log('This channel is locked by its owner — you can\'t join it right now.');
 				disconnect();
-			} else if (msg.code === 'not_owner' || msg.code === 'unknown_target') {
+			} else if (msg.code === 'CHANNEL_FULL') {
+				// The channel is at its member limit — the join failed the same way as a locked/mismatched one.
+				log('This channel is full — it has reached its member limit.');
+				disconnect();
+			} else if (msg.code === 'NOT_OWNER' || msg.code === 'UNKNOWN_TARGET') {
 				// A rejected ownership transfer leaves the dropdown showing the failed target — snap it back to the
 				// real owner (state.ownerId is unchanged on a rejection) and settle the Apply button (the pending
 				// transfer is gone, so it should hide unless something else is still pending).

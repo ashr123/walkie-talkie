@@ -2,6 +2,7 @@ package io.github.ashr123.walkietalkie.server.integration;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.WebSocketSession;
@@ -64,7 +65,7 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sa, new ClientMessage.Join("rtc-unknown", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 			awaitType(a.messages, ServerMessage.Joined.class);
 			send(sa, new ClientMessage.Offer("ghost", "sdp"));
-			assertEquals("unknown_target", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.UNKNOWN_TARGET, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 
@@ -80,7 +81,7 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 			String bob = awaitType(b.messages, ServerMessage.Joined.class).selfId();
 
 			send(sa, new ClientMessage.Offer(bob, "sdp"));   // Bob is real, but not in Alice's channel
-			assertEquals("unknown_target", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.UNKNOWN_TARGET, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 
@@ -89,7 +90,7 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(SIGNAL, a, login())) {
 			send(sa, new ClientMessage.Offer("anyone", "sdp"));
-			assertEquals("not_in_channel", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.NOT_IN_CHANNEL, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 
@@ -124,7 +125,7 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(SIGNAL, a, login())) {
 			sendRaw(sa, "<<<garbage>>>");
-			assertEquals("bad_message", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.BAD_MESSAGE, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 
@@ -139,7 +140,7 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 			assertEquals(ids[1], awaitType(a.messages, ServerMessage.MemberLeft.class).memberId());
 
 			send(sa, new ClientMessage.Offer(ids[1], "sdp"));   // Bob is gone now
-			assertEquals("unknown_target", awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
+			assertEquals(ErrorCode.UNKNOWN_TARGET, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 		}
 	}
 }
