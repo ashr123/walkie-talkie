@@ -8,7 +8,16 @@
 // 1-byte codec tag so receivers can decode whatever the sender used. The WebRTC path uses the
 // browser's native Opus, tuned up via SDP + sender bitrate.
 
-import {decryptFrame, deriveKey, E2EE_SCHEME, encryptFrame, frameDisposition, rekeyAction, unwrapPassphrase, wrapPassphrase} from './e2ee.js';
+import {
+	decryptFrame,
+	deriveKey,
+	E2EE_SCHEME,
+	encryptFrame,
+	frameDisposition,
+	rekeyAction,
+	unwrapPassphrase,
+	wrapPassphrase
+} from './e2ee.js';
 
 // Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
 const byId = id => document.getElementById(id);
@@ -1382,8 +1391,11 @@ function createPeer(remoteId) {
 	pc.onicecandidate = e => {
 		if (e.candidate) {
 			sendCtrl({
-				type: 'ice', target: remoteId,
-				candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex,
+				type: 'ice',
+				target: remoteId,
+				candidate: e.candidate.candidate,
+				sdpMid: e.candidate.sdpMid,
+				sdpMLineIndex: e.candidate.sdpMLineIndex,
 			});
 		}
 	};
