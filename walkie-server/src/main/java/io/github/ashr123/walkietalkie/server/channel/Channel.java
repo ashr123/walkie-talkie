@@ -215,7 +215,7 @@ public final class Channel {
 
 	/// Whether the channel is at capacity — one stream index per member, and the space is 0..254, so a channel
 	/// holds at most [#STREAM_INDEX_RANGE] members. [ChannelRegistry#joinOrCreate] refuses a newcomer here rather
-	/// than letting [#assignStreamIndex] run out of indices.
+	/// than letting [#allocateStreamIndex] run out of indices.
 	public boolean isFull() {
 		return members.size() >= STREAM_INDEX_RANGE;
 	}
