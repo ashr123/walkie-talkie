@@ -198,7 +198,7 @@ public final class Channel {
 	/// [#requireStreamIndex]; the audio fan-out matches [NoneInt] to DROP a frame whose sender just left (a leave
 	/// racing an in-flight frame), rather than stamp a bogus index.
 	public OptionInt streamIndexOf(String sessionId) {
-		return members.get(sessionId) instanceof Member(ClientSession _, int index) ?
+		return members.get(sessionId) instanceof Member(_, int index) ?
 				new SomeInt(index) :
 				NoneInt.INSTANCE;
 	}
