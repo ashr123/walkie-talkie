@@ -1169,8 +1169,7 @@ function handleAudioFrame(arrayBuffer) {
 	// Decryption is serialized PER sender (one stateful decoder per lane), so a slow decrypt for one sender
 	// can't reorder that sender's frames or head-of-line-block another.
 	lane.rxChain = lane.rxChain
-		.then(() => decryptFrame(body, state.cryptoKey))
-		.then(plaintext => processFrame(lane, new Uint8Array(plaintext)))
+		.then(async () => processFrame(lane, new Uint8Array(await decryptFrame(body, state.cryptoKey))))
 		.catch(() => {
 			if (!state.warnedDecrypt) {
 				state.warnedDecrypt = true;
@@ -1495,6 +1494,18 @@ function closePeer(remoteId) {
 
 // --- members + UI ---------------------------------------------------------------------------------
 
+/**
+ * One roster entry from the server — the wire shape of walkie-shared's `MemberInfo` record, as carried in
+ * `joined.members[]` and `memberJoined.member`.
+ *
+ * @typedef {Object} MemberInfo
+ * @property {string} id session id — the routing identity (floor, ownership, WebRTC, audio)
+ * @property {string} displayName human label (not unique; rendered with a `#id` prefix)
+ * @property {number} streamId per-channel uint8 stream index (0..254) prefixed onto this member's relayed audio
+ * @property {boolean} muted owner-muted — the server drops this member's relay audio while true
+ */
+
+/** @param {MemberInfo} member */
 function addMember(member) {
 	state.members.set(member.id, member.displayName);
 	// Seed the owner-mute state from the roster snapshot, so a member joining a channel where someone is already
