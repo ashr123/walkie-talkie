@@ -92,6 +92,7 @@ public final class Channel {
 	// monitor — the registry takes its bin lock then this monitor (via add/remove), so the reverse order deadlocks.
 	private volatile Instant floorAcquiredAt = Instant.EPOCH;
 	private volatile Instant floorActivityAt = Instant.EPOCH;
+
 	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck) {
 		this.name = name;
 		this.mode = mode;
