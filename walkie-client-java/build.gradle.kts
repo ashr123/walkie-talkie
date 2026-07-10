@@ -6,7 +6,7 @@ plugins {
 dependencies {
     // Dedicated BOMs for version management — no Spring Boot BOM, because this is a plain console
     // application, not a Spring Boot one. A BOM contributes only version constraints, no jars.
-    implementation(platform("tools.jackson:jackson-bom:3.2.0"))
+    implementation(platform("tools.jackson:jackson-bom:3.2.1"))
     implementation(project(":walkie-shared"))
 
     // Jackson 3 databind, used to (de)serialize the shared protocol records.
