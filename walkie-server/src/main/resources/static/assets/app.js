@@ -19,7 +19,9 @@ import {
 	wrapPassphrase
 } from './e2ee.js';
 
-// Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
+/**
+ * Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
+ */
 const byId = id => document.getElementById(id);
 const STUN = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
 
@@ -102,14 +104,18 @@ function isOpen() {
 
 // --- connection -----------------------------------------------------------------------------------
 
-// Derive (or clear) the relay E2EE key + key-check for a (transport, passphrase, mode, channel) and store them
-// in state. WebRTC media is already peer-to-peer encrypted, so it never uses a relay key. Shared by connect()
-// and applyOrSwitch() so re-keying on a channel switch matches the initial-connect derivation exactly.
+/**
+ * Derive (or clear) the relay E2EE key + key-check for a (transport, passphrase, mode, channel) and store them
+ * in state. WebRTC media is already peer-to-peer encrypted, so it never uses a relay key. Shared by connect()
+ * and applyOrSwitch() so re-keying on a channel switch matches the initial-connect derivation exactly.
+ */
 async function deriveJoinKey(transport, passphrase, mode, channel) {
-	// Global is the server-managed, always-unencrypted room — the server rejects an encrypted global join
-	// (ENCRYPTION_NOT_ALLOWED). So drop the key for GLOBAL_PTT regardless of any passphrase still sitting in the
-	// field (e.g. when switching INTO global from an encrypted channel), mirroring the Java client's deriveCrypto;
-	// otherwise the join would carry a non-null keyCheck and be refused, silently failing the switch.
+	/**
+	 * Global is the server-managed, always-unencrypted room — the server rejects an encrypted global join
+	 * (ENCRYPTION_NOT_ALLOWED). So drop the key for GLOBAL_PTT regardless of any passphrase still sitting in the
+	 * field (e.g. when switching INTO global from an encrypted channel), mirroring the Java client's deriveCrypto;
+	 * otherwise the join would carry a non-null keyCheck and be refused, silently failing the switch.
+	 */
 	const derived = transport === 'relay' && passphrase && mode !== 'GLOBAL_PTT'
 		? await deriveKey(passphrase, channel)
 		: null;
@@ -163,13 +169,13 @@ async function connect() {
 		// server-assigned session id; the display name is sent with the join below.
 		const res = await fetch('/api/auth/login', {method: 'POST'});
 		if (!res.ok) {
-			log('Login failed: HTTP ' + res.status);
+			log(`Login failed: HTTP ${res.status}`);
 			cleanup();   // reset the connecting state and flip back to the Connect button
 			return;
 		}
 		const auth = await res.json();
 		state.token = auth.token;
-		log('Authenticated as ' + display);
+		log(`Authenticated as ${display}`);
 
 		await setupAudio();
 		log(state.transport === 'relay'
@@ -191,9 +197,9 @@ async function connect() {
 
 		ws.onopen = () => {
 			state.connecting = false;   // connect flow completed — now connected
-			log('WebSocket open (' + state.transport + ')');
+			log(`WebSocket open (${state.transport})`);
 			sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck});
-			setStatus(true, 'Connected — ' + state.transport);
+			setStatus(true, `Connected — ${state.transport}`);
 			// The Connect/Disconnect buttons were already flipped to "Disconnect only" when the connect flow began.
 			// The in-channel controls — Rename, the adaptive Apply/Switch button, the owner dropdown — appear only
 			// once the server confirms the join (the Joined snapshot), via onJoined. Revealing them here on a mere
@@ -202,17 +208,17 @@ async function connect() {
 		};
 		ws.onmessage = onWsMessage;
 		ws.onclose = ev => {
-			log('WebSocket closed (' + ev.code + ')');
+			log(`WebSocket closed (${ev.code})`);
 			const reconnecting = state.pendingReconnect;
 			state.pendingReconnect = false;
 			cleanup();
 			if (reconnecting) {
-				connect();   // transport changed — reopen as a NEW session with the current settings
+				void connect();   // transport changed — reopen as a NEW session with the current settings (self-handles errors)
 			}
 		};
 		ws.onerror = () => log('WebSocket error');
 	} catch (err) {
-		log('Connect error: ' + err.message);
+		log(`Connect error: ${err.message}`);
 		state.connecting = false;
 		if (!state.ws) {
 			cleanup();  // tear down any mic / AudioContext acquired before the socket existed
@@ -229,13 +235,15 @@ function disconnect() {
 	}
 }
 
-// One adaptive action for the connected form. SWITCH to a different channel when the channel name changed
-// (carrying the chosen mode/passphrase), or APPLY the current channel's properties (mode / passphrase /
-// transport) in one click when it hasn't — think of mode+passphrase+transport as the channel's properties.
-// A switch is a fresh Join on the same socket ("leave old, join new"), so the session id (and the mic,
-// AudioContext and socket) survive and the new Joined snapshot resets per-channel state (resetChannelState in
-// onJoined). Changing the TRANSPORT can't be done in place (different socket endpoint + audio pipeline), so it
-// reconnects as a new session; connect() re-reads the form, carrying any other pending change into the join.
+/**
+ * One adaptive action for the connected form. SWITCH to a different channel when the channel name changed
+ * (carrying the chosen mode/passphrase), or APPLY the current channel's properties (mode / passphrase /
+ * transport) in one click when it hasn't — think of mode+passphrase+transport as the channel's properties.
+ * A switch is a fresh Join on the same socket ("leave old, join new"), so the session id (and the mic,
+ * AudioContext and socket) survive and the new Joined snapshot resets per-channel state (resetChannelState in
+ * onJoined). Changing the TRANSPORT can't be done in place (different socket endpoint + audio pipeline), so it
+ * reconnects as a new session; connect() re-reads the form, carrying any other pending change into the join.
+ */
 async function applyOrSwitch() {
 	if (state.connecting || !isOpen()) {
 		return;
@@ -307,7 +315,7 @@ async function applyOrSwitch() {
 	if (iAmOwner && byId('ownerSelect').value !== state.ownerId) {
 		const newOwnerId = byId('ownerSelect').value;
 		sendCtrl({type: 'transferOwnership', newOwnerId});
-		log('Transferring ownership to ' + (state.members.get(newOwnerId) || newOwnerId) + '…');
+		log(`Transferring ownership to ${memberLabel(newOwnerId)}…`);
 		acted = true;
 	}
 	if (!acted) {
@@ -316,9 +324,11 @@ async function applyOrSwitch() {
 	updateApplyControls();
 }
 
-// Reset (cancel): restore every editable channel-property field — transport, mode, channel, passphrase, and the
-// owner dropdown — to its current live value, so nothing is pending and the Apply/Switch + Reset buttons (and the
-// hint) disappear together. Mirrors exactly the fields updateApplyControls compares against state.
+/**
+ * Reset (cancel): restore every editable channel-property field — transport, mode, channel, passphrase, and the
+ * owner dropdown — to its current live value, so nothing is pending and the Apply/Switch + Reset buttons (and the
+ * hint) disappear together. Mirrors exactly the fields updateApplyControls compares against state.
+ */
 function resetApplyControls() {
 	if (!isOpen()) {
 		return;
@@ -336,9 +346,11 @@ function resetApplyControls() {
 	updateApplyControls();     // nothing pending now → Apply/Switch + Reset + hint hide
 }
 
-// Reflects whether the adaptive button can act and what it does. Shown only while connected; labeled
-// "Switch channel" when the channel name differs from the current one, else "Apply changes"; disabled when
-// nothing changed (a pending member re-key keeps it enabled so the new passphrase can still be applied).
+/**
+ * Reflects whether the adaptive button can act and what it does. Shown only while connected; labeled
+ * "Switch channel" when the channel name differs from the current one, else "Apply changes"; disabled when
+ * nothing changed (a pending member re-key keeps it enabled so the new passphrase can still be applied).
+ */
 function updateApplyControls() {
 	const btn = byId('applyBtn');
 	const hint = byId('applyHint');
@@ -374,7 +386,7 @@ function updateApplyControls() {
 	// pending property change, or a member re-key to adopt) AND the channel name is valid, and are hidden
 	// otherwise. The label switches between "Switch channel" (the channel name changed → a fresh join) and
 	// "Apply changes" (in-place edit).
-	const actionable = (changed && channelValid) || state.rekeyPending;
+	const actionable = changed && channelValid || state.rekeyPending;
 	btn.hidden = !actionable;
 	byId('resetBtn').hidden = !actionable;   // Reset (cancel) appears and disappears together with Apply/Switch
 	hint.hidden = !actionable;
@@ -428,11 +440,13 @@ function updateApplyControls() {
 	// (rotation + canAutoShare: leave .checked alone, so a manual uncheck isn't undone on the next keystroke)
 }
 
-// The owner dropdown: lists members and lets the current owner hand ownership to another. Selecting a different
-// member is a PENDING change applied via "Apply changes" (not sent live); the echoed ownerChanged is what
-// actually moves the controls. Shown ONLY to the current owner — everyone else already sees who owns the channel
-// via the crown in the members list, so a disabled dropdown would just be confusing noise. Rebuilt with the
-// roster (called from renderMembers), which resets the selection to the current owner.
+/**
+ * The owner dropdown: lists members and lets the current owner hand ownership to another. Selecting a different
+ * member is a PENDING change applied via "Apply changes" (not sent live); the echoed ownerChanged is what
+ * actually moves the controls. Shown ONLY to the current owner — everyone else already sees who owns the channel
+ * via the crown in the members list, so a disabled dropdown would just be confusing noise. Rebuilt with the
+ * roster (called from renderMembers), which resets the selection to the current owner.
+ */
 function renderOwnerSelect() {
 	const select = byId('ownerSelect');
 	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
@@ -448,7 +462,7 @@ function renderOwnerSelect() {
 			const opt = document.createElement('option');
 			opt.value = id;
 			// textContent (set via the option's text) avoids markup injection from a crafted display name.
-			opt.textContent = `${name} (#${id.slice(0, 8)})` + (id === state.selfId ? ' (you)' : '');
+			opt.textContent = `${name}${idTag(id)}${id === state.selfId ? ' (you)' : ''}`;
 			return opt;
 		}));
 	// Preserve a pending transfer target across a roster rebuild if that member is still present; fall back to the
@@ -468,10 +482,12 @@ function sendCtrl(obj) {
 
 // --- passphrase rotation (the owner changes the channel's E2EE key for everyone) -------------------
 
-// Owner action (invoked by Apply changes): derive the key-check from the passphrase field for the CURRENT
-// channel and ask the server to rotate it for everyone (a blank field clears encryption → a null key-check).
-// We do NOT swap our own key here — we apply it when the server echoes passphraseChanged, so a rejected request
-// changes nothing.
+/**
+ * Owner action (invoked by Apply changes): derive the key-check from the passphrase field for the CURRENT
+ * channel and ask the server to rotate it for everyone (a blank field clears encryption → a null key-check).
+ * We do NOT swap our own key here — we apply it when the server echoes passphraseChanged, so a rejected request
+ * changes nothing.
+ */
 async function initiatePassphraseChange() {
 	if (!isOpen() || byId('transport').value !== 'relay') {
 		return;
@@ -488,7 +504,7 @@ async function initiatePassphraseChange() {
 	// new passphrase under the OLD key so connected members adopt it automatically. The server relays the blob
 	// without ever seeing the passphrase. Opting out (or no old key / disabling) sends no wrap, so members must
 	// re-enter it out-of-band — use that for a revocation-style rotation that locks out the old key.
-	const wrappedKey = (derived && state.cryptoKey && byId('shareRekey').checked)
+	const wrappedKey = derived && state.cryptoKey && byId('shareRekey').checked
 		? await wrapPassphrase(passphrase, state.cryptoKey)
 		: null;
 	sendCtrl({type: 'changePassphrase', keyCheck: derived ? derived.keyCheck : null, wrappedKey});
@@ -499,10 +515,12 @@ async function initiatePassphraseChange() {
 		: 'Requested encryption OFF for everyone…');
 }
 
-// Re-derive the key from the passphrase field and apply it ONLY if it matches the channel's announced key-check.
-// Used when a passphraseChanged arrives and when a member re-applies via Apply changes after typing the new
-// secret. On a mismatch we keep the old key (or no key) and flag a pending re-key — sendTagged then stays SILENT
-// rather than leak plaintext into the now-encrypted channel. Returns whether it applied.
+/**
+ * Re-derive the key from the passphrase field and apply it ONLY if it matches the channel's announced key-check.
+ * Used when a passphraseChanged arrives and when a member re-applies via Apply changes after typing the new
+ * secret. On a mismatch we keep the old key (or no key) and flag a pending re-key — sendTagged then stays SILENT
+ * rather than leak plaintext into the now-encrypted channel. Returns whether it applied.
+ */
 async function applyAnnouncedPassphrase() {
 	const passphrase = byId('passphrase').value;
 	// Derive only when encryption IS announced and we have a passphrase in a secure context; otherwise leave
@@ -539,9 +557,11 @@ async function applyAnnouncedPassphrase() {
 	return false;
 }
 
-// Server told us (and everyone) the channel's passphrase changed. Record the new key-check and try to apply it
-// from whatever is in the passphrase field — seamless for the owner who just set it (and any member who
-// pre-entered the new secret), a clear prompt for everyone else.
+/**
+ * Server told us (and everyone) the channel's passphrase changed. Record the new key-check and try to apply it
+ * from whatever is in the passphrase field — seamless for the owner who just set it (and any member who
+ * pre-entered the new secret), a clear prompt for everyone else.
+ */
 async function onPassphraseChanged(keyCheck, wrappedKey) {
 	state.channelKeyCheck = keyCheck;
 	// A new key era — re-arm the one-shot "could not decrypt" notice so a member who misses THIS rotation gets a
@@ -584,9 +604,11 @@ async function onPassphraseChanged(keyCheck, wrappedKey) {
 		: 'The owner changed the passphrase — enter the new one above and click "Apply changes" to keep talking (others won\'t hear you until you do).');
 }
 
-// Ask the server to change our display name to the current value of the Display name field. The server
-// validates it and, on success, broadcasts memberRenamed (including back to us) — so our own roster label
-// updates from that broadcast, not optimistically, and an invalid name surfaces as a server error instead.
+/**
+ * Ask the server to change our display name to the current value of the Display name field. The server
+ * validates it and, on success, broadcasts memberRenamed (including back to us) — so our own roster label
+ * updates from that broadcast, not optimistically, and an invalid name surfaces as a server error instead.
+ */
 function rename() {
 	if (!isOpen()) {
 		return;
@@ -602,9 +624,11 @@ function rename() {
 	sendCtrl({type: 'rename', displayName: display});
 }
 
-// Enable Rename only when the Display name field holds a name DIFFERENT from the server-confirmed current one —
-// a no-op rename is pointless (and the server rejects it). Called on every keystroke in the field, on join, and
-// whenever our own name changes. Only meaningful while connected; the button is hidden (and this no-ops) until then.
+/**
+ * Enable Rename only when the Display name field holds a name DIFFERENT from the server-confirmed current one —
+ * a no-op rename is pointless (and the server rejects it). Called on every keystroke in the field, on join, and
+ * whenever our own name changes. Only meaningful while connected; the button is hidden (and this no-ops) until then.
+ */
 function updateRenameButton() {
 	const btn = byId('renameBtn');
 	if (btn.hidden) {
@@ -627,9 +651,11 @@ function onWsMessage(ev) {
 			break;
 		case 'memberJoined':
 			addMember(msg.member);
-			log('+ ' + msg.member.displayName);
+			log(`+ ${memberLabel(msg.member.id)}`);   // addMember above populated the roster, so the name resolves
 			break;
 		case 'memberLeft':
+			// Log before removeMember drops the entry, so the name resolves (not the bare id).
+			log(`- ${memberLabel(msg.memberId)}`);
 			removeMember(msg.memberId);
 			closePeer(msg.memberId);
 			break;
@@ -647,7 +673,7 @@ function onWsMessage(ev) {
 			beginTransmit();
 			break;
 		case 'floorDenied':
-			log('Floor busy (held by ' + msg.currentHolderId + ')');
+			log(`Floor busy (held by ${memberLabel(msg.currentHolderId)})`);
 			break;
 		case 'floorTaken':
 			// PTT/global: the floor holder is the speaker. On the relay path the per-frame highlight already
@@ -659,7 +685,7 @@ function onWsMessage(ev) {
 				state.floorSpeaker = msg.holderId;
 				setSpeaking(msg.holderId, true);
 			}
-			log('Talking: ' + (state.members.get(msg.holderId) || msg.holderId));
+			log(`Talking: ${memberLabel(msg.holderId)}`);
 			// If we were the PTT holder and the floor is now someone else's, the server reassigned it away from
 			// us (idle auto-release) — stop our mic and reset the button so we're not talking into a closed floor.
 			if (state.transmitting && state.mode !== 'FULL_DUPLEX' && msg.holderId !== state.selfId) {
@@ -686,19 +712,19 @@ function onWsMessage(ev) {
 			onOwnerChanged(msg.ownerId);
 			break;
 		case 'passphraseChanged':
-			onPassphraseChanged(msg.keyCheck, msg.wrappedKey).catch(err => log('Passphrase change error: ' + err.message));
+			onPassphraseChanged(msg.keyCheck, msg.wrappedKey).catch(err => log(`Passphrase change error: ${err.message}`));
 			break;
 		case 'signalOffer':
-			onOffer(msg.from, msg.sdp).catch(err => log('Offer error: ' + err.message));
+			onOffer(msg.from, msg.sdp).catch(err => log(`Offer error: ${err.message}`));
 			break;
 		case 'signalAnswer':
-			onAnswer(msg.from, msg.sdp).catch(err => log('Answer error: ' + err.message));
+			onAnswer(msg.from, msg.sdp).catch(err => log(`Answer error: ${err.message}`));
 			break;
 		case 'signalIce':
-			onIce(msg.from, msg.candidate, msg.sdpMid, msg.sdpMLineIndex).catch(err => log('ICE error: ' + err.message));
+			onIce(msg.from, msg.candidate, msg.sdpMid, msg.sdpMLineIndex).catch(err => log(`ICE error: ${err.message}`));
 			break;
 		case 'error':
-			log('Server error [' + msg.code + ']: ' + msg.message);
+			log(`Server error [${msg.code}]: ${msg.message}`);
 			// Codes are the shared ErrorCode enum serialized as its constant names; an unrecognized code (a newer
 			// server) simply falls through — the log line above already showed it.
 			if (msg.code === 'PASSPHRASE_MISMATCH') {
@@ -723,7 +749,7 @@ function onWsMessage(ev) {
 			}
 			break;
 		default:
-			log('Unknown message: ' + msg.type);
+			log(`Unknown message: ${msg.type}`);
 	}
 }
 
@@ -753,7 +779,7 @@ function onJoined(msg) {
 		? 'Server-managed global room — everyone can talk (push-to-talk), no owner, no encryption.'
 		: state.selfId === state.ownerId
 			? 'You own this channel — change mode/passphrase and click Apply, or pick a new owner.'
-			: 'Owner: ' + (state.members.get(state.ownerId) || state.ownerId));
+			: `Owner: ${memberLabel(state.ownerId)}`);
 	// Report the channel's E2EE status on every confirmed room entry — initial join AND in-place switch, whether
 	// we created the channel or joined an existing one — reflecting the key we actually hold for it. (The global
 	// room already states "no encryption" in the owner line above, so skip the redundant line there.)
@@ -764,7 +790,7 @@ function onJoined(msg) {
 	if (state.transport === 'webrtc') {
 		msg.members
 			.filter(m => m.id !== state.selfId)
-			.forEach(m => offerTo(m.id).catch(err => log('Offer error: ' + err.message)));
+			.forEach(m => offerTo(m.id).catch(err => log(`Offer error: ${err.message}`)));
 	}
 
 	if (state.mode === 'FULL_DUPLEX' && !state.startMuted) {
@@ -797,7 +823,7 @@ function onModeChanged(mode) {
 	updateModeControl();
 	updateGlobalModeLocks();
 	updateApplyControls();   // the live mode now matches the selector again → the Apply button settles
-	log('Mode changed to ' + mode);
+	log(`Mode changed to ${mode}`);
 }
 
 function onOwnerChanged(ownerId) {
@@ -816,7 +842,7 @@ function onOwnerChanged(ownerId) {
 	updateApplyControls();
 	log(state.selfId === ownerId
 		? 'You are now the channel owner — you can change the mode/passphrase and pick the next owner.'
-		: 'Channel owner is now ' + (state.members.get(ownerId) || ownerId));
+		: `Channel owner is now ${memberLabel(ownerId)}`);
 	if (becameOwner && state.rekeyPending) {
 		// We were promoted while still holding a stale key we never reconciled. As owner, Apply now ROTATES the
 		// channel for everyone — so clear the leftover unmatched passphrase and the pending flag, otherwise a
@@ -829,9 +855,11 @@ function onOwnerChanged(ownerId) {
 	}
 }
 
-// The owner muted or unmuted a member (server-authoritative — the server also DROPS a muted member's relay audio,
-// so this is enforcement we merely reflect, not the enforcement itself). Update the roster mark; if WE are the one
-// affected, stop transmitting immediately and lock/unlock our talk control so the UI matches what the relay does.
+/**
+ * The owner muted or unmuted a member (server-authoritative — the server also DROPS a muted member's relay audio,
+ * so this is enforcement we merely reflect, not the enforcement itself). Update the roster mark; if WE are the one
+ * affected, stop transmitting immediately and lock/unlock our talk control so the UI matches what the relay does.
+ */
 function onMemberMuted(memberId, muted) {
 	if (muted) {
 		state.mutedMembers.add(memberId);
@@ -855,14 +883,16 @@ function onMemberMuted(memberId, muted) {
 		}
 		updateTalkButton();   // re-render the talk control's disabled state + label for the new mute state
 	} else {
-		log((state.members.get(memberId) || memberId) + (muted ? ' was muted' : ' was unmuted') + ' by the owner');
+		log(`${memberLabel(memberId)}${muted ? ' was muted' : ' was unmuted'} by the owner`);
 	}
 	// Re-render the roster: the muted mark and (for the owner) each row's Mute/Unmute label follow state.mutedMembers.
 	renderMembers();
 }
 
-// The owner locked or unlocked the channel to new members (server-enforced at join; existing members, us included,
-// are unaffected). Reflect it: everyone sees the 🔒 indicator, and the owner's toggle button relabels.
+/**
+ * The owner locked or unlocked the channel to new members (server-enforced at join; existing members, us included,
+ * are unaffected). Reflect it: everyone sees the 🔒 indicator, and the owner's toggle button relabels.
+ */
 function onChannelLocked(locked) {
 	state.locked = locked;
 	log(locked
@@ -871,8 +901,10 @@ function onChannelLocked(locked) {
 	updateLockControls();
 }
 
-// Reflects the live mode in the selector and lets only the owner change it while connected; when
-// disconnected the selector is just the initial-mode chooser for the next Connect.
+/**
+ * Reflects the live mode in the selector and lets only the owner change it while connected; when
+ * disconnected the selector is just the initial-mode chooser for the next Connect.
+ */
 function updateModeControl() {
 	const select = byId('mode');
 	if (isOpen()) {
@@ -882,10 +914,12 @@ function updateModeControl() {
 	}
 }
 
-// Locks the channel + passphrase inputs in GLOBAL_PTT mode. That mode joins the server-managed "global"
-// room, which forces the channel name to "global" and forbids end-to-end encryption (the server rejects an
-// encrypted global join), so both fields are misleading if editable. Each field's typed value is stashed and
-// restored when switching back. Driven by the mode SELECTOR (the pending pick), not the live mode.
+/**
+ * Locks the channel + passphrase inputs in GLOBAL_PTT mode. That mode joins the server-managed "global"
+ * room, which forces the channel name to "global" and forbids end-to-end encryption (the server rejects an
+ * encrypted global join), so both fields are misleading if editable. Each field's typed value is stashed and
+ * restored when switching back. Driven by the mode SELECTOR (the pending pick), not the live mode.
+ */
 function updateGlobalModeLocks() {
 	// Key the locks off the mode SELECTOR (what you're about to connect or switch with), not the live state.mode.
 	// This (a) disables the channel field the moment GLOBAL_PTT is picked — pre-connect AND while connected — and
@@ -918,11 +952,13 @@ function updateGlobalModeLocks() {
 	// so show it only PRE-CONNECT when full-duplex is the selected mode — and hide it once connected (rather than
 	// showing it greyed-out). Toggle display directly rather than the `hidden` attribute: this row's inline
 	// `display:flex` would override the UA `[hidden]{display:none}` rule.
-	byId('startMutedRow').style.display = (!isOpen() && mode === 'FULL_DUPLEX') ? 'flex' : 'none';
+	byId('startMutedRow').style.display = !isOpen() && mode === 'FULL_DUPLEX' ? 'flex' : 'none';
 }
 
-// Disables `input` and shows `hint` while in global mode, swapping in `lockedValue` and stashing the user's
-// typed value in a data attribute so it is restored verbatim when the mode changes back.
+/**
+ * Disables `input` and shows `hint` while in global mode, swapping in `lockedValue` and stashing the user's
+ * typed value in a data attribute so it is restored verbatim when the mode changes back.
+ */
 function lockInGlobalMode(input, hint, lockedValue, global) {
 	input.disabled = global;
 	hint.hidden = !global;
@@ -1029,8 +1065,7 @@ async function setupAudio() {
 	state.micStream = await navigator.mediaDevices.getUserMedia({audio: captureConstraints()});
 	const micSettings = state.micStream.getAudioTracks()[0].getSettings();
 	state.channels = OPUS_SUPPORTED && micSettings.channelCount === 2 ? 2 : 1;
-	log('Audio ready — context ' + ctx.state + ' @ ' + ctx.sampleRate + ' Hz, '
-		+ (state.channels === 2 ? 'stereo' : 'mono') + ', transport ' + state.transport);
+	log(`Audio ready — context ${ctx.state} @ ${ctx.sampleRate} Hz, ${state.channels === 2 ? 'stereo' : 'mono'}, transport ${state.transport}`);
 
 	if (state.transport === 'relay') {
 		setupRelayCodec();
@@ -1062,7 +1097,7 @@ function setupRelayCodec() {
 			return sendEncoded(chunk);
 		},
 		error(e) {
-			return log('Opus encoder error: ' + e.message);
+			return log(`Opus encoder error: ${e.message}`);
 		},
 	});
 	state.opusEncoder.configure({
@@ -1139,13 +1174,15 @@ function sendTagged(tag, payloadBytes) {
 				state.ws.send(enc.buffer);
 			}
 		})
-		.catch(err => log('Encrypt error: ' + err.message));
+		.catch(err => log(`Encrypt error: ${err.message}`));
 }
 
 // --- end-to-end encryption (relay path) -----------------------------------------------------------
 
-// Decrypts (when E2EE is on) before decoding. Decryption is serialized through a promise chain so async
-// WebCrypto can't hand frames to the stateful Opus decoder out of order.
+/**
+ * Decrypts (when E2EE is on) before decoding. Decryption is serialized through a promise chain so async
+ * WebCrypto can't hand frames to the stateful Opus decoder out of order.
+ */
 function handleAudioFrame(arrayBuffer) {
 	const bytes = new Uint8Array(arrayBuffer);
 	if (bytes.length < 2) {
@@ -1241,10 +1278,12 @@ function playbackDecoded(lane, audioData) {
 	enqueuePlayback(lane, interleaved, frames, srcChannels);
 }
 
-// Adapt an interleaved Float32 buffer (srcChannels) to the device's output channel count and queue it on
-// this sender's playback node — so a mono sender plays on a stereo listener (and vice versa) regardless of
-// how the Opus decoder reports channels. Mirrors the Java client's "decode to my own channel count".
-// Takes ownership of `src`: the underlying buffer is transferred (detached) once queued.
+/**
+ * Adapt an interleaved Float32 buffer (srcChannels) to the device's output channel count and queue it on
+ * this sender's playback node — so a mono sender plays on a stereo listener (and vice versa) regardless of
+ * how the Opus decoder reports channels. Mirrors the Java client's "decode to my own channel count".
+ * Takes ownership of `src`: the underlying buffer is transferred (detached) once queued.
+ */
 function enqueuePlayback(lane, src, frames, srcChannels) {
 	// Full-duplex: every sender's mic is open, so highlight a member only when their decoded audio is actually
 	// loud (voice activity), not just because frames keep arriving. (PTT/global use frame arrival / the floor.)
@@ -1270,7 +1309,7 @@ function enqueuePlayback(lane, src, frames, srcChannels) {
 		// Unexpected channel count (not 1 or 2) — drop rather than mis-stride the worklet de-interleave.
 		if (!state.warnedChannels) {
 			state.warnedChannels = true;
-			log('Dropping audio with unexpected channel count: ' + srcChannels);
+			log(`Dropping audio with unexpected channel count: ${srcChannels}`);
 		}
 		return;
 	}
@@ -1279,10 +1318,12 @@ function enqueuePlayback(lane, src, frames, srcChannels) {
 
 // --- per-sender lanes (relay full-duplex) ---------------------------------------------------------
 
-// Returns the decode/playback lane for a stream index, creating it on first use. Each lane carries its own
-// stateful Opus decoder and its own Web Audio playback node (ctx.destination mixes all lanes natively), so
-// simultaneous talkers no longer collide in one decoder. If the index has been reassigned to a different
-// member, the stale lane is torn down and rebuilt with a fresh decoder.
+/**
+ * Returns the decode/playback lane for a stream index, creating it on first use. Each lane carries its own
+ * stateful Opus decoder and its own Web Audio playback node (ctx.destination mixes all lanes natively), so
+ * simultaneous talkers no longer collide in one decoder. If the index has been reassigned to a different
+ * member, the stale lane is torn down and rebuilt with a fresh decoder.
+ */
 function getLane(sid) {
 	const expectedMember = state.memberOfStream.get(sid);
 	let lane = state.lanes.get(sid);
@@ -1329,7 +1370,7 @@ function createLane(memberId) {
 				return playbackDecoded(lane, audioData);
 			},
 			error(e) {
-				return log('Opus decoder error: ' + e.message);
+				return log(`Opus decoder error: ${e.message}`);
 			},
 		});
 	}
@@ -1354,8 +1395,10 @@ function closeAllLanes() {
 	[...state.lanes.keys()].forEach(closeLane);
 }
 
-// Evicts the longest-silent lane to stay under MAX_ACTIVE_DECODERS (loudness isn't computable for an
-// un-decoded sender). A dropped sender simply isn't audible until a slot frees.
+/**
+ * Evicts the longest-silent lane to stay under MAX_ACTIVE_DECODERS (loudness isn't computable for an
+ * un-decoded sender). A dropped sender simply isn't audible until a slot frees.
+ */
 function evictOldestLane() {
 	let oldestSid = null;
 	let oldest = Infinity;
@@ -1434,7 +1477,9 @@ async function onIce(from, candidate, sdpMid, sdpMLineIndex) {
 	}
 }
 
-// Raise Opus quality in the SDP: fullband, high bitrate, in-band FEC, no DTX.
+/**
+ * Raise Opus quality in the SDP: fullband, high bitrate, in-band FEC, no DTX.
+ */
 function tuneOpusSdp(sdp) {
 	const rtpmap = sdp.match(/a=rtpmap:(\d+) opus\/48000/);
 	if (!rtpmap) {
@@ -1461,23 +1506,23 @@ function setSenderBitrate(pc, bitsPerSecond) {
 			try {
 				await sender.setParameters(params);
 			} catch (err) {
-				log('setParameters: ' + err.message);
+				log(`setParameters: ${err.message}`);
 			}
 		});
 }
 
 function attachRemoteAudio(remoteId, stream) {
-	let el = document.getElementById('audio-' + remoteId);
+	let el = document.getElementById(`audio-${remoteId}`);
 	if (!el) {
 		el = document.createElement('audio');
-		el.id = 'audio-' + remoteId;
+		el.id = `audio-${remoteId}`;
 		el.autoplay = true;
 		document.body.appendChild(el);
 	}
 	el.srcObject = stream;
 	// autoplay should start it, but call play() explicitly so a blocked autoplay surfaces a hint
 	// instead of failing silently.
-	el.play().catch(e => log('Browser blocked audio autoplay (click the page to enable): ' + e.message));
+	el.play().catch(e => log(`Browser blocked audio autoplay (click the page to enable): ${e.message}`));
 }
 
 function closePeer(remoteId) {
@@ -1486,7 +1531,7 @@ function closePeer(remoteId) {
 		pc.close();
 		state.peers.delete(remoteId);
 	}
-	const el = document.getElementById('audio-' + remoteId);
+	const el = document.getElementById(`audio-${remoteId}`);
 	if (el) {
 		el.remove();
 	}
@@ -1522,8 +1567,10 @@ function addMember(member) {
 	renderMembers();
 }
 
-// A member changed its display name (id is unchanged — only the label moves). Update the roster map and
-// re-render; the streamId / speaking state / decoder lanes are keyed by id, so they're untouched.
+/**
+ * A member changed its display name (id is unchanged — only the label moves). Update the roster map and
+ * re-render; the streamId / speaking state / decoder lanes are keyed by id, so they're untouched.
+ */
 function renameMember(id, name) {
 	const old = state.members.get(id);
 	if (old === undefined) {
@@ -1532,7 +1579,7 @@ function renameMember(id, name) {
 	state.members.set(id, name);
 	renderMembers();
 	updateRenameButton();   // if this was our own rename, the field now matches the new name → Rename re-disables
-	log(id === state.selfId ? `You are now "${name}"` : `"${old}" is now "${name}"`);
+	log(`${id === state.selfId ? 'You are' : `"${old}" is`} now "${name}"${idTag(id)}`);
 }
 
 function removeMember(id) {
@@ -1553,8 +1600,10 @@ function removeMember(id) {
 	renderMembers();
 }
 
-// Toggles the "speaking" highlight on a roster entry. Operates on the cached <li> so a per-frame update is
-// cheap (no full re-render); the state.speaking Set is the source of truth that renderMembers re-applies.
+/**
+ * Toggles the "speaking" highlight on a roster entry. Operates on the cached <li> so a per-frame update is
+ * cheap (no full re-render); the state.speaking Set is the source of truth that renderMembers re-applies.
+ */
 function setSpeaking(id, speaking) {
 	if (!id) {
 		return;
@@ -1570,8 +1619,10 @@ function setSpeaking(id, speaking) {
 	}
 }
 
-// A relay audio frame just arrived from `id`: highlight them and (re)arm a short silence timer that clears it.
-// This keys off actual audio frames, so it works in every mode on the relay path (PTT, global, full-duplex).
+/**
+ * A relay audio frame just arrived from `id`: highlight them and (re)arm a short silence timer that clears it.
+ * This keys off actual audio frames, so it works in every mode on the relay path (PTT, global, full-duplex).
+ */
 function markSpeaking(id) {
 	if (!id) {
 		return;
@@ -1584,8 +1635,10 @@ function markSpeaking(id) {
 	}, SPEAK_SILENCE_MS));
 }
 
-// Rough voice-activity gate: true when a PCM frame's RMS (after dividing by `scale` to normalize to [-1, 1])
-// exceeds VAD_RMS_THRESHOLD. `scale` is 32768 for captured Int16, 1 for already-normalized decoded Float32.
+/**
+ * Rough voice-activity gate: true when a PCM frame's RMS (after dividing by `scale` to normalize to [-1, 1])
+ * exceeds VAD_RMS_THRESHOLD. `scale` is 32768 for captured Int16, 1 for already-normalized decoded Float32.
+ */
 function isVoiceActive(samples, scale) {
 	let sum = 0;
 	for (let i = 0; i < samples.length; i++) {
@@ -1593,6 +1646,25 @@ function isVoiceActive(samples, scale) {
 		sum += v * v;
 	}
 	return samples.length > 0 && Math.sqrt(sum / samples.length) > VAD_RMS_THRESHOLD;
+}
+
+/**
+ * The short "(#id-prefix)" tag rendered after a display name so members sharing a name stay distinguishable: the
+ * session id is a UUID (the real identity), and its first 8 chars disambiguate a handful of participants without
+ * the full ~36-char id. Matches the Java client's name() suffix. Leading space so callers append it directly.
+ */
+const ID_PREFIX_LENGTH = 8;
+
+function idTag(id) {
+	return ` (#${id.slice(0, ID_PREFIX_LENGTH)})`;
+}
+
+/**
+ * A member's display name followed by its id tag — the standard way to name a member in a log line, so a name is
+ * always attributable to a session id (mirrors the Java client's name()).
+ */
+function memberLabel(id) {
+	return `${state.members.get(id)}${idTag(id)}`;
 }
 
 function renderMembers() {
@@ -1607,7 +1679,7 @@ function renderMembers() {
 	[...state.members.entries()]
 		.sort(([idA, nameA], [idB, nameB]) => nameA.localeCompare(nameB, undefined, {sensitivity: 'base'}) || (idA < idB ? -1 : idA > idB ? 1 : 0))
 		.forEach(([id, name]) => {
-			let label = `${name} (#${id.slice(0, 8)})`;
+			let label = `${name}${idTag(id)}`;
 			if (id === state.selfId) {
 				label += ' (you)';
 			}
@@ -1662,9 +1734,11 @@ function renderMembers() {
 	updateApplyControls(); // re-settle Apply/Reset: a rebuild may have dropped a now-departed pending owner pick
 }
 
-// Shows the owner's "Mute all" toggle (hidden for everyone else and in the ownerless global room) and labels it
-// "Unmute all" when every other member is already muted, else "Mute all". Disabled when the owner is alone —
-// there is no one to mute. The click handler recomputes the mute-vs-unmute intent from the live roster.
+/**
+ * Shows the owner's "Mute all" toggle (hidden for everyone else and in the ownerless global room) and labels it
+ * "Unmute all" when every other member is already muted, else "Mute all". Disabled when the owner is alone —
+ * there is no one to mute. The click handler recomputes the mute-vs-unmute intent from the live roster.
+ */
 function updateMuteAllButton() {
 	const btn = byId('muteAllBtn');
 	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
@@ -1678,9 +1752,11 @@ function updateMuteAllButton() {
 	btn.disabled = others.length === 0;
 }
 
-// Reflects the channel's lock state: the 🔒 indicator is shown to EVERYONE when locked (so non-owners, who don't
-// see the toggle, still know newcomers are blocked); the "Lock/Unlock channel" toggle is owner-only (hidden for
-// others and in the ownerless global room). The button label follows state.locked, recomputed at click time.
+/**
+ * Reflects the channel's lock state: the 🔒 indicator is shown to EVERYONE when locked (so non-owners, who don't
+ * see the toggle, still know newcomers are blocked); the "Lock/Unlock channel" toggle is owner-only (hidden for
+ * others and in the ownerless global room). The button label follows state.locked, recomputed at click time.
+ */
 function updateLockControls() {
 	const badge = byId('lockedBadge');
 	const btn = byId('lockBtn');
@@ -1717,10 +1793,12 @@ function updateTalkButton() {
 			'Hold to talk';
 }
 
-// Resets everything tied to the CURRENT channel — peers, decode lanes, roster, and floor/speaking highlights —
-// but NOT the connection (socket, mic, AudioContext, encoder). Used by cleanup() on disconnect AND by onJoined,
-// so an in-place channel switch (a re-Join on the same session) starts the new channel from a clean slate and
-// can't leak the old channel's peer connections, decoders, members, or "talking" state.
+/**
+ * Resets everything tied to the CURRENT channel — peers, decode lanes, roster, and floor/speaking highlights —
+ * but NOT the connection (socket, mic, AudioContext, encoder). Used by cleanup() on disconnect AND by onJoined,
+ * so an in-place channel switch (a re-Join on the same session) starts the new channel from a clean slate and
+ * can't leak the old channel's peer connections, decoders, members, or "talking" state.
+ */
 function resetChannelState() {
 	state.peers.forEach((_, id) => closePeer(id));
 	state.peers.clear();
@@ -1840,7 +1918,7 @@ window.addEventListener('DOMContentLoaded', () => {
 		}
 		if (!byId('connectBtn').hidden) {
 			e.preventDefault();
-			connect();
+			void connect();   // fire-and-forget: connect() handles its own errors (logs "Connect error")
 		} else if (isOpen() && e.target.id === 'display' && !byId('renameBtn').disabled) {
 			e.preventDefault();
 			rename();
@@ -1869,9 +1947,9 @@ window.addEventListener('DOMContentLoaded', () => {
 		try {
 			await Promise.all(state.micStream.getAudioTracks().map(t =>
 				t.applyConstraints({echoCancellation: dsp, noiseSuppression: dsp, autoGainControl: dsp})));
-			log('Mic processing ' + (dsp ? 'on (clean speech)' : 'off (hi-fi)'));
+			log(`Mic processing ${dsp ? 'on (clean speech)' : 'off (hi-fi)'}`);
 		} catch (err) {
-			log('Could not change mic processing live (reconnect to apply): ' + err.message);
+			log(`Could not change mic processing live (reconnect to apply): ${err.message}`);
 		}
 	});
 

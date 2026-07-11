@@ -21,8 +21,10 @@ import {
 	unwrapPassphrase,
 } from '../../main/resources/static/assets/e2ee.js';
 
-// Fixed inputs shared with FrameCryptoTest (Java). If the browser's PBKDF2/AES-GCM ever drifts from the Java
-// client, one side's known-answer assertions fail.
+/**
+ * Fixed inputs shared with FrameCryptoTest (Java). If the browser's PBKDF2/AES-GCM ever drifts from the Java
+ * client, one side's known-answer assertions fail.
+ */
 const PASSPHRASE = 'correct horse battery staple';
 const CHANNEL = 'lobby';
 const IV = Uint8Array.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
