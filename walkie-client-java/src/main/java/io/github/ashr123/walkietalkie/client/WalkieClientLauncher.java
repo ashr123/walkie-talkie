@@ -90,6 +90,11 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 				tlsTruststore,
 				startMuted
 		))) {
+		} catch (IllegalArgumentException e) {
+			// Bad --display / --channel etc. — a usage error, so print the message cleanly (no stack trace) and
+			// return picocli's usage exit code rather than letting it surface as an uncaught exception.
+			System.err.println(e.getMessage());
+			return CommandLine.ExitCode.USAGE;
 		}
 		return 0;
 	}

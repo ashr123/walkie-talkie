@@ -63,6 +63,17 @@ public final class WalkieClient implements AutoCloseable {
 	/// Display-name charset, mirrored from the server's validation so the `n` command can reject a bad name
 	/// locally before the round-trip (the server validates authoritatively too).
 	private static final Pattern DISPLAY_NAME = Pattern.compile("[A-Za-z0-9_.-]{1,32}");
+	/// Channel-name charset, mirrored from the server (and the browser client's CHANNEL_NAME) so the `c` command
+	/// and the initial `--channel` are rejected locally before the round-trip. Note `.` is allowed in a display
+	/// name but NOT a channel name.
+	private static final Pattern CHANNEL_NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+	/// First byte of an end-to-end-encrypted frame (mirrors FrameCrypto's scheme marker); lets the receive path
+	/// distinguish encrypted audio from a plaintext peer's `[codec tag][payload]` when we hold no key.
+	private static final int E2EE_SCHEME = 0xE2;
+	/// Number of leading id characters shown in a member's `(#…)` tag (see [#name]); matches the browser client's
+	/// `ID_PREFIX_LENGTH` so both render the same short id. Callers clamp with `Math.min` because [String#substring]
+	/// throws when the id is shorter than this (the browser's `slice` clamps on its own, so it needs no guard).
+	private static final int ID_PREFIX_LENGTH = 8;
 	/// Upper bound on how long [#close] waits for the HttpClient — and the WebSocket close handshake riding on
 	/// it — to drain gracefully before forcing termination, so quitting can never hang on a slow or vanished
 	/// server. Two seconds is ample for a localhost/LAN close handshake while still feeling instant to a user.
@@ -86,7 +97,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// just gained. One source of truth, so the help and the promotion notice can't drift; the server also rejects
 	/// these from a non-owner, so hiding them is UI honesty, not the security boundary.
 	private static final String OWNER_COMMANDS = """
-			Owner:     m <ptt|global|duplex> = change the mode for everyone
+			Owner:     m <ptt|duplex> = change the mode for everyone (global is a separate room — join with 'c global global')
 			           p [passphrase] = change the passphrase (blank = turn encryption off; members auto-adopt)
 			           p! [passphrase] = change the passphrase WITHOUT auto-sharing (members must re-enter it)
 			           o <#id> = give ownership to another member
@@ -125,11 +136,22 @@ public final class WalkieClient implements AutoCloseable {
 	// --- HTTP login + WebSocket -------------------------------------------------------------------
 	private volatile String pendingPassphrase;   // the new passphrase we (as owner) submitted, applied when the echo arrives
 	private volatile boolean warnedDecrypt; // listener thread only today, but volatile so the warn-once intent survives a threading refactor
+	private volatile boolean warnedEncryptedNoKey; // warn-once (like warnedDecrypt): encrypted audio arrived while we hold no key
 	private volatile boolean welcomeShown;  // print the role-aware help once, after the first Joined reveals our role (same listener-thread-only-but-volatile rationale as warnedDecrypt)
 	private volatile boolean channelLocked; // whether the owner has locked the channel to new members (from Joined/ChannelLocked); volatile — set on the listener thread, read on the console thread for 'w'
 
 	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
 		this.options = options;
+		// Validate the startup identity/channel locally before opening audio or a socket — the same checks the `n`
+		// and `c` commands apply, and the browser client applies on connect. The server validates authoritatively
+		// too, but failing fast here avoids a connected-but-not-joined dead-end on a bad --display/--channel.
+		if (!DISPLAY_NAME.matcher(options.display()).matches()) {
+			throw new IllegalArgumentException("--display must be 1-32 chars of letters, digits, _ . or - (got: \"" + options.display() + "\").");
+		}
+		// Global forces the channel to "global" server-side, so the --channel name only matters for the other modes.
+		if (options.mode() != ChannelMode.GLOBAL_PTT && !CHANNEL_NAME.matcher(options.channel()).matches()) {
+			throw new IllegalArgumentException("--channel must be 1-64 chars of letters, digits, _ or - (got: \"" + options.channel() + "\").");
+		}
 		this.httpClient = HttpClient.newBuilder()
 				.sslContext(TlsTrust.forServer(options.server(), options.tlsTruststore()))
 				.build();
@@ -330,7 +352,7 @@ public final class WalkieClient implements AutoCloseable {
 				String ownerLine = SERVER_OWNER.equals(ownerId)
 						? "server-managed room — no owner, unencrypted"
 						: selfId.equals(ownerId)
-						  ? "you own this channel — 'm <ptt|global|duplex>' to change the mode for everyone"
+						  ? "you own this channel — 'm <ptt|duplex>' to change the mode for everyone"
 						  : "owner: " + name(ownerId);
 				// If the channel already existed in another mode, its owner's mode wins and you adopt it.
 				String modeNote = mode == options.mode()
@@ -340,6 +362,13 @@ public final class WalkieClient implements AutoCloseable {
 						+ (locked ? " 🔒 locked" : "")
 						+ System.lineSeparator() + "[owner] " + ownerLine
 						+ System.lineSeparator() + modeHint(mode, audio.isTransmitting()));
+				// Report the channel's E2EE status on EVERY confirmed entry (initial join AND in-place switch), like
+				// the browser — so switching into/out of an encrypted channel says so. The global room already states
+				// "unencrypted" in its owner line, so skip the redundant line there. crypto reflects the key held for
+				// this channel (on a successful Joined an encrypted channel implies we hold a matching key).
+				if (!SERVER_OWNER.equals(ownerId)) {
+					log(crypto == null ? "[e2ee] off" : "[e2ee] ON (AES-256-GCM)");
+				}
 				if (!welcomeShown) {
 					// Now that this first Joined has set our role, print the role-aware command help — deferred from
 					// consoleLoop's start, where the role wasn't known yet. Once only, so a later channel switch
@@ -353,14 +382,20 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.MemberRenamed(String memberId, String displayName) -> announceRename(memberId, displayName);
 			case ServerMessage.MemberMuted(String memberId, boolean muted) -> handleMuteChange(memberId, muted);
 			case ServerMessage.ChannelLocked(boolean locked) -> handleChannelLocked(locked);
+			case ServerMessage.FloorGranted _ when mutedMembers.contains(selfId) ->
+					// Owner-muted: never open the mic, even on a (stray) grant — the server refuses the floor to a
+					// muted member, so this shouldn't arrive, but guard it like the browser's beginTransmit does.
+					log("[floor granted] but you are muted by the owner — mic stays closed until unmuted.");
 			case ServerMessage.FloorGranted _ -> {
 				audio.setTransmitting(true);
 				log("[floor granted] talking — type 't' to stop");
 			}
 			case ServerMessage.FloorDenied(String currentHolderId) ->
 					log("[floor busy] currently held by " + name(currentHolderId));
-			case ServerMessage.FloorTaken(String holderId) when audio.isTransmitting() && currentMode != ChannelMode.FULL_DUPLEX -> {
-				// We held the floor and the server handed it to someone else (idle auto-release): stop.
+			case ServerMessage.FloorTaken(String holderId)
+					when audio.isTransmitting() && currentMode != ChannelMode.FULL_DUPLEX && !holderId.equals(selfId) -> {
+				// We held the floor and the server handed it to someone ELSE (idle auto-release): stop. The
+				// !holderId.equals(selfId) guard mirrors the browser: a FloorTaken naming US must not stop our mic.
 				audio.setTransmitting(false);
 				log("[released] floor reassigned to " + name(holderId) + " — type 't' to request it again");
 			}
@@ -448,13 +483,12 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	/// Resolves a member's display name from its session id, always suffixed with a short session-id prefix
-	/// (the session id is the real identity — display names aren't unique), or the raw id if the name is unknown.
+	/// Resolves a member's display name from its session id, always suffixed with a short session-id prefix (the
+	/// session id is the real identity — display names aren't unique). Every call site passes a current member's
+	/// id (membership precedes any floor/owner/mute reference, and delivery is ordered per recipient), so no
+	/// unknown-id fallback is needed — mirrors the browser client's memberLabel().
 	private String name(String id) {
-		String display = memberNames.get(id);
-		return display == null
-				? id
-				: display + " (#" + id.substring(0, Math.min(8, id.length())) + ")";
+		return memberNames.get(id) + " (#" + id.substring(0, Math.min(ID_PREFIX_LENGTH, id.length())) + ")";
 	}
 
 	private void announceJoin(MemberInfo member) {
@@ -629,9 +663,12 @@ public final class WalkieClient implements AutoCloseable {
 		}
 		switch (arg.toLowerCase(Locale.ROOT)) {
 			case "ptt", "multi" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
-			case "global" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.GLOBAL_PTT));
 			case "duplex", "full" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
-			default -> System.out.println("Usage: m <ptt|global|duplex>");
+			// "global" is NOT a mode a regular channel can take — the server rejects ChangeMode(GLOBAL_PTT) with
+			// INVALID_MODE (global-ptt lives only in the server-managed "global" room). Redirect rather than send a
+			// doomed request; the browser likewise reaches global by switching rooms, not by changing a mode.
+			case "global" -> log("[mode] 'global' is a separate server-managed room, not a mode for this channel — join it with 'c global global'.");
+			default -> System.out.println("Usage: m <ptt|duplex>");
 		}
 	}
 
@@ -777,13 +814,14 @@ public final class WalkieClient implements AutoCloseable {
 	private void switchChannel(String args) {
 		String[] parts = args.strip().split("\\s+", 3);
 		String channel = parts[0];
-		if (channel.isBlank()) {
-			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]");
+		ChannelMode mode = parts.length > 1 ? parseMode(parts[1], currentMode) : currentMode;
+		// Validate the name locally before the round-trip (like the `n` command and the browser client). Global
+		// forces the channel to "global" server-side, so the name only matters — and is only checked — otherwise.
+		if (mode != ChannelMode.GLOBAL_PTT && !CHANNEL_NAME.matcher(channel).matches()) {
+			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]  (channel = 1-64 chars of letters, digits, _ or -)");
 			return;
 		}
-		switchTo(channel,
-				parts.length > 1 ? parseMode(parts[1], currentMode) : currentMode,
-				parts.length > 2 ? parts[2] : currentPassphrase);
+		switchTo(channel, mode, parts.length > 2 ? parts[2] : currentPassphrase);
 	}
 
 	/// Re-derives the E2EE key for the new channel (the key salts on the channel name) and sends the Join; the
@@ -1039,7 +1077,17 @@ public final class WalkieClient implements AutoCloseable {
 					byte[] body = Arrays.copyOfRange(frame, 1, frame.length);
 					FrameCrypto key = crypto;   // read the volatile once — a concurrent channel switch may swap it
 					if (key == null) {
-						audio.play(sid, body);
+						if (body.length > 0 && (body[0] & 0xFF) == E2EE_SCHEME) {
+							// Encrypted audio arriving while we hold no key (a plaintext->encrypted enable we haven't
+							// adopted): drop it — the engine would treat 0xE2 as an unknown codec tag and silently emit
+							// nothing — and explain once, like the browser's warnedEncryptedNoKey path.
+							if (!warnedEncryptedNoKey) {
+								warnedEncryptedNoKey = true;
+								log("[warn] received end-to-end-encrypted audio but no passphrase is set — run 'p <passphrase>' to hear it.");
+							}
+						} else {
+							audio.play(sid, body);
+						}
 					} else {
 						try {
 							audio.play(sid, key.decrypt(body));
