@@ -1,8 +1,19 @@
 import org.springframework.boot.gradle.plugin.SpringBootPlugin
+import org.springframework.boot.gradle.tasks.bundling.BootJar
+import org.springframework.boot.gradle.tasks.run.BootRun
 
 plugins {
 	id("walkietalkie.java-conventions")
 	id("org.springframework.boot") version "4.1.0"
+	// GraalVM Native Build Tools. Version pinned to what Spring Boot 4.1.0 aligns with
+	// (`native-build-tools-plugin.version` in the spring-boot-dependencies BOM) — plugin versions aren't
+	// managed by the BOM's dependency constraints, so it is stated explicitly. Applying this also makes Spring
+	// Boot register its AOT tasks (`processAot` / `processTestAot`), which run the AOT engine and fold in the
+	// hints from ProtocolRuntimeHints. `build`/`test` also generate and compile those AOT sources as a dependency
+	// (so a context that can't be AOT-processed fails the ordinary build — cheap native-readiness insurance). The
+	// `test` task still EXECUTES reflectively; `bootRun` and the boot jar execute AOT-processed (wired below);
+	// only the `native*` tasks build/run an actual native image and need a GraalVM JDK on PATH.
+	id("org.graalvm.buildtools.native") version "1.1.4"
 }
 
 dependencies {
@@ -72,3 +83,52 @@ val jsTest = tasks.register<Exec>("jsTest") {
 }
 
 tasks.named("check") { dependsOn(jsTest) }
+
+// Native-image tuning. The reachability-metadata repository supplies hints for the third-party stack (embedded
+// Tomcat, Jackson, Spring internals) so only our own types need hand-registered hints (see ProtocolRuntimeHints).
+// `nativeCompile` requires a GraalVM JDK; see README "Native image / AOT readiness" for the deployment caveat
+// (`keytool` is absent in the image, so the dev-cert auto-gen path can't run there — supply WALKIE_TLS_KEYSTORE
+// or terminate TLS at a proxy).
+graalvmNative {
+	metadataRepository {
+		enabled.set(true)
+	}
+	binaries {
+		named("main") {
+			imageName.set("walkie-server")
+		}
+	}
+}
+
+// --- Run the AOT-optimized application on the JVM by default -------------------------------------
+// `bootRun` and the runnable boot jar use the AOT-generated context (spring.aot.enabled=true) instead of
+// reflective startup: that needs BOTH the flag AND the generated classes/resources on the runtime classpath, so
+// both are wired here. AotDetector reads the flag from system properties / a classpath `spring.properties`, NOT
+// application.yml (it is consulted before the Environment loads), so bootRun sets a system property and the jar
+// bundles src/aot-launch/spring.properties into BOOT-INF/classes. Referencing the `aot` source set output makes
+// each task depend on the AOT chain (processAot -> compileAotJava -> ...), so the generated code is fresh.
+//
+// Tests stay REFLECTIVE on purpose: the flag reaches neither the `test` task nor the main/test classpath (the
+// spring.properties lives outside src/main/resources), so a @SpringBootTest — which has no generated context on
+// the plain test classpath — is unaffected.
+//
+// The TLS on/off toggle survives AOT: TlsConfiguration reads walkie.tls.enabled at runtime (not a build-time
+// @ConditionalOnProperty), so one AOT build serves HTTPS:8443 (default) or HTTP:8080 (--walkie.tls.enabled=false).
+val aotOutput = sourceSets["aot"].output
+
+tasks.named<BootRun>("bootRun") {
+	classpath(aotOutput)
+	// AOT on by default; `-Paot=false` is a general reflective-startup escape hatch (e.g. to compare AOT vs
+	// reflective behaviour when debugging). It is NOT needed for the plain-HTTP dev mode — TlsConfiguration reads
+	// walkie.tls.enabled at runtime, so `--walkie.tls.enabled=false` works under AOT too. The packaged jar has no
+	// such switch: its bundled spring.properties wins over any -D (SpringProperties reads the file before the
+	// system property), so `java -jar` is always AOT.
+	systemProperty("spring.aot.enabled", providers.gradleProperty("aot").getOrElse("true"))
+}
+
+tasks.named<BootJar>("bootJar") {
+	classpath(aotOutput)
+	from(layout.projectDirectory.dir("src/aot-launch")) {
+		into("BOOT-INF/classes")
+	}
+}
