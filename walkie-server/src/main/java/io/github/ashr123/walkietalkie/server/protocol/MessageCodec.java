@@ -2,13 +2,19 @@ package io.github.ashr123.walkietalkie.server.protocol;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
+import org.springframework.context.annotation.ImportRuntimeHints;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.json.JsonMapper;
 
 /// Translates between the JSON wire format and the typed protocol records, using Spring Boot's
 /// auto-configured Jackson 3 [JsonMapper]. Jackson 3 throws unchecked exceptions, so decode
 /// failures surface as runtime exceptions for the caller to turn into an error reply.
+///
+/// This is the one place the protocol records are (de)serialized, so it carries the `@ImportRuntimeHints` that
+/// registers their GraalVM/AOT reflection hints (see [ProtocolRuntimeHints]) — keeping the hint next to the
+/// reflection it covers, per Spring's "register hints near their usage" guidance.
 @Component
+@ImportRuntimeHints(ProtocolRuntimeHints.class)
 public class MessageCodec {
 
 	private final JsonMapper jsonMapper;
