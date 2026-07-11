@@ -55,11 +55,10 @@ class PlaybackProcessor extends AudioWorkletProcessor {
 		this._current = null;
 		this._pos = 0; // per-channel sample index into the current (interleaved) frame
 		this.port.onmessage = event => {
-			// event.data is interleaved Float32 already matched to the output channel count.
-			const frame = new Float32Array(event.data);
 			// Bound the buffer so a fast sender can't grow playback latency without limit.
 			if (this._queue.length < 50) {
-				this._queue.push(frame);
+				// event.data is interleaved Float32 already matched to the output channel count.
+				this._queue.push(new Float32Array(event.data));
 			}
 		};
 	}

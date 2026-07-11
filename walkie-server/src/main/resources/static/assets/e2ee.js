@@ -48,7 +48,13 @@ async function deriveBits384(passphrase, effectiveChannel) {
 export async function deriveKey(passphrase, effectiveChannel) {
 	const bits = await deriveBits384(passphrase, effectiveChannel);
 	return {
-		key: await crypto.subtle.importKey('raw', bits.slice(0, KEY_BYTES), 'AES-GCM', false, ['encrypt', 'decrypt']),
+		key: await crypto.subtle.importKey(
+			'raw',
+			bits.slice(0, KEY_BYTES),
+			'AES-GCM',
+			false,
+			['encrypt', 'decrypt']
+		),
 		keyCheck: hex(bits.slice(KEY_BYTES, KEY_BYTES + KCV_BYTES))
 	};
 }
