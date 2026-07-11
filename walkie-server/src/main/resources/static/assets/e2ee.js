@@ -9,6 +9,7 @@ export const E2EE_AAD = Uint8Array.of(E2EE_SCHEME);   // the scheme byte, authen
 const IV_BYTES = 12;
 const KEY_BYTES = 32;          // AES-256
 const KCV_BYTES = 16;          // key-check value, derived alongside the key
+const TAG_LENGTH_BITS = 128; // AES-GCM tag length, in bits (16 bytes)
 const PBKDF2_ITERATIONS = 600000;
 const SALT_PREFIX = 'walkie-talkie:e2ee:';
 
@@ -80,7 +81,15 @@ export async function encryptFrame(plaintext, key) {
  */
 export async function encryptFrameWithIv(plaintext, key, iv) {
 	const ct = new Uint8Array(await crypto.subtle.encrypt(
-		{name: 'AES-GCM', iv, tagLength: 128, additionalData: E2EE_AAD}, key, plaintext));
+		{
+			name: 'AES-GCM',
+			iv,
+			tagLength: TAG_LENGTH_BITS,
+			additionalData: E2EE_AAD
+		},
+		key,
+		plaintext
+	));
 	const out = new Uint8Array(1 + iv.length + ct.length);
 	out[0] = E2EE_SCHEME;
 	out.set(iv, 1);
@@ -93,11 +102,17 @@ export async function encryptFrameWithIv(plaintext, key, iv) {
  * in an encrypted channel) or a bad tag (tampered / wrong passphrase) — never decoding ciphertext as audio.
  */
 export function decryptFrame(frame, key) {
-	return frame.length < 1 + IV_BYTES + 16 || frame[0] !== E2EE_SCHEME ?
+	return frame.length < 1 + IV_BYTES + TAG_LENGTH_BITS / 8 || frame[0] !== E2EE_SCHEME ?
 		Promise.reject(new Error('not an end-to-end-encrypted frame')) :
 		crypto.subtle.decrypt(
-			{name: 'AES-GCM', iv: frame.subarray(1, 1 + IV_BYTES), tagLength: 128, additionalData: E2EE_AAD},
-			key, frame.subarray(1 + IV_BYTES)
+			{
+				name: 'AES-GCM',
+				iv: frame.subarray(1, 1 + IV_BYTES),
+				tagLength: TAG_LENGTH_BITS,
+				additionalData: E2EE_AAD
+			},
+			key,
+			frame.subarray(1 + IV_BYTES)
 		);
 }
 
