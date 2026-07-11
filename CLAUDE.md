@@ -21,8 +21,10 @@ so only Gradle needs the prefix. Use the bundled wrapper (`./gradlew`, Gradle 9.
 
 ```bash
 JAVA_OPTS= ./gradlew build                       # compile all modules + run all tests
-JAVA_OPTS= ./gradlew :walkie-server:bootRun       # HTTPS on https://localhost:8443 by default (auto self-signed cert); walkie.tls.enabled=false -> http://localhost:8080
-java -jar walkie-server/build/libs/walkie-server-0.1.0.jar   # or run the built boot jar
+JAVA_OPTS= ./gradlew :walkie-server:bootRun       # runs AOT-processed (spring.aot.enabled), HTTPS on https://localhost:8443 (auto self-signed cert)
+JAVA_OPTS= ./gradlew :walkie-server:bootRun --args='--walkie.tls.enabled=false'   # still AOT-processed, plain HTTP on http://localhost:8080 (TLS toggle is a runtime read, works under AOT)
+JAVA_OPTS= ./gradlew :walkie-server:bootRun -Paot=false   # general escape hatch: reflective (non-AOT) startup, for debugging
+java -jar walkie-server/build/libs/walkie-server-0.1.0.jar   # the built boot jar — ALWAYS AOT (bundled spring.properties); add --walkie.tls.enabled=false for HTTP
 
 # Java desktop client (relay transport). --mode: ptt|global|duplex ; --hifi flag for the music profile; --help for all options
 JAVA_OPTS= ./gradlew :walkie-client-java:run --args="--server https://localhost:8443 --display alice --channel team1 --mode ptt"
@@ -136,7 +138,23 @@ awaits `deriveJoinKey` before re-sending `Join`.
 `@JsonTypeName` (Jackson 3 needs only `@JsonTypeInfo` on sealed types). The server (de)serializes via
 `MessageCodec` using the auto-configured Jackson 3 bean — note the type is
 `tools.jackson.databind.json.JsonMapper` (Jackson 3 moved databind to the `tools.jackson` group;
-annotations stay under `com.fasterxml.jackson.core`). Jackson 3 exceptions are unchecked.
+annotations stay under `com.fasterxml.jackson.core`). Jackson 3 exceptions are unchecked. **AOT/native
+readiness:** because that (de)serialization happens in a `@Component` and not a controller signature,
+Spring's AOT engine can't auto-discover the protocol types, so `ProtocolRuntimeHints`
+(a `RuntimeHintsRegistrar` wired via `@ImportRuntimeHints` on `MessageCodec`) registers their reflection
+hints — derived from each sealed root's `getPermittedSubclasses()` so a newly added message type is covered
+automatically (the carried `MemberInfo`/`ChannelMode`/`ErrorCode` are reached transitively, verified by
+`ProtocolRuntimeHintsTest`). The `org.graalvm.buildtools.native` plugin **is** applied, so `processAot` /
+`processTestAot` / `nativeCompile` / `nativeTest` exist; `build`/`test` generate+compile the AOT sources as a
+dependency but the **test suite stays reflective**. **`bootRun` and the boot jar run AOT-processed by default**
+(`spring.aot.enabled=true` — bootRun via a system property overridable with `-Paot=false`; the jar via a
+bundled `BOOT-INF/classes/spring.properties` that wins over any `-D`, so the jar is always AOT). Never put
+`spring.aot.enabled` in `application.yml` — `AotDetector`/`SpringProperties` read it before the YAML loads.
+`TlsConfiguration` reads `walkie.tls.enabled` **at runtime** (not `@ConditionalOnProperty`), so the TLS/HTTP
+toggle keeps working under AOT — one AOT build serves HTTPS:8443 (default) or HTTP:8080
+(`--walkie.tls.enabled=false`). Do **not** reintroduce a build-time `@Conditional` on that bean; AOT would
+freeze it. See README "Native image / AOT readiness" for the native caveat (`keytool` is absent in a native
+image, so the dev-cert auto-gen path can't run there → supply `WALKIE_TLS_KEYSTORE` or terminate TLS at a proxy).
 
 **Audio wire contract (cross-cutting — read before touching audio).** On the relay transport each
 binary frame is `[1-byte codec tag][payload]`: tag `1` = Opus (48 kHz, 20 ms / 960-samples-per-channel

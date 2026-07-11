@@ -399,6 +399,71 @@ otherwise mono — and interoperates with relay-mode browser clients.
 Structured Concurrency (JEP 505) and Stable Values (JEP 502) are still *preview* in Java 25, so the
 default build stays preview-free.
 
+## Native image / AOT readiness
+
+The server is **GraalVM-native-ready**. The `org.graalvm.buildtools.native` plugin is applied (version
+aligned with Spring Boot's `native-build-tools-plugin.version`), so Spring Boot's AOT tasks are wired in:
+
+```bash
+JAVA_OPTS= ./gradlew :walkie-server:processAot     # run the AOT engine; emits generated context + reachability-metadata.json
+JAVA_OPTS= ./gradlew :walkie-server:nativeCompile  # build the native executable      (needs a GraalVM JDK on PATH)
+JAVA_OPTS= ./gradlew :walkie-server:nativeTest     # run the test suite as a native image (needs a GraalVM JDK)
+```
+
+Only the `native*` tasks need a GraalVM JDK installed; a normal `JAVA_OPTS= ./gradlew build` on the stock
+JVM works unchanged. Note that `build`/`test` now also **generate and compile** the AOT sources (via
+`processAot`/`processTestAot`) as a dependency, so a context that can't be AOT-processed fails the ordinary
+build. The **test suite still executes reflectively** (it only runs in AOT mode under `nativeTest`).
+
+**Normal runs use the AOT-generated context on the JVM.** `bootRun` and the runnable boot jar are wired to
+run with `spring.aot.enabled=true` and the generated classes on the classpath, so they load the pre-computed
+`ApplicationContextInitializer` instead of reflective startup (the log says `Starting AOT-processed …`). The
+jar bundles the flag as `BOOT-INF/classes/spring.properties`, so `java -jar` is **always** AOT (that file wins
+over any `-Dspring.aot.enabled`); `bootRun` sets it as a system property you can override with **`-Paot=false`**.
+
+The `walkie.tls.enabled` toggle keeps working under AOT: `TlsConfiguration` reads it **at runtime** inside
+`customize()` rather than via a build-time `@ConditionalOnProperty`, so one AOT build serves either mode from
+the same generated context — `bootRun` / `java -jar` default to **HTTPS:8443**, and `--walkie.tls.enabled=false`
+brings up **HTTP:8080** even in AOT mode (verified: the log shows `Starting AOT-processed …` followed by either
+`TLS enabled on port 8443` or `TLS disabled … serving plain HTTP`). `-Paot=false` remains only as a general
+reflective-startup escape hatch (e.g. for debugging), not something you need for the HTTP dev mode.
+
+**Why the code is already clean.** There is **no application-level reflection**, all beans use **constructor
+injection**, and there are **no runtime proxies** (`@Transactional`/`@Async`/`@Aspect`), no SpEL/`@Value`,
+and no programmatic bean registration — the patterns that fight AOT. Spring Boot's AOT engine handles the
+framework reflection on its own.
+
+**The one thing AOT can't see, registered explicitly.** The WebSocket protocol (`ClientMessage`/`ServerMessage`
+and the types they carry) is (de)serialized inside `MessageCodec`, a plain `@Component`, so Spring's AOT
+engine — which only auto-derives Jackson binding hints from `@Controller` request/response types — never
+discovers it. `ProtocolRuntimeHints` (a `RuntimeHintsRegistrar` wired via `@ImportRuntimeHints` on
+`MessageCodec`) registers reflection/binding hints for the whole protocol, derived from each sealed root's
+`getPermittedSubclasses()` so the hint set can't drift as message types are added. `ProtocolRuntimeHintsTest`
+asserts the coverage against a `RuntimeHints` instance, so a missing hint fails an ordinary JVM test run
+rather than only surfacing at native runtime. (Confirmed present in the generated `reachability-metadata.json`.)
+
+**On `spring.aot.enabled` — it is deliberately *not* in `application.yml`.** `AotDetector.useGeneratedArtifacts()`
+reads it via `SpringProperties`, which consults a classpath `spring.properties` and JVM system properties
+*before* the `Environment` (and `application.yml`) is loaded — so a value in `application.yml` is never read.
+It also returns `true` automatically inside a native image (no flag needed there). We enable it for JVM runs
+the two places it is actually read: `bootRun` sets it as a **system property** (override with `-Paot=false`),
+and the boot jar bundles it as **`BOOT-INF/classes/spring.properties`** (which takes precedence over any `-D`,
+so the jar is always AOT). It is kept off `src/main/resources` on purpose, so it never reaches the **test**
+classpath — tests have no generated context there and must stay reflective.
+
+**Native-image-only deployment facts:**
+
+- **The self-signed dev-cert path won't work in native.** When TLS is on and no `WALKIE_TLS_KEYSTORE` is set,
+  `TlsConfiguration` shells out to the JDK's `keytool` to mint a dev cert — and `keytool` isn't present in a
+  native image (there is no bundled JDK), so that path fails at startup. A native deployment must supply a real
+  keystore via `WALKIE_TLS_KEYSTORE`, or run with `walkie.tls.enabled=false` **behind a TLS-terminating reverse
+  proxy** — never in the clear (see `deploy/`). TLS itself stays 1.2+/1.3. (The TLS on/off choice is a runtime
+  read, so a native image honours `walkie.tls.enabled` the same as the JVM — it is only the dev-cert
+  *auto-generation* that native can't do.)
+- The JCA algorithms used (`PKCS12` keystore, `HmacSHA512`, EC/X.509 parsing, `SecureRandom`) need GraalVM's
+  security services enabled in the native build args; the community reachability-metadata repository (enabled
+  in `build.gradle.kts`) covers the embedded Tomcat/Jackson/Spring internals.
+
 ## Known constraints (by design)
 
 - **WebRTC is browser-to-browser.** There is no mature pure-Java WebRTC stack, so the Java desktop
