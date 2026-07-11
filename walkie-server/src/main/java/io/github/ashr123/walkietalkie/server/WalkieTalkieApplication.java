@@ -7,7 +7,7 @@ import org.springframework.boot.security.autoconfigure.UserDetailsServiceAutoCon
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 /// Auth is our own stateless bearer-token scheme (`AuthService` + `TokenAuthenticationFilter`), with HTTP Basic
-/// and form login disabled in `SecurityConfig` — so there is no [UserDetailsService] to back. Excluding
+/// and form login disabled in `SecurityConfig` — so there is no `UserDetailsService` to back. Excluding
 /// [UserDetailsServiceAutoConfiguration] stops Spring Boot auto-creating a default in-memory `user` with a random
 /// password printed at startup: an unused default credential we don't want lingering in memory or in the logs.
 @SpringBootApplication(exclude = UserDetailsServiceAutoConfiguration.class)
