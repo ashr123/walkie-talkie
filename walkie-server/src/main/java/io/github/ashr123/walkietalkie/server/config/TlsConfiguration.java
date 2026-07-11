@@ -3,11 +3,11 @@ package io.github.ashr123.walkietalkie.server.config;
 import org.jspecify.annotations.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.web.server.Ssl;
 import org.springframework.boot.web.server.WebServerFactoryCustomizer;
 import org.springframework.boot.web.server.servlet.ConfigurableServletWebServerFactory;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -27,8 +27,17 @@ import java.util.concurrent.TimeUnit;
 
 /// Makes the embedded server speak **HTTPS (and therefore WSS) by default**, so all client↔server traffic —
 /// control messages, the binary audio frames, the login, and the handshake `?token=` — is encrypted in
-/// transit. It is active unless `walkie.tls.enabled=false` (the integration tests and the
-/// "TLS-terminated-at-a-reverse-proxy" production model set that to run plain HTTP).
+/// transit. Set `walkie.tls.enabled=false` to serve plain HTTP instead (the integration tests and the
+/// "TLS-terminated-at-a-reverse-proxy" production model do this).
+///
+/// The enable/disable decision is read **at runtime** inside [#customize] rather than via a
+/// `@ConditionalOnProperty` on the bean — deliberately. Under Spring AOT / GraalVM native a `@Conditional` is
+/// evaluated once, at build time, and frozen into the generated context; that would nail TLS to whatever was set
+/// during `processAot` (absent → on) and make `walkie.tls.enabled` a no-op on a normal AOT run. Registering the
+/// customizer unconditionally and branching on the live property keeps the flag a real runtime switch even when
+/// the app runs from its AOT-generated context (see README "Native image / AOT readiness"). When disabled,
+/// [#customize] returns before touching any keystore, so the server just keeps its plain-HTTP connector on the
+/// configured `server.port`.
 ///
 /// Certificate source:
 /// - if `WALKIE_TLS_KEYSTORE` (+ `WALKIE_TLS_KEYSTORE_PASSWORD`) is set, that operator keystore is used (real
@@ -38,11 +47,13 @@ import java.util.concurrent.TimeUnit;
 ///   its public cert is exported to `dev-cert.pem` so the Java client can trust it on localhost. Browsers show
 ///   a one-time warning. For a CA-issued cert, point `WALKIE_TLS_KEYSTORE` at your keystore.
 @Configuration
-@ConditionalOnProperty(name = "walkie.tls.enabled", havingValue = "true", matchIfMissing = true)
 public class TlsConfiguration implements WebServerFactoryCustomizer<ConfigurableServletWebServerFactory> {
 
 	private static final Logger log = LoggerFactory.getLogger(TlsConfiguration.class);
 
+	/// Runtime toggle: TLS is on unless this is explicitly `false`. Read live in [#customize] (not a
+	/// `@ConditionalOnProperty`) so it survives an AOT/native build — see the class doc.
+	private static final String TLS_ENABLED_PROPERTY = "walkie.tls.enabled";
 	private static final int TLS_PORT = 8443;
 	private static final String DEV_ALIAS = "walkie-dev";
 	/// EC P-384 (`secp384r1`, ~192-bit security) — the strongest curve browsers actually support for TLS.
@@ -74,13 +85,23 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 	private static final Path DEV_PASS_FILE = DEV_TLS_DIR.resolve("dev-keystore.pass");
 
 	private final SecureRandom secureRandom;
+	private final Environment environment;
 
-	public TlsConfiguration(SecureRandom secureRandom) {
+	public TlsConfiguration(SecureRandom secureRandom, Environment environment) {
 		this.secureRandom = secureRandom;
+		this.environment = environment;
 	}
 
 	@Override
 	public void customize(@NonNull ConfigurableServletWebServerFactory factory) {
+		// Read the toggle live rather than via @ConditionalOnProperty, so it stays a real runtime switch under an
+		// AOT/native build (see the class doc). Absent -> on, mirroring the previous matchIfMissing=true; when off
+		// we return before any keystore/cert work, leaving the plain-HTTP connector on the configured server.port.
+		if (!environment.getProperty(TLS_ENABLED_PROPERTY, Boolean.class, true)) {
+			log.info("TLS disabled ({}=false); serving plain HTTP on the configured server.port "
+					+ "(intended for a TLS-terminating reverse proxy).", TLS_ENABLED_PROPERTY);
+			return;
+		}
 		Ssl ssl = new Ssl();
 		ssl.setEnabled(true);
 		ssl.setKeyStoreType("PKCS12");
