@@ -719,7 +719,7 @@ public final class WalkieClient implements AutoCloseable {
 				// sharing — a plaintext→encrypted ENABLE has no old key to wrap under (first secret goes out-of-band),
 				// disabling carries nothing, and `p!` deliberately withholds it (revocation-style). Server relays the
 				// blob blindly; only an old-key holder can unwrap it.
-				String wrappedKey = (share && old != null && next != null) ? old.wrap(passphrase) : null;
+				String wrappedKey = share && old != null && next != null ? old.wrap(passphrase) : null;
 				pendingPassphrase = next == null ? null : passphrase;
 				rekeyInFlight = true;
 				enqueue(new ClientMessage.ChangePassphrase(next == null ? null : next.keyCheck(), wrappedKey));
