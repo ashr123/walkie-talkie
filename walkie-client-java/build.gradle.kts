@@ -18,7 +18,7 @@ dependencies {
     // picocli: declarative command-line parsing (Apache 2.0). Plain library — no Spring runtime.
     implementation("info.picocli:picocli:4.7.7")
 
-    testImplementation(platform("org.junit:junit-bom:6.1.1"))
+    testImplementation(platform("org.junit:junit-bom:6.1.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
