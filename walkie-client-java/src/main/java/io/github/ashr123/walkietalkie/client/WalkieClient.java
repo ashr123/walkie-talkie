@@ -97,7 +97,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// just gained. One source of truth, so the help and the promotion notice can't drift; the server also rejects
 	/// these from a non-owner, so hiding them is UI honesty, not the security boundary.
 	private static final String OWNER_COMMANDS = """
-			Owner:     m <ptt|duplex> = change the mode for everyone (global is a separate room — join with 'c global global')
+			Owner:     m <ptt|global|duplex> = change the mode for everyone ('m global' switches YOU to the global room)
 			           p [passphrase] = change the passphrase (blank = turn encryption off; members auto-adopt)
 			           p! [passphrase] = change the passphrase WITHOUT auto-sharing (members must re-enter it)
 			           o <#id> = give ownership to another member
@@ -352,7 +352,7 @@ public final class WalkieClient implements AutoCloseable {
 				String ownerLine = SERVER_OWNER.equals(ownerId)
 						? "server-managed room — no owner, unencrypted"
 						: selfId.equals(ownerId)
-						  ? "you own this channel — 'm <ptt|duplex>' to change the mode for everyone"
+						  ? "you own this channel — 'm <ptt|global|duplex>' to change the mode for everyone"
 						  : "owner: " + name(ownerId);
 				// If the channel already existed in another mode, its owner's mode wins and you adopt it.
 				String modeNote = mode == options.mode()
@@ -654,21 +654,27 @@ public final class WalkieClient implements AutoCloseable {
 		log("[hi-fi " + (hifi ? "on — music profile" : "off — voice profile") + "] (applies on the next transmitted frame)");
 	}
 
-	/// Asks the server to change the channel mode. Gated locally to the owner (the server enforces it
-	/// too); the resulting [ServerMessage.ModeChanged] is what actually updates everyone's controls.
+	/// `m <ptt|global|duplex>` — mirrors the browser's mode selector. `ptt`/`duplex` change the CURRENT channel's
+	/// mode for everyone (owner-only; the server enforces it, and the echoed [ServerMessage.ModeChanged] is what
+	/// updates the controls). `global` is different: global-ptt lives only in the server-managed "global" room and
+	/// can't be set on a regular channel (the server rejects ChangeMode(GLOBAL_PTT) with INVALID_MODE), so — exactly
+	/// like the browser, whose "global" mode pick performs a Join to the global room rather than a mode change — it
+	/// SWITCHES you there. That's a room change open to anyone (the same as `c global global`), so it is handled
+	/// before the owner gate that guards real mode changes.
 	private void changeMode(String arg) {
+		String mode = arg.toLowerCase(Locale.ROOT);
+		if ("global".equals(mode)) {
+			switchTo("global", ChannelMode.GLOBAL_PTT, null);
+			return;
+		}
 		if (!selfId.equals(ownerId)) {
 			log("[denied] only the channel owner can change the mode");
 			return;
 		}
-		switch (arg.toLowerCase(Locale.ROOT)) {
+		switch (mode) {
 			case "ptt", "multi" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
 			case "duplex", "full" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
-			// "global" is NOT a mode a regular channel can take — the server rejects ChangeMode(GLOBAL_PTT) with
-			// INVALID_MODE (global-ptt lives only in the server-managed "global" room). Redirect rather than send a
-			// doomed request; the browser likewise reaches global by switching rooms, not by changing a mode.
-			case "global" -> log("[mode] 'global' is a separate server-managed room, not a mode for this channel — join it with 'c global global'.");
-			default -> System.out.println("Usage: m <ptt|duplex>");
+			default -> System.out.println("Usage: m <ptt|global|duplex>");
 		}
 	}
 

@@ -312,7 +312,7 @@ All flags are optional (run with `--args="--help"` for the full list):
 > `--input` (e.g. `--input "USB"`).
 
 **Interactive commands** (type at the prompt): `t` talk/stop · `w` list who's in the channel · `m
-<ptt|global|duplex>` change the mode (owner only) · `c <channel> [mode] [key]` switch channel without dropping
+<ptt|global|duplex>` change the mode — `ptt`/`duplex` change the current channel's mode (owner only); `m global` **switches you** to the server-managed global room (like the browser's mode selector, this is a room switch, not a mode change) · `c <channel> [mode] [key]` switch channel without dropping
 the session (mode/key default to the current ones) · `p [passphrase]` change the passphrase (owner; blank turns
 encryption off; auto-shares the new passphrase so members adopt it automatically — a member uses `p` to apply
 the owner's new passphrase) · `p! [passphrase]` rotate **without** auto-sharing (revocation-style; members must
