@@ -358,23 +358,20 @@ public final class WalkieClient implements AutoCloseable {
 						mutedMembers.add(member.id());   // seed the mute state so a member joining a channel with someone already muted renders it
 					}
 				});
-				// Full-duplex: the mic is live as soon as you join, unless --muted was passed; PTT/global start
-				// muted and require 't' to grab the floor. (Full-duplex transmit needs no floor request.) Done AFTER
-				// seeding mutedMembers so a member re-joining its current channel while muted keeps its mic closed —
-				// shouldAutoOpenMic checks the mute.
 				audio.setTransmitting(shouldAutoOpenMic(mode));
-				String ownerLine = SERVER_OWNER.equals(ownerId)
+				log("[joined] channel=" + channel + " mode=" + mode + (mode == options.mode() // If the channel already existed in another mode, its owner's mode wins and you adopt it.
+						? ""
+						: " (you requested " + options.mode() + ", adopted the channel's existing mode)") + " members=" + members.size()
+						+ (locked ? " 🔒 locked" : "")
+						// Full-duplex: the mic is live as soon as you join, unless --muted was passed; PTT/global start
+						// muted and require 't' to grab the floor. (Full-duplex transmit needs no floor request.) Done AFTER
+						// seeding mutedMembers so a member re-joining its current channel while muted keeps its mic closed —
+						// shouldAutoOpenMic checks the mute.
+						+ System.lineSeparator() + "[owner] " + (SERVER_OWNER.equals(ownerId)
 						? "server-managed room — no owner, unencrypted"
 						: selfId.equals(ownerId)
 						  ? "you own this channel — 'm <ptt|global|duplex>' to change the mode for everyone"
-						  : "owner: " + name(ownerId);
-				// If the channel already existed in another mode, its owner's mode wins and you adopt it.
-				String modeNote = mode == options.mode()
-						? ""
-						: " (you requested " + options.mode() + ", adopted the channel's existing mode)";
-				log("[joined] channel=" + channel + " mode=" + mode + modeNote + " members=" + members.size()
-						+ (locked ? " 🔒 locked" : "")
-						+ System.lineSeparator() + "[owner] " + ownerLine
+						  : "owner: " + name(ownerId))
 						+ System.lineSeparator() + modeHint(mode, audio.isTransmitting()));
 				// Report the channel's E2EE status on EVERY confirmed entry (initial join AND in-place switch), like
 				// the browser — so switching into/out of an encrypted channel says so. The global room already states
@@ -393,12 +390,13 @@ public final class WalkieClient implements AutoCloseable {
 			}
 			case ServerMessage.MemberJoined(MemberInfo member) -> announceJoin(member);
 			case ServerMessage.MemberLeft(String memberId) -> announceLeave(memberId);
-			case ServerMessage.MemberRenamed(String memberId, String displayName) -> announceRename(memberId, displayName);
+			case ServerMessage.MemberRenamed(String memberId, String displayName) ->
+					announceRename(memberId, displayName);
 			case ServerMessage.MemberMuted(String memberId, boolean muted) -> handleMuteChange(memberId, muted);
 			case ServerMessage.ChannelLocked(boolean locked) -> handleChannelLocked(locked);
 			case ServerMessage.FloorGranted _ when mutedMembers.contains(selfId) ->
-					// Owner-muted: never open the mic, even on a (stray) grant — the server refuses the floor to a
-					// muted member, so this shouldn't arrive, but guard it like the browser's beginTransmit does.
+				// Owner-muted: never open the mic, even on a (stray) grant — the server refuses the floor to a
+				// muted member, so this shouldn't arrive, but guard it like the browser's beginTransmit does.
 					log("[floor granted] but you are muted by the owner — mic stays closed until unmuted.");
 			case ServerMessage.FloorGranted _ -> {
 				audio.setTransmitting(true);
@@ -432,15 +430,13 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.OwnerChanged(String ownerId) -> {
 				boolean becameOwner = selfId.equals(ownerId) && !selfId.equals(this.ownerId);
 				this.ownerId = ownerId;
-				if (becameOwner) {
-					// On promotion, show the commands we just gained (so the user needn't press 'h' to discover
-					// them) — the same block the role-aware help prints for an owner.
-					log("[owner] you are now the channel owner. You can now also:" + System.lineSeparator() + OWNER_COMMANDS);
-				} else {
-					log(selfId.equals(ownerId)
-							? "[owner] you own this channel"
-							: "[owner] channel owner is now " + name(ownerId));
-				}
+				log(becameOwner ?
+						// On promotion, show the commands we just gained (so the user needn't press 'h' to discover
+						// them) — the same block the role-aware help prints for an owner.
+						"[owner] you are now the channel owner. You can now also:" + System.lineSeparator() + OWNER_COMMANDS :
+						selfId.equals(ownerId)
+						? "[owner] you own this channel"
+						: "[owner] channel owner is now " + name(ownerId));
 				// Mirror the browser: if we were promoted while still holding a key that doesn't match the channel
 				// (a rotation we never reconciled), warn that 'p' now ROTATES for everyone — so a user must not
 				// just re-type the stale passphrase (it would re-key the whole channel to it).
@@ -450,7 +446,8 @@ public final class WalkieClient implements AutoCloseable {
 					log("[owner] note: your key doesn't match the channel — as owner, 'p <passphrase>' now ROTATES it for everyone, so set one you actually hold instead of re-typing a stale one.");
 				}
 			}
-			case ServerMessage.PassphraseChanged(String keyCheck, String wrappedKey) -> handlePassphraseChanged(keyCheck, wrappedKey);
+			case ServerMessage.PassphraseChanged(String keyCheck, String wrappedKey) ->
+					handlePassphraseChanged(keyCheck, wrappedKey);
 			case ServerMessage.SignalOffer _, ServerMessage.SignalAnswer _,
 			     ServerMessage.SignalIce _ -> { /* WebRTC: not used by the relay client */ }
 			case ServerMessage.ErrorMessage(ErrorCode code, String message) -> {
@@ -771,7 +768,8 @@ public final class WalkieClient implements AutoCloseable {
 					currentPassphrase = passphrase;
 					log("[passphrase] re-keyed — end-to-end encryption updated.");
 				}
-				case KEEP -> log("[passphrase] that passphrase doesn't match the channel's current key — try 'p <passphrase>' again.");
+				case KEEP ->
+						log("[passphrase] that passphrase doesn't match the channel's current key — try 'p <passphrase>' again.");
 			}
 		} catch (GeneralSecurityException e) {
 			log("[passphrase] key derivation failed: " + e.getMessage());
@@ -826,7 +824,8 @@ public final class WalkieClient implements AutoCloseable {
 					currentPassphrase = passphrase;
 					log("[passphrase] channel re-keyed — end-to-end encryption updated.");
 				}
-				case KEEP -> log("[passphrase] the owner changed the passphrase — run 'p <new-passphrase>' to keep talking.");
+				case KEEP ->
+						log("[passphrase] the owner changed the passphrase — run 'p <new-passphrase>' to keep talking.");
 			}
 		} catch (GeneralSecurityException e) {
 			log("[passphrase] key derivation failed: " + e.getMessage());
@@ -921,7 +920,8 @@ public final class WalkieClient implements AutoCloseable {
 				enqueue(new ClientMessage.TransferOwnership(target));
 				log("[transfer] handing ownership to " + name(target) + "...");
 			}
-			default -> log("[transfer] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
+			default ->
+					log("[transfer] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
 		}
 	}
 
@@ -960,13 +960,15 @@ public final class WalkieClient implements AutoCloseable {
 		}
 		List<String> matches = otherMembersMatching(prefix);
 		switch (matches.size()) {
-			case 0 -> log("[" + verb + "] no other member's id starts with \"" + prefix + "\" — use 'w' to list members.");
+			case 0 ->
+					log("[" + verb + "] no other member's id starts with \"" + prefix + "\" — use 'w' to list members.");
 			case 1 -> {
 				String target = matches.getFirst();
 				enqueue(new ClientMessage.MuteMember(target, muted));
 				log("[" + verb + "] " + verb + "-ing " + name(target) + "...");
 			}
-			default -> log("[" + verb + "] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
+			default ->
+					log("[" + verb + "] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
 		}
 	}
 
