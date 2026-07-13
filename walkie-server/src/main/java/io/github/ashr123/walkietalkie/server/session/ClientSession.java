@@ -17,6 +17,12 @@ public interface ClientSession {
 	/// The channel currently joined, or `null` if not in a channel.
 	String channelName();
 
+	/// The channel this socket was routed to at the WebSocket handshake (the `channel` query param), or `null`
+	/// if none was supplied. Under multi-instance channel affinity it identifies the channel this instance was
+	/// picked to serve for this connection; single-instance it is informational only. Unlike [#channelName] it is
+	/// fixed for the connection's lifetime (a switch changes `channelName`, not this).
+	String handshakeChannel();
+
 	void joinedChannel(String channel);
 
 	void leftChannel();

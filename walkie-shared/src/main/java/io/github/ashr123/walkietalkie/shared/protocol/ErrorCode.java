@@ -38,6 +38,10 @@ public enum ErrorCode {
 	/// A request naming another member (signal, transfer, mute) whose target isn't addressable — not a member,
 	/// or the owner itself as a mute target.
 	UNKNOWN_TARGET,
+	/// `join`/switch to a channel served by a DIFFERENT instance than the one this socket is connected to
+	/// (multi-instance channel-affinity routing only; never emitted single-instance). The client must reconnect
+	/// so the router pins the new socket to the instance that owns the target channel.
+	CHANNEL_ROUTING_MISMATCH,
 	/// Not a real wire code: the deserialization fallback for a code minted by a NEWER server than this client
 	/// (see the class doc). Treat as "an error happened, nothing special to do beyond showing the message".
 	@JsonEnumDefaultValue

@@ -3,8 +3,14 @@
     {
       "name": "walkie.tls.enabled",
       "type": "java.lang.Boolean",
-      "description": "Whether the server serves HTTPS/WSS (transport TLS). On by default; set to false to serve plain HTTP (e.g. behind a TLS-terminating reverse proxy). Consumed by TlsConfiguration via @ConditionalOnProperty.",
+      "description": "Whether the server serves HTTPS/WSS (transport TLS). On by default; set to false to serve plain HTTP (e.g. behind a TLS-terminating reverse proxy). Read at runtime by TlsConfiguration (not @ConditionalOnProperty, so the toggle survives AOT/native).",
       "defaultValue": true
+    },
+    {
+      "name": "walkie.channel-affinity",
+      "type": "java.lang.Boolean",
+      "description": "Multi-instance channel-affinity routing. When true, a socket may only serve a channel this instance owns (the handshake ?channel= it was routed to, or one it already hosts); a switch to a channel owned by another instance is refused with CHANNEL_ROUTING_MISMATCH so the client reconnects and the router re-pins it. Requires a channel-aware ingress that consistent-hashes the ?channel= query param. Off (default) = single instance: every channel is served locally.",
+      "defaultValue": false
     }
   ]
 }

@@ -173,6 +173,19 @@ public class ConnectionService {
 					"The global channel can't be end-to-end encrypted — clear the passphrase to join it.");
 			return;
 		}
+		// Channel-affinity (multi-instance): this socket may only serve a channel THIS instance owns — the channel
+		// it was routed to at the handshake, or one it already hosts (a live local Channel proves that channel
+		// routes here, by the affinity invariant). A switch to a channel owned by another instance is refused so
+		// the client reconnects and the router re-pins it. Off (single instance): every channel is served here, so
+		// this is skipped and switches stay in place. (The idempotent re-Join of the current channel returned above,
+		// so it never reaches here.)
+		if (properties.channelAffinity()
+				&& !requested.equals(session.handshakeChannel())
+				&& !(channelRegistry.find(requested) instanceof Some(Channel _))) {
+			sendError(session, ErrorCode.CHANNEL_ROUTING_MISMATCH,
+					"'" + requested + "' is served by another instance — reconnect to switch to it.");
+			return;
+		}
 
 		// Switching channels: leave the current one only after the target passed the validations above.
 		if (session.channelName() != null) {

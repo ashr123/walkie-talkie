@@ -276,6 +276,27 @@ behind even for control is disconnected to force a clean reconnect/re-sync. The 
 limit aborts a wedged in-flight write). In the Java client the Opus encoder/decoder are confined to the
 capture/playback threads respectively.
 
+**Multi-instance (channel affinity), off by default.** The `Channel` (membership, floor, owner/mode/lock,
+keyCheck, mute, audio fan-out, stream-index pool) is entirely in-process, so horizontal scaling uses
+**channel affinity**: an external ingress consistent-hashes the handshake `?channel=` query param so every
+member of a channel lands on the one instance that owns it (each instance owns a disjoint set of channels — no
+shared media bus). Both clients send that param; `ChannelHandshakeInterceptor` captures it into the session
+(`ClientSession.handshakeChannel()`). When `walkie.channel-affinity=true`, `ConnectionService.handleJoin`
+enforces the invariant **a socket may only serve a channel this instance owns** — the handshake channel, or one
+it already hosts (`channelRegistry.find` present ⇒ that channel routes here by the affinity invariant) — and
+refuses a switch to a channel owned elsewhere with `CHANNEL_ROUTING_MISMATCH` (client reconnects, ingress
+re-pins). The flag defaults **false** (single instance): the check is skipped and in-place switches work as
+before. Tokens are already stateless (share `WALKIE_AUTH_SIGNING_KEY`). **The Java client auto-reconnects on
+`CHANNEL_ROUTING_MISMATCH`**: `WalkieClient.switchTo` advances the connect target (`connectChannel`/`connectMode`,
+distinct from the server-confirmed `currentChannel`/`currentMode`) and applies the target's key optimistically;
+on the mismatch, `reconnect()` (its own virtual thread — not the listener callback) closes the socket and opens a
+fresh one carrying `?channel=<target>`, whose `onOpen` re-joins the target. A `reconnecting` flag makes the old
+socket's `onClose` a no-op (not a lost connection → no process exit) and collapses a burst of mismatches into one
+reconnect; the sender loop now survives a single failed send (socket closing/swapped) instead of exiting.
+Not yet done: the **browser** client's auto-reconnect (`app.js` still surfaces the code as a logged error); the
+`global` room hashes to one instance (doesn't scale); a single oversized channel would need a shared backplane.
+See README "Known constraints".
+
 ## Testing notes
 
 Server tests mix unit (`FloorControlServiceTest`, `ChannelRegistryTest` via the `FakeClientSession`

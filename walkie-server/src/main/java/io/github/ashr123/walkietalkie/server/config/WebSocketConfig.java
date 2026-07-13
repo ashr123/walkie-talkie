@@ -1,6 +1,7 @@
 package io.github.ashr123.walkietalkie.server.config;
 
 import io.github.ashr123.walkietalkie.server.transport.AudioRelayHandler;
+import io.github.ashr123.walkietalkie.server.transport.ChannelHandshakeInterceptor;
 import io.github.ashr123.walkietalkie.server.transport.SignalingHandler;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -21,20 +22,29 @@ public class WebSocketConfig implements WebSocketConfigurer {
 
 	private final AudioRelayHandler audioRelayHandler;
 	private final SignalingHandler signalingHandler;
+	private final ChannelHandshakeInterceptor channelHandshakeInterceptor;
 	private final WalkieProperties properties;
 
 	public WebSocketConfig(AudioRelayHandler audioRelayHandler,
 	                       SignalingHandler signalingHandler,
+	                       ChannelHandshakeInterceptor channelHandshakeInterceptor,
 	                       WalkieProperties properties) {
 		this.audioRelayHandler = audioRelayHandler;
 		this.signalingHandler = signalingHandler;
+		this.channelHandshakeInterceptor = channelHandshakeInterceptor;
 		this.properties = properties;
 	}
 
 	@Override
 	public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
-		registry.addHandler(audioRelayHandler, "/ws/audio").setAllowedOriginPatterns(properties.allowedOrigins());
-		registry.addHandler(signalingHandler, "/ws/signal").setAllowedOriginPatterns(properties.allowedOrigins());
+		// The interceptor captures the ?channel= routing key into the session attributes (see
+		// ChannelHandshakeInterceptor) before either handler's afterConnectionEstablished runs.
+		registry.addHandler(audioRelayHandler, "/ws/audio")
+				.addInterceptors(channelHandshakeInterceptor)
+				.setAllowedOriginPatterns(properties.allowedOrigins());
+		registry.addHandler(signalingHandler, "/ws/signal")
+				.addInterceptors(channelHandshakeInterceptor)
+				.setAllowedOriginPatterns(properties.allowedOrigins());
 	}
 
 	@Bean

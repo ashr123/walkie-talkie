@@ -54,6 +54,8 @@ public final class WebSocketClientSession implements ClientSession {
 	private final WebSocketSession session;
 	private final MessageCodec codec;
 	private final Transport transport;
+	/// The `channel` query param captured at the handshake (see [ClientSession#handshakeChannel]); may be null.
+	private final String handshakeChannel;
 
 	private final BlockingQueue<Runnable> controlOut = new LinkedBlockingQueue<>(CONTROL_CAPACITY);
 	private final BlockingQueue<Runnable> audioOut = new LinkedBlockingQueue<>(AUDIO_CAPACITY);
@@ -68,10 +70,17 @@ public final class WebSocketClientSession implements ClientSession {
 
 	public WebSocketClientSession(WebSocketSession session,
 	                              MessageCodec codec,
-	                              Transport transport) {
+	                              Transport transport,
+	                              String handshakeChannel) {
 		this.session = session;
 		this.codec = codec;
 		this.transport = transport;
+		this.handshakeChannel = handshakeChannel;
+	}
+
+	@Override
+	public String handshakeChannel() {
+		return handshakeChannel;
 	}
 
 	/// Starts the single outbound drainer virtual thread. Called once, AFTER the session has been registered

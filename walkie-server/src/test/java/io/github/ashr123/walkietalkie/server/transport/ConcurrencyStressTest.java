@@ -48,7 +48,7 @@ class ConcurrencyStressTest {
 						0,
 						0,
 						null
-				)
+				, false)
 		);
 
 		int workers = 16;
@@ -138,7 +138,7 @@ class ConcurrencyStressTest {
 						0,
 						0,
 						null
-				)
+				, false)
 		);
 
 		int members = 8;

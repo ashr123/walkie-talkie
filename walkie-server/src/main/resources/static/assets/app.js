@@ -188,10 +188,11 @@ async function connect() {
 		state.txChain = Promise.resolve();
 		state.warnedDecrypt = false;
 
-		const path = state.transport === 'webrtc' ? '/ws/signal' : '/ws/audio';
-		const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-		const url = `${proto}://${location.host}${path}?token=${encodeURIComponent(state.token)}`;
-		const ws = new WebSocket(url);
+		// Carry the effective channel as the ?channel= routing key so a channel-affinity ingress can pin this
+		// socket to the instance owning the channel (server: ChannelHandshakeInterceptor). Harmless single-instance.
+		const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${state.transport === 'webrtc' ? '/ws/signal' : '/ws/audio'}`
+			+ `?token=${encodeURIComponent(state.token)}`
+			+ `&channel=${encodeURIComponent(state.mode === 'GLOBAL_PTT' ? 'global' : channel)}`);
 		ws.binaryType = 'arraybuffer';
 		state.ws = ws;
 
@@ -739,6 +740,16 @@ function onWsMessage(ev) {
 			} else if (msg.code === 'CHANNEL_FULL') {
 				// The channel is at its member limit — the join failed the same way as a locked/mismatched one.
 				log('This channel is full — it has reached its member limit.');
+				disconnect();
+			} else if (msg.code === 'CHANNEL_ROUTING_MISMATCH') {
+				// Channel affinity (multi-instance): the channel we tried to switch to lives on another instance, so
+				// an in-place switch can't reach it. Reconnect as a NEW session — reusing the transport-change path
+				// (pendingReconnect → disconnect → ws.onclose → connect). connect() re-reads the form, which still
+				// holds the target channel/mode/passphrase we just tried (a rejected switch doesn't clear them), so
+				// the fresh socket carries ?channel=<target> and the ingress routes it to the owning instance,
+				// transparently completing the switch. A single instance never emits this code, so it stays dormant.
+				log('Reconnecting to reach it on the instance that owns it…');
+				state.pendingReconnect = true;
 				disconnect();
 			} else if (msg.code === 'NOT_OWNER' || msg.code === 'UNKNOWN_TARGET') {
 				// A rejected ownership transfer leaves the dropdown showing the failed target — snap it back to the

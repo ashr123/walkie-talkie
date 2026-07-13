@@ -27,7 +27,7 @@ class AuthServiceTest {
 	}
 
 	private static WalkieProperties props(String signingKey) {
-		return new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 200, 5, 300, signingKey);
+		return new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 200, 5, 300, signingKey, false);
 	}
 
 	@Test

@@ -115,13 +115,18 @@ public final class WalkieClient implements AutoCloseable {
 	private final HttpClient httpClient;
 	private final AtomicBoolean running = new AtomicBoolean(true);
 	private final AtomicBoolean closed = new AtomicBoolean();   // guards close() so it is idempotent
+	// True only while an intentional channel-affinity reconnect tears down the old socket and opens a new one, so
+	// the old socket's onClose is not mistaken for a lost connection (which would exit the process). See reconnect().
+	private final AtomicBoolean reconnecting = new AtomicBoolean();
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
 	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
 	// Session ids the owner has muted (server-authoritative — the server also DROPS their relay audio). Read on the
 	// capture thread's frame sink (a lock-free concurrent set), mutated on the single listener thread from MemberMuted.
 	private final Set<String> mutedMembers = ConcurrentHashMap.newKeySet();
 	private final AudioEngine audio;
-	private final WebSocket webSocket;
+	// The live relay socket. Volatile (not final) because a CHANNEL_ROUTING_MISMATCH reconnect swaps it for a new
+	// socket bound to the target channel's instance; onOpen publishes each new socket here before it queues its Join.
+	private volatile WebSocket webSocket;
 	// AES-256-GCM E2EE for the current channel, or null when no passphrase. Volatile + reassigned on an in-place
 	// channel switch (the `c` command), since the capture/playback loops read it from other threads.
 	private volatile FrameCrypto crypto;
@@ -129,6 +134,11 @@ public final class WalkieClient implements AutoCloseable {
 	private volatile String ownerId;
 	private volatile ChannelMode currentMode;
 	private volatile String currentChannel;     // server-confirmed current channel (updated on Joined)
+	// The channel/mode this socket (re)connects and joins as: the ?channel= routing key at the handshake AND the
+	// Join sent from onOpen. Distinct from currentChannel/currentMode (server-CONFIRMED) — switchTo advances these
+	// to the target OPTIMISTICALLY so a CHANNEL_ROUTING_MISMATCH reconnect rebuilds against the channel we asked for.
+	private volatile String connectChannel;
+	private volatile ChannelMode connectMode;
 	private volatile String currentPassphrase;   // passphrase backing the current channel's key (for switch defaults)
 	private volatile String currentChannelKeyCheck;   // the channel's currently-announced key-check (null = unencrypted); the yardstick a member re-keys against
 	private volatile boolean rekeyInFlight;      // true between sending our own ChangePassphrase (owner) and its echoed PassphraseChanged
@@ -157,6 +167,8 @@ public final class WalkieClient implements AutoCloseable {
 				.build();
 		this.currentMode = options.mode();
 		this.currentChannel = options.channel();
+		this.connectChannel = options.channel();
+		this.connectMode = options.mode();
 		this.currentPassphrase = options.key();
 		this.audio = new AudioEngine(options, this::sendAudioFrame);
 		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
@@ -168,10 +180,9 @@ public final class WalkieClient implements AutoCloseable {
 				+ (crypto == null ? "" : ", end-to-end encrypted (AES-256-GCM)"));
 
 		webSocket = connect(token);
-		// Start the sender only after webSocket is assigned, so this final field is safely published to the
-		// sender thread (Thread.start() happens-after the write). The final-field freeze can't be relied on
-		// here because `this` escapes during construction. A join queued by onOpen during connect is sent
-		// once the sender drains the queue.
+		// Start the sender only after webSocket is assigned, so it is published to the sender thread (Thread.start()
+		// happens-after the write, and the field is volatile). onOpen republishes each socket it opens — including a
+		// reconnect's — into webSocket before queueing that socket's Join, so a Join is never sent on a stale socket.
 		Thread.ofVirtual().name("ptt-sender").start(this::senderLoop);
 
 		// Blocks until the user quits or stdin closes; the caller then closes us (try-with-resources).
@@ -278,18 +289,21 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	private void senderLoop() {
-		try {
-			while (running.get()) {
+		while (running.get()) {
+			try {
 				(switch (sendQueue.take()) {
 					case Outbound.Text(String json) -> webSocket.sendText(json, true);
 					case Outbound.Binary(byte[] data) -> webSocket.sendBinary(ByteBuffer.wrap(data), true);
 				})
 						.join();
+			} catch (InterruptedException _) {
+				Thread.currentThread().interrupt();
+				return;
+			} catch (RuntimeException _) {
+				// This one send failed — the socket is closing, or was swapped mid-reconnect (this frame targeted the
+				// old socket). Drop the frame and keep draining on the current socket; a genuine disconnect is caught
+				// by the listener (onClose/onError -> onConnectionLost), which is what actually ends the session.
 			}
-		} catch (InterruptedException _) {
-			Thread.currentThread().interrupt();
-		} catch (RuntimeException _) {
-			// connection closed; sender exits quietly
 		}
 	}
 
@@ -473,6 +487,11 @@ public final class WalkieClient implements AutoCloseable {
 							System.exit(0);
 						}
 					}
+					// The target channel lives on another instance (channel affinity): an in-place switch can't reach
+					// it, so reconnect — a fresh handshake carrying ?channel=<target> is routed to the owning instance,
+					// and switchTo already applied the target's mode/key + advanced connectChannel/connectMode so the
+					// re-join lands us in it. A single instance never emits this code, so this path stays dormant there.
+					case CHANNEL_ROUTING_MISMATCH -> reconnect();
 					// Every other code — including UNKNOWN, the fallback the mapper substitutes for a code a NEWER
 					// server minted (see ErrorCode) — needs no reaction beyond the [error] line already logged. A
 					// deliberate default: future codes must degrade gracefully here, not force client handling.
@@ -844,6 +863,11 @@ public final class WalkieClient implements AutoCloseable {
 			FrameCrypto next = deriveCrypto(passphrase, mode, channel);
 			crypto = next;                 // volatile — the capture/playback loops pick up the new key
 			currentPassphrase = passphrase;
+			// Advance the (re)connect target too, optimistically like crypto above: if the server refuses this
+			// in-place switch with CHANNEL_ROUTING_MISMATCH (the target lives on another instance under channel
+			// affinity), reconnect() rebuilds the socket against exactly this channel/mode and onOpen re-joins it.
+			connectChannel = channel;
+			connectMode = mode;
 			// Do NOT advance currentChannelKeyCheck here: leave it at the OLD channel's value until the server
 			// confirms the switch (the Joined handler baselines it). The server still routes our audio to the OLD
 			// channel during the join round-trip, so if we're switching OUT of an encrypted channel to a plaintext
@@ -959,9 +983,16 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	private WebSocket connect(String token) {
+		// Carry the effective channel as the ?channel= routing key so a channel-affinity ingress can pin this
+		// socket to the instance that owns the channel (see the server's ChannelHandshakeInterceptor). Harmless
+		// single-instance. Global forces the routing key to "global", matching the Join's effective channel. Reads
+		// the connect target (not options) so a reconnect routes to the channel we switched to, not the startup one.
+		String routingChannel = connectMode == ChannelMode.GLOBAL_PTT ? "global" : connectChannel;
 		return httpClient.newWebSocketBuilder()
 				.buildAsync(
-						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8)),
+						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio"
+								+ "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8)
+								+ "&channel=" + URLEncoder.encode(routingChannel, StandardCharsets.UTF_8)),
 						new ClientListener()
 				)
 				.join();
@@ -972,10 +1003,12 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	private void sendJoin() {
+		// (Re)announce us on this socket's target channel. connectChannel/connectMode (not options) so a reconnect
+		// joins the channel we switched to; the current display (not options.display()) so a rename survives it.
 		enqueue(new ClientMessage.Join(
-				options.channel(),
-				options.mode(),
-				options.display(),
+				connectChannel,
+				connectMode,
+				memberNames.getOrDefault(selfId, options.display()),
 				crypto == null ? null : crypto.keyCheck()
 		));
 	}
@@ -1010,6 +1043,40 @@ public final class WalkieClient implements AutoCloseable {
 			Thread.currentThread().interrupt();
 		}
 		System.out.println("Goodbye.");
+	}
+
+	/// Rebuilds the relay socket against the current connect target and re-joins it. Triggered by
+	/// `CHANNEL_ROUTING_MISMATCH`: under channel affinity the target channel lives on another instance, so only a
+	/// fresh handshake — carrying `?channel=<target>` — is routed to the owning instance; an in-place switch can't
+	/// reach it. [#switchTo] already applied the target's mode/key and advanced [#connectChannel]/[#connectMode], so
+	/// [ClientListener#onOpen]'s [#sendJoin] lands us straight in it.
+	///
+	/// Runs on its own virtual thread — never the listener callback thread (whose executor [#connect]'s `join()`
+	/// blocks on) and never the console thread. A fresh token keeps it robust even if the original has expired
+	/// (login takes no input). The [#reconnecting] guard both collapses a burst of mismatches into one reconnect and
+	/// tells the old socket's `onClose` this drop is intentional, so it is not treated as a lost connection.
+	private void reconnect() {
+		if (!reconnecting.compareAndSet(false, true)) {
+			return;   // a reconnect is already in flight; ignore piled-up mismatches
+		}
+		log("[switch] \"" + connectChannel + "\" is served by another instance — reconnecting to reach it...");
+		Thread.ofVirtual().name("ptt-reconnect").start(() -> {
+			try {
+				WebSocket previous = webSocket;
+				if (previous != null) {
+					previous.sendClose(WebSocket.NORMAL_CLOSURE, "switching instance");
+				}
+				webSocket = connect(login());   // onOpen publishes the new socket + re-joins the target via sendJoin()
+			} catch (IOException | RuntimeException e) {
+				log("[reconnect] could not switch to \"" + connectChannel + "\": " + e.getMessage());
+				onConnectionLost();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				onConnectionLost();
+			} finally {
+				reconnecting.set(false);
+			}
+		});
 	}
 
 	/// Reacts to the WebSocket dropping. A user-initiated quit has already flipped `running` to false and
@@ -1047,6 +1114,10 @@ public final class WalkieClient implements AutoCloseable {
 
 		@Override
 		public void onOpen(WebSocket webSocket) {
+			// Publish this socket as the live one BEFORE queueing its Join, so the sender thread (which reads the
+			// volatile webSocket) sends that Join on THIS socket even on a reconnect — where the sender is already
+			// running and the reconnect thread's own `webSocket = connect(...)` assignment may not have landed yet.
+			WalkieClient.this.webSocket = webSocket;
 			log("[connected]");
 			sendJoin();
 			webSocket.request(1);
@@ -1112,6 +1183,11 @@ public final class WalkieClient implements AutoCloseable {
 
 		@Override
 		public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+			if (reconnecting.get() || webSocket != WalkieClient.this.webSocket) {
+				// An intentional reconnect closing the OLD socket (or a late close of one we already replaced) — not
+				// a lost connection. The new socket's own future close, once reconnecting clears, is handled normally.
+				return null;
+			}
 			log("[closed " + statusCode + (reason.isBlank() ? "" : " " + reason) + "]");
 			onConnectionLost();
 			return null;
@@ -1119,6 +1195,9 @@ public final class WalkieClient implements AutoCloseable {
 
 		@Override
 		public void onError(WebSocket webSocket, Throwable error) {
+			if (reconnecting.get() || webSocket != WalkieClient.this.webSocket) {
+				return;   // an error on a socket we are intentionally tearing down / have already replaced
+			}
 			log("[error] " + error.getMessage());
 			onConnectionLost();
 		}

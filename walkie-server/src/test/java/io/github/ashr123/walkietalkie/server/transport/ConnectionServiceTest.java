@@ -39,7 +39,7 @@ class ConnectionServiceTest {
 					1_000_000,
 					5,
 					300,
-					null
+					null, false
 			)
 	);
 
@@ -58,7 +58,7 @@ class ConnectionServiceTest {
 						1_000_000,
 						idleSeconds,
 						maxHoldSeconds,
-						null
+						null, false
 				),
 				clock
 		);
@@ -97,6 +97,65 @@ class ConnectionServiceTest {
 		FakeClientSession session = session(id);
 		service.onMessage(session, new ClientMessage.Join(channelName, mode, id, null));
 		return session;
+	}
+
+	// --- channel affinity (multi-instance routing) -------------------------------------------------
+
+	/// A service with `channelAffinity` ON, over the shared registry — so the routing invariant is exercised.
+	private ConnectionService affinityService() {
+		return new ConnectionService(
+				channelRegistry,
+				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, null, true));
+	}
+
+	private static boolean received(FakeClientSession session, ErrorCode code) {
+		return session.sent.stream().anyMatch(m -> m instanceof ServerMessage.ErrorMessage(ErrorCode c, String _) && c == code);
+	}
+
+	@Test
+	void channelAffinityAllowsJoiningTheHandshakeChannel() {
+		ConnectionService svc = affinityService();
+		FakeClientSession alice = session("alice");
+		alice.setHandshakeChannel("team1");   // the router pinned this socket to team1
+		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		assertEquals("team1", alice.channelName());
+		assertFalse(received(alice, ErrorCode.CHANNEL_ROUTING_MISMATCH));
+	}
+
+	@Test
+	void channelAffinityAllowsSwitchingToAChannelThisInstanceAlreadyHosts() {
+		ConnectionService svc = affinityService();
+		FakeClientSession bob = session("bob");
+		bob.setHandshakeChannel("team2");
+		svc.onMessage(bob, new ClientMessage.Join("team2", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));   // team2 now hosted here
+		FakeClientSession alice = session("alice");
+		alice.setHandshakeChannel("team1");
+		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.Join("team2", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));   // co-located switch
+		assertEquals("team2", alice.channelName());
+		assertFalse(received(alice, ErrorCode.CHANNEL_ROUTING_MISMATCH));
+	}
+
+	@Test
+	void channelAffinityRefusesSwitchingToAChannelOwnedByAnotherInstance() {
+		ConnectionService svc = affinityService();
+		FakeClientSession alice = session("alice");
+		alice.setHandshakeChannel("team1");
+		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		// team9 is neither the handshake channel nor hosted here → this socket can't serve it.
+		svc.onMessage(alice, new ClientMessage.Join("team9", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		assertTrue(received(alice, ErrorCode.CHANNEL_ROUTING_MISMATCH));
+		assertEquals("team1", alice.channelName(), "the rejected switch must not drop the client from its channel");
+		assertFalse(channelExists("team9"), "the wrong-instance channel must not be created here");
+	}
+
+	@Test
+	void withoutChannelAffinityASwitchToAnyChannelIsAllowed() {
+		// The default `service` has affinity OFF: switching to a brand-new channel is fine (single instance).
+		FakeClientSession alice = join("alice", "team1", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.Join("team9", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		assertEquals("team9", alice.channelName());
+		assertFalse(received(alice, ErrorCode.CHANNEL_ROUTING_MISMATCH));
 	}
 
 	@Test
@@ -970,7 +1029,7 @@ class ConnectionServiceTest {
 						1_000_000,
 						0,
 						0,
-						null
+						null, false
 				)
 		);
 		FakeClientSession alice = session("alice");
@@ -999,7 +1058,7 @@ class ConnectionServiceTest {
 						1_000_000,
 						0,
 						0,
-						null
+						null, false
 				)
 		);
 		FakeClientSession alice = session("alice");
@@ -1034,7 +1093,7 @@ class ConnectionServiceTest {
 						2,
 						0,
 						0,
-						null
+						null, false
 				),
 				new MutableClock(Instant.EPOCH)
 		);
@@ -1484,6 +1543,11 @@ class ConnectionServiceTest {
 		@Override
 		public String id() {
 			return id;
+		}
+
+		@Override
+		public String handshakeChannel() {
+			return null;
 		}
 
 		@Override

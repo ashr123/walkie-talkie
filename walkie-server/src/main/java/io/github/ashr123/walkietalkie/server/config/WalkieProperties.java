@@ -30,6 +30,12 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 ///                               `walkie.auth-signing-key` (env `WALKIE_AUTH_SIGNING_KEY`). Blank/absent means
 ///                               a random key is generated per process (dev only — tokens then don't survive a
 ///                               restart or span instances). Never hardcode a real key.
+/// @param channelAffinity        multi-instance routing switch (`walkie.channel-affinity`, default `false`). When
+///                               enabled, a socket may only serve a channel that this instance OWNS — the channel
+///                               it was routed to at the handshake, or any channel it already hosts — and a switch
+///                               to a channel owned by another instance is refused with `CHANNEL_ROUTING_MISMATCH`
+///                               so the client reconnects and the router re-pins it. Off (single instance): every
+///                               channel is served here, so no routing check applies and switches stay in place.
 @ConfigurationProperties(prefix = "walkie")
 public record WalkieProperties(
 		String[] allowedOrigins,
@@ -39,7 +45,8 @@ public record WalkieProperties(
 		long maxControlMessagesPerSecond,
 		long floorIdleReleaseSeconds,
 		long floorMaxHoldSeconds,
-		String authSigningKey) {
+		String authSigningKey,
+		boolean channelAffinity) {
 
 	/// One second has this many nanoseconds; above this many events/second a rate limiter's per-token interval
 	/// (1 s ÷ rate) would round down to zero nanoseconds and its `Duration.dividedBy` would throw, so any rate is

@@ -17,11 +17,23 @@ public final class FakeClientSession implements ClientSession {
 	private final Transport transport;
 	private String displayName;
 	private String channelName;
+	private String handshakeChannel;   // the routing channel a test pins via setHandshakeChannel (null by default)
 
 	public FakeClientSession(String id, Transport transport, String displayName) {
 		this.id = id;
 		this.transport = transport;
 		this.displayName = displayName;
+	}
+
+	/// Test hook: set the channel this fake was "routed to" at the handshake (see [ClientSession#handshakeChannel]),
+	/// so channel-affinity behaviour can be exercised without a real WebSocket handshake.
+	public void setHandshakeChannel(String handshakeChannel) {
+		this.handshakeChannel = handshakeChannel;
+	}
+
+	@Override
+	public String handshakeChannel() {
+		return handshakeChannel;
 	}
 
 	@Override

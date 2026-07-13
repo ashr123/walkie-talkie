@@ -125,7 +125,8 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 						SEND_BUFFER_LIMIT_BYTES
 				),
 				codec,
-				transport
+				transport,
+				(String) session.getAttributes().get(ChannelHandshakeInterceptor.HANDSHAKE_CHANNEL_ATTR)
 		);
 		session.getAttributes().put(SESSION_KEY, clientSession);
 		// Start the outbound pump only after the session is registered, so afterConnectionClosed can always

@@ -19,7 +19,7 @@ class WalkiePropertiesTest {
 				-1,
 				-1,
 				null
-		);
+		, false);
 		assertArrayEquals(new String[]{"*"}, p.allowedOrigins(), "null origins default to the wildcard");
 		assertEquals(8 * 1024, p.maxAudioFrameBytes(), "a non-positive audio size falls back to 8 KiB");
 		assertEquals(64 * 1024, p.maxTextMessageBytes(), "a non-positive text size falls back to 64 KiB");
@@ -43,7 +43,7 @@ class WalkiePropertiesTest {
 						1,
 						1,
 						null
-				)
+				, false)
 						.allowedOrigins()
 		);
 	}
@@ -59,7 +59,7 @@ class WalkiePropertiesTest {
 				7,
 				42,
 				"secret"
-		);
+		, false);
 		assertArrayEquals(new String[]{"https://example.test"}, p.allowedOrigins());
 		assertEquals(4096, p.maxAudioFrameBytes());
 		assertEquals(16384, p.maxTextMessageBytes());
@@ -81,7 +81,7 @@ class WalkiePropertiesTest {
 				0,
 				0,
 				null
-		);
+		, false);
 		assertEquals(0, p.floorIdleReleaseSeconds(), "0 disables idle auto-release (not coerced to the default)");
 		assertEquals(0, p.floorMaxHoldSeconds(), "0 disables the max-hold cap (not coerced to the default)");
 	}
@@ -99,7 +99,7 @@ class WalkiePropertiesTest {
 				5,
 				300,
 				null
-		);
+		, false);
 		assertEquals(1_000_000_000L, p.maxAudioFramesPerSecond(), "audio rates above 1e9 are clamped to 1e9");
 		assertEquals(1_000_000_000L, p.maxControlMessagesPerSecond(), "control rates above 1e9 are clamped to 1e9");
 	}
