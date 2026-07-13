@@ -24,8 +24,21 @@ tasks.withType<JavaCompile>().configureEach {
 	//   java { toolchain { languageVersion = JavaLanguageVersion.of(25) } }
 	// and add the foojay-resolver-convention plugin in settings.gradle.kts.
 	options.release.set(25)
-	options.compilerArgs.addAll(listOf("-parameters", "-Xlint:all"))
 	options.encoding = "UTF-8"
+	options.compilerArgs.add("-parameters")
+	// compileAotJava (main) and compileAotTestJava (test) compile the sources Spring Boot's AOT engine GENERATES
+	// into build/generated/aotSources + aotTestSources (bean-definition suppliers etc.). That code is not ours and
+	// legitimately uses raw generic types (e.g. BeanInstanceSupplier<IncludeExcludeEndpointFilter> for the generic
+	// IncludeExcludeEndpointFilter<E>), so -Xlint:all floods those compiles with [rawtypes] warnings we can neither
+	// fix nor act on — and which would drown out a real warning in OUR code. Keep the strict lint on the
+	// hand-written sources; silence it only for the generated AOT compiles. (removeAll guards against the
+	// native-build-tools plugin having added its own -Xlint to these tasks before this action runs.)
+	if (name.startsWith("compileAot")) {   // compileAotJava + compileAotTestJava
+		options.compilerArgs.removeAll { it.startsWith("-Xlint") }
+		options.compilerArgs.add("-Xlint:none")
+	} else {
+		options.compilerArgs.add("-Xlint:all")
+	}
 }
 
 // Use the explicitly-typed task API (named<Test>/named<JacocoReport>) rather than Gradle's generated
