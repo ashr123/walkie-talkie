@@ -3,6 +3,7 @@ package io.github.ashr123.walkietalkie.server;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.util.Collection;
 import java.util.List;
@@ -10,6 +11,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 /// In-memory [ClientSession] for unit tests; records everything sent to it.
 public final class FakeClientSession implements ClientSession {
+
+	/// Decodes the pre-serialized form a broadcast delivers back into a typed message — so this test double, not
+	/// production, is where a sent [ServerMessage] is reconstructed. Round-trips the same simple protocol records
+	/// the real Jackson bean does, so no configuration is needed.
+	private static final JsonMapper JSON = JsonMapper.shared();
 
 	public final Collection<ServerMessage> sent = new CopyOnWriteArrayList<>();
 	public final List<byte[]> audio = new CopyOnWriteArrayList<>();
@@ -79,6 +85,13 @@ public final class FakeClientSession implements ClientSession {
 	@Override
 	public void send(ServerMessage message) {
 		sent.add(message);
+	}
+
+	@Override
+	public void sendEncoded(String encoded) {
+		// A fan-out delivers the pre-serialized JSON; decode it back to a typed message so tests assert on received
+		// ServerMessages uniformly, whether they arrived via a single send or a broadcast.
+		sent.add(JSON.readValue(encoded, ServerMessage.class));
 	}
 
 	@Override

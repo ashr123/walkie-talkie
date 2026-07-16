@@ -29,8 +29,14 @@ public interface ClientSession {
 
 	boolean supportsAudioRelay();
 
-	/// Sends a control/signaling message as a JSON text frame.
+	/// Sends a control/signaling message as a JSON text frame (encoded here, for a single recipient).
 	void send(ServerMessage message);
+
+	/// Sends a control message that a channel-wide fan-out has ALREADY serialized to its JSON wire form once (see
+	/// [io.github.ashr123.walkietalkie.server.transport.MessageBroadcaster]): the recipient enqueues the shared
+	/// `encoded` string without re-encoding. Same delivery as [#send(ServerMessage)] for one recipient, but avoids
+	/// the per-recipient encode when broadcasting to many.
+	void sendEncoded(String encoded);
 
 	/// Sends a raw audio frame as a binary frame.
 	void sendAudio(byte[] audio);

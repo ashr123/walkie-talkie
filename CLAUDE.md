@@ -271,8 +271,13 @@ recipient backs up only its own queue (never the fan-out caller `Channel.forEach
 and the single consumer keeps each recipient's frames in submission order (required by the stateful Opus
 decode). Audio and control are split: audio is bounded and **dropped** on overflow (lossy, real-time), while
 control (floor/mode/owner/membership) is delivered reliably and drained ahead of audio — a client too far
-behind even for control is disconnected to force a clean reconnect/re-sync. The wrapping
-`ConcurrentWebSocketSessionDecorator` is kept only as the socket-layer backstop (its send-time / buffer
+behind even for control is disconnected to force a clean reconnect/re-sync. A channel-wide control broadcast is
+serialized **once**: `MessageBroadcaster` (which owns the `MessageCodec`) encodes each message a single time and
+hands the same JSON to every recipient's mailbox via `ClientSession.sendEncoded`, so fan-out to N members costs
+one encode, not N — and it keeps `ConnectionService` transport-agnostic (it passes the broadcaster a typed
+`ServerMessage`, never the wire format; single-recipient control uses `send(ServerMessage)`, which encodes then
+delegates to the same `sendEncoded` path). The wrapping `ConcurrentWebSocketSessionDecorator` is kept only as the
+socket-layer backstop (its send-time / buffer
 limit aborts a wedged in-flight write). In the Java client the Opus encoder/decoder are confined to the
 capture/playback threads respectively.
 
@@ -293,8 +298,11 @@ on the mismatch, `reconnect()` (its own virtual thread — not the listener call
 fresh one carrying `?channel=<target>`, whose `onOpen` re-joins the target. A `reconnecting` flag makes the old
 socket's `onClose` a no-op (not a lost connection → no process exit) and collapses a burst of mismatches into one
 reconnect; the sender loop now survives a single failed send (socket closing/swapped) instead of exiting.
-Not yet done: the **browser** client's auto-reconnect (`app.js` still surfaces the code as a logged error); the
-`global` room hashes to one instance (doesn't scale); a single oversized channel would need a shared backplane.
+The **browser** client auto-reconnects too, reusing its transport-change path: on the mismatch it sets
+`state.pendingReconnect` and disconnects, and `ws.onclose` → `connect()` re-reads the form (which still holds the
+target channel/mode/passphrase), so the fresh socket carries `?channel=<target>` and the ingress re-pins it. Not
+yet done: the `global` room hashes to one instance (doesn't scale); a single oversized channel would need a
+shared backplane.
 See README "Known constraints".
 
 ## Testing notes

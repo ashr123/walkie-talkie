@@ -6,6 +6,7 @@ import io.github.ashr123.walkietalkie.server.MutableClock;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
+import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -20,11 +21,18 @@ import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 
+import tools.jackson.databind.json.JsonMapper;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /// Drives [ConnectionService] with fake sessions to verify channel ownership, mode adoption and the
 /// owner-only mode-change broadcast.
 class ConnectionServiceTest {
+
+	// A real broadcaster over a throwaway JsonMapper: the fan-out serializes once and FakeClientSession records
+	// the typed message it carries, so the encoded JSON is irrelevant to assertions (no round-trip in tests).
+	private static final MessageBroadcaster BROADCASTER =
+			new MessageBroadcaster(new MessageCodec(JsonMapper.shared()));
 
 	private final ChannelRegistry channelRegistry = new ChannelRegistry();
 	private final ConnectionService service = new ConnectionService(
@@ -40,7 +48,8 @@ class ConnectionServiceTest {
 					5,
 					300,
 					null, false
-			)
+			),
+			BROADCASTER
 	);
 
 	/// Builds a service over the shared registry but with a hand-driven clock, so the push-to-talk floor
@@ -60,6 +69,7 @@ class ConnectionServiceTest {
 						maxHoldSeconds,
 						null, false
 				),
+				BROADCASTER,
 				clock
 		);
 	}
@@ -105,7 +115,7 @@ class ConnectionServiceTest {
 	private ConnectionService affinityService() {
 		return new ConnectionService(
 				channelRegistry,
-				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, null, true));
+				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, null, true), BROADCASTER);
 	}
 
 	private static boolean received(FakeClientSession session, ErrorCode code) {
@@ -1030,7 +1040,8 @@ class ConnectionServiceTest {
 						0,
 						0,
 						null, false
-				)
+				),
+				BROADCASTER
 		);
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
@@ -1059,7 +1070,8 @@ class ConnectionServiceTest {
 						0,
 						0,
 						null, false
-				)
+				),
+				BROADCASTER
 		);
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
@@ -1095,6 +1107,7 @@ class ConnectionServiceTest {
 						0,
 						null, false
 				),
+				BROADCASTER,
 				new MutableClock(Instant.EPOCH)
 		);
 		FakeClientSession alice = session("alice");
@@ -1587,6 +1600,11 @@ class ConnectionServiceTest {
 
 		@Override
 		public void send(ServerMessage message) {
+			// control frames are irrelevant to this fake
+		}
+
+		@Override
+		public void sendEncoded(String encoded) {
 			// control frames are irrelevant to this fake
 		}
 

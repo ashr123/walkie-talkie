@@ -43,6 +43,7 @@ public class ConnectionService {
 
 	private final ChannelRegistry channelRegistry;
 	private final WalkieProperties properties;
+	private final MessageBroadcaster broadcaster;
 	private final SessionRateLimiter audioRateLimiter;
 	private final SessionRateLimiter controlRateLimiter;
 	private final Clock clock;
@@ -51,8 +52,9 @@ public class ConnectionService {
 
 	@Autowired
 	public ConnectionService(ChannelRegistry channelRegistry,
-	                         WalkieProperties properties) {
-		this(channelRegistry, properties, Clock.systemUTC());
+	                         WalkieProperties properties,
+	                         MessageBroadcaster broadcaster) {
+		this(channelRegistry, properties, broadcaster, Clock.systemUTC());
 	}
 
 	/// Package-private seam: lets tests drive the push-to-talk floor timers and both rate limiters with a
@@ -61,9 +63,11 @@ public class ConnectionService {
 	/// this clock.
 	ConnectionService(ChannelRegistry channelRegistry,
 	                  WalkieProperties properties,
+	                  MessageBroadcaster broadcaster,
 	                  Clock clock) {
 		this.channelRegistry = channelRegistry;
 		this.properties = properties;
+		this.broadcaster = broadcaster;
 		this.audioRateLimiter = new SessionRateLimiter(properties.maxAudioFramesPerSecond(), clock);
 		this.controlRateLimiter = new SessionRateLimiter(properties.maxControlMessagesPerSecond(), clock);
 		this.clock = clock;
@@ -133,8 +137,7 @@ public class ConnectionService {
 	}
 
 	private void handleJoin(ClientSession session, ClientMessage.Join join) {
-		ChannelMode mode = join.mode();
-		String requested = mode == ChannelMode.GLOBAL_PTT ? GLOBAL_CHANNEL : join.channel();
+		String requested = join.mode() == ChannelMode.GLOBAL_PTT ? GLOBAL_CHANNEL : join.channel();
 
 		// Connect guard: a duplicate Join for the channel this session is already in is idempotent — re-send
 		// the current snapshot so the client re-syncs, but do NOT churn membership (no leave/rejoin, no
@@ -163,12 +166,12 @@ public class ConnectionService {
 		}
 		// The "global" channel is the server-managed broadcast room: reachable ONLY via global push-to-talk,
 		// and never end-to-end encrypted — so anyone can join it (there is no shared passphrase to know).
-		if (GLOBAL_CHANNEL.equals(requested) && mode != ChannelMode.GLOBAL_PTT) {
+		if (GLOBAL_CHANNEL.equals(requested) && join.mode() != ChannelMode.GLOBAL_PTT) {
 			sendError(session, ErrorCode.RESERVED_CHANNEL,
 					"'" + GLOBAL_CHANNEL + "' is reserved — use Single global push-to-talk to join it.");
 			return;
 		}
-		if (mode == ChannelMode.GLOBAL_PTT && join.keyCheck() != null) {
+		if (join.mode() == ChannelMode.GLOBAL_PTT && join.keyCheck() != null) {
 			sendError(session, ErrorCode.ENCRYPTION_NOT_ALLOWED,
 					"The global channel can't be end-to-end encrypted — clear the passphrase to join it.");
 			return;
@@ -215,9 +218,9 @@ public class ConnectionService {
 
 		// Global is server-owned (sentinel owner) and forced unencrypted (null key-check); every other channel
 		// is owned by its creator and adopts the joiner's key-check.
-		ChannelRegistry.JoinResult joined = mode == ChannelMode.GLOBAL_PTT
-				? channelRegistry.joinOrCreate(requested, mode, null, session, GLOBAL_CHANNEL_OWNER, emitInitialState)
-				: channelRegistry.joinOrCreate(requested, mode, join.keyCheck(), session, emitInitialState);
+		ChannelRegistry.JoinResult joined = join.mode() == ChannelMode.GLOBAL_PTT
+				? channelRegistry.joinOrCreate(requested, join.mode(), null, session, GLOBAL_CHANNEL_OWNER, emitInitialState)
+				: channelRegistry.joinOrCreate(requested, join.mode(), join.keyCheck(), session, emitInitialState);
 		if (joined == null) {
 			// The atomic join refused to add us. joinOrCreate checks, in order, lock -> capacity -> key-check, so
 			// attribute the reason by re-reading the target. The enforcement itself was atomic inside joinOrCreate;
@@ -236,32 +239,33 @@ public class ConnectionService {
 			}
 			return;
 		}
-		Channel channel = joined.channel();
 		// Advance the MDC channel so this handler's "joined" line (and anything after it in this scope) is tagged
 		// with the channel just joined, instead of repeating channel=… in the body.
-		RequestContext.updateChannel(channel.name());
+		RequestContext.updateChannel(joined.channel().name());
 
 		// Tell the OTHER members about the joiner. This is intentionally OUTSIDE the registry lock: it concerns
 		// the joiner's visibility to others, not the joiner's own floor view, so it needs no floor serialization.
-		ServerMessage notice = new ServerMessage.MemberJoined(new MemberInfo(
+		broadcaster.toOthers(
+				joined.channel(),
 				session.id(),
-				session.displayName(),
-				channel.requireStreamIndex(session.id()),
-				false
-		));
-		channel.forEachOther(session.id(), other -> safeSend(other, notice));
+				new ServerMessage.MemberJoined(new MemberInfo(
+						session.id(),
+						session.displayName(),
+						joined.channel().requireStreamIndex(session.id()),
+						false
+				))
+		);
 
 		// Identity (session + name) and the channel are carried by the MDC prefix now (the name advanced above,
 		// the channel just updated). "created" when this join brought the channel into being; else "joined".
-		log.info("{} mode={}", joined.created() ? "created" : "joined", channel.mode());
+		log.info("{} mode={}", joined.created() ? "created" : "joined", joined.channel().mode());
 	}
 
 	private void handleLeave(ClientSession session) {
-		String channelName = session.channelName();
-		if (channelName == null) {
+		if (session.channelName() == null) {
 			return;
 		}
-		Channel channel = channelRegistry.find(channelName) instanceof Some(Channel found) ? found : null;
+		Channel channel = channelRegistry.find(session.channelName()) instanceof Some(Channel found) ? found : null;
 		if (channel != null) {
 			// Free the leaver's floor (if held) and tell the others, under the floor monitor so this FloorIdle
 			// can't race a new holder's grant. Capture wasHolding HERE — registry.leave (below) also clears the
@@ -269,28 +273,25 @@ public class ConnectionService {
 			// channelRegistry.leave while holding this monitor — see the lock-order note on Channel.)
 			synchronized (channel) {
 				if (channel.releaseFloor(session.id())) {
-					ServerMessage idle = new ServerMessage.FloorIdle();
-					channel.forEachOther(session.id(), other -> safeSend(other, idle));
+					broadcaster.toOthers(channel, session.id(), new ServerMessage.FloorIdle());
 				}
 			}
 		}
 		// Remove the member + re-elect an owner atomically in the registry, THEN announce — broadcasting MemberLeft
 		// only AFTER the removal closes the ghost-member window: a member joining between an earlier broadcast and
 		// the removal could otherwise snapshot a roster still containing the leaver yet never receive its MemberLeft.
-		boolean ownerChanged = channelRegistry.leave(channelName, session.id()) instanceof Some(String _);
+		boolean ownerChanged = channelRegistry.leave(session.channelName(), session.id()) instanceof Some(String _);
 		if (channel != null) {
 			// Announce to the survivors of the SAME channel object the leave acted on — NOT a fresh find()-by-name,
 			// which could resolve a dropped-and-recreated same-named channel and notify its members instead.
 			synchronized (channel) {
-				ServerMessage left = new ServerMessage.MemberLeft(session.id());
-				channel.forEachOther(session.id(), other -> safeSend(other, left));
+				broadcaster.toOthers(channel, session.id(), new ServerMessage.MemberLeft(session.id()));
 				if (ownerChanged) {
 					// Read the CURRENT owner (not the value leave returned) under the monitor: when two owners
 					// leave back-to-back, the monitor orders the OwnerChanged broadcasts and each carries the
 					// latest elected owner, so a survivor converges on the real owner rather than ending up
 					// believing it is a member who has already left.
-					ServerMessage ownerMsg = new ServerMessage.OwnerChanged(channel.ownerId());
-					channel.forEachOther(session.id(), other -> safeSend(other, ownerMsg));
+					broadcaster.toOthers(channel, session.id(), new ServerMessage.OwnerChanged(channel.ownerId()));
 					// Auto-election can promote a muted member (it picks any remaining member): the new owner is
 					// never muted, so unmute it if needed — else it would be a muted owner nobody can unmute.
 					unmuteOwnerIfMuted(channel);
@@ -369,10 +370,9 @@ public class ConnectionService {
 	/// Confirms the (already-acquired) floor to `session` and announces the new holder to everyone else (the
 	/// acquire/activity marks were stamped atomically with the swap in [Channel]). The `FloorTaken` broadcast
 	/// doubles as the notice to a just-preempted ex-holder that the floor is no longer theirs.
-	private static void grantFloor(Channel channel, ClientSession session) {
+	private void grantFloor(Channel channel, ClientSession session) {
 		session.send(new ServerMessage.FloorGranted());
-		ServerMessage taken = new ServerMessage.FloorTaken(session.id());
-		channel.forEachOther(session.id(), other -> safeSend(other, taken));
+		broadcaster.toOthers(channel, session.id(), new ServerMessage.FloorTaken(session.id()));
 	}
 
 	private void handleReleaseFloor(ClientSession session) {
@@ -382,8 +382,7 @@ public class ConnectionService {
 		}
 		synchronized (channel) {
 			if (channel.releaseFloor(session.id())) {
-				ServerMessage idle = new ServerMessage.FloorIdle();
-				channel.forEachOther(session.id(), other -> safeSend(other, idle));
+				broadcaster.toOthers(channel, session.id(), new ServerMessage.FloorIdle());
 				log.debug("released the floor");
 			}
 		}
@@ -408,8 +407,7 @@ public class ConnectionService {
 			synchronized (channel) {
 				String holder = channel.releaseIfExpired(cutoff);
 				if (holder != null) {
-					ServerMessage idle = new ServerMessage.FloorIdle();
-					channel.forEach(member -> safeSend(member, idle));
+					broadcaster.toAll(channel, new ServerMessage.FloorIdle());
 					// The sweep is a scheduled task, not bound to a session scope, and the holder is some OTHER
 					// session — so log its id + name explicitly rather than relying on the MDC.
 					log.info(
@@ -464,8 +462,7 @@ public class ConnectionService {
 						&& channel.releaseFloor(session.id())) {
 					// Talk-time limit reached: free the floor and tell the whole channel (incl. the (ex-)speaker
 					// so its client stops transmitting and resets); the speaker must re-request to continue.
-					ServerMessage idle = new ServerMessage.FloorIdle();
-					channel.forEach(member -> safeSend(member, idle));
+					broadcaster.toAll(channel, new ServerMessage.FloorIdle());
 					// onAudio is intentionally not session-scoped (no per-frame MDC churn), so log id + name inline.
 					log.info("session={} ({}) reached the max floor-hold time on channel={}; floor released",
 							session.id(), session.displayName(), channel.name());
@@ -586,17 +583,12 @@ public class ConnectionService {
 		}
 		// Mode switch + floor reset + the broadcast happen under the floor monitor, so the FloorIdle can't race a
 		// concurrent grant and the mode/floor everyone sees is consistent.
-		ServerMessage modeChanged = new ServerMessage.ModeChanged(mode);
-		ServerMessage floorIdle = new ServerMessage.FloorIdle();
 		synchronized (channel) {
 			channel.setMode(mode);
 			channel.clearFloor();
 			// Broadcast to everyone (incl. the owner): the new mode and a floor reset, so any 'talking'
 			// indicator is superseded and a fresh push-to-talk floor is available.
-			channel.forEach(member -> {
-				safeSend(member, modeChanged);
-				safeSend(member, floorIdle);
-			});
+			broadcaster.toAll(channel, new ServerMessage.ModeChanged(mode), new ServerMessage.FloorIdle());
 		}
 		log.info("changed mode to {}", mode);
 	}
@@ -620,12 +612,11 @@ public class ConnectionService {
 	/// so a brief transition where some members hold the new key and others the old just drops a few GCM-failing
 	/// frames, exactly as a channel switch does.
 	private void handleChangePassphrase(ClientSession session, String keyCheck, String wrappedKey) {
-		String channelName = session.channelName();
-		if (channelName == null) {
+		if (session.channelName() == null) {
 			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			return;
 		}
-		switch (channelRegistry.changePassphrase(channelName, session.id(), keyCheck)) {
+		switch (channelRegistry.changePassphrase(session.channelName(), session.id(), keyCheck)) {
 			case ChannelRegistry.RekeyResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.RekeyResult.NotOwner _ ->
 					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can change the passphrase");
@@ -635,8 +626,7 @@ public class ConnectionService {
 					// the server never inspects or stores it; members that hold the old key decrypt it to adopt the
 					// new passphrase automatically (and re-verify against the live key-check, so a stale/tampered
 					// blob just falls back to a manual re-entry).
-					ServerMessage passphraseChanged = new ServerMessage.PassphraseChanged(channel.keyCheck(), wrappedKey);
-					channel.forEach(member -> safeSend(member, passphraseChanged));
+					broadcaster.toAll(channel, new ServerMessage.PassphraseChanged(channel.keyCheck(), wrappedKey));
 				}
 				// Log the encrypted/plaintext STATUS only — never the key-check token or the wrapped blob.
 				log.info("changed passphrase (now {})", keyCheck == null ? "unencrypted" : "encrypted");
@@ -673,8 +663,7 @@ public class ConnectionService {
 					"No member '" + newOwnerId + "' in this channel");
 			case ChannelRegistry.TransferResult.Ok(Channel channel) -> {
 				synchronized (channel) {
-					ServerMessage ownerChanged = new ServerMessage.OwnerChanged(channel.ownerId());
-					channel.forEach(member -> safeSend(member, ownerChanged));
+					broadcaster.toAll(channel, new ServerMessage.OwnerChanged(channel.ownerId()));
 					// The new owner is never muted: if the previous owner had muted this member before handing it
 					// ownership, unmute it now — otherwise it would be a muted owner with no way to unmute itself.
 					unmuteOwnerIfMuted(channel);
@@ -754,13 +743,11 @@ public class ConnectionService {
 	/// learns to disable its own talk control). MUST be called while holding the channel monitor. When muting takes
 	/// the floor from the muted member, the floor is freed first and a `FloorIdle` announced — so a member muted
 	/// mid-transmission stops talking and the floor reopens for others; unmuting never touches the floor.
-	private static void broadcastMute(Channel channel, String memberId, boolean muted) {
+	private void broadcastMute(Channel channel, String memberId, boolean muted) {
 		if (muted && channel.releaseFloor(memberId)) {
-			ServerMessage floorIdle = new ServerMessage.FloorIdle();
-			channel.forEach(member -> safeSend(member, floorIdle));
+			broadcaster.toAll(channel, new ServerMessage.FloorIdle());
 		}
-		ServerMessage memberMuted = new ServerMessage.MemberMuted(memberId, muted);
-		channel.forEach(member -> safeSend(member, memberMuted));
+		broadcaster.toAll(channel, new ServerMessage.MemberMuted(memberId, muted));
 	}
 
 	/// Restores the "the channel owner is never muted" invariant after an ownership change — a deliberate
@@ -770,11 +757,9 @@ public class ConnectionService {
 	/// as a mute target) with no one else owner to do it. So unmute it and tell the channel. MUST be called under
 	/// the channel monitor, after the ownership write. The global room's sentinel owner is never in the mute set,
 	/// so this is a no-op there.
-	private static void unmuteOwnerIfMuted(Channel channel) {
-		String owner = channel.ownerId();
-		if (channel.setMuted(owner, false)) {   // true only if the new owner really was muted — else no spurious notice
-			ServerMessage memberMuted = new ServerMessage.MemberMuted(owner, false);
-			channel.forEach(member -> safeSend(member, memberMuted));
+	private void unmuteOwnerIfMuted(Channel channel) {
+		if (channel.setMuted(channel.ownerId(), false)) {   // true only if the new owner really was muted — else no spurious notice
+			broadcaster.toAll(channel, new ServerMessage.MemberMuted(channel.ownerId(), false));
 		}
 	}
 
@@ -787,19 +772,17 @@ public class ConnectionService {
 	/// channel's LIVE lock state, so two back-to-back toggles converge — a delayed broadcast carries the current
 	/// value rather than leaving a member gating against a stale one.
 	private void handleSetLocked(ClientSession session, boolean locked) {
-		String channelName = session.channelName();
-		if (channelName == null) {
+		if (session.channelName() == null) {
 			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			return;
 		}
-		switch (channelRegistry.setLocked(channelName, session.id(), locked)) {
+		switch (channelRegistry.setLocked(session.channelName(), session.id(), locked)) {
 			case ChannelRegistry.LockResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.LockResult.NotOwner _ ->
 					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can lock the channel");
 			case ChannelRegistry.LockResult.Ok(Channel channel) -> {
 				synchronized (channel) {
-					ServerMessage channelLocked = new ServerMessage.ChannelLocked(channel.isLocked());
-					channel.forEach(member -> safeSend(member, channelLocked));
+					broadcaster.toAll(channel, new ServerMessage.ChannelLocked(channel.isLocked()));
 				}
 				log.info("channel {}", locked ? "locked" : "unlocked");
 			}
@@ -832,12 +815,10 @@ public class ConnectionService {
 			// harmlessly rather than rejected.
 			return;
 		}
-		String channelName = session.channelName();
-		if (channelName != null && channelRegistry.find(channelName) instanceof Some(Channel channel)) {
+		if (session.channelName() != null && channelRegistry.find(session.channelName()) instanceof Some(Channel channel)) {
 			synchronized (channel) {
 				session.setDisplayName(displayName);
-				ServerMessage renamed = new ServerMessage.MemberRenamed(session.id(), displayName);
-				channel.forEach(member -> safeSend(member, renamed));
+				broadcaster.toAll(channel, new ServerMessage.MemberRenamed(session.id(), displayName));
 			}
 			// Advance the MDC name so this line's prefix carries the NEW name, like every line after it (onMessage
 			// snapshotted the old name at scope entry); the scope's restore-on-exit still cleans it up.

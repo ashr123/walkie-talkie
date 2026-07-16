@@ -5,6 +5,7 @@ import io.github.ashr123.walkietalkie.server.FakeClientSession;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
 import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
+import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
@@ -12,6 +13,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -31,6 +33,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /// session has closed, no channel is leaked.
 class ConcurrencyStressTest {
 
+	private static final MessageBroadcaster BROADCASTER =
+			new MessageBroadcaster(new MessageCodec(JsonMapper.shared()));
+
 	@Test
 	@Timeout(60)
 	void concurrentJoinLeaveFloorRenameAndAudioStaysConsistentAndDeadlockFree() throws Exception {
@@ -47,8 +52,10 @@ class ConcurrencyStressTest {
 						1_000_000,
 						0,
 						0,
-						null
-				, false)
+						null,
+						false
+				),
+				BROADCASTER
 		);
 
 		int workers = 16;
@@ -137,8 +144,10 @@ class ConcurrencyStressTest {
 						1_000_000,
 						0,
 						0,
-						null
-				, false)
+						null,
+						false
+				),
+				BROADCASTER
 		);
 
 		int members = 8;

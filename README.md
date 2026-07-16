@@ -484,10 +484,9 @@ classpath — tests have no generated context there and must stay reflective.
   To run **multiple instances**, set `walkie.channel-affinity=true` and front them with an ingress that
   consistent-hashes the handshake `?channel=` query param, so all members of a channel land on the one instance
   that owns it (each instance owns a disjoint set of channels — no shared media bus). The server pins each socket
-  to a channel and refuses a switch to a channel owned by another instance with `CHANNEL_ROUTING_MISMATCH`; the
-  **Java client then reconnects automatically** — it opens a fresh socket carrying `?channel=<target>` so the
-  ingress re-pins it to the owning instance, transparently completing the switch (the **browser** client does not
-  yet auto-reconnect: there the code surfaces as a logged error). Caveats: the single `global` room hashes to one
+  to a channel and refuses a switch to a channel owned by another instance with `CHANNEL_ROUTING_MISMATCH`; **both
+  clients then reconnect automatically** — they open a fresh socket carrying `?channel=<target>` so the ingress
+  re-pins them to the owning instance, transparently completing the switch. Caveats: the single `global` room hashes to one
   instance, so it doesn't scale horizontally; and a single channel that must exceed one instance's capacity would
   need a shared backplane (not implemented). Off by default = single instance, everything served locally.
 - **End-to-end encryption uses one shared passphrase per channel** (a pre-shared key, no key exchange):

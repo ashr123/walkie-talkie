@@ -8,7 +8,6 @@ import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -153,8 +152,17 @@ public final class WebSocketClientSession implements ClientSession {
 		if (closed.get()) {
 			return;
 		}
-		// Encode on the caller (cheap, CPU-only) so the single drainer stays lean and stays the sole writer.
-		String encoded = codec.encode(message);
+		// A single-recipient send with nothing pre-encoded: serialize here (on the caller — cheap, CPU-only, so the
+		// single drainer stays the sole writer) and hand off to the shared enqueue path below. A channel-wide
+		// fan-out instead encodes ONCE in MessageBroadcaster and calls sendEncoded directly.
+		sendEncoded(codec.encode(message));
+	}
+
+	@Override
+	public void sendEncoded(String encoded) {
+		if (closed.get()) {
+			return;
+		}
 		if (!controlOut.offer(() -> sendQuietly(new TextMessage(encoded)))) {
 			// A state-changing message is never silently dropped: if it can't even be queued, the client is
 			// hopelessly behind, so disconnect it to force a clean reconnect + Joined re-sync.
@@ -167,8 +175,10 @@ public final class WebSocketClientSession implements ClientSession {
 		if (closed.get()) {
 			return;
 		}
-		ByteBuffer payload = ByteBuffer.wrap(audio);
-		if (!audioOut.offer(() -> sendQuietly(new BinaryMessage(payload)))) {
+		// BinaryMessage(byte[]) wraps the array without copying (ByteBuffer.wrap under the hood) and the frame is
+		// sent exactly once, so build it directly in the send task. The relay never mutates a payload it forwards,
+		// so the shared no-copy wrap is safe even though this same array is fanned out to every recipient.
+		if (!audioOut.offer(() -> sendQuietly(new BinaryMessage(audio)))) {
 			log.debug("Audio backlog overflow for {}; dropping a frame", id());
 		}
 	}
