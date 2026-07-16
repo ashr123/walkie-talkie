@@ -22,7 +22,10 @@ import {
 /**
  * Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
  */
-const byId = id => document.getElementById(id);
+function byId(id) {
+	return document.getElementById(id);
+}
+
 const STUN = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
 
 const SAMPLE_RATE = 48000;
