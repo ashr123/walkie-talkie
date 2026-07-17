@@ -590,7 +590,8 @@ public final class WalkieClient implements AutoCloseable {
 						System.lineSeparator() + "  - ",
 						"[members] " + memberNames.size() + " in this channel"
 								+ (channelLocked ? " 🔒 locked to new members" : "") + ":" + System.lineSeparator() + "  - ",
-						"")));
+						""
+				)));
 	}
 
 	private void consoleLoop() {
