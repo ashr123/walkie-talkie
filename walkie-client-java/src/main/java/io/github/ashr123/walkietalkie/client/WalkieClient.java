@@ -228,10 +228,11 @@ public final class WalkieClient implements AutoCloseable {
 	///   adopted (don't emit audio the rekeyed channel can't decode, and don't desync — a straggler is muted until
 	///   it adopts the new key, so the experience is symmetric for everyone).
 	static byte[] outboundFrame(byte[] frame, FrameCrypto key, String announcedKeyCheck) throws GeneralSecurityException {
-		if (announcedKeyCheck == null) {
-			return frame;
-		}
-		return key != null && announcedKeyCheck.equals(key.keyCheck()) ? key.encrypt(frame) : null;
+		return announcedKeyCheck == null ?
+				frame :
+				key != null && announcedKeyCheck.equals(key.keyCheck()) ?
+						key.encrypt(frame) :
+						null;
 	}
 
 	/// Pure decision behind the full-duplex mic auto-open: open only when the mode is full-duplex, the user did not
@@ -245,10 +246,11 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	static RekeyAction rekeyAction(String announcedKeyCheck, FrameCrypto candidate) {
-		if (announcedKeyCheck == null) {
-			return RekeyAction.DISABLE;
-		}
-		return candidate != null && announcedKeyCheck.equals(candidate.keyCheck()) ? RekeyAction.APPLY : RekeyAction.KEEP;
+		return announcedKeyCheck == null ?
+				RekeyAction.DISABLE :
+				candidate != null && announcedKeyCheck.equals(candidate.keyCheck()) ?
+						RekeyAction.APPLY :
+						RekeyAction.KEEP;
 	}
 
 	private static ChannelMode parseMode(String arg, ChannelMode fallback) {
