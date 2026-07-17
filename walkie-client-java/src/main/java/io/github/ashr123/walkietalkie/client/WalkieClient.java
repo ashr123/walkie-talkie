@@ -441,7 +441,8 @@ public final class WalkieClient implements AutoCloseable {
 				// (a rotation we never reconciled), warn that 'p' now ROTATES for everyone — so a user must not
 				// just re-type the stale passphrase (it would re-key the whole channel to it).
 				FrameCrypto held = crypto;
-				if (becameOwner && currentChannelKeyCheck != null
+				if (becameOwner
+						&& currentChannelKeyCheck != null
 						&& (held == null || !currentChannelKeyCheck.equals(held.keyCheck()))) {
 					log("[owner] note: your key doesn't match the channel — as owner, 'p <passphrase>' now ROTATES it for everyone, so set one you actually hold instead of re-typing a stale one.");
 				}
@@ -462,28 +463,13 @@ public final class WalkieClient implements AutoCloseable {
 						rekeyInFlight = false;
 						pendingPassphrase = null;
 					}
-					// A passphrase mismatch is fatal: the channel requires a different --key, so there's nothing
-					// to do but disconnect. getAndSet(false) makes this fire once (mirrors onConnectionLost).
-					case PASSPHRASE_MISMATCH -> {
-						if (running.getAndSet(false)) {
-							log("Disconnecting — this channel needs a different --key.");
-							System.exit(0);
-						}
-					}
+					// A passphrase mismatch is fatal: the channel requires a different --key, so there's nothing to do
+					// but disconnect — gracefully, so the server sees a clean close instead of an abrupt EOF.
+					case PASSPHRASE_MISMATCH -> exitGracefully("Disconnecting — this channel needs a different --key.");
 					// A locked/full channel refused our join. Like a passphrase mismatch, the join failed (an initial
-					// connect joined nothing; a refused switch dropped us), so there's nothing to do but exit — once.
-					case CHANNEL_LOCKED -> {
-						if (running.getAndSet(false)) {
-							log("This channel is locked by its owner — cannot join.");
-							System.exit(0);
-						}
-					}
-					case CHANNEL_FULL -> {
-						if (running.getAndSet(false)) {
-							log("This channel is full — it has reached its member limit.");
-							System.exit(0);
-						}
-					}
+					// connect joined nothing; a refused switch dropped us), so there's nothing to do but exit gracefully.
+					case CHANNEL_LOCKED -> exitGracefully("This channel is locked by its owner — cannot join.");
+					case CHANNEL_FULL -> exitGracefully("This channel is full — it has reached its member limit.");
 					// The target channel lives on another instance (channel affinity): an in-place switch can't reach
 					// it, so reconnect — a fresh handshake carrying ?channel=<target> is routed to the owning instance,
 					// and switchTo already applied the target's mode/key + advanced connectChannel/connectMode so the
@@ -834,7 +820,7 @@ public final class WalkieClient implements AutoCloseable {
 
 	/// Switches to a different channel WITHOUT dropping the session: the server treats a fresh Join as
 	/// "leave the old channel, join the new one" on the same socket, so the session id (and the audio loops)
-	/// survive. Mode and passphrase are optional and default to the current ones. Usage: c <channel> [mode] [key].
+	/// survive. Mode and passphrase are optional and default to the current ones. Usage: `c <channel> [mode] [key]`.
 	private void switchChannel(String args) {
 		String[] parts = args.strip().split("\\s+", 3);
 		String channel = parts[0];
@@ -1081,16 +1067,28 @@ public final class WalkieClient implements AutoCloseable {
 		});
 	}
 
-	/// Reacts to the WebSocket dropping. A user-initiated quit has already flipped `running` to false and
-	/// is tearing down on the main thread, so this is a no-op for that path. Any other close means the
-	/// server went away while we were still live — and because the console loop is parked in a
-	/// non-interruptible `System.in` read, it can never observe the flag, so we stop the process here
-	/// instead of hanging until the next keypress. `getAndSet` makes this fire exactly once.
-	private void onConnectionLost() {
-		if (running.getAndSet(false)) {
-			log("Server connection lost — exiting.");
-			System.exit(0);
+	/// Ends the session with a CLEAN WebSocket close — a `NORMAL_CLOSURE` frame the server sees, instead of the
+	/// abrupt EOF an immediate `System.exit` leaves — then stops the process. Used by the fatal join rejections
+	/// (wrong passphrase, locked or full channel) and by a lost connection: the console loop is parked in a
+	/// non-interruptible `System.in` read and can't observe a flag, so stopping the process is the only way out.
+	/// The close runs on its OWN virtual thread, NOT the WebSocket listener callback thread these paths fire on
+	/// (whose executor [#close]'s bounded HttpClient shutdown must drain to flush the frame). Fires exactly once.
+	private void exitGracefully(String reason) {
+		if (!running.getAndSet(false)) {
+			return;
 		}
+		log(reason);
+		Thread.ofVirtual().name("ptt-shutdown").start(() -> {
+			close();   // sends NORMAL_CLOSURE, then the bounded HttpClient shutdown flushes it before we halt
+			System.exit(0);
+		});
+	}
+
+	/// Reacts to the WebSocket dropping. A user-initiated quit has already flipped `running` and is tearing down
+	/// on the main thread (so [#exitGracefully] no-ops there); any other close means the server went away while we
+	/// were live, so end gracefully and stop.
+	private void onConnectionLost() {
+		exitGracefully("Server connection lost — exiting.");
 	}
 
 	/// The decision for an announced passphrase change, given the channel's announced key-check and the key a
