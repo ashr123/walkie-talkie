@@ -1,7 +1,5 @@
 package io.github.ashr123.walkietalkie.server.session;
 
-import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
-import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
@@ -41,13 +39,11 @@ class WebSocketClientSessionTest {
 		WebSocketSession ws = mock(WebSocketSession.class);
 		when(ws.getId()).thenReturn("sess-1");
 		doThrow(new IOException("socket down")).when(ws).sendMessage(any());
-		MessageCodec codec = mock(MessageCodec.class);
-		when(codec.encode(any())).thenReturn("{}");
 
-		WebSocketClientSession session = new WebSocketClientSession(ws, codec, Transport.AUDIO_RELAY, null);
+		WebSocketClientSession session = new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null);
 		session.start();
 		try {
-			assertDoesNotThrow(() -> session.send(new ServerMessage.FloorIdle()));
+			assertDoesNotThrow(() -> session.sendEncoded("{}"));
 			verify(ws, timeout(1000)).sendMessage(any());   // the drainer attempted the send and swallowed the failure
 		} finally {
 			session.close();
@@ -60,7 +56,7 @@ class WebSocketClientSessionTest {
 		when(ws.getId()).thenReturn("sess-2");
 		doThrow(new IOException("socket down")).when(ws).sendMessage(any());
 
-		WebSocketClientSession session = new WebSocketClientSession(ws, mock(MessageCodec.class), Transport.AUDIO_RELAY, null);
+		WebSocketClientSession session = new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null);
 		session.start();
 		try {
 			assertDoesNotThrow(() -> session.sendAudio(new byte[]{1, 2, 3}));
@@ -76,14 +72,12 @@ class WebSocketClientSessionTest {
 		WebSocketSession ws = mock(WebSocketSession.class);
 		when(ws.getId()).thenReturn("sess-3");
 		doThrow(new IllegalStateException("session limit exceeded")).when(ws).sendMessage(any());
-		MessageCodec codec = mock(MessageCodec.class);
-		when(codec.encode(any())).thenReturn("{}");
 
-		WebSocketClientSession session = new WebSocketClientSession(ws, codec, Transport.AUDIO_RELAY, null);
+		WebSocketClientSession session = new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null);
 		session.start();
 		try {
-			assertDoesNotThrow(() -> session.send(new ServerMessage.FloorIdle()));
-			assertDoesNotThrow(() -> session.send(new ServerMessage.FloorIdle()));
+			assertDoesNotThrow(() -> session.sendEncoded("{}"));
+			assertDoesNotThrow(() -> session.sendEncoded("{}"));
 			verify(ws, timeout(1000).times(2)).sendMessage(any());   // the drainer survived the first RuntimeException
 		} finally {
 			session.close();
@@ -102,8 +96,8 @@ class WebSocketClientSessionTest {
 		WebSocketSession fastWs = mock(WebSocketSession.class);
 		when(fastWs.getId()).thenReturn("fast");
 
-		WebSocketClientSession slow = new WebSocketClientSession(slowWs, mock(MessageCodec.class), Transport.AUDIO_RELAY, null);
-		WebSocketClientSession fast = new WebSocketClientSession(fastWs, mock(MessageCodec.class), Transport.AUDIO_RELAY, null);
+		WebSocketClientSession slow = new WebSocketClientSession(slowWs, Transport.AUDIO_RELAY, null);
+		WebSocketClientSession fast = new WebSocketClientSession(fastWs, Transport.AUDIO_RELAY, null);
 		slow.start();
 		fast.start();
 		try {
@@ -130,7 +124,7 @@ class WebSocketClientSessionTest {
 		when(ws.getId()).thenReturn("flooded");
 		doAnswer(blockUntil(wedged, release)).when(ws).sendMessage(any());
 
-		WebSocketClientSession session = new WebSocketClientSession(ws, mock(MessageCodec.class), Transport.AUDIO_RELAY, null);
+		WebSocketClientSession session = new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null);
 		session.start();
 		try {
 			session.sendAudio(new byte[]{0});                 // the drainer takes this and wedges
@@ -153,11 +147,9 @@ class WebSocketClientSessionTest {
 		CountDownLatch wedged = new CountDownLatch(1);
 		WebSocketSession ws = mock(WebSocketSession.class);
 		when(ws.getId()).thenReturn("congested");
-		MessageCodec codec = mock(MessageCodec.class);
-		when(codec.encode(any())).thenReturn("{}");
 		doAnswer(blockUntil(wedged, release)).when(ws).sendMessage(any());
 
-		WebSocketClientSession session = new WebSocketClientSession(ws, codec, Transport.AUDIO_RELAY, null);
+		WebSocketClientSession session = new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null);
 		session.start();
 		try {
 			session.sendAudio(new byte[]{0});                 // wedge the drainer
@@ -165,7 +157,7 @@ class WebSocketClientSessionTest {
 			for (int i = 0; i < 1_000; i++) {
 				session.sendAudio(new byte[]{1});             // audio overflows and is dropped
 			}
-			session.send(new ServerMessage.FloorIdle());      // ...but a control message must NOT be dropped
+			session.sendEncoded("{}");      // ...but a control message must NOT be dropped
 			release.countDown();
 			// The control TextMessage is delivered (drained with priority), proving it survived the audio flood.
 			verify(ws, timeout(2000)).sendMessage(argThat(TextMessage.class::isInstance));
@@ -181,17 +173,15 @@ class WebSocketClientSessionTest {
 		CountDownLatch wedged = new CountDownLatch(1);
 		WebSocketSession ws = mock(WebSocketSession.class);
 		when(ws.getId()).thenReturn("dead");
-		MessageCodec codec = mock(MessageCodec.class);
-		when(codec.encode(any())).thenReturn("{}");
 		doAnswer(blockUntil(wedged, release)).when(ws).sendMessage(any());
 
-		WebSocketClientSession session = new WebSocketClientSession(ws, codec, Transport.AUDIO_RELAY, null);
+		WebSocketClientSession session = new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null);
 		session.start();
 		try {
-			session.send(new ServerMessage.FloorIdle());      // the drainer takes this and wedges
+			session.sendEncoded("{}");      // the drainer takes this and wedges
 			assertTrue(wedged.await(1, TimeUnit.SECONDS));
 			for (int i = 0; i < 2_000; i++) {
-				session.send(new ServerMessage.FloorIdle());  // control overflows its generous headroom
+				session.sendEncoded("{}");  // control overflows its generous headroom
 			}
 			verify(ws, timeout(2000)).close(any(CloseStatus.class));   // hopelessly behind -> disconnected
 		} finally {
@@ -205,7 +195,7 @@ class WebSocketClientSessionTest {
 		WebSocketSession ws = mock(WebSocketSession.class);
 		when(ws.getId()).thenReturn("closing");
 
-		WebSocketClientSession session = new WebSocketClientSession(ws, mock(MessageCodec.class), Transport.AUDIO_RELAY, null);
+		WebSocketClientSession session = new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null);
 		session.start();
 		session.close();
 
@@ -216,15 +206,14 @@ class WebSocketClientSessionTest {
 	@Test
 	void closingBeforeStartingIsASafeNoOp() {
 		WebSocketSession ws = mock(WebSocketSession.class);
-		assertDoesNotThrow(() -> new WebSocketClientSession(ws, mock(MessageCodec.class), Transport.AUDIO_RELAY, null).close());
+		assertDoesNotThrow(() -> new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null).close());
 	}
 
 	@Test
 	void supportsAudioRelayReflectsTheTransport() {
 		WebSocketSession ws = mock(WebSocketSession.class);
-		MessageCodec codec = mock(MessageCodec.class);
-		assertTrue(new WebSocketClientSession(ws, codec, Transport.AUDIO_RELAY, null).supportsAudioRelay());
-		assertFalse(new WebSocketClientSession(ws, codec, Transport.SIGNALING, null).supportsAudioRelay(),
+		assertTrue(new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null).supportsAudioRelay());
+		assertFalse(new WebSocketClientSession(ws, Transport.SIGNALING, null).supportsAudioRelay(),
 				"a signaling session does not relay audio");
 	}
 }

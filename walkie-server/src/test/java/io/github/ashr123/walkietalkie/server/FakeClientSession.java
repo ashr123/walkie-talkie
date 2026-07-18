@@ -83,14 +83,10 @@ public final class FakeClientSession implements ClientSession {
 	}
 
 	@Override
-	public void send(ServerMessage message) {
-		sent.add(message);
-	}
-
-	@Override
 	public void sendEncoded(String encoded) {
-		// A fan-out delivers the pre-serialized JSON; decode it back to a typed message so tests assert on received
-		// ServerMessages uniformly, whether they arrived via a single send or a broadcast.
+		// All control now arrives pre-serialized (via MessageBroadcaster's toOne/toAll/toOthers); decode it back to
+		// a typed message so tests assert on received ServerMessages. This test double, not production, is the only
+		// place a sent message is reconstructed.
 		sent.add(JSON.readValue(encoded, ServerMessage.class));
 	}
 

@@ -47,7 +47,9 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 			connectionService.onMessage(clientSession, codec.decode(message.getPayload()));
 		} catch (RuntimeException e) {
 			getLogger().debug("Bad control message from {}: {}", clientSession.id(), e.getMessage());
-			clientSession.send(new ServerMessage.ErrorMessage(ErrorCode.BAD_MESSAGE, "Could not parse control message"));
+			// Encode the parse-error reply with the handler's own codec (already held for decode above) — this is a
+			// transport-boundary error for a message ConnectionService never saw, so it doesn't route via the broadcaster.
+			clientSession.sendEncoded(codec.encode(new ServerMessage.ErrorMessage(ErrorCode.BAD_MESSAGE, "Could not parse control message")));
 		}
 	}
 
@@ -124,7 +126,6 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 						SEND_TIME_LIMIT_MS,
 						SEND_BUFFER_LIMIT_BYTES
 				),
-				codec,
 				transport,
 				(String) session.getAttributes().get(ChannelHandshakeInterceptor.HANDSHAKE_CHANNEL_ATTR)
 		);

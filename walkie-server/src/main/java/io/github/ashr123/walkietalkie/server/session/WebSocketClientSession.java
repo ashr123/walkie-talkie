@@ -1,7 +1,5 @@
 package io.github.ashr123.walkietalkie.server.session;
 
-import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
-import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.socket.*;
@@ -16,8 +14,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// [ClientSession] backed by a Spring [WebSocketSession] (expected to be a
 /// [ConcurrentWebSocketSessionDecorator] so the socket layer bounds a wedged in-flight write).
 ///
-/// Sends are **asynchronous and non-blocking**: each outbound frame is encoded on the caller thread and then
-/// handed to a per-session mailbox drained by exactly **one** dedicated virtual thread. This gives:
+/// Sends are **asynchronous and non-blocking**: each outbound frame is handed to a per-session mailbox drained
+/// by exactly **one** dedicated virtual thread (a control frame arrives already encoded — see
+/// [io.github.ashr123.walkietalkie.server.transport.MessageBroadcaster]; audio is a raw byte[]). This gives:
 ///   - **Isolation** — a slow/backpressured recipient backs up only its own mailbox and its own drainer; it
 ///     never blocks the fan-out caller ([io.github.ashr123.walkietalkie.server.channel.Channel#forEachOther])
 ///     or any other recipient.
@@ -51,7 +50,6 @@ public final class WebSocketClientSession implements ClientSession {
 	private static final long POLL_TIMEOUT_MS = 200;
 
 	private final WebSocketSession session;
-	private final MessageCodec codec;
 	private final Transport transport;
 	/// The `channel` query param captured at the handshake (see [ClientSession#handshakeChannel]); may be null.
 	private final String handshakeChannel;
@@ -68,11 +66,9 @@ public final class WebSocketClientSession implements ClientSession {
 	private volatile String channelName;
 
 	public WebSocketClientSession(WebSocketSession session,
-	                              MessageCodec codec,
 	                              Transport transport,
 	                              String handshakeChannel) {
 		this.session = session;
-		this.codec = codec;
 		this.transport = transport;
 		this.handshakeChannel = handshakeChannel;
 	}
@@ -145,17 +141,6 @@ public final class WebSocketClientSession implements ClientSession {
 	@Override
 	public boolean supportsAudioRelay() {
 		return transport == Transport.AUDIO_RELAY;
-	}
-
-	@Override
-	public void send(ServerMessage message) {
-		if (closed.get()) {
-			return;
-		}
-		// A single-recipient send with nothing pre-encoded: serialize here (on the caller — cheap, CPU-only, so the
-		// single drainer stays the sole writer) and hand off to the shared enqueue path below. A channel-wide
-		// fan-out instead encodes ONCE in MessageBroadcaster and calls sendEncoded directly.
-		sendEncoded(codec.encode(message));
 	}
 
 	@Override

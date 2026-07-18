@@ -1599,11 +1599,6 @@ class ConnectionServiceTest {
 		}
 
 		@Override
-		public void send(ServerMessage message) {
-			// control frames are irrelevant to this fake
-		}
-
-		@Override
 		public void sendEncoded(String encoded) {
 			// control frames are irrelevant to this fake
 		}

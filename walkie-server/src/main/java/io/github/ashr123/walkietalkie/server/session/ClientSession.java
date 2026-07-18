@@ -1,7 +1,5 @@
 package io.github.ashr123.walkietalkie.server.session;
 
-import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
-
 /// A connected participant, abstracted away from the underlying WebSocket so that the channel and
 /// connection logic can be unit-tested with simple fakes.
 public interface ClientSession {
@@ -29,13 +27,10 @@ public interface ClientSession {
 
 	boolean supportsAudioRelay();
 
-	/// Sends a control/signaling message as a JSON text frame (encoded here, for a single recipient).
-	void send(ServerMessage message);
-
-	/// Sends a control message that a channel-wide fan-out has ALREADY serialized to its JSON wire form once (see
-	/// [io.github.ashr123.walkietalkie.server.transport.MessageBroadcaster]): the recipient enqueues the shared
-	/// `encoded` string without re-encoding. Same delivery as [#send(ServerMessage)] for one recipient, but avoids
-	/// the per-recipient encode when broadcasting to many.
+	/// Enqueues an already-serialized control message (its JSON wire form) as a text frame. All control goes out
+	/// through [io.github.ashr123.walkietalkie.server.transport.MessageBroadcaster], which owns the codec and
+	/// encodes ONCE (so a channel fan-out costs one encode, not one per recipient); this session is a dumb sink
+	/// that never touches the wire format itself.
 	void sendEncoded(String encoded);
 
 	/// Sends a raw audio frame as a binary frame.

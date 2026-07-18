@@ -10,18 +10,19 @@ import org.springframework.stereotype.Component;
 
 import java.util.stream.Stream;
 
-/// Fans one or more control [ServerMessage]s out to a channel, serializing each EXACTLY ONCE and handing every
-/// recipient the same pre-encoded JSON (via [ClientSession#sendEncoded]) — so a broadcast to N members costs one
-/// encode per message, not N. When several messages are passed they are delivered to each member in argument
-/// order (a member's outbound queue is FIFO), so e.g. a mode change can fan out ModeChanged + FloorIdle in one
-/// call and every member sees them in that order.
+/// The single place OUTBOUND control [ServerMessage]s are serialized: to one recipient ([#toOne]), to a whole
+/// channel ([#toAll]), or to everyone-but-one ([#toOthers]). Each message is encoded EXACTLY ONCE and the same
+/// pre-encoded JSON is handed to every recipient (via [ClientSession#sendEncoded]) — so a broadcast to N members
+/// costs one encode per message, not N. When several messages are passed to toAll/toOthers they are delivered to
+/// each member in argument order (a member's outbound queue is FIFO), so e.g. a mode change can fan out
+/// ModeChanged + FloorIdle in one call and every member sees them in that order.
 ///
-/// Concentrating channel-wide serialization here is what lets [ConnectionService] stay transport-agnostic: it
-/// hands over a typed message and never touches the wire format or the [MessageCodec]. A failed send to one
-/// recipient is swallowed (like ConnectionService's single-send `safeSend`) so it can't abort the fan-out to the
-/// rest. Call sites pass the SAME `channel` they already hold, so a broadcast issued under `synchronized(channel)`
-/// (the passphrase/owner/lock convergence discipline) stays under that monitor — and the single encode now runs
-/// there too, which is briefer than the per-recipient encodes it replaces.
+/// Owning all outbound encoding here is what lets [ConnectionService] stay transport-agnostic: it hands over a
+/// typed message and never touches the wire format or the [MessageCodec] — [ClientSession] carries only the raw
+/// [ClientSession#sendEncoded] sink, no codec of its own. A failed send to one recipient is swallowed so it can't
+/// abort a fan-out to the rest. Call sites pass the SAME `channel` they already hold, so a broadcast issued under
+/// `synchronized(channel)` (the passphrase/owner/lock convergence discipline) stays under that monitor — and the
+/// single encode now runs there too, briefer than the per-recipient encodes it replaces.
 @Component
 public class MessageBroadcaster {
 
@@ -47,14 +48,20 @@ public class MessageBroadcaster {
 		channel.forEachOther(excludeSessionId, member -> deliver(member, encoded));
 	}
 
+	/// Serialize `message` and send it to a SINGLE recipient — the non-fan-out control sends (a Joined snapshot, a
+	/// floor grant/denial, an error reply, a relayed WebRTC signal). Swallows a send failure like the fan-outs.
+	public void toOne(ClientSession recipient, ServerMessage message) {
+		deliver(recipient, codec.encode(message));
+	}
+
 	private String[] encodeAll(ServerMessage... messages) {
 		return Stream.of(messages)
 				.map(codec::encode).
 				toArray(String[]::new);
 	}
 
-	/// Delivers the already-encoded frames to one recipient in order, swallowing a per-recipient failure so it
-	/// can't abort the fan-out to the rest (mirrors ConnectionService's single-send `safeSend`).
+	/// Delivers the already-encoded frame(s) to one recipient in order, swallowing a per-recipient failure so it
+	/// can't abort a fan-out to the rest.
 	private static void deliver(ClientSession member, String... encoded) {
 		for (String frame : encoded) {
 			try {

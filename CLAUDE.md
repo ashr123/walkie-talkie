@@ -266,20 +266,21 @@ server must read and act on it).
 
 **Concurrency.** Virtual threads are enabled (`spring.threads.virtual.enabled`). Each
 `WebSocketClientSession` owns an **asynchronous outbound mailbox** drained by exactly one dedicated virtual
-thread: `send`/`sendAudio` encode on the caller thread, then hand the frame off without blocking — so a slow
-recipient backs up only its own queue (never the fan-out caller `Channel.forEachOther` or other recipients),
-and the single consumer keeps each recipient's frames in submission order (required by the stateful Opus
-decode). Audio and control are split: audio is bounded and **dropped** on overflow (lossy, real-time), while
-control (floor/mode/owner/membership) is delivered reliably and drained ahead of audio — a client too far
-behind even for control is disconnected to force a clean reconnect/re-sync. A channel-wide control broadcast is
-serialized **once**: `MessageBroadcaster` (which owns the `MessageCodec`) encodes each message a single time and
-hands the same JSON to every recipient's mailbox via `ClientSession.sendEncoded`, so fan-out to N members costs
-one encode, not N — and it keeps `ConnectionService` transport-agnostic (it passes the broadcaster a typed
-`ServerMessage`, never the wire format; single-recipient control uses `send(ServerMessage)`, which encodes then
-delegates to the same `sendEncoded` path). The wrapping `ConcurrentWebSocketSessionDecorator` is kept only as the
-socket-layer backstop (its send-time / buffer
-limit aborts a wedged in-flight write). In the Java client the Opus encoder/decoder are confined to the
-capture/playback threads respectively.
+thread: the caller hands off each outbound frame without blocking — a control frame already encoded by
+`MessageBroadcaster`, or a raw audio `byte[]` — so a slow recipient backs up only its own queue (never the
+fan-out caller `Channel.forEachOther` or other recipients), and the single consumer keeps each recipient's frames
+in submission order (required by the stateful Opus decode). Audio and control are split: audio is bounded and
+**dropped** on overflow (lossy, real-time), while control (floor/mode/owner/membership) is delivered reliably and
+drained ahead of audio — a client too far behind even for control is disconnected to force a clean
+reconnect/re-sync. **All outbound control goes through `MessageBroadcaster`** (which owns the `MessageCodec`):
+`toOne` for a single recipient (a `Joined` snapshot, a floor grant, an error), `toAll`/`toOthers` for a channel
+fan-out. It serializes each message **once** and hands the same JSON to every recipient's mailbox via
+`ClientSession.sendEncoded`, so a fan-out to N members costs one encode, not N — and it keeps `ConnectionService`
+transport-agnostic: it passes the broadcaster a typed `ServerMessage` and never touches the wire format, and the
+session holds no codec (a dumb `sendEncoded`/`sendAudio` sink). The wrapping
+`ConcurrentWebSocketSessionDecorator` is kept only as the socket-layer backstop (its send-time / buffer limit
+aborts a wedged in-flight write). In the Java client the Opus encoder/decoder are confined to the capture/playback
+threads respectively.
 
 **Multi-instance (channel affinity), off by default.** The `Channel` (membership, floor, owner/mode/lock,
 keyCheck, mute, audio fan-out, stream-index pool) is entirely in-process, so horizontal scaling uses

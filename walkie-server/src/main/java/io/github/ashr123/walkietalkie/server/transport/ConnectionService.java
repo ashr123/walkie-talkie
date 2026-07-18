@@ -120,20 +120,12 @@ public class ConnectionService {
 		}
 	}
 
-	private static void safeSend(ClientSession session, ServerMessage message) {
-		try {
-			session.send(message);
-		} catch (RuntimeException e) {
-			log.debug("Control send to {} failed: {}", session.id(), e.getMessage());
-		}
-	}
-
 	/// Sends a control-plane error to the requester AND logs why the request was refused — so an operator can
 	/// see the reason, and when a client then disconnects (e.g. it closes after a passphrase mismatch) the
 	/// preceding line explains why. Runs in the requester's message scope, so the log carries its id + name.
-	private static void sendError(ClientSession session, ErrorCode code, String message) {
+	private void sendError(ClientSession session, ErrorCode code, String message) {
 		log.info("request refused: {} — {}", code, message);
-		safeSend(session, new ServerMessage.ErrorMessage(code, message));
+		broadcaster.toOne(session, new ServerMessage.ErrorMessage(code, message));
 	}
 
 	private void handleJoin(ClientSession session, ClientMessage.Join join) {
@@ -145,8 +137,17 @@ public class ConnectionService {
 		if (requested != null
 				&& requested.equals(session.channelName())
 				&& channelRegistry.find(requested) instanceof Some(Channel current)) {
-			session.send(new ServerMessage.Joined(
-					session.id(), current.name(), current.mode(), current.ownerId(), current.isLocked(), current.memberInfos()));
+			broadcaster.toOne(
+					session,
+					new ServerMessage.Joined(
+							session.id(),
+							current.name(),
+							current.mode(),
+							current.ownerId(),
+							current.isLocked(),
+							current.memberInfos()
+					)
+			);
 			return;
 		}
 
@@ -209,10 +210,19 @@ public class ConnectionService {
 		Consumer<ChannelRegistry.JoinResult> emitInitialState = joined -> {
 			Channel joinedChannel = joined.channel();
 			session.joinedChannel(joinedChannel.name());
-			safeSend(session, new ServerMessage.Joined(session.id(), joinedChannel.name(),
-					joinedChannel.mode(), joinedChannel.ownerId(), joinedChannel.isLocked(), joined.roster()));
+			broadcaster.toOne(
+					session,
+					new ServerMessage.Joined(
+							session.id(),
+							joinedChannel.name(),
+							joinedChannel.mode(),
+							joinedChannel.ownerId(),
+							joinedChannel.isLocked(),
+							joined.roster()
+					)
+			);
 			if (joined.floorHolder() instanceof Some(String holder)) {
-				safeSend(session, new ServerMessage.FloorTaken(holder));
+				broadcaster.toOne(session, new ServerMessage.FloorTaken(holder));
 			}
 		};
 
@@ -319,7 +329,7 @@ public class ConnectionService {
 			return;
 		}
 		if (channel.mode() == ChannelMode.FULL_DUPLEX) {
-			session.send(new ServerMessage.FloorGranted());
+			broadcaster.toOne(session, new ServerMessage.FloorGranted());
 			return;
 		}
 		Instant now = clock.instant();
@@ -346,7 +356,7 @@ public class ConnectionService {
 				log.info("preempted idle floor holder={}", currentHolderId);
 				grantFloor(channel, session);
 			} else {
-				session.send(new ServerMessage.FloorDenied(currentHolderId));
+				broadcaster.toOne(session, new ServerMessage.FloorDenied(currentHolderId));
 				log.debug("denied the floor (held by session={})", currentHolderId);
 			}
 		}
@@ -371,7 +381,7 @@ public class ConnectionService {
 	/// acquire/activity marks were stamped atomically with the swap in [Channel]). The `FloorTaken` broadcast
 	/// doubles as the notice to a just-preempted ex-holder that the floor is no longer theirs.
 	private void grantFloor(Channel channel, ClientSession session) {
-		session.send(new ServerMessage.FloorGranted());
+		broadcaster.toOne(session, new ServerMessage.FloorGranted());
 		broadcaster.toOthers(channel, session.id(), new ServerMessage.FloorTaken(session.id()));
 	}
 
@@ -531,7 +541,7 @@ public class ConnectionService {
 			return;
 		}
 		if (channel.member(targetId) instanceof Some(ClientSession target))
-			safeSend(target, message);
+			broadcaster.toOne(target, message);
 		else
 			sendError(session, ErrorCode.UNKNOWN_TARGET,
 					"No member '" + targetId + "' in this channel");
