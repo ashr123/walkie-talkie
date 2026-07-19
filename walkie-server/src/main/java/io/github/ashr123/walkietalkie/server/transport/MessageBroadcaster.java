@@ -34,6 +34,18 @@ public class MessageBroadcaster {
 		this.codec = codec;
 	}
 
+	/// Delivers the already-encoded frame(s) to one recipient in order, swallowing a per-recipient failure so it
+	/// can't abort a fan-out to the rest.
+	private static void deliver(ClientSession member, String... encoded) {
+		for (String frame : encoded) {
+			try {
+				member.sendEncoded(frame);
+			} catch (RuntimeException e) {
+				log.debug("Control fan-out to {} failed: {}", member.id(), e.getMessage());
+			}
+		}
+	}
+
 	/// Serialize each message once, then deliver them all — in argument order — to EVERY member of `channel`.
 	public void toAll(Channel channel, ServerMessage... messages) {
 		String[] encoded = encodeAll(messages);
@@ -56,19 +68,7 @@ public class MessageBroadcaster {
 
 	private String[] encodeAll(ServerMessage... messages) {
 		return Stream.of(messages)
-				.map(codec::encode).
-				toArray(String[]::new);
-	}
-
-	/// Delivers the already-encoded frame(s) to one recipient in order, swallowing a per-recipient failure so it
-	/// can't abort a fan-out to the rest.
-	private static void deliver(ClientSession member, String... encoded) {
-		for (String frame : encoded) {
-			try {
-				member.sendEncoded(frame);
-			} catch (RuntimeException e) {
-				log.debug("Control fan-out to {} failed: {}", member.id(), e.getMessage());
-			}
-		}
+				.map(codec::encode)
+				.toArray(String[]::new);
 	}
 }
