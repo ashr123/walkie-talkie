@@ -319,9 +319,11 @@ public class ConnectionService {
 					// never muted, so unmute it if needed — else it would be a muted owner nobody can unmute.
 					unmuteOwnerIfMuted(channel);
 					log.info(
-							"ownership transferred to \"{}\" (session={})",
-							channel.member(newOwnerId) instanceof Some(ClientSession newOwner) ? newOwner.displayName() : "?",
-							newOwnerId
+							"ownership transferred to session={} ({})",
+							newOwnerId,
+							channel.member(newOwnerId) instanceof Some(
+									ClientSession newOwner
+							) ? newOwner.displayName() : "?"
 					);
 				}
 				// Floor teardown on LIVE state, run UNCONDITIONALLY. This is safe despite the monitor gap around
