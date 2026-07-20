@@ -1,9 +1,11 @@
 package io.github.ashr123.walkietalkie.server.support;
 
+import io.github.ashr123.walkietalkie.server.FakeClientSession;
+import io.github.ashr123.walkietalkie.server.channel.Channel;
+import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import org.junit.jupiter.api.Test;
 import org.slf4j.MDC;
-
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -11,80 +13,53 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class RequestContextTest {
 
 	@Test
-	void runAsBindsTheSessionNameAndChannelForTheScopeAndClearsThemAfterwards() {
-		assertEquals("system", RequestContext.currentSessionIdOrSystem(), "no session is bound initially");
+	void aScopeBindsSessionNameAndChannelForItsBlockAndRestoresThemOnClose() {
 		assertNull(MDC.get(RequestContext.MDC_SESSION_KEY), "MDC has no session initially");
 		assertNull(MDC.get(RequestContext.MDC_NAME_KEY), "MDC has no name initially");
 		assertNull(MDC.get(RequestContext.MDC_CHANNEL_KEY), "MDC has no channel initially");
 
-		AtomicReference<String> scopedInside = new AtomicReference<>();
-		AtomicReference<String> mdcSessionInside = new AtomicReference<>();
-		AtomicReference<String> mdcNameInside = new AtomicReference<>();
-		AtomicReference<String> mdcChannelInside = new AtomicReference<>();
-		RequestContext.runAs("session-a", "Alice", "room-1", () -> {
-			scopedInside.set(RequestContext.currentSessionIdOrSystem());
-			mdcSessionInside.set(MDC.get(RequestContext.MDC_SESSION_KEY));
-			mdcNameInside.set(MDC.get(RequestContext.MDC_NAME_KEY));
-			mdcChannelInside.set(MDC.get(RequestContext.MDC_CHANNEL_KEY));
-		});
+		try (RequestContext.Scope _ = RequestContext.open("session-a", "Alice", "room-1")) {
+			assertEquals("session-a", MDC.get(RequestContext.MDC_SESSION_KEY), "MDC carries the session inside the scope");
+			assertEquals("Alice", MDC.get(RequestContext.MDC_NAME_KEY), "MDC carries the name inside the scope");
+			assertEquals("room-1", MDC.get(RequestContext.MDC_CHANNEL_KEY), "MDC carries the channel inside the scope");
+		}
 
-		assertEquals("session-a", scopedInside.get(), "scoped value is readable inside the scope");
-		assertEquals("session-a", mdcSessionInside.get(), "MDC carries the session inside the scope");
-		assertEquals("Alice", mdcNameInside.get(), "MDC carries the name inside the scope");
-		assertEquals("room-1", mdcChannelInside.get(), "MDC carries the channel inside the scope");
-		assertEquals("system", RequestContext.currentSessionIdOrSystem(), "scope is unbound afterwards");
-		assertNull(MDC.get(RequestContext.MDC_SESSION_KEY), "MDC session is cleared afterwards");
-		assertNull(MDC.get(RequestContext.MDC_NAME_KEY), "MDC name is cleared afterwards");
-		assertNull(MDC.get(RequestContext.MDC_CHANNEL_KEY), "MDC channel is cleared afterwards");
+		assertNull(MDC.get(RequestContext.MDC_SESSION_KEY), "MDC session is cleared after the scope");
+		assertNull(MDC.get(RequestContext.MDC_NAME_KEY), "MDC name is cleared after the scope");
+		assertNull(MDC.get(RequestContext.MDC_CHANNEL_KEY), "MDC channel is cleared after the scope");
 	}
 
 	@Test
-	void aBlankNameOrChannelLeavesThoseKeysUnset() {
-		AtomicReference<String> mdcNameInside = new AtomicReference<>("sentinel");
-		AtomicReference<String> mdcChannelInside = new AtomicReference<>("sentinel");
-		// Pre-join: the name is still blank and the session is in no channel.
-		RequestContext.runAs("session-a", "", null, () -> {
-			mdcNameInside.set(MDC.get(RequestContext.MDC_NAME_KEY));
-			mdcChannelInside.set(MDC.get(RequestContext.MDC_CHANNEL_KEY));
-		});
-
-		assertNull(mdcNameInside.get(), "a blank display name (pre-join) does not set the MDC name key");
-		assertNull(mdcChannelInside.get(), "a null channel (not in a channel) does not set the MDC channel key");
+	void aNullOrBlankComponentLeavesThatKeyUnsetSoThePatternDefaultShows() {
+		// What channelScope passes: server-initiated, channel-only work — no session, no name.
+		try (RequestContext.Scope _ = RequestContext.open(null, null, "room-1")) {
+			assertNull(MDC.get(RequestContext.MDC_SESSION_KEY), "a null session leaves the key unset — pattern shows 'system'");
+			assertNull(MDC.get(RequestContext.MDC_NAME_KEY), "a null name leaves the key unset");
+			assertEquals("room-1", MDC.get(RequestContext.MDC_CHANNEL_KEY), "the channel is still set");
+		}
 	}
 
 	@Test
 	void updateDisplayNameAdvancesTheMdcNameMidScopeAndIsStillCleanedUp() {
-		AtomicReference<String> atEntry = new AtomicReference<>("sentinel");
-		AtomicReference<String> afterUpdate = new AtomicReference<>();
 		// Mirrors a join: the scope begins with a blank name, then the name becomes known partway through.
-		RequestContext.runAs("session-a", "", null, () -> {
-			atEntry.set(MDC.get(RequestContext.MDC_NAME_KEY));
+		try (RequestContext.Scope _ = RequestContext.open("session-a", "", null)) {
+			assertNull(MDC.get(RequestContext.MDC_NAME_KEY), "the name is unset at entry when the scope began blank");
 			RequestContext.updateDisplayName("Alice");
-			afterUpdate.set(MDC.get(RequestContext.MDC_NAME_KEY));
-		});
-
-		assertNull(atEntry.get(), "the name is unset at entry when the scope began blank");
-		assertEquals("Alice", afterUpdate.get(), "updateDisplayName advances the MDC name within the scope");
+			assertEquals("Alice", MDC.get(RequestContext.MDC_NAME_KEY), "updateDisplayName advances the MDC name within the scope");
+		}
 		assertNull(MDC.get(RequestContext.MDC_NAME_KEY), "the mid-scope name is still cleaned up on scope exit");
 	}
 
 	@Test
 	void updateChannelAdvancesOnJoinThenClearsOnLeaveMidScopeAndIsStillCleanedUp() {
-		AtomicReference<String> atEntry = new AtomicReference<>("sentinel");
-		AtomicReference<String> afterJoin = new AtomicReference<>();
-		AtomicReference<String> afterLeave = new AtomicReference<>("sentinel");
 		// Mirrors a session that joins a channel partway through the scope, then leaves it.
-		RequestContext.runAs("session-a", "Alice", null, () -> {
-			atEntry.set(MDC.get(RequestContext.MDC_CHANNEL_KEY));
+		try (RequestContext.Scope _ = RequestContext.open("session-a", "Alice", null)) {
+			assertNull(MDC.get(RequestContext.MDC_CHANNEL_KEY), "no channel at entry when the scope began outside a channel");
 			RequestContext.updateChannel("room-1");
-			afterJoin.set(MDC.get(RequestContext.MDC_CHANNEL_KEY));
+			assertEquals("room-1", MDC.get(RequestContext.MDC_CHANNEL_KEY), "updateChannel advances the MDC channel on a join");
 			RequestContext.updateChannel(null);
-			afterLeave.set(MDC.get(RequestContext.MDC_CHANNEL_KEY));
-		});
-
-		assertNull(atEntry.get(), "no channel at entry when the scope began outside a channel");
-		assertEquals("room-1", afterJoin.get(), "updateChannel advances the MDC channel on a join");
-		assertNull(afterLeave.get(), "updateChannel(null) clears the MDC channel on a leave");
+			assertNull(MDC.get(RequestContext.MDC_CHANNEL_KEY), "updateChannel(null) clears the MDC channel on a leave");
+		}
 		assertNull(MDC.get(RequestContext.MDC_CHANNEL_KEY), "the mid-scope channel is cleaned up on scope exit");
 	}
 
@@ -97,36 +72,59 @@ class RequestContextTest {
 	}
 
 	@Test
-	void nestedRunAsRestoresTheOuterSessionNameAndChannelOnExit() {
-		AtomicReference<String> innerSession = new AtomicReference<>();
-		AtomicReference<String> innerName = new AtomicReference<>();
-		AtomicReference<String> innerChannel = new AtomicReference<>();
-		AtomicReference<String> afterInnerSession = new AtomicReference<>();
-		AtomicReference<String> afterInnerName = new AtomicReference<>();
-		AtomicReference<String> afterInnerChannel = new AtomicReference<>();
-		AtomicReference<String> afterInnerScoped = new AtomicReference<>();
+	void theUpdatersAreNoOpsInAChannelOnlyScopeWhichBindsNoSession() {
+		// A channelScope (no session) is not a per-client scope: the mid-scope updaters must not fire there.
+		try (RequestContext.Scope _ = RequestContext.open(null, null, "room-1")) {
+			RequestContext.updateDisplayName("Alice");
+			assertNull(MDC.get(RequestContext.MDC_NAME_KEY), "updateDisplayName is a no-op in a channel-only scope (no session bound)");
+		}
+	}
 
-		RequestContext.runAs("outer", "Olivia", "room-out", () -> {
-			RequestContext.runAs("inner", "Ivan", "room-in", () -> {
-				innerSession.set(MDC.get(RequestContext.MDC_SESSION_KEY));
-				innerName.set(MDC.get(RequestContext.MDC_NAME_KEY));
-				innerChannel.set(MDC.get(RequestContext.MDC_CHANNEL_KEY));
-			});
-			afterInnerSession.set(MDC.get(RequestContext.MDC_SESSION_KEY));
-			afterInnerName.set(MDC.get(RequestContext.MDC_NAME_KEY));
-			afterInnerChannel.set(MDC.get(RequestContext.MDC_CHANNEL_KEY));
-			afterInnerScoped.set(RequestContext.currentSessionIdOrSystem());
-		});
-
-		assertEquals("inner", innerSession.get(), "inner scope tags the inner session");
-		assertEquals("Ivan", innerName.get(), "inner scope tags the inner name");
-		assertEquals("room-in", innerChannel.get(), "inner scope tags the inner channel");
-		assertEquals("outer", afterInnerSession.get(), "MDC session is restored to the outer scope, not wiped");
-		assertEquals("Olivia", afterInnerName.get(), "MDC name is restored to the outer scope, not wiped");
-		assertEquals("room-out", afterInnerChannel.get(), "MDC channel is restored to the outer scope, not wiped");
-		assertEquals("outer", afterInnerScoped.get(), "scoped value still resolves to the outer session");
+	@Test
+	void nestedScopesRestoreTheOuterValuesOnInnerClose() {
+		try (RequestContext.Scope _ = RequestContext.open("outer", "Olivia", "room-out")) {
+			try (RequestContext.Scope _inner = RequestContext.open("inner", "Ivan", "room-in")) {
+				assertEquals("inner", MDC.get(RequestContext.MDC_SESSION_KEY), "inner scope tags the inner session");
+				assertEquals("room-in", MDC.get(RequestContext.MDC_CHANNEL_KEY), "inner scope tags the inner channel");
+			}
+			assertEquals("outer", MDC.get(RequestContext.MDC_SESSION_KEY), "the outer session is restored on inner close, not wiped");
+			assertEquals("room-out", MDC.get(RequestContext.MDC_CHANNEL_KEY), "the outer channel is restored on inner close, not wiped");
+		}
 		assertNull(MDC.get(RequestContext.MDC_SESSION_KEY), "MDC session is cleared after the outer scope");
-		assertNull(MDC.get(RequestContext.MDC_NAME_KEY), "MDC name is cleared after the outer scope");
 		assertNull(MDC.get(RequestContext.MDC_CHANNEL_KEY), "MDC channel is cleared after the outer scope");
+	}
+
+	@Test
+	void closingAScopeTwiceIsIdempotentAndDoesNotClobberAnEnclosingScope() {
+		try (RequestContext.Scope _ = RequestContext.open("outer", "Olivia", "room-out")) {
+			RequestContext.Scope inner = RequestContext.open("inner", "Ivan", "room-in");
+			inner.close();
+			assertEquals("outer", MDC.get(RequestContext.MDC_SESSION_KEY), "the first close restored the outer session");
+			inner.close();   // a second close must be a no-op
+			assertEquals("outer", MDC.get(RequestContext.MDC_SESSION_KEY), "a double close does not re-restore and clobber the outer session");
+			assertEquals("room-out", MDC.get(RequestContext.MDC_CHANNEL_KEY), "the outer channel is intact after the double close");
+		}
+		assertNull(MDC.get(RequestContext.MDC_SESSION_KEY), "MDC session is cleared after the outer scope");
+	}
+
+	@Test
+	void scopeFromAClientSessionPopulatesTheMdcFromItsAccessors() {
+		// Guards the field mapping — id / displayName / channelName are all Strings, so a swap would still compile.
+		FakeClientSession session = new FakeClientSession("sess-x", Transport.AUDIO_RELAY, "Alice");
+		session.joinedChannel("room-9");
+		try (RequestContext.Scope _ = RequestContext.scope(session)) {
+			assertEquals("sess-x", MDC.get(RequestContext.MDC_SESSION_KEY), "scope maps ClientSession.id() to the session key");
+			assertEquals("Alice", MDC.get(RequestContext.MDC_NAME_KEY), "scope maps ClientSession.displayName() to the name key");
+			assertEquals("room-9", MDC.get(RequestContext.MDC_CHANNEL_KEY), "scope maps ClientSession.channelName() to the channel key");
+		}
+	}
+
+	@Test
+	void channelScopeTagsOnlyTheChannelAndLeavesTheSessionUnset() {
+		Channel channel = new Channel("room-9", ChannelMode.MULTI_CHANNEL_PTT, "owner", null, false);
+		try (RequestContext.Scope _ = RequestContext.channelScope(channel)) {
+			assertEquals("room-9", MDC.get(RequestContext.MDC_CHANNEL_KEY), "channelScope tags the channel from Channel.name()");
+			assertNull(MDC.get(RequestContext.MDC_SESSION_KEY), "channelScope binds no session — the pattern shows its 'system' default");
+		}
 	}
 }

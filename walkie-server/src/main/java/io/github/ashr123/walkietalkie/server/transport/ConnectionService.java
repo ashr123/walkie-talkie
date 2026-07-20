@@ -85,14 +85,14 @@ public class ConnectionService {
 	public static void onConnect(ClientSession session) {
 		// Scope the lifecycle line so it carries the session id (and the name, once known) via the MDC, like the
 		// per-message lines. At connect the client hasn't joined yet, so the name is still blank.
-		RequestContext.runAs(session.id(), session.displayName(), session.channelName(),
-				() -> log.info("connected (transport={})", session.transport()));
+		try (RequestContext.Scope _ = RequestContext.scope(session)) {
+			log.info("connected (transport={})", session.transport());
+		}
 	}
 
-	/// Handles one decoded control message. The caller's identity is bound for the dynamic scope of the
-	/// call (a Java 25 [ScopedValue]) and surfaced on the log lines emitted while handling it (via the
-	/// MDC) — see [RequestContext#runAs]. The audio relay path ({@link #onAudio}) is deliberately not
-	/// scoped, to avoid per-frame MDC churn.
+	/// Handles one decoded control message. The caller's identity is bound for the dynamic scope of the call and
+	/// surfaced on the log lines emitted while handling it (via the MDC) — see [RequestContext#scope]. The audio
+	/// relay path ([#onAudio]) is deliberately not scoped, to avoid per-frame MDC churn.
 	public void onMessage(ClientSession session, ClientMessage message) {
 		// Per-session control-plane flood guard: drop messages from a sender over its rate ceiling BEFORE doing
 		// any work (dispatch, broadcasts, the MDC scope), so a control flood — e.g. a rename storm fanning out to
@@ -101,7 +101,9 @@ public class ConnectionService {
 		if (!controlRateLimiter.tryAcquire(session.id())) {
 			return;
 		}
-		RequestContext.runAs(session.id(), session.displayName(), session.channelName(), () -> dispatch(session, message));
+		try (RequestContext.Scope _ = RequestContext.scope(session)) {
+			dispatch(session, message);
+		}
 	}
 
 	private void dispatch(ClientSession session, ClientMessage message) {
@@ -499,58 +501,65 @@ public class ConnectionService {
 	void releaseExpiredFloors() {
 		Instant now = clock.instant();
 		for (Channel channel : channelRegistry.channels()) {
-			synchronized (channel) {
-				boolean freed = false;
-				// 1. Max-hold cap (bounds any holder, incl. WebRTC).
-				if (!floorMaxHold.isZero()) {
-					String holder = channel.releaseIfExpired(now.minus(floorMaxHold));
-					if (holder != null) {
-						freed = true;
-						// The sweep is a scheduled task, not bound to a session scope, and the holder is some OTHER
-						// session — so log its id + name explicitly rather than relying on the MDC.
-						log.info(
-								"session={} ({}) reached the max floor-hold time on channel={}; floor released by sweep",
-								holder,
-								channel.member(holder) instanceof Some(ClientSession held) ? held.displayName() : "?",
-								channel.name());
+			// Tag every line this per-channel pass logs with channel=… in the MDC, the way the per-message handler
+			// lines are (the channel is logging context, not identity — see RequestContext). The sweep runs on a
+			// scheduler thread with no acting client, so identity stays "system"; the AFFECTED member is named as
+			// the subject in each message.
+			try (RequestContext.Scope _ = RequestContext.channelScope(channel)) {
+				synchronized (channel) {
+					boolean freed = false;
+					// 1. Max-hold cap (bounds any holder, incl. WebRTC).
+					if (!floorMaxHold.isZero()) {
+						String holder = channel.releaseIfExpired(now.minus(floorMaxHold));
+						if (holder != null) {
+							freed = true;
+							log.info("session={} ({}) reached the max floor-hold time; floor released by sweep",
+									holder,
+									channel.member(holder) instanceof Some(ClientSession held) ? held.displayName() : "?");
+						}
 					}
-				}
-				// 2. Idle-release to advance the queue: only when nothing was freed above, the queue is on and
-				// non-empty, and the current holder is a relay member (WebRTC gives the server no activity signal,
-				// so an active WebRTC speaker must not be reclaimed as "idle").
-				if (!freed
-						&& !floorIdleRelease.isZero()
-						&& channel.isFloorQueueEnabled()
-						&& !channel.floorQueue().isEmpty()
-						&& channel.floorHolder() instanceof Some(String holderId)
-						&& channel.member(holderId) instanceof Some(ClientSession holder)
-						&& holder.supportsAudioRelay()) {
-					String released = channel.releaseIfIdle(now.minus(floorIdleRelease));
-					if (released != null) {
-						freed = true;
-						log.info(
-								"session={} ({}) idle past the release window on channel={}; floor offered to the queue",
-								released, holder.displayName(), channel.name());
+					// 2. Idle-release to advance the queue: only when nothing was freed above, the queue is on and
+					// non-empty, and the current holder is a relay member (WebRTC gives the server no activity signal,
+					// so an active WebRTC speaker must not be reclaimed as "idle").
+					if (!freed
+							&& !floorIdleRelease.isZero()
+							&& channel.isFloorQueueEnabled()
+							&& !channel.floorQueue().isEmpty()
+							&& channel.floorHolder() instanceof Some(String holderId)
+							&& channel.member(holderId) instanceof Some(ClientSession holder)
+							&& holder.supportsAudioRelay()) {
+						String released = channel.releaseIfIdle(now.minus(floorIdleRelease));
+						if (released != null) {
+							freed = true;
+							log.info("session={} ({}) idle past the release window; floor offered to the queue",
+									released, holder.displayName());
+						}
 					}
-				}
-				// 3. Whatever freed the floor above, offer it to the queue head and re-broadcast the snapshot.
-				if (freed) {
-					reserveAndNotify(channel, now);
-					broadcastFloorStatus(channel);
-				}
-				// 4. Reservation-expiry: a reserved head that missed its claim window is dropped and the floor is
-				// offered to the next in line. Runs last so a reservation freshly stamped at `now` by steps 1–3 is
-				// not itself treated as expired.
-				String missed = channel.expiredReservationHead(now.minus(floorReservation));
-				if (missed != null) {
-					channel.dequeueFloor(missed);
-					reserveAndNotify(channel, now);
-					broadcastFloorStatus(channel);
-					log.info(
-							"session={} ({}) missed its floor reservation on channel={}; offered to the next in line",
-							missed,
-							channel.member(missed) instanceof Some(ClientSession m) ? m.displayName() : "?",
-							channel.name());
+					// 3. Whatever freed the floor above, offer it to the queue head and re-broadcast the snapshot.
+					if (freed) {
+						reserveAndNotify(channel, now);
+						broadcastFloorStatus(channel);
+					}
+					// 4. Reservation-expiry: a reserved head that missed its claim window is dropped, and the floor is
+					// offered to the next in line — if anyone was behind it. Runs last so a reservation freshly
+					// stamped at `now` by steps 1–3 is not itself treated as expired.
+					String missed = channel.expiredReservationHead(now.minus(floorReservation));
+					if (missed != null) {
+                        channel.dequeueFloor(missed);
+						reserveAndNotify(channel, now);
+						broadcastFloorStatus(channel);
+						// reserveAndNotify stamps a fresh reservation on the next head IFF one was behind the dropped
+						// member: a present reservedHolder() means the floor was handed on; an absent one means the
+						// queue emptied and the floor is simply free. The {} tail reflects which.
+						log.info(
+								"session={} ({}) missed its floor reservation; {}",
+								missed,
+								channel.member(missed) instanceof Some(ClientSession m) ? m.displayName() : "?",
+								channel.reservedHolder() instanceof Some(String _)
+										? "the floor was offered to the next in line"
+										: "no one else was waiting, so the floor is now free"
+						);
+					}
 				}
 			}
 		}
@@ -598,9 +607,13 @@ public class ConnectionService {
 					// resets); the speaker must re-request to continue.
 					reserveAndNotify(channel, now);
 					broadcastFloorStatus(channel);
-					// onAudio is intentionally not session-scoped (no per-frame MDC churn), so log id + name inline.
-					log.info("session={} ({}) reached the max floor-hold time on channel={}; floor released",
-							session.id(), session.displayName(), channel.name());
+					// onAudio is intentionally not session-scoped (no per-frame MDC churn), so the holder's id + name
+					// are logged inline; the channel is mirrored into the MDC (channelScope) so this line carries
+					// channel=… like the handler lines rather than repeating it in the message.
+					try (RequestContext.Scope _ = RequestContext.channelScope(channel)) {
+						log.info("session={} ({}) reached the max floor-hold time; floor released",
+								session.id(), session.displayName());
+					}
 					return;
 				}
 				channel.markFloorActivity(now);
@@ -652,12 +665,12 @@ public class ConnectionService {
 	public void onClose(ClientSession session, String closeReason) {
 		// Scope the whole teardown so the leave + disconnect lines carry the session id AND the display name via
 		// the MDC (this is why a disconnect previously logged no name — onClose wasn't bound to the identity).
-		RequestContext.runAs(session.id(), session.displayName(), session.channelName(), () -> {
+		try (RequestContext.Scope _ = RequestContext.scope(session)) {
 			handleLeave(session);
 			audioRateLimiter.forget(session.id());
 			controlRateLimiter.forget(session.id());
 			log.info("disconnected ({})", closeReason);
-		});
+		}
 	}
 
 	private void relaySignal(ClientSession session, String targetId, ServerMessage message) {

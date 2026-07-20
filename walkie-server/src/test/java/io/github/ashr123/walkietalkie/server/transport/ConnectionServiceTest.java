@@ -1263,6 +1263,32 @@ class ConnectionServiceTest {
 	}
 
 	@Test
+	void anUnclaimedReservationWithNoOneBehindItJustFreesTheFloor() {
+		// The lone reserved head misses its window with an empty queue behind it: it is dropped and the floor is
+		// simply freed (the "no one else was waiting" path) — no successor to reserve, so no FloorReserved goes out.
+		MutableClock clock = new MutableClock(Instant.EPOCH.plusSeconds(1_000));
+		ConnectionService svc = serviceWithClock(clock, 0, 0);   // idle/max-hold off; reservation window = 10 s
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("q5b", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("q5b", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues (the sole head)
+		svc.onMessage(alice, new ClientMessage.ReleaseFloor());   // t=0: bob reserved, nobody behind it
+
+		clock.advance(Duration.ofSeconds(11));                    // past the claim window
+		bob.sent.clear();
+		svc.releaseExpiredFloors();
+
+		assertTrue(channel("q5b").floorQueue().isEmpty(), "bob missed its turn and was dropped, leaving the queue empty");
+		assertFalse(channel("q5b").floorHolder() instanceof Some(String _), "the floor is free — no successor took it");
+		assertFalse(bob.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"a dropped lone head is not itself re-reserved");
+	}
+
+	@Test
 	void onlyTheOwnerTogglesTheFloorQueueAndDisablingClearsIt() {
 		FakeClientSession alice = join("alice", "q6", ChannelMode.MULTI_CHANNEL_PTT);   // owner
 		FakeClientSession bob = join("bob", "q6", ChannelMode.MULTI_CHANNEL_PTT);
