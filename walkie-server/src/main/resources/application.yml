@@ -2,6 +2,11 @@ server:
   # Transport TLS is ON by default (HTTPS/WSS on 8443) — see TlsConfiguration. This port is used only when
   # TLS is turned off with walkie.tls.enabled=false (e.g. behind a TLS-terminating reverse proxy on loopback).
   port: 8080
+  # Graceful shutdown: on SIGTERM / context close, stop accepting new connections and let in-flight work finish
+  # before the JVM exits (bounded by spring.lifecycle.timeout-per-shutdown-phase, default 30s), so a rolling
+  # restart or scale-down drains cleanly instead of cutting connections mid-frame. Closing the web server closes
+  # the WebSocket sessions, which runs each session's outbound-drainer flush.
+  shutdown: graceful
 
 spring:
   application:
