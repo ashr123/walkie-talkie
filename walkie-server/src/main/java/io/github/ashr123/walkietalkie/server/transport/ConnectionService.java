@@ -321,9 +321,9 @@ public class ConnectionService {
 					log.info(
 							"ownership transferred to session={} ({})",
 							newOwnerId,
-							channel.member(newOwnerId) instanceof Some(
-									ClientSession newOwner
-							) ? newOwner.displayName() : "?"
+							channel.member(newOwnerId) instanceof Some(ClientSession newOwner)
+									? newOwner.displayName()
+									: "?"
 					);
 				}
 				// Floor teardown on LIVE state, run UNCONDITIONALLY. This is safe despite the monitor gap around
