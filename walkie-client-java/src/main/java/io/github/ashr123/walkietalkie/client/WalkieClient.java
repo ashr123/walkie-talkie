@@ -564,9 +564,12 @@ public final class WalkieClient implements AutoCloseable {
 			case IN_LINE ->
 					log("[in line #" + (waiting.indexOf(self) + 1) + " of " + waiting.size() + "] — type 't' to leave the queue");
 			case IDLE -> {
-				if (awaitingClaim) {
+				if (awaitingClaim && floorQueueEnabled) {
 					// We were the reserved head and let the claim window lapse (or declined): the server dropped us and
 					// offered the floor onward (grant-to-claim, miss → dropped). Report it once; the flag resets below.
+					// Guard on floorQueueEnabled: if the owner just DISABLED the queue out from under us, the
+					// FloorQueueChanged("disabled") that arrives right before this snapshot already explained it — don't
+					// also (wrongly) claim we "didn't claim in time" or tell us to rejoin a queue that is now off.
 					log("[your turn passed] you didn't claim in time — type 't' to rejoin the queue");
 				} else if (released) {
 					log("[released] the floor is no longer yours — type 't' to request it again");

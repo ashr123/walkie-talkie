@@ -1174,7 +1174,10 @@ function onFloorStatus(holderId, waiting) {
 			log(`In line #${state.floorWaiting.indexOf(self) + 1} of ${state.floorWaiting.length} — tap Talk to leave the queue`);
 			break;
 		default: // IDLE
-			if (prevAwaiting) {
+			if (prevAwaiting && state.floorQueueEnabled) {
+				// A genuine miss (the queue is still on). If the owner just DISABLED the queue out from under us,
+				// the FloorQueueChanged("disabled") that arrives right before this snapshot already explained it, so
+				// don't also claim we "did not claim in time" or tell us to rejoin a queue that is now off.
 				log('Your turn passed — you did not claim in time. Tap Talk to rejoin the queue.');
 			} else if (released) {
 				log('You were released from the floor — tap Talk to speak again');
