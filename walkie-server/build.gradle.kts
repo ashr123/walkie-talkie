@@ -29,6 +29,16 @@ dependencies {
 	implementation("org.springframework.boot:spring-boot-starter-validation")
 	implementation("org.springframework.boot:spring-boot-starter-actuator")
 
+	// Dev-only: fast auto-restart + LiveReload for the browser client (edits to src/main/resources/static/ reload
+	// the page). `developmentOnly` keeps it off the test and production classpaths, and the Spring Boot plugin
+	// excludes it from the boot jar, so it never ships. The BOM is re-imported on THIS configuration because
+	// `developmentOnly` does not extend `implementation` (where the platform above is applied), so it would
+	// otherwise get no managed version (resolves to an empty version and fails). NOTE: `bootRun` defaults to AOT
+	// (spring.aot.enabled=true), which DevTools' reflective restart doesn't pair with — use `-Paot=false` for an
+	// auto-restart dev loop; static-resource LiveReload works regardless of AOT.
+	developmentOnly(platform(SpringBootPlugin.BOM_COORDINATES))
+	developmentOnly("org.springframework.boot:spring-boot-devtools")
+
 	testImplementation("org.springframework.boot:spring-boot-starter-test")
 	testImplementation("org.springframework.security:spring-security-test")
 }

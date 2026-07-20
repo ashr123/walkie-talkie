@@ -23,7 +23,7 @@ so only Gradle needs the prefix. Use the bundled wrapper (`./gradlew`, Gradle 9.
 JAVA_OPTS= ./gradlew build                       # compile all modules + run all tests
 JAVA_OPTS= ./gradlew :walkie-server:bootRun       # runs AOT-processed (spring.aot.enabled), HTTPS on https://localhost:8443 (auto self-signed cert)
 JAVA_OPTS= ./gradlew :walkie-server:bootRun --args='--walkie.tls.enabled=false'   # still AOT-processed, plain HTTP on http://localhost:8080 (TLS toggle is a runtime read, works under AOT)
-JAVA_OPTS= ./gradlew :walkie-server:bootRun -Paot=false   # general escape hatch: reflective (non-AOT) startup, for debugging
+JAVA_OPTS= ./gradlew :walkie-server:bootRun -Paot=false   # reflective (non-AOT) startup — for debugging, and the mode for a DevTools auto-restart dev loop (spring-boot-devtools is dev-only, excluded from the jar; static/ edits LiveReload the browser regardless of AOT, but a code recompile — IDE build or `gradle -t compileJava` — only auto-restarts under reflective startup)
 java -jar walkie-server/build/libs/walkie-server-0.1.0.jar   # the built boot jar — ALWAYS AOT (bundled spring.properties); add --walkie.tls.enabled=false for HTTP
 
 # Java desktop client (relay transport). --mode: ptt|global|duplex ; --hifi flag for the music profile; --help for all options
