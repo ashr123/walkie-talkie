@@ -53,3 +53,20 @@ logging:
   # client has joined, and the channel while it is in one.
   pattern:
     level: "%5p [session=%X{session:-system} name=%X{name:--} channel=%X{channel:--}]"
+    # Console pattern trimmed from Spring Boot's default: `%t` (full thread) replaces the default's `%15.15t`, which
+    # capped the thread at 15 chars and front-truncated it — "tomcat-handler-114" showed as "cat-handler-114" and
+    # the drainer's "ws-out-<uuid>" was unreadable. The default's PID and constant application name are dropped; in
+    # that identity slot we print [${WALKIE_INSTANCE_ID:local}] — a stable, fleet-unique instance label for the
+    # multi-instance (channel-affinity) deployment (a PID is PID 1 in every container, collides across hosts, and
+    # changes on restart). Set WALKIE_INSTANCE_ID per instance (e.g. the Kubernetes pod name via the downward API);
+    # an unset run shows "local".
+    # GOTCHA: SPRING resolves the ${...} in this value (Logback never sees them), and Spring's default-value
+    # separator is a single ":" — Logback's ":-" makes Spring fold the dash INTO the default. That bit us twice:
+    # "${WALKIE_INSTANCE_ID:-local}" rendered "[-local]", and the date placeholder "${LOG_DATEFORMAT_PATTERN:-yyyy-
+    # ...}" prefixed EVERY timestamp with a literal "-" ("-2026-..."), because neither var is set here so the
+    # default branch is taken. So the WALKIE_INSTANCE_ID default uses ":", and the date format + exception word are
+    # inlined with NO placeholder at all. ${LOG_LEVEL_PATTERN} stays — it is how the MDC block is injected (resolves
+    # to the `level:` line above, session/name/channel) and is always set, so its ":%5p" default is never taken.
+    # (The `%X{...:-...}` inside `level:` is Logback's own MDC-default syntax, resolved by Logback, so it is fine.)
+    # Only the console is affected; a `logging.pattern.file` (none here) would need the same treatment.
+    console: "%clr(%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX}){faint} %clr(${LOG_LEVEL_PATTERN:%5p}) %clr([${WALKIE_INSTANCE_ID:local}]){magenta} %clr(---){faint} %clr([%t]){faint} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n%wEx"
