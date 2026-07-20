@@ -1,5 +1,7 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
+import io.github.ashr123.option.None;
+import io.github.ashr123.option.Option;
 import io.github.ashr123.option.Some;
 import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
@@ -246,16 +248,22 @@ public class ConnectionService {
 			// attribute the reason by re-reading the target. The enforcement itself was atomic inside joinOrCreate;
 			// this re-read only picks which equally-true "can't join" message to show, so a state change in the
 			// instant after the failed join at worst shows another true reason — never a wrong admit/reject.
-			Channel target = channelRegistry.find(requested) instanceof Some(Channel c) ? c : null;
-			if (target != null && target.isLocked()) {
-				sendError(session, ErrorCode.CHANNEL_LOCKED,
-						"This channel is locked by its owner — you can't join it right now.");
-			} else if (target != null && target.isFull()) {
-				sendError(session, ErrorCode.CHANNEL_FULL,
-						"This channel is full — it has reached its member limit.");
-			} else {
-				sendError(session, ErrorCode.PASSPHRASE_MISMATCH,
-						"This channel is using a different encryption passphrase (or none) — you can't join it.");
+			switch (channelRegistry.find(requested)) {
+				case Some(Channel target) when target.isLocked() -> sendError(
+						session,
+						ErrorCode.CHANNEL_LOCKED,
+						"This channel is locked by its owner — you can't join it right now."
+				);
+				case Some(Channel target) when target.isFull() -> sendError(
+						session,
+						ErrorCode.CHANNEL_FULL,
+						"This channel is full — it has reached its member limit."
+				);
+				default -> sendError(
+						session,
+						ErrorCode.PASSPHRASE_MISMATCH,
+						"This channel is using a different encryption passphrase (or none) — you can't join it."
+				);
 			}
 			return;
 		}
@@ -285,7 +293,7 @@ public class ConnectionService {
 		if (session.channelName() == null) {
 			return;
 		}
-		Channel channel = channelRegistry.find(session.channelName()) instanceof Some(Channel found) ? found : null;
+		Option<Channel> channelBeforeLeave = channelRegistry.find(session.channelName());
 		// Remove the member + re-elect an owner atomically in the registry, THEN announce — broadcasting MemberLeft
 		// only AFTER the removal closes the ghost-member window: a member joining between an earlier broadcast and
 		// the removal could otherwise snapshot a roster still containing the leaver yet never receive its MemberLeft.
@@ -295,7 +303,7 @@ public class ConnectionService {
 		// registry takes its bin lock then this monitor, so the reverse order deadlocks — see the lock-order note on
 		// Channel), so the floor teardown runs AFTER the removal, on LIVE state.
 		boolean ownerChanged = channelRegistry.leave(session.channelName(), session.id()) instanceof Some(String _);
-		if (channel != null) {
+		if (channelBeforeLeave instanceof Some(Channel channel)) {
 			// Announce to the survivors of the SAME channel object the leave acted on — NOT a fresh find()-by-name,
 			// which could resolve a dropped-and-recreated same-named channel and notify its members instead.
 			synchronized (channel) {
@@ -329,8 +337,7 @@ public class ConnectionService {
 	}
 
 	private void handleRequestFloor(ClientSession session) {
-		Channel channel = requireChannel(session);
-		if (channel == null) {
+		if (!(requireChannel(session) instanceof Some(Channel channel))) {
 			return;
 		}
 		if (channel.isMuted(session.id())) {
@@ -442,8 +449,7 @@ public class ConnectionService {
 	}
 
 	private void handleReleaseFloor(ClientSession session) {
-		Channel channel = requireChannel(session);
-		if (channel == null || channel.mode() == ChannelMode.FULL_DUPLEX) {
+		if (!(requireChannel(session) instanceof Some(Channel channel)) || channel.mode() == ChannelMode.FULL_DUPLEX) {
 			return;
 		}
 		Instant now = clock.instant();
@@ -650,8 +656,7 @@ public class ConnectionService {
 	}
 
 	private void relaySignal(ClientSession session, String targetId, ServerMessage message) {
-		Channel channel = requireChannel(session);
-		if (channel == null) {
+		if (!(requireChannel(session) instanceof Some(Channel channel))) {
 			return;
 		}
 		if (channel.member(targetId) instanceof Some(ClientSession target))
@@ -661,15 +666,13 @@ public class ConnectionService {
 					"No member '" + targetId + "' in this channel");
 	}
 
-	private Channel requireChannel(ClientSession session) {
+	private Option<Channel> requireChannel(ClientSession session) {
 		String name = session.channelName();
 		if (name == null) {
 			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
-			return null;
+			return None.instance();
 		}
-		return channelRegistry.find(name) instanceof Some(Channel channel) ?
-				channel :
-				null;
+		return channelRegistry.find(name);   // already an Option<Channel> — no ternary, no null
 	}
 
 	/// The caller's channel IF the caller currently owns it, else `null` after sending the right error: the shared
@@ -679,23 +682,21 @@ public class ConnectionService {
 	/// `action` completes the "Only the channel owner can …" message. The owner check reads the live `ownerId`, so a
 	/// concurrent ownership transfer just means an already-authorized action may still land — benign and reversible,
 	/// not a privilege leak. The sentinel-owned `global` room is never equal to a session id, so it fails here.
-	private Channel requireOwnedChannel(ClientSession session, String action) {
-		Channel channel = requireChannel(session);
-		if (channel == null) {
-			return null;
+	private Option<Channel> requireOwnedChannel(ClientSession session, String action) {
+		if (!(requireChannel(session) instanceof Some(Channel channel))) {
+			return None.instance();   // requireChannel already sent NOT_IN_CHANNEL
 		}
 		if (!session.id().equals(channel.ownerId())) {
 			sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can " + action);
-			return null;
+			return None.instance();
 		}
-		return channel;
+		return Option.of(channel);
 	}
 
 	/// Changes the current channel's mode, but only for its owner. Clears the floor and broadcasts the
 	/// new mode to every member so their controls update; a non-owner gets a `NOT_OWNER` error.
 	private void handleChangeMode(ClientSession session, ChannelMode mode) {
-		Channel channel = requireOwnedChannel(session, "change the mode");
-		if (channel == null) {
+		if (!(requireOwnedChannel(session, "change the mode") instanceof Some(Channel channel))) {
 			return;
 		}
 		if (mode == ChannelMode.GLOBAL_PTT && !channel.name().equals(GLOBAL_CHANNEL)) {
@@ -818,8 +819,7 @@ public class ConnectionService {
 	/// window between the check and the mutation, its (already-authorized) mute may still land — harmless and
 	/// reversible moderation by the new owner, not a privilege leak (the requester WAS owner when it acted).
 	private void handleMuteMember(ClientSession session, String memberId, boolean muted) {
-		Channel channel = requireOwnedChannel(session, "mute members");
-		if (channel == null) {
+		if (!(requireOwnedChannel(session, "mute members") instanceof Some(Channel channel))) {
 			return;
 		}
 		// The owner can't mute itself, and only a current member can be muted. This is the friendly fast-path error;
@@ -854,8 +854,7 @@ public class ConnectionService {
 	/// actually changed) as [#handleMuteMember]; a non-owner gets `NOT_OWNER`. If the current floor holder is among
 	/// those muted, its floor is freed too (via [#broadcastMute]).
 	private void handleMuteAll(ClientSession session, boolean muted) {
-		Channel channel = requireOwnedChannel(session, "mute members");
-		if (channel == null) {
+		if (!(requireOwnedChannel(session, "mute members") instanceof Some(Channel channel))) {
 			return;
 		}
 		synchronized (channel) {
@@ -936,14 +935,13 @@ public class ConnectionService {
 	/// server-enforced, never trusted to the client (like [#handleSetLocked]). A non-owner gets `NOT_OWNER` (via
 	/// [#requireOwnedChannel]), so the sentinel-owned `global` room refuses it and stays unbounded/queue-off; a
 	/// request before joining gets `NOT_IN_CHANNEL`. Disabling CLEARS any waiting queue and running reservation
-	/// (there is nowhere to wait) — done inside [Channel#setFloorQueueEnabled] — so the following [FloorStatus]
+	/// (there is nowhere to wait) — done inside [Channel#setFloorQueueEnabled] — so the following [ServerMessage.FloorStatus]
 	/// shows an empty queue and dropped waiters re-derive "free/busy" from it. The flip, the clear and both
 	/// broadcasts run under the channel monitor (mirroring the mode/lock/mute discipline) so they are one atomic,
 	/// consistently-ordered transition; a [ServerMessage.FloorQueueChanged] renders the toggle and the
 	/// [ServerMessage.FloorStatus] renders the (possibly cleared) queue.
 	private void handleSetFloorQueue(ClientSession session, boolean enabled) {
-		Channel channel = requireOwnedChannel(session, "change the floor queue");
-		if (channel == null) {
+		if (!(requireOwnedChannel(session, "change the floor queue") instanceof Some(Channel channel))) {
 			return;
 		}
 		// Full-duplex has no talk floor, so a floor queue is meaningless there — refuse enabling it (mirrors
