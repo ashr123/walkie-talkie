@@ -42,40 +42,57 @@ val mockitoAgentJar = configurations.testRuntimeClasspath.map { classpath ->
 }
 
 tasks.named<Test>("test") {
+	// Capture the provider in a LOCAL so the argument provider (which runs at execution time and is serialized into
+	// the configuration cache) closes over the Provider, not the enclosing build script. Referencing the
+	// script-level `mockitoAgentJar` directly from the lambda captures the script object, which the configuration
+	// cache cannot serialize ("cannot serialize Gradle script object references").
+	val agentJar = mockitoAgentJar
 	jvmArgumentProviders.add(CommandLineArgumentProvider {
-		listOf("-javaagent:${mockitoAgentJar.get().absolutePath}")
+		listOf("-javaagent:${agentJar.get().absolutePath}")
 	})
+}
+
+// Probe for `node` on PATH. A ValueSource (not a plain script-level `by lazy`) so it is configuration-cache
+// correct: Gradle re-runs it to decide whether a cached configuration is still valid, and — unlike a script-level
+// val captured by the task's `onlyIf` — it never drags the build script into the serialized task graph.
+abstract class NodeOnPath : ValueSource<Boolean, ValueSourceParameters.None> {
+	override fun obtain(): Boolean =
+		runCatching { ProcessBuilder("node", "--version").redirectErrorStream(true).start().waitFor() == 0 }
+			.getOrDefault(false)
 }
 
 // Browser-client tests (src/test/js, plain ES modules) run under Node's built-in test runner — no npm
 // dependencies, no build step. Files are passed explicitly (this Node treats a bare directory arg as a script to
 // execute, not a folder to scan). Guarded with onlyIf so the Java build still succeeds on a machine without Node
-// (it logs a skip); hooked into `check` so `JAVA_OPTS= ./gradlew build` runs them when Node is present.
-val isNodeAvailable: Boolean by lazy {
-	runCatching { ProcessBuilder("node", "--version").redirectErrorStream(true).start().waitFor() == 0 }
-		.getOrDefault(false)
-}
+// (it is skipped with a reason); hooked into `check` so `JAVA_OPTS= ./gradlew build` runs them when Node is present.
+val nodeAvailable = providers.of(NodeOnPath::class) {}
 
 val jsTest = tasks.register<Exec>("jsTest") {
 	group = "verification"
 	description = "Runs the browser client's ES-module tests with Node's built-in test runner (node --test)."
+	// Capture the provider in a LOCAL so the onlyIf Spec (serialized into the configuration cache) closes over the
+	// Provider, not the build script. Referencing the script-level `nodeAvailable` from the Spec lambda would
+	// capture the script object (its `this$0`), which the configuration cache cannot serialize.
+	val nodeOnPath = nodeAvailable
 	val jsTestFiles = fileTree(layout.projectDirectory.dir("src/test/js")) { include("**/*.test.js") }
-	inputs.files(jsTestFiles).withPropertyName("jsTestFiles")
+	inputs.files(jsTestFiles).withPropertyName("jsTestFiles")   // declared input (Gradle serializes this itself)
 	inputs.dir(layout.projectDirectory.dir("src/main/resources/static/assets")).withPropertyName("browserClient")
 	workingDir = layout.projectDirectory.asFile
 	executable = "node"
-	argumentProviders.add(CommandLineArgumentProvider {
-		listOf("--test") + jsTestFiles.files.map { it.absolutePath }
-	})
-	onlyIf {
-		isNodeAvailable.also { available ->
-			if (!available) logger.warn("jsTest: skipping browser client tests — `node` is not on PATH.")
-		}
-	}
+	// Resolve the matched files to a plain List<String> at CONFIGURATION time. The execution-time lambdas below
+	// (argument provider, doFirst) then close over this immutable list — NOT the FileTree, which holds a reference
+	// to the build script that the configuration cache cannot serialize ("cannot serialize Gradle script object
+	// references"). The configuration cache fingerprints this config-time directory read, so adding or removing a
+	// test file invalidates the entry and the list is recomputed — it is not frozen stale.
+	val jsTestFilePaths = jsTestFiles.files.map { it.absolutePath }
+	argumentProviders.add(CommandLineArgumentProvider { listOf("--test") + jsTestFilePaths })
+	// The Spec closes over the `nodeAvailable` provider (serializable), not the build script; the reason string is
+	// shown when the task is skipped, replacing the old captured-`logger` warning.
+	onlyIf("`node` is on PATH (browser-client ES-module tests need Node's test runner)") { nodeOnPath.get() }
 	// Fail loudly if the glob matched nothing: passing zero files makes `node --test` scan the working dir and
 	// exit 0 on finding no tests, which would silently skip the browser interop suite while `build` stays green.
 	doFirst {
-		if (jsTestFiles.files.isEmpty()) {
+		if (jsTestFilePaths.isEmpty()) {
 			throw GradleException("jsTest: no browser client tests matched src/test/js/**/*.test.js — refusing to run " +
 					"`node --test` with no files (it would pass vacuously). Did the tests move or get renamed?")
 		}
