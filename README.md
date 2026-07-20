@@ -68,7 +68,7 @@ once, for Bob.)
   │    1.  size ≤ walkie.max-audio-frame-bytes                                          │
   │    2.  holdsFloor(Alice)?           ─  push-to-talk floor                           │
   │    3.  AudioRateLimiter.tryAcquire? ─  per-sender token bucket  (flood guard)       │
-  │    4.  within max-hold?             ─  else free the floor + broadcast FloorIdle    │
+  │    4.  within max-hold?             ─  else free the floor + broadcast FloorStatus  │
   │                                                                                     │
   │ Then  prefix 1-byte stream id  →  [sid][body] ,  markFloorActivity                  │
   │ Then  Channel.forEachOther(Alice)  →  offer() one frame into EACH recipient mailbox │
@@ -208,7 +208,11 @@ throughout.
    immediately). To encrypt audio **end-to-end**, set the same **Encryption
    passphrase** as everyone else in the channel (relay transport only; needs HTTPS or `localhost`).
    Click **Connect** and allow microphone access.
-3. **Push-to-talk** modes: hold the big button (or hold **Space**). **Full-duplex**: click to toggle your
+3. **Push-to-talk** modes: hold the big button (or hold **Space**). If the owner has enabled the channel's
+   **floor queue** (a "raise hand" line — owner-only **Enable queue**/**Disable queue** control) and the floor
+   is busy, the button flips to **tap to raise your hand**: you join the line, see your place, and tap again to
+   leave. When your turn comes the button pulses **YOUR TURN — hold to talk** with a countdown (grant-to-claim);
+   hold it in time to go live or the turn passes to the next person. **Full-duplex**: click to toggle your
    mic — or tick **Connect muted** before connecting to join with the mic off (it stays muted until you
    click Talk). That checkbox shows only in full-duplex mode and locks once connected.
 4. **Disconnect** (or closing the tab) closes the WebSocket, which ends your session — the signed token is
@@ -311,7 +315,10 @@ All flags are optional (run with `--args="--help"` for the full list):
 > Tip: run `--help` to see the detected capture-device names, then pass a distinctive substring to
 > `--input` (e.g. `--input "USB"`).
 
-**Interactive commands** (type at the prompt): `t` talk/stop · `w` list who's in the channel · `m
+**Interactive commands** (type at the prompt): `t` talk/stop — in push-to-talk it is **state-driven**: it grabs
+a free floor, claims your turn when the floor is reserved for you, or (when the owner has enabled the floor queue
+and the floor is busy) joins/leaves the "raise hand" line, showing your place and alerting you when it's your
+turn · `queue on` / `queue off` toggle this channel's push-to-talk floor queue (owner only) · `w` list who's in the channel · `m
 <ptt|global|duplex>` change the mode — `ptt`/`duplex` change the current channel's mode (owner only); `m global` **switches you** to the server-managed global room (like the browser's mode selector, this is a room switch, not a mode change) · `c <channel> [mode] [key]` switch channel without dropping
 the session (mode/key default to the current ones) · `p [passphrase]` change the passphrase (owner; blank turns
 encryption off; auto-shares the new passphrase so members adopt it automatically — a member uses `p` to apply
@@ -378,9 +385,18 @@ otherwise mono — and interoperates with relay-mode browser clients.
   background sweep enforces this hard cap (a relay holder also hits it immediately on its next frame). On top of
   that, **idle auto-release** hands the floor to a waiting requester once the current holder has sent no audio
   for `walkie.floor-idle-release-seconds` (default 5). Set either to `0` to disable. On a server-initiated
-  release the (ex-)holder is notified so its client stops transmitting. Idle auto-release applies to **relay
+  release the (ex-)holder is told so its client stops transmitting. Idle auto-release applies to **relay
   holders only** — it needs a per-frame activity signal, which peer-to-peer WebRTC media doesn't give the
   server; max-hold is a pure time cap and bounds every holder, including WebRTC.
+- **Push-to-talk floor queue ("raise hand").** A channel owner can turn on a per-channel floor queue (default
+  **off** — a busy floor is simply not granted, as before). With it on, asking for a busy floor puts you **in
+  line** (FIFO) and everyone sees their place; when the floor frees it passes to the head of the line. It is
+  **grant-to-claim, never a hot mic**: when your turn arrives the floor is *reserved* for you for
+  `walkie.floor-reservation-seconds` (default 10) and you must take the normal talk action to go live — miss the
+  window and you're dropped and the floor moves to the next in line. The owner toggles it with `SetFloorQueue`;
+  the on/off default a new channel adopts is `walkie.floor-queue-default` (default `false`). The reservation
+  window is a positive claim window, so `0`/blank means "use the default", not "disabled" (unlike the two timers
+  above). The ownerless `global` room is always off, and full-duplex has no floor or queue.
 - **For production:** serve over WSS/HTTPS (TLS 1.2+) — see _Transport encryption (TLS / WSS)_ above and the
   `deploy/` proxy configs — and **override `walkie.allowed-origins`**: it **defaults to `*`** (wide open),
   and because CSRF is disabled this WebSocket origin check is the sole anti-CSWSH (cross-site WebSocket

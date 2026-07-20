@@ -93,8 +93,8 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 |---------------------|--------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `join`              | `channel`, `mode`, `displayName`, `keyCheck`     | Join/create — or **switch** channel in place when re-sent on a live socket (§3c); `keyCheck` per §7                                                                                                                                                          |
 | `leave`             | —                                                | Leave the current channel (keep the socket)                                                                                                                                                                                                                  |
-| `requestFloor`      | —                                                | Ask for the talk floor (PTT modes)                                                                                                                                                                                                                           |
-| `releaseFloor`      | —                                                | Release the floor                                                                                                                                                                                                                                            |
+| `requestFloor`      | —                                                | Ask for the talk floor (PTT modes). **State-interpreted** by your floor state: grab a free floor, claim your reserved turn, or — when the queue is on and the floor is busy — join the FIFO queue (§3b)                                                      |
+| `releaseFloor`      | —                                                | Give up the floor. **State-interpreted**: stop talking if you hold it, or leave the queue / decline your turn if you are waiting or reserved (§3b)                                                                                                           |
 | `changeMode`        | `mode`                                           | Owner-only: change the channel mode                                                                                                                                                                                                                          |
 | `rename`            | `displayName`                                    | Change your own display name in place (→ `memberRenamed`, §3c)                                                                                                                                                                                               |
 | `changePassphrase`  | `keyCheck`, `wrappedKey`                         | Owner-only: rotate/clear the channel passphrase; `keyCheck` = the new one's KCV, or `null` to make it plaintext. Optional `wrappedKey` = the new passphrase encrypted under the OLD key so members auto-adopt; `null` opts out (§3c) (→ `passphraseChanged`) |
@@ -102,31 +102,32 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `muteMember`        | `memberId`, `muted`                              | Owner-only: mute/unmute one member's relay audio; server-enforced (→ `memberMuted`, §3d)                                                                                                                                                                     |
 | `muteAll`           | `muted`                                          | Owner-only: mute/unmute every member but the owner at once (→ one `memberMuted` per changed member, §3d)                                                                                                                                                     |
 | `setLocked`         | `locked`                                         | Owner-only: lock/unlock the channel to NEW members (→ `channelLocked`, §3e); existing members unaffected                                                                                                                                                     |
+| `setFloorQueue`     | `enabled`                                        | Owner-only: turn this channel's push-to-talk floor queue on/off (→ `floorQueueChanged` + a fresh `floorStatus`, §3b); disabling clears any waiting queue. Full-duplex → `INVALID_MODE`; non-owner / `global` → `NOT_OWNER`                                   |
 | `offer`             | `target`, `sdp`                                  | WebRTC (see §3a)                                                                                                                                                                                                                                             |
 | `answer`            | `target`, `sdp`                                  | WebRTC                                                                                                                                                                                                                                                       |
 | `ice`               | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                                                                                                                                                                                                                                       |
 
 ### Server → client
 
-| `type`              | Fields                                              | Meaning                                                                                                                                                                                                                                 |
-|---------------------|-----------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `joined`            | `selfId`, `channel`, `mode`, `ownerId`, `locked`, `members[]` | Join ack + full snapshot (re-sync on every join); `locked` = channel locked to new members (§3e)                                                                                                                              |
-| `memberJoined`      | `member` (`MemberInfo`)                             | A participant joined                                                                                                                                                                                                                    |
-| `memberLeft`        | `memberId`                                          | A participant left/disconnected                                                                                                                                                                                                         |
-| `floorGranted`      | —                                                   | You hold the floor; you may transmit                                                                                                                                                                                                    |
-| `floorDenied`       | `currentHolderId`                                   | Floor request refused; names the current holder                                                                                                                                                                                         |
-| `floorTaken`        | `holderId`                                          | Another member holds the floor (sent on join; also to a holder preempted by idle auto-release — §3b)                                                                                                                                    |
-| `floorIdle`         | —                                                   | The floor is free (also sent to a holder force-released by max-hold — §3b)                                                                                                                                                              |
-| `modeChanged`       | `mode`                                              | The channel mode changed; reset talk state                                                                                                                                                                                              |
-| `ownerChanged`      | `ownerId`                                           | New owner (e.g. previous owner left)                                                                                                                                                                                                    |
-| `memberRenamed`     | `memberId`, `displayName`                           | A member changed its display name (incl. you — §3c)                                                                                                                                                                                     |
-| `memberMuted`       | `memberId`, `muted`                                 | The owner muted/unmuted a member (broadcast to all, incl. the muted member — §3d)                                                                                                                                                       |
-| `channelLocked`     | `locked`                                            | The owner locked/unlocked the channel to new members (broadcast to all — §3e)                                                                                                                                                           |
-| `passphraseChanged` | `keyCheck`, `wrappedKey`                            | The owner changed/cleared the channel passphrase (`null` = now unencrypted). If `wrappedKey` is present, decrypt it with your old key to auto-adopt; else re-derive from the out-of-band passphrase and verify against `keyCheck` (§3c) |
-| `signalOffer`       | `from`, `sdp`                                       | WebRTC (see §3a)                                                                                                                                                                                                                        |
-| `signalAnswer`      | `from`, `sdp`                                       | WebRTC                                                                                                                                                                                                                                  |
-| `signalIce`         | `from`, `candidate`, `sdpMid`, `sdpMLineIndex`      | WebRTC                                                                                                                                                                                                                                  |
-| `error`             | `code`, `message`                                   | A request failed (see §13 for codes)                                                                                                                                                                                                    |
+| `type`              | Fields                                                                             | Meaning                                                                                                                                                                                                                                 |
+|---------------------|------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `joined`            | `selfId`, `channel`, `mode`, `ownerId`, `locked`, `floorQueueEnabled`, `members[]` | Join ack + full snapshot (re-sync on every join); `locked` = channel locked to new members (§3e); `floorQueueEnabled` = the PTT floor queue is on (§3b). A `floorStatus` follows immediately                                            |
+| `memberJoined`      | `member` (`MemberInfo`)                                                            | A participant joined                                                                                                                                                                                                                    |
+| `memberLeft`        | `memberId`                                                                         | A participant left/disconnected                                                                                                                                                                                                         |
+| `floorGranted`      | —                                                                                  | You hold the floor; you may transmit. Imperative "go live" trigger to the new holder only — the broadcast `floorStatus` renders who holds it (§3b)                                                                                      |
+| `floorStatus`       | `holderId`, `waiting`                                                              | Authoritative PTT floor snapshot: `holderId` = live holder or `null`; `waiting` = FIFO queue. Broadcast on every floor change + after join; clients derive ALL floor UI from it (§3b)                                                   |
+| `floorReserved`     | `claimSeconds`                                                                     | It's your turn: the floor is reserved for you for `claimSeconds`. Claim with `requestFloor` before the window lapses or it passes to the next in line. To-one trigger to the reserved head (§3b)                                        |
+| `floorQueueChanged` | `enabled`                                                                          | The owner turned the floor queue on/off (broadcast; also in `joined.floorQueueEnabled`). When off the queue is cleared — a following `floorStatus` reflects it (§3b)                                                                    |
+| `modeChanged`       | `mode`                                                                             | The channel mode changed; reset talk state                                                                                                                                                                                              |
+| `ownerChanged`      | `ownerId`                                                                          | New owner (e.g. previous owner left)                                                                                                                                                                                                    |
+| `memberRenamed`     | `memberId`, `displayName`                                                          | A member changed its display name (incl. you — §3c)                                                                                                                                                                                     |
+| `memberMuted`       | `memberId`, `muted`                                                                | The owner muted/unmuted a member (broadcast to all, incl. the muted member — §3d)                                                                                                                                                       |
+| `channelLocked`     | `locked`                                                                           | The owner locked/unlocked the channel to new members (broadcast to all — §3e)                                                                                                                                                           |
+| `passphraseChanged` | `keyCheck`, `wrappedKey`                                                           | The owner changed/cleared the channel passphrase (`null` = now unencrypted). If `wrappedKey` is present, decrypt it with your old key to auto-adopt; else re-derive from the out-of-band passphrase and verify against `keyCheck` (§3c) |
+| `signalOffer`       | `from`, `sdp`                                                                      | WebRTC (see §3a)                                                                                                                                                                                                                        |
+| `signalAnswer`      | `from`, `sdp`                                                                      | WebRTC                                                                                                                                                                                                                                  |
+| `signalIce`         | `from`, `candidate`, `sdpMid`, `sdpMLineIndex`                                     | WebRTC                                                                                                                                                                                                                                  |
+| `error`             | `code`, `message`                                                                  | A request failed (see §13 for codes)                                                                                                                                                                                                    |
 
 `MemberInfo` = `{ id, displayName, streamId, muted }` (see §4; `muted` = whether the owner has muted this
 member — §3d).
@@ -153,25 +154,51 @@ single-decoder limit).
 
 ## 3b. Push-to-talk floor lifecycle
 
-A holder normally keeps the floor until it sends `releaseFloor` (or disconnects). The server may also
-**revoke** it, so a client MUST treat the following as "you lost the floor" — stop transmitting and reset its
-talk control:
+All floor UI derives from ONE authoritative snapshot, `floorStatus { holderId, waiting }`, which the server
+broadcasts to the channel on **every** floor change and sends to you once right after `joined`. `holderId` is the
+live holder (or `null`); `waiting` is the FIFO queue in order. A client renders its own state purely from the
+snapshot plus its own id:
 
-- **`floorTaken` whose `holderId` is not your own, while you believed you held the floor** — you were
-  preempted by **idle auto-release**: you sent no audio for `walkie.floor-idle-release-seconds` (default 5)
-  *and* another member requested the floor. Idle is measured from frame *timing*, never content, so it works
-  on encrypted channels; it applies to **relay holders only** (the server has no activity signal for WebRTC
-  media, §3a).
-- **`floorIdle` while you held the floor** — you were force-released by the **max-hold** cap
-  (`walkie.floor-max-hold-seconds`, default 300) after holding the floor that long. Re-`requestFloor` to keep
-  talking.
+- `holderId == me` → **you are live** (you may transmit).
+- `holderId == null && waiting[0] == me` → **it's your turn** (you are the reserved head).
+- `me ∈ waiting` (not the head) → **in line** at position `waiting.indexOf(me)`.
+- otherwise → the floor is busy (someone else holds/is offered it) or free.
 
-Both timers `0`-disable. Max-hold is a pure time cap (a periodic server sweep enforces it) and bounds **any**
-holder, including a WebRTC peer (§3a); idle auto-release applies to **relay holders only**, since it needs the
-per-frame activity signal that peer-to-peer WebRTC media doesn't give the server. A normal active relay talker
-is **never** idle-released: it transmits continuously while holding (the mic sends a frame every 20 ms, even
-through speech pauses), which refreshes the activity mark on every frame — so idle auto-release only catches a
-holder that genuinely went silent on the wire without releasing.
+There is deliberately **no `reserved` field**: the member being offered a free floor is exactly `waiting[0]`
+whenever `holderId == null`, because the server reserves the head the instant the floor frees (there is never a
+"free, queue non-empty, nobody reserved" state). So `reserved = (holderId == null && waiting.length > 0) ?
+waiting[0] : null` — derived identically by every client.
+
+**Two to-one imperative triggers** accompany the snapshot for the moments you must *act*:
+
+- **`floorGranted`** — you just acquired the floor: open your mic and transmit. (The broadcast `floorStatus`
+  renders who holds it for everyone else.)
+- **`floorReserved { claimSeconds }`** — sent to the reserved head: it's your turn. Alert the user and start a
+  `claimSeconds` countdown. **Grant-to-claim, never a hot mic:** you must take the normal talk action
+  (`requestFloor`) within the window to go live. Miss it and the server drops you from the queue and offers the
+  floor to the next in line (you will see a `floorStatus` in which you are no longer the head).
+
+`requestFloor` / `releaseFloor` are **interpreted by your current floor state** — there are no separate queue
+commands: `requestFloor` grabs a free floor, claims your reserved turn, or (when the queue is on and the floor is
+busy) joins the FIFO queue; `releaseFloor` stops talking if you hold the floor, or leaves the queue / declines
+your turn if you are waiting or reserved.
+
+**The queue is owner-toggleable per channel** (`setFloorQueue` → broadcast `floorQueueChanged`; the current
+state also rides in `joined.floorQueueEnabled`), **default off**. With it off there is no line — a request for a
+busy floor simply is not granted and the snapshot keeps showing it busy (the pre-queue behaviour). The ownerless
+`global` room is always off; full-duplex has no floor or queue.
+
+The old imperative triggers `floorTaken` / `floorIdle` / `floorDenied` are **retired** (all subsumed by
+`floorStatus`), so a client learns it **lost the floor** purely from a `floorStatus` in which it is no longer
+`holderId` — treat that transition as "you lost the floor": stop transmitting and reset the talk control. The
+server revokes the floor by **idle auto-release** (a relay holder silent for `walkie.floor-idle-release-seconds`,
+default 5, when another member wants the floor — relay-only, measured from frame *timing* so it works on
+encrypted channels) and **max-hold** (any holder past `walkie.floor-max-hold-seconds`, default 300 — a pure time
+cap that also bounds a WebRTC peer, §3a). Both `0`-disable. When the queue is on, a freed floor is offered to the
+queue head (a fresh `floorReserved` to it + a `floorStatus` to all) instead of going idle. A normal active relay
+talker is **never** idle-released: it sends a frame every 20 ms (even through speech pauses), refreshing the
+activity mark, so idle auto-release only catches a holder that genuinely went silent on the wire without
+releasing.
 
 ---
 
@@ -271,8 +298,9 @@ a late joiner renders who's muted.
 - **Relay path only.** WebRTC media is peer-to-peer (DTLS-SRTP), so the server cannot drop it; a WebRTC talker
   still receives `memberMuted` and stops as a courtesy, but the hard guarantee holds only on the relay
   transport — the same boundary as the E2EE payload encryption (§7).
-- **Muting a talker frees the floor.** If the muted member currently holds the PTT floor, the server releases
-  it and broadcasts `floorIdle` (§3b), so the ex-holder's client stops transmitting and the floor reopens.
+- **Muting takes the member off the floor.** A muted member is released if it was the live holder and dequeued
+  if it was waiting/reserved; the server then re-broadcasts `floorStatus` (§3b) — offering the freed floor to the
+  queue head if the queue is on — so the ex-holder's client stops transmitting and the floor reopens.
 - **Scope & lifetime.** Mute is per-channel state and is cleared when the member leaves (a re-used id does not
   inherit it). It is **not** related to the E2EE "muted straggler" of §3c/§7 (a member whose key doesn't match),
   which is a client-side transmit gate, not an owner action.
@@ -541,7 +569,10 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
   them, so it works on encrypted channels. Always on (0/blank → default, never disabled).
 - **PTT floor timers:** max-hold force-release of **any** holder after `walkie.floor-max-hold-seconds`
   (default 300; a periodic sweep, plus a relay holder's next frame) and idle auto-release of a silent **relay**
-  holder after `walkie.floor-idle-release-seconds` (default 5; on contention); each `0`-disables (§3b).
+  holder after `walkie.floor-idle-release-seconds` (default 5; on contention); each `0`-disables (§3b). When the
+  floor queue is on, the reserved head has `walkie.floor-reservation-seconds` (default 10) to claim its turn
+  before it is dropped and the floor passes to the next in line — a positive claim window, so `0`/blank falls
+  back to the default, it is not "disabled" (§3b).
 - **Channel size:** ≤ **255 members** (one per stream index, 0..254). A join that would overflow is refused with
   `CHANNEL_FULL` rather than assigning a colliding index.
 - **Error codes** (`error.code`): the shared `ErrorCode` enum, serialized **as its constant name** (like
@@ -556,11 +587,11 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 | `BAD_MESSAGE`            | Unparseable / unknown-type control frame                                                                                                                                    |
 | `INVALID_CHANNEL`        | `join` with a channel name not matching the pattern                                                                                                                         |
 | `INVALID_DISPLAY_NAME`   | `join` or `rename` with a display name not matching the pattern                                                                                                             |
-| `INVALID_MODE`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel                                                                                                                   |
+| `INVALID_MODE`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel, or `setFloorQueue` in a full-duplex channel                                                                      |
 | `RESERVED_CHANNEL`       | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode                                                                                        |
 | `ENCRYPTION_NOT_ALLOWED` | a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext)                                                                                  |
-| `NOT_IN_CHANNEL`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / `setLocked` / signal before `join`                   |
-| `NOT_OWNER`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember`, `muteAll` or `setLocked` by a non-owner                                                                |
+| `NOT_IN_CHANNEL`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / `setLocked` / `setFloorQueue` / signal before `join` |
+| `NOT_OWNER`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember`, `muteAll`, `setLocked` or `setFloorQueue` by a non-owner                                               |
 | `PASSPHRASE_MISMATCH`    | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel                                         |
 | `CHANNEL_LOCKED`         | `join` (or in-place switch) to a channel the owner has locked to new members (§3e); like `PASSPHRASE_MISMATCH`, a locked switch drops you                                   |
 | `CHANNEL_FULL`           | `join` (or in-place switch) to a channel already at its member cap (one stream index per member, 0..254 → 255 members); like `PASSPHRASE_MISMATCH`, a full switch drops you |

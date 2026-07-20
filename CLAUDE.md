@@ -31,8 +31,8 @@ JAVA_OPTS= ./gradlew :walkie-client-java:run --args="--server https://localhost:
 
 # Tests
 JAVA_OPTS= ./gradlew :walkie-server:test                                            # one module
-JAVA_OPTS= ./gradlew :walkie-server:test --tests '*FloorControlServiceTest'         # one class
-JAVA_OPTS= ./gradlew :walkie-server:test --tests '*FloorControlServiceTest.fullDuplexGrantsEveryoneAndTracksNoHolder'  # one method
+JAVA_OPTS= ./gradlew :walkie-server:test --tests '*ChannelTest'                     # one class
+JAVA_OPTS= ./gradlew :walkie-server:test --tests '*ChannelTest.fullDuplexAlwaysGrantsTheFloorAndTracksNoHolder'  # one method
 ```
 
 ## Build layout
@@ -56,7 +56,8 @@ Project rule: **no `var` keyword** anywhere. A linter may reformat saved files (
 (`AudioRelayHandler` for `/ws/audio`, `SignalingHandler` for `/ws/signal`) are thin subclasses of
 `BaseWalkieHandler`. All real logic lives in the transport-agnostic `ConnectionService`, which never
 touches a `WebSocketSession` (so it's unit-testable with a fake `ClientSession`). It owns membership
-(`ChannelRegistry` → `Channel`), push-to-talk floor arbitration (`FloorControlService`), audio
+(`ChannelRegistry` → `Channel`), push-to-talk floor arbitration (its own floor handlers plus the
+monitor-guarded floor state on `Channel` — there is **no** separate floor-control service), audio
 fan-out, and WebRTC signaling relay. To understand message handling, read `ConnectionService.dispatch`
 — a **pattern-matching `switch` over the sealed `ClientMessage`**, so adding a message type forces
 every site to handle it.
@@ -66,15 +67,19 @@ every site to handle it.
 the **owner** (creator) may change it (`ChangeMode` → broadcast `ModeChanged`), and ownership transfers
 to another member if the owner leaves. Floor state is a monitor-guarded `volatile String` holder on `Channel`
 (every mutation runs under the channel monitor; the hot-path reads `holdsFloor`/`floorHolder` are lock-free
-volatile reads, re-validated under the monitor before audio fan-out); full-duplex bypasses it. **Floor anti-hogging** (PTT modes, in `ConnectionService`): a holder gone silent past
+volatile reads, re-validated under the monitor before audio fan-out); full-duplex bypasses it. The floor is
+conveyed to clients by ONE authoritative snapshot `FloorStatus(holderId, waiting)` — broadcast on **every** floor
+change and sent to-one right after `Joined` — plus two to-one imperative triggers, `FloorGranted` ("go live") and
+`FloorReserved(claimSeconds)` ("your turn — claim it"; queue only). `FloorTaken`/`FloorIdle`/`FloorDenied` are
+**retired** (all subsumed by `FloorStatus`). **Floor anti-hogging** (PTT modes, in `ConnectionService`): a holder gone silent past
 `walkie.floor-idle-release-seconds` (default 5) is preempted when another member requests the floor (idle
 auto-release — `Channel.preemptFloorIfIdle`, relay holders only, keyed off frame *timing* not content), and any
 holder is force-released after `walkie.floor-max-hold-seconds` (default 300) of continuous holding (max-hold —
 a scheduled sweep `releaseExpiredFloors` via `Channel.releaseIfExpired`, plus an immediate check in `onAudio` on
 a relay holder's next frame). Max-hold is a pure time cap and bounds **any** holder incl. WebRTC; idle
-auto-release is relay-only. Both `0`-disable; on a server-initiated release the (ex-)holder is told
-(`FloorTaken`/`FloorIdle`) so its client stops transmitting. Floor timing uses a `java.time.Clock` + `Instant`
-(injectable for tests). **The `global` channel is special and server-managed:** it is reachable *only*
+auto-release is relay-only. Both `0`-disable; on a server-initiated release the ex-holder learns it is no longer
+the holder from the re-broadcast `FloorStatus` and stops transmitting. Floor timing uses a `java.time.Clock` +
+`Instant` (injectable for tests). **The `global` channel is special and server-managed:** it is reachable *only*
 via `GLOBAL_PTT` (a `MULTI_CHANNEL_PTT`/`FULL_DUPLEX` join naming `global` is rejected with
 `RESERVED_CHANNEL`); it is **always unencrypted** (a `GLOBAL_PTT` join carrying a `keyCheck` is rejected
 with `ENCRYPTION_NOT_ALLOWED`, so anyone can join without knowing a passphrase); and it is created with a
@@ -83,14 +88,30 @@ participant owns it** — its mode can't be changed (`NOT_OWNER`) and ownership 
 dropped when empty and recreated server-owned + unencrypted on the next join; clients render its owner as
 "server-managed".
 
+**Push-to-talk floor queue ("raise hand"), owner-toggleable per channel, default OFF.** The owner turns it on/off
+(`SetFloorQueue` → broadcast `FloorQueueChanged`; the state rides in `Joined.floorQueueEnabled`, and a new channel
+adopts `walkie.floor-queue-default` — off == the pre-queue behaviour, where a busy floor is simply not granted).
+With the queue on, `RequestFloor` against a busy floor **enqueues** the member (FIFO, `Channel.enqueueFloor`)
+instead of refusing it; when the floor frees it is **RESERVED** to the head for `walkie.floor-reservation-seconds`
+(default 10) — **grant-to-claim, never a hot mic**: the head must claim (a `RequestFloor` → `FloorGranted`) within
+that window or it is dropped and the floor passes to the next in line. The reserved member is **derived**, not
+stored — it is exactly the head of `waiting` whenever `holderId` is null, because the server reserves the head the
+instant the floor frees. `RequestFloor`/`ReleaseFloor` are interpreted by the sender's own floor state (grab /
+claim / enqueue vs. stop / leave-queue / decline), so the queue needs no new client command. A muted member is
+dropped from the queue; the ownerless `global` room is always off; full-duplex has no floor and no queue. The 1 s
+`releaseExpiredFloors` sweep now runs three per-channel steps under the monitor — max-hold, idle-release (queue
+advance, relay-only), then reservation-expiry — each handing the freed floor to the queue head (`reserveHead` +
+a to-one `FloorReserved`) and re-broadcasting `FloorStatus`.
+
 **Owner-enforced mute.** The owner can mute members (`MuteMember` for one, `MuteAll` for everyone but the owner
 → broadcast `MemberMuted`, `ConnectionService.handleMuteMember` / `handleMuteAll`); the muted set is per-`Channel`
 state (`Channel.mutedMembers`, a `ConcurrentHashMap.newKeySet()`) surfaced in `MemberInfo.muted`. Enforcement is
 **server-side and does not trust the client**: `onAudio` drops a muted sender's frame (`Channel.isMuted`, a
 lock-free volatile-set read on the hot path, alongside the `holdsFloor` gate), and `handleRequestFloor` refuses a
 muted member the floor so it can't seize-and-hold it (blocking PTT) even though its audio would be dropped. Muting
-the current floor holder frees the floor (`releaseFloor` + broadcast `FloorIdle`) so a talking-then-muted member
-stops. **Enforcement is relay-only** — WebRTC media is peer-to-peer (DTLS-SRTP), so a WebRTC talker's mute is
+a member takes it off the floor entirely (`releaseFloor` if it was the live holder, `dequeueFloor` if it was
+waiting/reserved) and re-broadcasts `FloorStatus` — offering the freed/advanced floor to the queue head — so a
+talking-then-muted member stops. **Enforcement is relay-only** — WebRTC media is peer-to-peer (DTLS-SRTP), so a WebRTC talker's mute is
 best-effort at its own client (it still gets `MemberMuted` and stops), matching the E2EE relay-only boundary.
 Only the owner may mute (`NOT_OWNER` otherwise); the owner can't mute itself and an unknown/left id is
 `UNKNOWN_TARGET`; the ownerless `global` room can't be muted (`NOT_OWNER` via its sentinel owner). Concurrency
@@ -280,7 +301,13 @@ transport-agnostic: it passes the broadcaster a typed `ServerMessage` and never 
 session holds no codec (a dumb `sendEncoded`/`sendAudio` sink). The wrapping
 `ConcurrentWebSocketSessionDecorator` is kept only as the socket-layer backstop (its send-time / buffer limit
 aborts a wedged in-flight write). In the Java client the Opus encoder/decoder are confined to the capture/playback
-threads respectively.
+threads respectively. **Floor + queue concurrency:** every floor mutation and the `FloorStatus` / `FloorGranted` /
+`FloorReserved` broadcast it triggers run under the per-channel monitor (`synchronized(channel)`), and the queue
+holds a reservation invariant — `floorReservedAt != EPOCH` **iff** a claim window is running: `reserveHead` is
+idempotent (never re-stamps a running window), `expiredReservationHead` never expires an unstamped head, and
+removing the reserved head (claim / decline / leave / mute) resets the clock. That is what lets the 1 s
+`releaseExpiredFloors` sweep and the leave/mute paths call `reserveHead` unconditionally on any floor-freeing
+event without racing a concurrent grant.
 
 **Multi-instance (channel affinity), off by default.** The `Channel` (membership, floor, owner/mode/lock,
 keyCheck, mute, audio fan-out, stream-index pool) is entirely in-process, so horizontal scaling uses
@@ -308,7 +335,7 @@ See README "Known constraints".
 
 ## Testing notes
 
-Server tests mix unit (`FloorControlServiceTest`, `ChannelRegistryTest` via the `FakeClientSession`
+Server tests mix unit (`ConnectionServiceTest`, `ChannelTest`, `ChannelRegistryTest` via the `FakeClientSession`
 helper) and integration (`WebSocketRelayIntegrationTest`, which boots on a random port and drives real
 `StandardWebSocketClient` connections). In Spring Boot 4, `TestRestTemplate` is not at its old package
 — the integration test uses the JDK `HttpClient` for the login call, and `@LocalServerPort` comes from
