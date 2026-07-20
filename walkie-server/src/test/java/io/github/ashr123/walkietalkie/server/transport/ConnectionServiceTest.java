@@ -1767,7 +1767,7 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.MuteAll(true));
 
 		assertFalse(channel("mute-all-floor").holdsFloor("bob"),
-				"mute-all frees the muted holder's floor too (via the same broadcastMute path as single mute)");
+				"mute-all frees the muted holder's floor too (the same floor teardown as single-member mute)");
 		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
 						&& holderId == null),
 				"the muted ex-holder is told the floor is free (FloorStatus)");
