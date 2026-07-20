@@ -87,6 +87,7 @@ const state = {
 	memberLis: new Map(),    // id -> roster <li>, so speaking/owner state toggles without a full re-render
 	speakTimers: new Map(),  // id -> timeout that clears a relay speaker after a short silence
 	floorSpeaker: null,      // PTT/global floor holder — drives the highlight when there are no relay frames (WebRTC)
+	floorHolder: null,       // PTT/global: id currently holding the floor (both transports), null when free or full-duplex — disables our Talk button when it's someone else's
 };
 
 function log(message) {
@@ -674,12 +675,16 @@ function onWsMessage(ev) {
 			break;
 		case 'floorGranted':
 			log('Floor granted — you are live');
+			state.floorHolder = state.selfId;   // we hold the floor now
 			beginTransmit();
 			break;
 		case 'floorDenied':
 			log(`Floor busy (held by ${memberLabel(msg.currentHolderId)})`);
+			state.floorHolder = msg.currentHolderId;   // someone else holds it — keep our Talk button disabled
+			updateTalkButton();
 			break;
 		case 'floorTaken':
+			state.floorHolder = msg.holderId;   // someone holds the floor now — disables our Talk button (below)
 			// PTT/global: the floor holder is the speaker. On the relay path the per-frame highlight already
 			// covers this, so only drive it from the floor on WebRTC, where there are no relay frames to key off.
 			if (state.transport === 'webrtc') {
@@ -696,8 +701,10 @@ function onWsMessage(ev) {
 				endTransmit();
 				log('You were released from the floor (idle) — tap Talk to speak again');
 			}
+			updateTalkButton();   // reflect the new holder in the Talk button's disabled state/label
 			break;
 		case 'floorIdle':
+			state.floorHolder = null;   // floor free — re-enables our Talk button (below)
 			if (state.floorSpeaker) {
 				setSpeaking(state.floorSpeaker, false);
 				state.floorSpeaker = null;
@@ -708,6 +715,7 @@ function onWsMessage(ev) {
 				endTransmit();
 				log('Your talk time was up — tap Talk to speak again');
 			}
+			updateTalkButton();   // re-enable the Talk button now the floor is free
 			break;
 		case 'modeChanged':
 			onModeChanged(msg.mode);
@@ -990,8 +998,11 @@ function lockInGlobalMode(input, hint, lockedValue, global) {
 // --- talk control ---------------------------------------------------------------------------------
 
 function pressTalk() {
-	if (state.mutedMembers.has(state.selfId)) {
-		return;   // owner-muted — the button is disabled too; this also guards the hold-Space path
+	// owner-muted — the button is disabled too; this also guards the hold-Space path
+	if (state.mutedMembers.has(state.selfId)
+		// another member holds the floor — the button is disabled too; this also guards the hold-Space path
+		|| state.mode !== 'FULL_DUPLEX' && state.floorHolder && state.floorHolder !== state.selfId) {
+		return;
 	}
 	if (state.mode === 'FULL_DUPLEX') {
 		if (state.transmitting) {
@@ -1039,6 +1050,9 @@ function endTransmit() {
 	state.transmitting = false;
 	enableLocalTracks(false);
 	setSpeaking(state.selfId, false);
+	if (state.floorHolder === state.selfId) {
+		state.floorHolder = null;   // we released the floor we held; it is free until someone else takes it
+	}
 	updateTalkButton();
 }
 
@@ -1797,6 +1811,13 @@ function updateTalkButton() {
 		btn.textContent = 'Muted by owner';
 		return;
 	}
+	// Another member holds the PTT/global floor: disable Talk (the server would refuse us the floor anyway) and
+	// name the holder — mirroring the owner-muted disable above. Full-duplex has no floor, so this never applies.
+	if (state.mode !== 'FULL_DUPLEX' && state.floorHolder && state.floorHolder !== state.selfId) {
+		btn.disabled = true;
+		btn.textContent = `Floor held by ${memberLabel(state.floorHolder)}`;
+		return;
+	}
 	btn.disabled = false;
 	btn.textContent = state.mode === 'FULL_DUPLEX' ?
 		state.transmitting ?
@@ -1823,6 +1844,7 @@ function resetChannelState() {
 	state.speakTimers.clear();
 	state.speaking.clear();
 	state.floorSpeaker = null;
+	state.floorHolder = null;
 	state.members.clear();
 	state.mutedMembers.clear();
 	state.locked = false;   // onJoined re-seeds from the snapshot; this keeps a clean baseline for the disconnect path
