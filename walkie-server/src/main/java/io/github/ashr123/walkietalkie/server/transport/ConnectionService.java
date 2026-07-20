@@ -318,8 +318,11 @@ public class ConnectionService {
 					// Auto-election can promote a muted member (it picks any remaining member): the new owner is
 					// never muted, so unmute it if needed — else it would be a muted owner nobody can unmute.
 					unmuteOwnerIfMuted(channel);
-					log.info("ownership transferred to session={} ({})", newOwnerId,
-							channel.member(newOwnerId) instanceof Some(ClientSession newOwner) ? newOwner.displayName() : "?");
+					log.info(
+							"ownership transferred to \"{}\" (session={})",
+							channel.member(newOwnerId) instanceof Some(ClientSession newOwner) ? newOwner.displayName() : "?",
+							newOwnerId
+					);
 				}
 				// Floor teardown on LIVE state, run UNCONDITIONALLY. This is safe despite the monitor gap around
 				// channelRegistry.leave precisely because reserveHead is IDEMPOTENT: it (re-)reserves + notifies the
