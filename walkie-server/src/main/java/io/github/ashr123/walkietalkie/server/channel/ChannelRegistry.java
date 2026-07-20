@@ -190,7 +190,7 @@ public class ChannelRegistry {
 		channels.computeIfPresent(name, (_, channel) -> {
 			if (!requesterId.equals(channel.ownerId())) {
 				result.set(new TransferResult.NotOwner());
-			} else if (channel.member(newOwnerId) instanceof Some(ClientSession _)) {
+			} else if (channel.member(newOwnerId) instanceof Some<ClientSession>) {
 				channel.setOwner(newOwnerId);
 				result.set(new TransferResult.Ok(channel));
 			} else {

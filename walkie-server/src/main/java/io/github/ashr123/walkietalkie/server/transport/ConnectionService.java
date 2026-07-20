@@ -198,7 +198,7 @@ public class ConnectionService {
 		// so it never reaches here.)
 		if (properties.channelAffinity()
 				&& !requested.equals(session.handshakeChannel())
-				&& !(channelRegistry.find(requested) instanceof Some(Channel _))) {
+				&& !(channelRegistry.find(requested) instanceof Some<Channel>)) {
 			sendError(session, ErrorCode.CHANNEL_ROUTING_MISMATCH,
 					"'" + requested + "' is served by another instance — reconnect to switch to it.");
 			return;
@@ -306,7 +306,7 @@ public class ConnectionService {
 		// the next head gets a fresh window). We must NOT hold the channel monitor across channelRegistry.leave (the
 		// registry takes its bin lock then this monitor, so the reverse order deadlocks — see the lock-order note on
 		// Channel), so the floor teardown runs AFTER the removal, on LIVE state.
-		boolean ownerChanged = channelRegistry.leave(session.channelName(), session.id()) instanceof Some(String _);
+		boolean ownerChanged = channelRegistry.leave(session.channelName(), session.id()) instanceof Some<String>;
 		if (channelBeforeLeave instanceof Some(Channel channel)) {
 			// Announce to the survivors of the SAME channel object the leave acted on — NOT a fresh find()-by-name,
 			// which could resolve a dropped-and-recreated same-named channel and notify its members instead.
@@ -564,7 +564,7 @@ public class ConnectionService {
 								"session={} ({}) missed its floor reservation; {}",
 								missed,
 								channel.member(missed) instanceof Some(ClientSession m) ? m.displayName() : "?",
-								channel.reservedHolder() instanceof Some(String _)
+								channel.reservedHolder() instanceof Some<String>
 										? "the floor was offered to the next in line"
 										: "no one else was waiting, so the floor is now free"
 						);
@@ -856,7 +856,7 @@ public class ConnectionService {
 		}
 		// The owner can't mute itself, and only a current member can be muted. This is the friendly fast-path error;
 		// the authoritative membership test is re-done under the monitor below (a member can leave in between).
-		if (memberId == null || memberId.equals(channel.ownerId()) || !(channel.member(memberId) instanceof Some(ClientSession _))) {
+		if (memberId == null || memberId.equals(channel.ownerId()) || !(channel.member(memberId) instanceof Some<ClientSession>)) {
 			sendError(session, ErrorCode.UNKNOWN_TARGET, "No member '" + memberId + "' to mute in this channel");
 			return;
 		}
@@ -865,7 +865,7 @@ public class ConnectionService {
 			// removing the member, so a target that left since the fast-path check is skipped here rather than
 			// leaving a ghost mute id that would outlive it (see Channel.remove). A silent no-op is right — the
 			// member is already gone (it got a MemberLeft), so there is nothing to mute and no error to report.
-			if (!(channel.member(memberId) instanceof Some(ClientSession _))) {
+			if (!(channel.member(memberId) instanceof Some<ClientSession>)) {
 				return;
 			}
 			if (!channel.setMuted(memberId, muted)) {

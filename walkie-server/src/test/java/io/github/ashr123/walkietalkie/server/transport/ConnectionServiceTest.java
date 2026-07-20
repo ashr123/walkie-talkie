@@ -14,14 +14,13 @@ import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
-
-import tools.jackson.databind.json.JsonMapper;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -101,10 +100,10 @@ class ConnectionServiceTest {
 				: fail("expected channel '" + name + "' to exist");
 	}
 
-	/// Whether a channel with `name` currently exists — the absence counterpart to [#channel], for asserting a
-	/// channel was never created or was dropped once empty (where [#channel] would instead fail the test).
-	private boolean channelExists(String name) {
-		return channelRegistry.find(name) instanceof Some(Channel _);
+	private static boolean received(FakeClientSession session, ErrorCode code) {
+		return session.sent.stream().anyMatch(m -> m instanceof ServerMessage.ErrorMessage(
+				ErrorCode c, _
+		) && c == code);
 	}
 
 	private FakeClientSession join(String id, String channelName, ChannelMode mode) {
@@ -122,8 +121,10 @@ class ConnectionServiceTest {
 				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, null, true), BROADCASTER);
 	}
 
-	private static boolean received(FakeClientSession session, ErrorCode code) {
-		return session.sent.stream().anyMatch(m -> m instanceof ServerMessage.ErrorMessage(ErrorCode c, String _) && c == code);
+	/// Whether a channel with `name` currently exists — the absence counterpart to [#channel], for asserting a
+	/// channel was never created or was dropped once empty (where [#channel] would instead fail the test).
+	private boolean channelExists(String name) {
+		return channelRegistry.find(name) instanceof Some<Channel>;
 	}
 
 	@Test
@@ -572,7 +573,7 @@ class ConnectionServiceTest {
 		String announced = lastOf(carol, ServerMessage.OwnerChanged.class).ownerId();
 		assertEquals(channel("team").ownerId(), announced, "survivors converge on the live owner");
 		assertNotEquals("bob", announced, "never left believing the departed member still owns the channel");
-		assertTrue(channel("team").member(announced) instanceof Some(ClientSession _), "the announced owner is a current member");
+		assertTrue(channel("team").member(announced) instanceof Some<ClientSession>, "the announced owner is a current member");
 	}
 
 	@Test
@@ -922,7 +923,7 @@ class ConnectionServiceTest {
 
 		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorGranted.class::isInstance),
 				"bob preempts the idle holder and is granted the floor");
-		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& "bob".equals(holderId)),
 				"the ex-holder learns via the FloorStatus snapshot that bob now holds the floor, so its client stops");
 		assertTrue(channel("ptt").holdsFloor("bob"));
@@ -974,10 +975,10 @@ class ConnectionServiceTest {
 		svc.releaseExpiredFloors();
 
 		assertFalse(channel("swept").holdsFloor("alice"), "the silent over-cap holder is reclaimed by the sweep");
-		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& holderId == null),
 				"the (ex-)holder is notified via FloorStatus (no holder) so its client stops transmitting");
-		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& holderId == null),
 				"other members are notified the floor is free");
 	}
@@ -1002,10 +1003,10 @@ class ConnectionServiceTest {
 		svc.onAudio(alice, new byte[]{4, 5, 6});
 
 		assertEquals(1, bob.audio.size(), "the over-cap frame is dropped, not relayed");
-		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& holderId == null),
 				"the speaker is told (FloorStatus shows no holder) its talk time was up so its client stops");
-		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& holderId == null),
 				"the other members are told the floor was released");
 		assertFalse(channel("ptt2").holdsFloor("alice"), "the floor is freed for the next requester");
@@ -1283,7 +1284,7 @@ class ConnectionServiceTest {
 		svc.releaseExpiredFloors();
 
 		assertTrue(channel("q5b").floorQueue().isEmpty(), "bob missed its turn and was dropped, leaving the queue empty");
-		assertFalse(channel("q5b").floorHolder() instanceof Some(String _), "the floor is free — no successor took it");
+		assertFalse(channel("q5b").floorHolder() instanceof Some<String>, "the floor is free — no successor took it");
 		assertFalse(bob.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
 				"a dropped lone head is not itself re-reserved");
 	}
@@ -1616,10 +1617,10 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
 
 		assertFalse(channel("mute-floor").holdsFloor("bob"), "muting the floor holder frees the floor");
-		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& holderId == null),
 				"the muted (ex-)holder is told the floor is free (FloorStatus) so its client stops transmitting");
-		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& holderId == null),
 				"the other members learn the floor reopened");
 		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.MemberMuted mm && mm.muted()),
@@ -1768,7 +1769,7 @@ class ConnectionServiceTest {
 
 		assertFalse(channel("mute-all-floor").holdsFloor("bob"),
 				"mute-all frees the muted holder's floor too (the same floor teardown as single-member mute)");
-		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& holderId == null),
 				"the muted ex-holder is told the floor is free (FloorStatus)");
 	}
