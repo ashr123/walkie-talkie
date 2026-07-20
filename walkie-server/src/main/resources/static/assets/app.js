@@ -44,6 +44,16 @@ const SILENCE_TTL_MS = 4000;     // close a per-sender lane after this much sile
 const SPEAK_SILENCE_MS = 250;   // a relay speaker stays highlighted until this long passes with no frame (a few 20 ms frames of grace)
 const VAD_RMS_THRESHOLD = 0.02; // full-duplex voice-activity gate: highlight a member only when their PCM RMS (normalized 0..1) exceeds this — a rough "actually talking" level (every mic is open in full-duplex). Tune per mic/AGC.
 
+// "Your turn" attention cues (grant-to-talk floor queue): a short beep + a tab-title flash, the browser analogue
+// of the Java client's terminal BEL — they grab an inattentive user the instant the floor is reserved for them.
+// The tones/durations are cosmetic, chosen so the chirp is clearly audible yet can't be mistaken for received
+// voice and is short enough not to mask the start of your own talk.
+const TURN_BEEP_HZ = 880;             // A5 — a clear, high-ish chirp distinct from speech
+const TURN_BEEP_SECONDS = 0.15;       // brief: long enough to notice, short enough not to mask your first word
+const TURN_BEEP_GAIN = 0.2;           // well below full scale (1.0) so the cue isn't jarring over playback
+const TURN_TITLE_FLASH_MS = 700;      // tab-title flash cadence, so a backgrounded tab still blinks for attention
+const TURN_TAB_TITLE = '🎤 Your turn!';
+
 const state = {
 	token: null,
 	ws: null,
@@ -87,7 +97,18 @@ const state = {
 	memberLis: new Map(),    // id -> roster <li>, so speaking/owner state toggles without a full re-render
 	speakTimers: new Map(),  // id -> timeout that clears a relay speaker after a short silence
 	floorSpeaker: null,      // PTT/global floor holder — drives the highlight when there are no relay frames (WebRTC)
-	floorHolder: null,       // PTT/global: id currently holding the floor (both transports), null when free or full-duplex — disables our Talk button when it's someone else's
+	// Push-to-talk floor snapshot, from the authoritative ServerMessage.FloorStatus (holderId + waiting). ALL floor
+	// UI is derived from these — mirroring the Java client's floorStateFor — so the Talk button, queue position and
+	// "your turn" state stay consistent across both clients.
+	floorHolder: null,       // id currently holding the floor (both transports), null when free/reserved/full-duplex
+	floorWaiting: [],        // the FIFO floor queue in order (empty when the queue is off or nobody is waiting)
+	floorQueueEnabled: false, // whether the owner-toggleable floor queue is on (from joined.floorQueueEnabled + floorQueueChanged)
+	awaitingClaim: false,    // true while it's our turn (reserved) — so a later snapshot that drops us can say "your turn passed"
+	talkHeld: false,         // whether the Talk button is physically held right now — a floorReserved landing mid-hold auto-claims
+	claimSecondsLeft: 0,     // display-only "your turn" countdown shown in the button (the server owns the real window)
+	claimTimer: null,        // interval id ticking claimSecondsLeft down
+	turnTitleTimer: null,    // interval id flashing the tab title while it's our turn
+	turnTitleBase: null,     // the tab title captured before flashing, restored when the alert clears
 };
 
 function log(message) {
@@ -675,47 +696,19 @@ function onWsMessage(ev) {
 			break;
 		case 'floorGranted':
 			log('Floor granted — you are live');
-			state.floorHolder = state.selfId;   // we hold the floor now
+			clearTurnAlert();                   // we claimed — stop the "your turn" beep countdown / tab-title flash
+			state.awaitingClaim = false;
+			state.floorHolder = state.selfId;   // we hold the floor now (the authoritative floorStatus follows)
 			beginTransmit();
 			break;
-		case 'floorDenied':
-			log(`Floor busy (held by ${memberLabel(msg.currentHolderId)})`);
-			state.floorHolder = msg.currentHolderId;   // someone else holds it — keep our Talk button disabled
-			updateTalkButton();
+		case 'floorStatus':
+			onFloorStatus(msg.holderId, msg.waiting);
 			break;
-		case 'floorTaken':
-			state.floorHolder = msg.holderId;   // someone holds the floor now — disables our Talk button (below)
-			// PTT/global: the floor holder is the speaker. On the relay path the per-frame highlight already
-			// covers this, so only drive it from the floor on WebRTC, where there are no relay frames to key off.
-			if (state.transport === 'webrtc') {
-				if (state.floorSpeaker && state.floorSpeaker !== msg.holderId) {
-					setSpeaking(state.floorSpeaker, false);
-				}
-				state.floorSpeaker = msg.holderId;
-				setSpeaking(msg.holderId, true);
-			}
-			log(`Talking: ${memberLabel(msg.holderId)}`);
-			// If we were the PTT holder and the floor is now someone else's, the server reassigned it away from
-			// us (idle auto-release) — stop our mic and reset the button so we're not talking into a closed floor.
-			if (state.transmitting && state.mode !== 'FULL_DUPLEX' && msg.holderId !== state.selfId) {
-				endTransmit();
-				log('You were released from the floor (idle) — tap Talk to speak again');
-			}
-			updateTalkButton();   // reflect the new holder in the Talk button's disabled state/label
+		case 'floorReserved':
+			onFloorReserved(msg.claimSeconds);
 			break;
-		case 'floorIdle':
-			state.floorHolder = null;   // floor free — re-enables our Talk button (below)
-			if (state.floorSpeaker) {
-				setSpeaking(state.floorSpeaker, false);
-				state.floorSpeaker = null;
-			}
-			log('Floor is free');
-			// Server-initiated release while we held it (e.g. the max-hold talk timeout) — stop transmitting.
-			if (state.transmitting && state.mode !== 'FULL_DUPLEX') {
-				endTransmit();
-				log('Your talk time was up — tap Talk to speak again');
-			}
-			updateTalkButton();   // re-enable the Talk button now the floor is free
+		case 'floorQueueChanged':
+			onFloorQueueChanged(msg.enabled);
 			break;
 		case 'modeChanged':
 			onModeChanged(msg.mode);
@@ -786,6 +779,7 @@ function onJoined(msg) {
 	state.mode = msg.mode;
 	state.channel = msg.channel;
 	state.locked = msg.locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join too)
+	state.floorQueueEnabled = msg.floorQueueEnabled;   // adopt the channel's queue setting (authoritative on every Joined; a fresh floorStatus follows)
 	if (channelChanged) {
 		// Baseline the announced key-check to what we joined with, and clear any pending rotation — ONLY on an
 		// actual channel change. A same-channel idempotent re-snapshot must NOT reset these, or it would revert a
@@ -844,6 +838,7 @@ function onModeChanged(mode) {
 	updateTalkButton();
 	updateModeControl();
 	updateGlobalModeLocks();
+	updateQueueControl();    // hide the owner queue toggle when the new mode is full-duplex (no floor), show it in PTT
 	updateApplyControls();   // the live mode now matches the selector again → the Apply button settles
 	log(`Mode changed to ${mode}`);
 }
@@ -995,16 +990,245 @@ function lockInGlobalMode(input, hint, lockedValue, global) {
 	}
 }
 
+// --- push-to-talk floor: queue + "your turn" attention --------------------------------------------
+// ALL floor UI is derived from ONE authoritative snapshot (ServerMessage.FloorStatus: holderId + waiting),
+// mirroring the Java client. floorStateFor is the SAME pure rule both clients apply; floorActionFor is the
+// state-driven decision behind the unified Talk control (there is no separate queue button).
+
+const FLOOR_LIVE = 'LIVE';       // we hold the floor and are transmitting
+const FLOOR_MY_TURN = 'MY_TURN'; // reserved for us: the floor is free and we are the queue head — claim it
+const FLOOR_IN_LINE = 'IN_LINE'; // waiting further back in the queue
+const FLOOR_IDLE = 'IDLE';       // none of the above: floor free, held by another, or reserved for another
+
+/**
+ * Derives our floor state from the authoritative snapshot (holderId + waiting) and our own id — the same rule the
+ * Java client's floorStateFor applies, so both stay in lock-step. There is deliberately no "reserved" field: the
+ * member offered a free floor is exactly waiting[0] (the server reserves the head the instant the floor frees).
+ */
+function floorStateFor(self, holderId, waiting) {
+	return self === holderId
+		? FLOOR_LIVE
+		: holderId == null && waiting.length > 0 && waiting[0] === self
+			? FLOOR_MY_TURN
+			: waiting.includes(self)
+				? FLOOR_IN_LINE
+				: FLOOR_IDLE;
+}
+
+/**
+ * The message the state-driven Talk control sends for a floor state — mirrors the Java client's floorActionFor:
+ * LIVE → releaseFloor (stop), IN_LINE → releaseFloor (leave the queue), MY_TURN → requestFloor (claim), IDLE →
+ * requestFloor (grab if free, else enqueue when the queue is on; the server ignores it when busy + queue off).
+ */
+function floorActionFor(floorState) {
+	return floorState === FLOOR_LIVE || floorState === FLOOR_IN_LINE
+		? {type: 'releaseFloor'}
+		: {type: 'requestFloor'};
+}
+
+/**
+ * Whether nobody holds OR is reserved for the floor — the only IDLE sub-case that stays a plain hold-to-talk. A
+ * busy floor instead becomes tap-to-raise-hand when the queue is on, or a disabled "held by X" when it's off.
+ */
+function floorIsFree() {
+	return !state.floorHolder && state.floorWaiting.length === 0;
+}
+
+/**
+ * The Talk button's INTERACTION mode for the current state — the subtle hold-vs-tap flip from the design's
+ * unified-control table. Read by BOTH the pointer/keyboard handlers and updateTalkButton so the gesture and the
+ * label can't drift:
+ *   'duplex'   — full-duplex mic on/off toggle (no floor);
+ *   'disabled' — owner-muted, or a busy floor with the queue OFF (today's committed behaviour) — no action;
+ *   'hold'     — press-and-hold drives the floor/mic (LIVE, MY_TURN, IDLE + free);
+ *   'tap'      — a click toggles queue membership; press/release do NOT drive the mic (IN_LINE, IDLE + busy + queue on).
+ */
+function talkMode() {
+	if (state.mutedMembers.has(state.selfId)) {
+		return 'disabled';
+	}
+	if (state.mode === 'FULL_DUPLEX') {
+		return 'duplex';
+	}
+	switch (floorStateFor(state.selfId, state.floorHolder, state.floorWaiting)) {
+		case FLOOR_LIVE:
+		case FLOOR_MY_TURN:
+			return 'hold';
+		case FLOOR_IN_LINE:
+			return 'tap';
+		default: // IDLE
+			return floorIsFree() ? 'hold' : state.floorQueueEnabled ? 'tap' : 'disabled';
+	}
+}
+
+/**
+ * A short beep via the live AudioContext to grab an inattentive user the instant it's their turn (the browser
+ * analogue of the Java client's terminal BEL). Best-effort: a failure here must never break floor handling.
+ */
+function playTurnBeep() {
+	const ctx = state.audioContext;
+	if (!ctx) {
+		return;
+	}
+	try {
+		const osc = ctx.createOscillator();
+		const gain = ctx.createGain();
+		osc.type = 'sine';
+		osc.frequency.value = TURN_BEEP_HZ;
+		gain.gain.value = TURN_BEEP_GAIN;
+		osc.connect(gain).connect(ctx.destination);
+		const now = ctx.currentTime;
+		osc.start(now);
+		osc.stop(now + TURN_BEEP_SECONDS);   // one-shot: the node stops and is released once it finishes
+	} catch (err) {
+		// best-effort attention cue only — never let a spurious AudioContext error break the floor state machine
+	}
+}
+
+/**
+ * Starts the "your turn" attention state: a live countdown shown in the Talk button and a tab-title flash for a
+ * backgrounded tab. The countdown is DISPLAY-ONLY — the server owns the claim window, so if it lapses the next
+ * floorStatus drops us to IDLE (and clears this). Idempotent: cancels any prior alert first.
+ */
+function startTurnAlert(claimSeconds) {
+	clearTurnAlert();
+	state.claimSecondsLeft = claimSeconds;
+	state.claimTimer = setInterval(() => {
+		state.claimSecondsLeft = Math.max(0, state.claimSecondsLeft - 1);
+		if (state.claimSecondsLeft === 0) {
+			// Stop ticking at 0; leave the button reading "0s" until the authoritative floorStatus flips us away.
+			clearInterval(state.claimTimer);
+			state.claimTimer = null;
+		}
+		updateTalkButton();
+	}, 1000);
+	// Flash the tab title so a backgrounded tab still blinks; clearTurnAlert restores whatever it was.
+	state.turnTitleBase = document.title;
+	let flashOn = false;
+	state.turnTitleTimer = setInterval(() => {
+		flashOn = !flashOn;
+		document.title = flashOn ? TURN_TAB_TITLE : state.turnTitleBase;
+	}, TURN_TITLE_FLASH_MS);
+}
+
+/**
+ * Cancels the "your turn" countdown + tab-title flash and restores the tab title. Safe to call when no alert is
+ * running (used on claim, on losing the turn, and in resetChannelState).
+ */
+function clearTurnAlert() {
+	if (state.claimTimer) {
+		clearInterval(state.claimTimer);
+		state.claimTimer = null;
+	}
+	if (state.turnTitleTimer) {
+		clearInterval(state.turnTitleTimer);
+		state.turnTitleTimer = null;
+		document.title = state.turnTitleBase || document.title;
+	}
+	state.claimSecondsLeft = 0;
+}
+
+/**
+ * Applies the authoritative FloorStatus snapshot: records the holder + queue, drives the WebRTC speaker highlight,
+ * reconciles our transmit state ("if the floor is no longer mine, I was released — stop the mic"), logs a concise
+ * status, and re-renders the Talk button. This is now the SINGLE source of the "you were released" truth — the
+ * imperative floorTaken/floorIdle triggers are retired, so the only signal is the holder no longer being us.
+ */
+function onFloorStatus(holderId, waiting) {
+	const self = state.selfId;
+	const prevAwaiting = state.awaitingClaim;
+	state.floorHolder = holderId ?? null;
+	state.floorWaiting = Array.isArray(waiting) ? waiting : [];
+
+	// PTT/global: the floor holder is the speaker. On the relay path the per-frame highlight already covers this,
+	// so only drive it from the floor on WebRTC, where there are no relay frames to key off (mirrors the retired
+	// floorTaken/floorIdle handlers).
+	if (state.transport === 'webrtc') {
+		if (state.floorSpeaker && state.floorSpeaker !== holderId) {
+			setSpeaking(state.floorSpeaker, false);
+		}
+		state.floorSpeaker = holderId || null;
+		if (holderId) {
+			setSpeaking(holderId, true);
+		}
+	}
+
+	// Release reconciliation: we were transmitting in a PTT mode but the floor is no longer ours (idle preempt,
+	// max-hold, an owner action, or a claim we lost) — stop the mic. endTransmit won't null state.floorHolder here
+	// because it is already the new (non-self) holder.
+	const released = state.transmitting && state.mode !== 'FULL_DUPLEX' && holderId !== self;
+	if (released) {
+		endTransmit();
+	}
+
+	const floorState = floorStateFor(self, state.floorHolder, state.floorWaiting);
+	if (floorState !== FLOOR_MY_TURN) {
+		clearTurnAlert();   // no longer our turn (claimed → LIVE, left, or the window lapsed) — stop beep/flash/countdown
+	}
+	switch (floorState) {
+		case FLOOR_LIVE:
+			break;   // we hold it; floorGranted already said so — stay quiet on queue churn
+		case FLOOR_MY_TURN:
+			break;   // floorReserved fires the prominent alert; nothing to add from the snapshot
+		case FLOOR_IN_LINE:
+			log(`In line #${state.floorWaiting.indexOf(self) + 1} of ${state.floorWaiting.length} — tap Talk to leave the queue`);
+			break;
+		default: // IDLE
+			if (prevAwaiting) {
+				log('Your turn passed — you did not claim in time. Tap Talk to rejoin the queue.');
+			} else if (released) {
+				log('You were released from the floor — tap Talk to speak again');
+			} else if (holderId) {
+				log(`Talking: ${memberLabel(holderId)}`);
+			} else if (state.floorWaiting.length > 0) {
+				log(`Floor is being offered to ${memberLabel(state.floorWaiting[0])}`);
+			} else {
+				log('Floor is free');
+			}
+	}
+	state.awaitingClaim = floorState === FLOOR_MY_TURN;   // so a later snapshot that drops us can log "your turn passed"
+	updateTalkButton();
+}
+
+/**
+ * Handles FloorReserved: it is our turn, reserved for claimSeconds. Alerts loudly (beep + tab-title flash + a
+ * pulsing "YOUR TURN" button with a live countdown) but NEVER opens the mic — grant-to-claim requires an explicit
+ * talk action, so the mic opens only on the resulting floorGranted. If the user is ALREADY holding the Talk button
+ * as the turn lands, that counts as an immediate claim (send requestFloor), per the design.
+ */
+function onFloorReserved(claimSeconds) {
+	state.awaitingClaim = true;
+	startTurnAlert(claimSeconds);
+	playTurnBeep();
+	if (state.talkHeld && !state.mutedMembers.has(state.selfId)) {
+		sendCtrl({type: 'requestFloor'});   // already holding when the turn landed → claim now (mic still opens on the grant)
+	}
+	updateTalkButton();
+}
+
+/**
+ * The owner turned the floor queue on or off (broadcast to everyone). Update the flag, re-render the owner toggle
+ * and the Talk button (a busy floor flips between "Raise hand ✋" (tap) and a disabled "Floor held by X").
+ */
+function onFloorQueueChanged(enabled) {
+	state.floorQueueEnabled = enabled;
+	log(enabled
+		? 'Floor queue enabled — a busy floor now forms a line; tap Talk to join it.'
+		: 'Floor queue disabled — a busy floor now refuses new requests until it frees.');
+	updateQueueControl();
+	updateTalkButton();
+}
+
 // --- talk control ---------------------------------------------------------------------------------
 
 function pressTalk() {
-	// owner-muted — the button is disabled too; this also guards the hold-Space path
-	if (state.mutedMembers.has(state.selfId)
-		// another member holds the floor — the button is disabled too; this also guards the hold-Space path
-		|| state.mode !== 'FULL_DUPLEX' && state.floorHolder && state.floorHolder !== state.selfId) {
+	// talkMode() folds in the owner-mute guard (returns 'disabled') and the full-duplex case, so this one check
+	// replaces the old explicit mute + floor-held guards (it also guards the hold-Space path).
+	const mode = talkMode();
+	if (mode === 'disabled') {
 		return;
 	}
-	if (state.mode === 'FULL_DUPLEX') {
+	if (mode === 'duplex') {
 		if (state.transmitting) {
 			endTransmit();
 		} else {
@@ -1012,16 +1236,30 @@ function pressTalk() {
 		}
 		return;
 	}
-	// push-to-talk: ask the server for the floor; we go live on 'floorGranted'
+	if (mode === 'tap') {
+		return;   // tap states toggle queue membership on RELEASE (a full tap), not on the down edge — see releaseTalk
+	}
+	// hold state (LIVE / MY_TURN / IDLE + free): the down edge begins the grab/claim. floorActionFor for a
+	// not-yet-live hold state (MY_TURN or IDLE) is requestFloor; the !transmitting guard makes re-pressing while
+	// already LIVE (button still physically held right after the grant) a no-op. We go live on floorGranted.
 	if (!state.transmitting) {
-		sendCtrl({type: 'requestFloor'});
+		sendCtrl(floorActionFor(floorStateFor(state.selfId, state.floorHolder, state.floorWaiting)));
 	}
 }
 
 function releaseTalk() {
-	if (state.mode === 'FULL_DUPLEX') {
-		return; // toggled via pressTalk
+	const mode = talkMode();
+	if (mode === 'duplex' || mode === 'disabled') {
+		return;   // full-duplex toggles on press; a disabled control has no release action
 	}
+	if (mode === 'tap') {
+		// A full tap on a tap-state button toggles queue membership: floorActionFor gives releaseFloor to LEAVE the
+		// line (IN_LINE) or requestFloor to JOIN it (IDLE + busy + queue on). The mic is never driven here.
+		sendCtrl(floorActionFor(floorStateFor(state.selfId, state.floorHolder, state.floorWaiting)));
+		return;
+	}
+	// hold: give up the floor and stop the mic. LIVE → releaseFloor; a press we never got granted also releases
+	// (harmless if we never held it).
 	if (state.transmitting) {
 		endTransmit();
 	}
@@ -1758,6 +1996,7 @@ function renderMembers() {
 		});
 	updateMuteAllButton(); // show/hide + relabel the owner's "Mute all" toggle to match the roster's mute state
 	updateLockControls();  // show the 🔒 indicator to everyone + the owner's Lock/Unlock toggle (ownership may have changed)
+	updateQueueControl();  // show/relabel the owner's floor-queue toggle (ownership may have changed)
 	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
 	updateApplyControls(); // re-settle Apply/Reset: a rebuild may have dropped a now-departed pending owner pick
 }
@@ -1796,6 +2035,22 @@ function updateLockControls() {
 	}
 }
 
+/**
+ * The owner-only floor-queue toggle: shown ONLY to the channel owner in a push-to-talk mode (never to a non-owner,
+ * never in full-duplex — which has no floor — and never in the sentinel-owned global room, whose ownerId is
+ * SERVER_OWNER so iAmOwner is already false there). Same visibility discipline as the Lock toggle. The label
+ * reflects state.floorQueueEnabled; the server enforces NOT_OWNER (and refuses global / full-duplex) regardless.
+ */
+function updateQueueControl() {
+	const btn = byId('queueBtn');
+	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const show = iAmOwner && state.mode !== 'FULL_DUPLEX';
+	btn.hidden = !show;
+	if (show) {
+		btn.textContent = state.floorQueueEnabled ? 'Disable queue' : 'Enable queue';
+	}
+}
+
 function enableTalkButton(enabled) {
 	byId('talkBtn').disabled = !enabled;
 }
@@ -1803,29 +2058,63 @@ function enableTalkButton(enabled) {
 function updateTalkButton() {
 	const btn = byId('talkBtn');
 	btn.classList.toggle('live', state.transmitting);
-	// Owner-muted: the control is disabled and says why. The server drops our audio (and refuses us the floor)
+	// Owner-muted first: the control is disabled and says why. The server drops our audio (and refuses us the floor)
 	// regardless, but disabling here stops us talking into a closed door and makes the reason plain. This runs only
 	// while connected (every caller is post-join), so it owns the connected disabled state alongside the mute.
 	if (state.mutedMembers.has(state.selfId)) {
+		btn.classList.remove('myturn');
 		btn.disabled = true;
 		btn.textContent = 'Muted by owner';
 		return;
 	}
-	// Another member holds the PTT/global floor: disable Talk (the server would refuse us the floor anyway) and
-	// name the holder — mirroring the owner-muted disable above. Full-duplex has no floor, so this never applies.
-	if (state.mode !== 'FULL_DUPLEX' && state.floorHolder && state.floorHolder !== state.selfId) {
-		btn.disabled = true;
-		btn.textContent = `Floor held by ${memberLabel(state.floorHolder)}`;
+	// Full-duplex: no floor — a plain mic on/off toggle (unchanged).
+	if (state.mode === 'FULL_DUPLEX') {
+		btn.classList.remove('myturn');
+		btn.disabled = false;
+		btn.textContent = state.transmitting ? 'Mic ON (click to mute)' : 'Mic OFF (click to talk)';
 		return;
 	}
-	btn.disabled = false;
-	btn.textContent = state.mode === 'FULL_DUPLEX' ?
-		state.transmitting ?
-			'Mic ON (click to mute)' :
-			'Mic OFF (click to talk)' :
-		state.transmitting ?
-			'LIVE — release to stop' :
-			'Hold to talk';
+	// Push-to-talk: the label AND the interaction mode are state-driven (see the design's unified-control table and
+	// talkMode()). The 'myturn' class drives the pulsing highlight for the reserved "your turn" state.
+	const floorState = floorStateFor(state.selfId, state.floorHolder, state.floorWaiting);
+	btn.classList.toggle('myturn', floorState === FLOOR_MY_TURN);
+	switch (floorState) {
+		case FLOOR_LIVE:
+			btn.disabled = false;
+			btn.textContent = 'LIVE — release to stop';
+			return;
+		case FLOOR_MY_TURN:
+			// Reserved for us (hold to claim). The countdown is display-only (startTurnAlert ticks it); fall back to
+			// no suffix if a floorStatus makes us the head a beat before floorReserved carries the window.
+			btn.disabled = false;
+			btn.textContent = state.claimSecondsLeft > 0
+				? `YOUR TURN — hold to talk · ${state.claimSecondsLeft}s`
+				: 'YOUR TURN — hold to talk';
+			return;
+		case FLOOR_IN_LINE:
+			// Waiting in line (tap to leave). Position is 1-based; self is in the queue by definition of IN_LINE.
+			btn.disabled = false;
+			btn.textContent = `In line #${state.floorWaiting.indexOf(state.selfId) + 1} of ${state.floorWaiting.length} — tap to leave`;
+			return;
+		default: { // IDLE
+			if (floorIsFree()) {
+				btn.disabled = false;
+				btn.textContent = 'Hold to talk';
+				return;
+			}
+			// Floor busy: with the queue ON, offer to raise a hand (tap to join the line); with it OFF, disable the
+			// button and name the holder — exactly today's committed queue-off behaviour.
+			if (state.floorQueueEnabled) {
+				btn.disabled = false;
+				btn.textContent = 'Raise hand ✋';
+				return;
+			}
+			btn.disabled = true;
+			const busyId = state.floorHolder || state.floorWaiting[0];
+			btn.textContent = `Floor held by ${memberLabel(busyId)}`;
+			return;
+		}
+	}
 }
 
 /**
@@ -1845,6 +2134,11 @@ function resetChannelState() {
 	state.speaking.clear();
 	state.floorSpeaker = null;
 	state.floorHolder = null;
+	state.floorWaiting = [];
+	state.floorQueueEnabled = false;   // onJoined re-seeds from the snapshot; a clean baseline for the disconnect path
+	state.awaitingClaim = false;
+	state.talkHeld = false;
+	clearTurnAlert();   // stop any "your turn" countdown / tab-title flash and restore the tab title
 	state.members.clear();
 	state.mutedMembers.clear();
 	state.locked = false;   // onJoined re-seeds from the snapshot; this keeps a clean baseline for the disconnect path
@@ -1899,6 +2193,7 @@ function cleanup() {
 	byId('ownerLabel').hidden = true;
 	byId('muteAllBtn').hidden = true;      // owner-only moderation control; renderMembers only re-shows it while connected
 	byId('lockBtn').hidden = true;         // owner-only lock toggle; ditto
+	byId('queueBtn').hidden = true;        // owner-only floor-queue toggle; ditto
 	byId('lockedBadge').hidden = true;     // clear the 🔒 indicator on disconnect
 	byId('shareRekeyRow').hidden = true;   // owner-only rotation control; updateApplyControls only runs while connected
 	byId('shareRekey').checked = true;     // back to the default-checked (auto-share) state for the next session
@@ -1937,6 +2232,9 @@ window.addEventListener('DOMContentLoaded', () => {
 	});
 	// Owner-only "Lock/Unlock channel" toggle: flip the current lock state (recomputed at click time). Immediate.
 	byId('lockBtn').addEventListener('click', () => sendCtrl({type: 'setLocked', locked: !state.locked}));
+	// Owner-only floor-queue toggle: flip the current queue state (recomputed at click time). The echoed
+	// floorQueueChanged is what actually flips everyone's state; the server enforces NOT_OWNER. Immediate.
+	byId('queueBtn').addEventListener('click', () => sendCtrl({type: 'setFloorQueue', enabled: !state.floorQueueEnabled}));
 	byId('ownerSelect').addEventListener('change', updateApplyControls);   // a pending transfer; applied via the button
 	// Re-evaluate the adaptive Switch/Apply button as the form fields change (mode is handled in its own listener).
 	byId('channel').addEventListener('input', updateApplyControls);
@@ -1990,30 +2288,50 @@ window.addEventListener('DOMContentLoaded', () => {
 	});
 
 	const talk = byId('talkBtn');
-	talk.addEventListener('mousedown', pressTalk);
-	talk.addEventListener('mouseup', releaseTalk);
+	// Track whether the Talk button is physically held (down edges set it, every up/leave edge clears it) so a
+	// floorReserved landing mid-hold auto-claims — the design's "already holding when the turn lands = immediate
+	// claim". The down/up edges call the SAME pressTalk/releaseTalk; those branch on talkMode() to decide whether the
+	// gesture is a hold (drives the mic) or a tap (toggles queue membership) — see talkMode().
+	talk.addEventListener('mousedown', () => {
+		state.talkHeld = true;
+		pressTalk();
+	});
+	talk.addEventListener('mouseup', () => {
+		state.talkHeld = false;
+		releaseTalk();
+	});
 	talk.addEventListener('mouseleave', () => {
-		if (state.mode !== 'FULL_DUPLEX') releaseTalk();
+		state.talkHeld = false;
+		// Only a HOLD gesture releases the floor when the pointer drifts off; a tap-state button must NOT toggle
+		// queue membership just because the pointer left after a click (releaseTalk handles the tap on mouseup).
+		if (talkMode() === 'hold') {
+			releaseTalk();
+		}
 	});
 	talk.addEventListener('touchstart', e => {
 		e.preventDefault();
+		state.talkHeld = true;
 		pressTalk();
 	}, {passive: false});
 	talk.addEventListener('touchend', e => {
 		e.preventDefault();
+		state.talkHeld = false;
 		releaseTalk();
 	}, {passive: false});
 
-	// Hold Space as a push-to-talk key.
+	// Space is a push-to-talk key (PTT only; full-duplex is excluded, as before). In tap states pressTalk no-ops on
+	// key-down and releaseTalk toggles the queue on key-up, so Space "raises a hand" / leaves the line too.
 	window.addEventListener('keydown', e => {
 		if (e.code === 'Space' && !e.repeat && !talk.disabled && state.mode !== 'FULL_DUPLEX' && document.activeElement.tagName !== 'INPUT') {
 			e.preventDefault();
+			state.talkHeld = true;
 			pressTalk();
 		}
 	});
 	window.addEventListener('keyup', e => {
 		if (e.code === 'Space' && !talk.disabled && state.mode !== 'FULL_DUPLEX' && document.activeElement.tagName !== 'INPUT') {
 			e.preventDefault();
+			state.talkHeld = false;
 			releaseTalk();
 		}
 	});

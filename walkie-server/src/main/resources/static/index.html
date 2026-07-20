@@ -159,6 +159,24 @@
             box-shadow: 0 0 0 4px rgba(63, 185, 80, .25);
         }
 
+        /* .myturn is toggled at runtime by app.js when the floor is RESERVED for you ("your turn"): a pulsing
+           highlight that — with the beep + tab-title flash — grabs an inattentive user during the claim window. */
+        /*noinspection CssUnusedSymbol*/
+        #talkBtn.myturn {
+            background: var(--accent-2);
+            animation: talkPulse 1s ease-in-out infinite;
+        }
+
+        /*noinspection CssUnusedSymbol*/
+        @keyframes talkPulse {
+            0%, 100% {
+                box-shadow: 0 0 0 0 rgba(46, 163, 255, .55);
+            }
+            50% {
+                box-shadow: 0 0 0 10px rgba(46, 163, 255, 0);
+            }
+        }
+
         .status {
             font-size: 13px;
             margin-top: 8px;
@@ -255,7 +273,7 @@
             gap: 8px;
         }
 
-        #muteAllBtn, #lockBtn {
+        #muteAllBtn, #lockBtn, #queueBtn {
             width: auto;
             padding: 5px 11px;
             font-size: 12px;
@@ -365,6 +383,7 @@
 					<h2>Members</h2>
 					<div class="members-controls">
 						<span hidden id="lockedBadge" title="The owner locked this channel — new members can't join">🔒 Locked</span>
+						<button class="secondary" hidden id="queueBtn" type="button" title="Turn the push-to-talk floor queue on or off">Enable queue</button>
 						<button class="secondary" hidden id="lockBtn" type="button">Lock channel</button>
 						<button class="secondary" hidden id="muteAllBtn" type="button">Mute all</button>
 					</div>
