@@ -100,7 +100,7 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
-	void aNewcomerJoiningWhileTheFloorIsHeldReceivesFloorTaken() throws Exception {
+	void aNewcomerJoiningWhileTheFloorIsHeldReceivesAFloorStatusNamingTheHolder() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
@@ -112,7 +112,8 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 
 			send(sb, new ClientMessage.Join("held", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
 			awaitType(b.messages, ServerMessage.Joined.class);
-			ServerMessage.FloorTaken taken = awaitType(b.messages, ServerMessage.FloorTaken.class);
+			// The newcomer's own initial FloorStatus snapshot (seeded on join) already shows the current holder.
+			ServerMessage.FloorStatus taken = awaitType(b.messages, ServerMessage.FloorStatus.class);
 			assertEquals(joinedA.selfId(), taken.holderId(), "the newcomer learns who currently holds the floor");
 		}
 	}
@@ -188,20 +189,22 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
 			send(sb, new ClientMessage.Join("old", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
 			awaitType(b.messages, ServerMessage.Joined.class);
-			awaitType(a.messages, ServerMessage.MemberJoined.class);
+			awaitType(a.messages, ServerMessage.MemberJoined.class);   // drains Alice's join FloorStatus snapshot
+			awaitType(b.messages, ServerMessage.FloorStatus.class);    // drain Bob's join FloorStatus snapshot
 
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
-			awaitType(b.messages, ServerMessage.FloorTaken.class);
+			awaitType(b.messages, ServerMessage.FloorStatus.class);    // Bob sees Alice hold
 
 			// Alice re-joins a different channel; the server leaves "old" first.
 			send(sa, new ClientMessage.Join("new", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
 
-			// FloorIdle precedes MemberLeft: the floor is freed atomically with the release (before removal), while
-			// MemberLeft is broadcast only after removal (ghost-member fix). Order is benign — independent state.
-			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class), "her held floor is released");
+			// Post-removal emission to the survivor is MemberLeft -> OwnerChanged (Bob is re-elected owner of "old")
+			// -> FloorStatus(null): the member is removed first (clearing the held floor), then survivors hear it.
+			// awaitType consumes the OwnerChanged it skips between the two assertions below.
 			ServerMessage.MemberLeft left = awaitType(b.messages, ServerMessage.MemberLeft.class);
 			assertEquals(joinedA.selfId(), left.memberId(), "the old channel is told Alice left");
+			assertNull(awaitType(b.messages, ServerMessage.FloorStatus.class).holderId(), "her held floor is released");
 
 			ServerMessage.Joined rejoined = awaitType(a.messages, ServerMessage.Joined.class);
 			assertEquals("new", rejoined.channel());

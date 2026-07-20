@@ -47,6 +47,8 @@ class ConnectionServiceTest {
 					1_000_000,
 					5,
 					300,
+					10,
+					false,
 					null, false
 			),
 			BROADCASTER
@@ -67,6 +69,8 @@ class ConnectionServiceTest {
 						1_000_000,
 						idleSeconds,
 						maxHoldSeconds,
+						10,
+						false,
 						null, false
 				),
 				BROADCASTER,
@@ -115,7 +119,7 @@ class ConnectionServiceTest {
 	private ConnectionService affinityService() {
 		return new ConnectionService(
 				channelRegistry,
-				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, null, true), BROADCASTER);
+				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, null, true), BROADCASTER);
 	}
 
 	private static boolean received(FakeClientSession session, ErrorCode code) {
@@ -799,7 +803,7 @@ class ConnectionServiceTest {
 		bob.sent.clear();
 
 		service.onMessage(alice, new ClientMessage.ReleaseFloor());
-		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorIdle.class::isInstance),
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorStatus.class::isInstance),
 				"a full-duplex release broadcasts nothing");
 	}
 
@@ -907,7 +911,8 @@ class ConnectionServiceTest {
 
 		bob.sent.clear();
 		svc.onMessage(bob, new ClientMessage.RequestFloor());     // immediate retry: alice isn't idle yet
-		assertEquals("alice", firstOf(bob, ServerMessage.FloorDenied.class).currentHolderId());
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
+				"with the queue off, a busy non-idle floor yields no grant (FloorDenied is retired — nothing is sent)");
 		assertTrue(channel("ptt").holdsFloor("alice"), "the floor is still alice's");
 
 		clock.advance(Duration.ofSeconds(6));                    // 6 s of silence from alice
@@ -917,8 +922,9 @@ class ConnectionServiceTest {
 
 		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorGranted.class::isInstance),
 				"bob preempts the idle holder and is granted the floor");
-		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorTaken.class::isInstance),
-				"the ex-holder is told (via FloorTaken) that the floor moved, so its client stops transmitting");
+		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+						&& "bob".equals(holderId)),
+				"the ex-holder learns via the FloorStatus snapshot that bob now holds the floor, so its client stops");
 		assertTrue(channel("ptt").holdsFloor("bob"));
 	}
 
@@ -943,7 +949,7 @@ class ConnectionServiceTest {
 
 		carol.sent.clear();
 		svc.onMessage(carol, new ClientMessage.RequestFloor());   // same instant: bob is freshly active, not idle
-		assertEquals("bob", firstOf(carol, ServerMessage.FloorDenied.class).currentHolderId(),
+		assertTrue(carol.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
 				"carol cannot steal the floor from a holder that was just granted it");
 		assertTrue(channel("ptt3").holdsFloor("bob"), "bob keeps the floor he just acquired");
 	}
@@ -968,9 +974,11 @@ class ConnectionServiceTest {
 		svc.releaseExpiredFloors();
 
 		assertFalse(channel("swept").holdsFloor("alice"), "the silent over-cap holder is reclaimed by the sweep");
-		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
-				"the (ex-)holder is notified so its client stops transmitting");
-		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+						&& holderId == null),
+				"the (ex-)holder is notified via FloorStatus (no holder) so its client stops transmitting");
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+						&& holderId == null),
 				"other members are notified the floor is free");
 	}
 
@@ -994,9 +1002,11 @@ class ConnectionServiceTest {
 		svc.onAudio(alice, new byte[]{4, 5, 6});
 
 		assertEquals(1, bob.audio.size(), "the over-cap frame is dropped, not relayed");
-		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
-				"the speaker is told its talk time was up so its client stops");
-		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+						&& holderId == null),
+				"the speaker is told (FloorStatus shows no holder) its talk time was up so its client stops");
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+						&& holderId == null),
 				"the other members are told the floor was released");
 		assertFalse(channel("ptt2").holdsFloor("alice"), "the floor is freed for the next requester");
 	}
@@ -1019,10 +1029,8 @@ class ConnectionServiceTest {
 		bob.sent.clear();
 		svc.onMessage(bob, new ClientMessage.RequestFloor());
 
-		assertEquals("alice", firstOf(bob, ServerMessage.FloorDenied.class).currentHolderId(),
-				"an active speaker's recent frame refreshes the activity mark, so bob is denied");
 		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
-				"an actively-talking holder is not preempted");
+				"an actively-talking holder is not preempted, so bob gets no grant (a refused request sends nothing)");
 		assertTrue(channel("ptt-active").holdsFloor("alice"), "the floor is still alice's");
 	}
 
@@ -1039,6 +1047,8 @@ class ConnectionServiceTest {
 						1_000_000,
 						0,
 						0,
+						10,
+						false,
 						null, false
 				),
 				BROADCASTER
@@ -1069,6 +1079,8 @@ class ConnectionServiceTest {
 						1_000_000,
 						0,
 						0,
+						10,
+						false,
 						null, false
 				),
 				BROADCASTER
@@ -1105,6 +1117,8 @@ class ConnectionServiceTest {
 						2,
 						0,
 						0,
+						10,
+						false,
 						null, false
 				),
 				BROADCASTER,
@@ -1118,6 +1132,382 @@ class ConnectionServiceTest {
 
 		assertEquals("renamed-once", alice.displayName(),
 				"the control message past the per-session rate cap is dropped before dispatch");
+	}
+
+	// --- push-to-talk floor QUEUE ("raise hand", owner-toggleable) — see docs/FLOOR_QUEUE.md -------
+
+	@Test
+	void enqueuingForABusyFloorPlacesTheMemberInTheFloorStatusQueue() {
+		FakeClientSession alice = join("alice", "q1", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "q1", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice grabs the free floor
+		assertTrue(channel("q1").holdsFloor("alice"));
+
+		bob.sent.clear();
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // busy floor + queue on -> bob is queued
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
+				"a queued member is not granted the floor");
+		ServerMessage.FloorStatus status = lastOf(bob, ServerMessage.FloorStatus.class);
+		assertEquals("alice", status.holderId(), "alice still holds the floor");
+		assertEquals(List.of("bob"), status.waiting(), "bob sees itself in the waiting queue");
+	}
+
+	@Test
+	void theReservedHeadClaimsItsTurnWhileANonHeadCannotGrabTheFreedFloor() {
+		FakeClientSession alice = join("alice", "q2", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "q2", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession carol = join("carol", "q2", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues (head)
+		service.onMessage(carol, new ClientMessage.RequestFloor());   // carol queues behind bob
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.ReleaseFloor());   // alice releases -> bob reserved
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"the head is told it is its turn (FloorReserved)");
+
+		carol.sent.clear();
+		service.onMessage(carol, new ClientMessage.RequestFloor());   // carol is NOT the head -> can't grab
+		assertTrue(carol.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
+				"a non-head cannot grab a reserved floor");
+		assertFalse(channel("q2").holdsFloor("carol"));
+
+		bob.sent.clear();
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // the reserved head claims its turn
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorGranted.class::isInstance),
+				"the reserved head claims and goes live");
+		assertTrue(channel("q2").holdsFloor("bob"));
+		ServerMessage.FloorStatus status = lastOf(bob, ServerMessage.FloorStatus.class);
+		assertEquals("bob", status.holderId(), "the snapshot shows bob holding the floor");
+		assertEquals(List.of("carol"), status.waiting(), "carol remains queued behind bob");
+	}
+
+	@Test
+	void aMidQueueWaiterLeavingDoesNotResetTheReservedHeadsClaimWindow() {
+		MutableClock clock = new MutableClock(Instant.EPOCH);
+		ConnectionService svc = serviceWithClock(clock, 0, 0);   // timers off; reservation clock driven by hand
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		FakeClientSession carol = session("carol");
+		svc.onMessage(alice, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(carol, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues (head)
+		svc.onMessage(carol, new ClientMessage.RequestFloor());   // carol queues behind bob
+
+		clock.advance(Duration.ofSeconds(3));
+		svc.onMessage(alice, new ClientMessage.ReleaseFloor());   // t=3 s: bob reserved
+		assertEquals(Instant.EPOCH.plusSeconds(3), channel("q3").floorReservedAt(), "bob's reservation is stamped at t=3 s");
+
+		clock.advance(Duration.ofSeconds(4));                     // t=7 s
+		svc.onMessage(carol, new ClientMessage.ReleaseFloor());   // a MID-QUEUE waiter leaves the line
+		assertEquals(Instant.EPOCH.plusSeconds(3), channel("q3").floorReservedAt(),
+				"a mid-queue waiter leaving must NOT reset the reserved head's running claim window");
+		assertEquals(List.of("bob"), channel("q3").floorQueue(), "carol left; bob is still the reserved head");
+	}
+
+	@Test
+	void theReservedHeadDecliningOffersTheFloorToTheNextInLine() {
+		FakeClientSession alice = join("alice", "q4", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "q4", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession carol = join("carol", "q4", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues (head)
+		service.onMessage(carol, new ClientMessage.RequestFloor());   // carol queues
+		service.onMessage(alice, new ClientMessage.ReleaseFloor());   // bob reserved
+
+		carol.sent.clear();
+		service.onMessage(bob, new ClientMessage.ReleaseFloor());     // the reserved head declines its turn
+		assertTrue(carol.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"declining the turn offers the floor to the next in line (carol reserved)");
+		assertEquals(List.of("carol"), channel("q4").floorQueue(), "bob left; carol is now the head");
+	}
+
+	@Test
+	void anUnclaimedReservationExpiresAndTheFloorPassesToTheNextInLine() {
+		// Base the clock at a NON-EPOCH instant: a reservation stamped at exactly Instant.EPOCH would collide with
+		// the "no reservation running" sentinel (floorReservedAt == EPOCH), so real reservations must be post-EPOCH.
+		MutableClock clock = new MutableClock(Instant.EPOCH.plusSeconds(1_000));
+		ConnectionService svc = serviceWithClock(clock, 0, 0);   // idle/max-hold off; reservation window = 10 s
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		FakeClientSession carol = session("carol");
+		svc.onMessage(alice, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(carol, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues (head)
+		svc.onMessage(carol, new ClientMessage.RequestFloor());   // carol queues
+		svc.onMessage(alice, new ClientMessage.ReleaseFloor());   // t=0: bob reserved
+
+		svc.releaseExpiredFloors();                               // within the 10 s window -> no change
+		assertEquals(List.of("bob", "carol"), channel("q5").floorQueue(), "the reservation stands within the window");
+
+		clock.advance(Duration.ofSeconds(11));                    // past the claim window
+		carol.sent.clear();
+		svc.releaseExpiredFloors();
+
+		assertEquals(List.of("carol"), channel("q5").floorQueue(), "bob missed its turn and was dropped from the queue");
+		assertTrue(carol.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"the floor is offered to the next in line (carol reserved)");
+	}
+
+	@Test
+	void onlyTheOwnerTogglesTheFloorQueueAndDisablingClearsIt() {
+		FakeClientSession alice = join("alice", "q6", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "q6", ChannelMode.MULTI_CHANNEL_PTT);
+
+		bob.sent.clear();
+		service.onMessage(bob, new ClientMessage.SetFloorQueue(true));
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(bob, ServerMessage.ErrorMessage.class).code(),
+				"a non-owner cannot toggle the floor queue");
+		assertFalse(channel("q6").isFloorQueueEnabled(), "a non-owner's toggle has no effect");
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		assertTrue(channel("q6").isFloorQueueEnabled());
+		assertTrue(firstOf(bob, ServerMessage.FloorQueueChanged.class).enabled(), "the enable is broadcast to the channel");
+		assertTrue(firstOf(alice, ServerMessage.FloorQueueChanged.class).enabled(), "the owner is notified too");
+
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
+		assertEquals(List.of("bob"), channel("q6").floorQueue());
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(false));
+		assertFalse(channel("q6").isFloorQueueEnabled());
+		assertTrue(channel("q6").floorQueue().isEmpty(), "disabling the queue clears the waiting line");
+		assertFalse(firstOf(bob, ServerMessage.FloorQueueChanged.class).enabled(), "the disable is broadcast");
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String _, List<String> waiting)
+						&& waiting.isEmpty()),
+				"the following FloorStatus shows the cleared (empty) queue");
+	}
+
+	@Test
+	void theGlobalRoomsFloorQueueCannotBeToggled() {
+		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(alice, ServerMessage.ErrorMessage.class).code(),
+				"the sentinel-owned global room refuses a floor-queue toggle");
+		assertFalse(channel("global").isFloorQueueEnabled());
+	}
+
+	@Test
+	void settingTheFloorQueueBeforeJoiningIsNotInChannel() {
+		FakeClientSession stray = session("stray");
+		service.onMessage(stray, new ClientMessage.SetFloorQueue(true));
+		assertEquals(ErrorCode.NOT_IN_CHANNEL, firstOf(stray, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void aMutedMemberCannotQueueForTheFloor() {
+		FakeClientSession alice = join("alice", "q7", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "q7", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds a busy floor
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+
+		bob.sent.clear();
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // muted -> refused, never queued
+		assertTrue(channel("q7").floorQueue().isEmpty(), "a muted member is not added to the queue");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance));
+	}
+
+	@Test
+	void withTheQueueOffABusyFloorRequestIsRefusedWithoutGrantOrQueueOrCrash() {
+		FakeClientSession alice = join("alice", "q8", ChannelMode.MULTI_CHANNEL_PTT);   // queue OFF by default
+		FakeClientSession bob = join("bob", "q8", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		assertTrue(channel("q8").holdsFloor("alice"));
+
+		bob.sent.clear();
+		assertDoesNotThrow(() -> service.onMessage(bob, new ClientMessage.RequestFloor()));
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorGranted.class::isInstance),
+				"with the queue off, a busy-floor request yields no grant (unchanged pre-queue behaviour)");
+		assertTrue(channel("q8").floorQueue().isEmpty(), "and forms no queue");
+		assertTrue(channel("q8").holdsFloor("alice"), "alice keeps the floor");
+	}
+
+	@Test
+	void aHolderLeavingWithAQueueReservesTheHeadAndBroadcastsIt() {
+		FakeClientSession alice = join("alice", "qA", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "qA", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues (head)
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.Leave());          // the holder leaves with bob waiting
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"the queue head is offered the floor (FloorReserved) when the holder leaves");
+		ServerMessage.FloorStatus status = lastOf(bob, ServerMessage.FloorStatus.class);
+		assertNull(status.holderId(), "the floor is free (bob is reserved, not yet holding)");
+		assertEquals(List.of("bob"), status.waiting(), "bob is the head being offered the floor");
+	}
+
+	@Test
+	void aReservedHeadDisconnectingOffersTheFloorToTheNext() {
+		FakeClientSession alice = join("alice", "qB", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "qB", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession carol = join("carol", "qB", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues (head)
+		service.onMessage(carol, new ClientMessage.RequestFloor());   // carol queues
+		service.onMessage(alice, new ClientMessage.ReleaseFloor());   // bob reserved
+
+		carol.sent.clear();
+		service.onClose(bob, "bob disconnects");   // the reserved head drops
+		assertTrue(carol.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"the next member is reserved when the reserved head disconnects");
+		assertEquals(List.of("carol"), channel("qB").floorQueue(), "bob is gone; carol is the new head");
+	}
+
+	@Test
+	void theSweepIdleReleasesARelayHolderAndReservesTheQueueHead() {
+		// NON-EPOCH clock base (a reservation stamped at EPOCH would collide with the no-reservation sentinel).
+		MutableClock clock = new MutableClock(Instant.EPOCH.plusSeconds(1_000));
+		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle 5 s, max-hold off
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("qC", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("qC", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice (relay) holds, then goes silent
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
+
+		svc.releaseExpiredFloors();   // within the idle window -> no change
+		assertTrue(channel("qC").holdsFloor("alice"), "a holder within the idle window is kept");
+
+		clock.advance(Duration.ofSeconds(6));   // alice idle past 5 s
+		bob.sent.clear();
+		svc.releaseExpiredFloors();
+
+		assertFalse(channel("qC").holdsFloor("alice"), "the idle relay holder is released for the queue");
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"the freed floor is offered to the queue head");
+	}
+
+	@Test
+	void aWebRtcHolderIsNotIdleReleasedEvenWithAQueueBehindIt() {
+		MutableClock clock = new MutableClock(Instant.EPOCH.plusSeconds(1_000));
+		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle 5 s
+		FakeClientSession alice = signaling("alice");   // WebRTC (non-relay) holder — no server-side activity signal
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("qD", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("qD", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // WebRTC alice holds
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
+
+		clock.advance(Duration.ofSeconds(60));   // long idle by wall time
+		bob.sent.clear();
+		svc.releaseExpiredFloors();
+
+		assertTrue(channel("qD").holdsFloor("alice"),
+				"a WebRTC (non-relay) holder is never idle-released — the server has no activity signal for it");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.FloorReserved.class::isInstance),
+				"so the queue head is not reserved");
+	}
+
+	@Test
+	void theSweepMaxHoldReleasesTheHolderAndOffersTheFloorToTheQueueHead() {
+		MutableClock clock = new MutableClock(Instant.EPOCH.plusSeconds(1_000));
+		ConnectionService svc = serviceWithClock(clock, 0, 10);   // idle off, max-hold 10 s
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("qE", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("qE", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
+
+		clock.advance(Duration.ofSeconds(11));   // past the max-hold cap
+		bob.sent.clear();
+		svc.releaseExpiredFloors();
+
+		assertFalse(channel("qE").holdsFloor("alice"), "the over-cap holder is swept off the floor");
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"the freed floor is offered to the queue head");
+	}
+
+	@Test
+	void maxHoldViaOnAudioReleasesTheHolderAndOffersTheFloorToTheQueueHead() {
+		MutableClock clock = new MutableClock(Instant.EPOCH.plusSeconds(1_000));
+		ConnectionService svc = serviceWithClock(clock, 0, 10);   // idle off, max-hold 10 s
+		FakeClientSession alice = session("alice");
+		FakeClientSession bob = session("bob");
+		svc.onMessage(alice, new ClientMessage.Join("qF", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(bob, new ClientMessage.Join("qF", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
+
+		clock.advance(Duration.ofSeconds(11));   // past the cap
+		bob.sent.clear();
+		svc.onAudio(alice, new byte[]{1, 2, 3});   // the holder's next frame trips the cap and releases the floor
+
+		assertFalse(channel("qF").holdsFloor("alice"), "the over-cap frame releases the holder");
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"onAudio's max-hold release offers the floor to the queue head");
+	}
+
+	@Test
+	void mutingAQueuedOrReservedMemberDequeuesThem() {
+		FakeClientSession alice = join("alice", "qG", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "qG", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession carol = join("carol", "qG", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession dave = join("dave", "qG", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // queue -> [bob]
+		service.onMessage(carol, new ClientMessage.RequestFloor());   // -> [bob, carol]
+		service.onMessage(dave, new ClientMessage.RequestFloor());    // -> [bob, carol, dave]
+		assertEquals(List.of("bob", "carol", "dave"), channel("qG").floorQueue());
+
+		// Mute a MID-QUEUE member (carol) while alice holds -> dequeued; the rest of the order is preserved.
+		service.onMessage(alice, new ClientMessage.MuteMember("carol", true));
+		assertEquals(List.of("bob", "dave"), channel("qG").floorQueue(), "a muted queued member is dequeued");
+
+		// Alice releases -> bob reserved. Then mute the RESERVED HEAD (bob) -> dequeued and dave advances.
+		service.onMessage(alice, new ClientMessage.ReleaseFloor());
+		dave.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+		assertEquals(List.of("dave"), channel("qG").floorQueue(), "muting the reserved head dequeues it, leaving dave");
+		assertTrue(dave.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
+				"the floor advances to the next in line (dave reserved)");
+	}
+
+	@Test
+	void aMidQueueMemberDisconnectingKeepsTheReservedHeadsWindow() {
+		FakeClientSession alice = join("alice", "qH", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "qH", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession carol = join("carol", "qH", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues (head)
+		service.onMessage(carol, new ClientMessage.RequestFloor());   // carol queues
+		service.onMessage(alice, new ClientMessage.ReleaseFloor());   // bob reserved
+
+		Instant reservedAt = channel("qH").floorReservedAt();
+		bob.sent.clear();
+		service.onClose(carol, "carol disconnects");   // a MID-QUEUE member drops
+		assertEquals(reservedAt, channel("qH").floorReservedAt(),
+				"a mid-queue member disconnecting must NOT reset the reserved head's claim window");
+		assertEquals(List.of("bob"), channel("qH").floorQueue(), "carol is gone; bob is still the reserved head");
+		ServerMessage.FloorStatus status = lastOf(bob, ServerMessage.FloorStatus.class);
+		assertNull(status.holderId(), "the floor is still free (bob reserved)");
+		assertEquals(List.of("bob"), status.waiting(), "the re-broadcast snapshot shows the shifted queue");
 	}
 
 	// --- owner-enforced mute -----------------------------------------------------------------------
@@ -1200,9 +1590,11 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
 
 		assertFalse(channel("mute-floor").holdsFloor("bob"), "muting the floor holder frees the floor");
-		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
-				"the muted (ex-)holder is told the floor is idle so its client stops transmitting");
-		assertTrue(alice.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+						&& holderId == null),
+				"the muted (ex-)holder is told the floor is free (FloorStatus) so its client stops transmitting");
+		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+						&& holderId == null),
 				"the other members learn the floor reopened");
 		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.MemberMuted mm && mm.muted()),
 				"bob is also told it was muted");
@@ -1350,8 +1742,9 @@ class ConnectionServiceTest {
 
 		assertFalse(channel("mute-all-floor").holdsFloor("bob"),
 				"mute-all frees the muted holder's floor too (via the same broadcastMute path as single mute)");
-		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorIdle.class::isInstance),
-				"the muted ex-holder is told the floor is idle");
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, java.util.List<String> _)
+						&& holderId == null),
+				"the muted ex-holder is told the floor is free (FloorStatus)");
 	}
 
 	@Test

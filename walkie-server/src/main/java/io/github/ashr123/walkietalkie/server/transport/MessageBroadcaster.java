@@ -15,7 +15,7 @@ import java.util.stream.Stream;
 /// pre-encoded JSON is handed to every recipient (via [ClientSession#sendEncoded]) — so a broadcast to N members
 /// costs one encode per message, not N. When several messages are passed to toAll/toOthers they are delivered to
 /// each member in argument order (a member's outbound queue is FIFO), so e.g. a mode change can fan out
-/// ModeChanged + FloorIdle in one call and every member sees them in that order.
+/// ModeChanged + FloorStatus in one call and every member sees them in that order.
 ///
 /// Owning all outbound encoding here is what lets [ConnectionService] stay transport-agnostic: it hands over a
 /// typed message and never touches the wire format or the [MessageCodec] — [ClientSession] carries only the raw

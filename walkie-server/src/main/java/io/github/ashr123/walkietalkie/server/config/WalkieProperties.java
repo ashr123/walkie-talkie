@@ -26,6 +26,14 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 ///                               this many seconds (0 disables). Enforced by a periodic background sweep, so it
 ///                               is a true time cap that bounds even a holder gone silent without releasing —
 ///                               and, unlike idle-release, applies to WebRTC holders too
+/// @param floorReservationSeconds when the owner-toggleable floor queue is on, how long the head is given to
+///                               CLAIM the floor once it is offered (its turn) before the server drops it and
+///                               offers the next member. A positive window — grant-to-claim needs one — so
+///                               0/absent falls back to the default (10), it is not "disabled". See
+///                               docs/FLOOR_QUEUE.md
+/// @param floorQueueDefault      the floor-queue on/off state a NEWLY created channel adopts (its owner can then
+///                               toggle it per channel via `setFloorQueue`); default false, preserving the plain
+///                               busy-floor-refused behaviour
 /// @param authSigningKey         HMAC-SHA512 key used to sign/verify bearer tokens, bound from
 ///                               `walkie.auth-signing-key` (env `WALKIE_AUTH_SIGNING_KEY`). Blank/absent means
 ///                               a random key is generated per process (dev only — tokens then don't survive a
@@ -45,6 +53,8 @@ public record WalkieProperties(
 		long maxControlMessagesPerSecond,
 		long floorIdleReleaseSeconds,
 		long floorMaxHoldSeconds,
+		long floorReservationSeconds,
+		boolean floorQueueDefault,
 		String authSigningKey,
 		boolean channelAffinity) {
 
@@ -82,6 +92,10 @@ public record WalkieProperties(
 		}
 		if (floorMaxHoldSeconds < 0) {
 			floorMaxHoldSeconds = 300;   // 5 minutes
+		}
+		if (floorReservationSeconds <= 0) {
+			// Grant-to-claim needs a positive window, so 0/blank means "use the default" (never "disabled").
+			floorReservationSeconds = 10;
 		}
 	}
 }

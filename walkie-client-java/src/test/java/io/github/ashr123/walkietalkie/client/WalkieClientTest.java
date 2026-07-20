@@ -1,6 +1,7 @@
 package io.github.ashr123.walkietalkie.client;
 
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
+import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
@@ -9,6 +10,7 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -150,5 +152,52 @@ class WalkieClientTest {
 		assertInstanceOf(ServerMessage.ErrorMessage.class, message);
 		assertEquals(ErrorCode.UNKNOWN, ((ServerMessage.ErrorMessage) message).code(),
 				"an unrecognized code must fall back to UNKNOWN, not fail deserialization");
+	}
+
+	// --- floor-queue: deriving our state from a FloorStatus snapshot + the `t` decision it drives --------
+	//
+	// These pin the two PURE helpers behind the unified state-driven `t` control (the new push-to-talk floor queue):
+	// floorStateFor derives our state from the authoritative FloorStatus (holderId + waiting) exactly as the design
+	// specifies, and floorActionFor maps that state to the ClientMessage `t` sends. The FloorStatus-driven "I was
+	// released -> stop the mic" reconciliation lives in handleFloorStatus, which mutates the live AudioEngine on the
+	// listener thread; it is deliberately NOT unit-tested here (it would need a real capture line + threading and
+	// would be brittle). The server owns the authoritative floor-transition coverage.
+
+	@Test
+	void floorStateIsLiveWhenWeHoldTheFloor() {
+		assertEquals(WalkieClient.FloorState.LIVE, WalkieClient.floorStateFor("me", "me", List.of()));
+		// Holding the floor wins even if we are (defensively) also listed in the queue.
+		assertEquals(WalkieClient.FloorState.LIVE, WalkieClient.floorStateFor("me", "me", List.of("me")));
+	}
+
+	@Test
+	void floorStateIsMyTurnWhenReservedAsTheFreeHead() {
+		// Free floor (holderId == null) and we are the head of the queue: the server has reserved it for us — our turn.
+		assertEquals(WalkieClient.FloorState.MY_TURN, WalkieClient.floorStateFor("me", null, List.of("me", "other")));
+	}
+
+	@Test
+	void floorStateIsInLineWhenWaitingButNotTheHead() {
+		// Free floor but someone else is the reserved head: we are further back in the line.
+		assertEquals(WalkieClient.FloorState.IN_LINE, WalkieClient.floorStateFor("me", null, List.of("other", "me")));
+		// Someone holds the floor and we are queued behind them: still IN_LINE (not the reserved head).
+		assertEquals(WalkieClient.FloorState.IN_LINE, WalkieClient.floorStateFor("me", "holder", List.of("other", "me")));
+	}
+
+	@Test
+	void floorStateIsIdleWhenUninvolved() {
+		assertEquals(WalkieClient.FloorState.IDLE, WalkieClient.floorStateFor("me", null, List.of()));            // floor free
+		assertEquals(WalkieClient.FloorState.IDLE, WalkieClient.floorStateFor("me", "holder", List.of()));        // busy, we're not queued
+		assertEquals(WalkieClient.FloorState.IDLE, WalkieClient.floorStateFor("me", null, List.of("a", "b")));    // reserved for someone else
+	}
+
+	@Test
+	void talkReleasesWhenLiveOrQueuedAndRequestsWhenClaimingOrGrabbing() {
+		// The unified control's decision table: LIVE and IN_LINE give the floor/place up (ReleaseFloor); MY_TURN claims
+		// and IDLE grabs-or-enqueues (RequestFloor). This is exactly what toggleTalk enqueues in a push-to-talk channel.
+		assertInstanceOf(ClientMessage.ReleaseFloor.class, WalkieClient.floorActionFor(WalkieClient.FloorState.LIVE));
+		assertInstanceOf(ClientMessage.ReleaseFloor.class, WalkieClient.floorActionFor(WalkieClient.FloorState.IN_LINE));
+		assertInstanceOf(ClientMessage.RequestFloor.class, WalkieClient.floorActionFor(WalkieClient.FloorState.MY_TURN));
+		assertInstanceOf(ClientMessage.RequestFloor.class, WalkieClient.floorActionFor(WalkieClient.FloorState.IDLE));
 	}
 }

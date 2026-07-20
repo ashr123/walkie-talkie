@@ -12,13 +12,15 @@ public sealed interface ServerMessage {
 	/// Acknowledges a successful join and snapshots the current channel mode, owner, membership and lock state.
 	/// When joining an existing channel, `mode` is the channel's actual mode (the joiner adopts it). `locked` is
 	/// whether the owner has locked the channel to new members — carried here so a re-snapshot (an in-place
-	/// re-join) renders the state without waiting for a [ChannelLocked].
+	/// re-join) renders the state without waiting for a [ChannelLocked]. `floorQueueEnabled` is whether the
+	/// owner-toggleable push-to-talk floor queue is on (see [FloorStatus]); carried here for the same reason.
 	@JsonTypeName("joined")
 	record Joined(String selfId,
 	              String channel,
 	              ChannelMode mode,
 	              String ownerId,
 	              boolean locked,
+	              boolean floorQueueEnabled,
 	              List<MemberInfo> members) implements ServerMessage {
 	}
 
@@ -52,24 +54,39 @@ public sealed interface ServerMessage {
 	record ChannelLocked(boolean locked) implements ServerMessage {
 	}
 
-	/// The floor was granted to you; you may transmit.
+	/// The floor was granted to you; open your mic and transmit. An imperative "go live now" trigger sent only to
+	/// the new holder — the accompanying [FloorStatus] (broadcast to everyone) is what renders who holds the floor.
 	@JsonTypeName("floorGranted")
 	record FloorGranted() implements ServerMessage {
 	}
 
-	/// Your floor request was refused because someone else is holding it.
-	@JsonTypeName("floorDenied")
-	record FloorDenied(String currentHolderId) implements ServerMessage {
+	/// The authoritative push-to-talk floor snapshot, broadcast to the whole channel on **every** floor change and
+	/// carried (implicitly, via a fresh broadcast) after a join. `holderId` is the member currently live, or
+	/// `null` when nobody is talking. `waiting` is the floor queue in FIFO order (empty when the queue is off or
+	/// nobody is waiting).
+	///
+	/// Clients render ALL floor UI by deriving from this one message — there is deliberately no separate
+	/// "reserved" field: the member currently offered the floor (its claim window ticking) is exactly
+	/// `waiting.get(0)` whenever `holderId == null`, because the server reserves the head the instant the floor
+	/// frees. So: `holderId == me` → you are live; `holderId == null && waiting.get(0) == me` → it is your turn;
+	/// `me ∈ waiting` → you are in line at that index; else the floor is busy (someone else) or free.
+	@JsonTypeName("floorStatus")
+	record FloorStatus(String holderId, List<String> waiting) implements ServerMessage {
 	}
 
-	/// Another member took the floor and is now talking.
-	@JsonTypeName("floorTaken")
-	record FloorTaken(String holderId) implements ServerMessage {
+	/// It is your turn: the floor is reserved for you for `claimSeconds`. An imperative "your turn — alert the
+	/// user and start the claim countdown" trigger sent only to the newly reserved head; you must claim it (send
+	/// [ClientMessage.RequestFloor]) within the window or the server drops you from the queue and offers the floor
+	/// to the next member. The accompanying [FloorStatus] shows you as `waiting.get(0)` with `holderId == null`.
+	@JsonTypeName("floorReserved")
+	record FloorReserved(long claimSeconds) implements ServerMessage {
 	}
 
-	/// The floor is now free.
-	@JsonTypeName("floorIdle")
-	record FloorIdle() implements ServerMessage {
+	/// The channel owner turned the push-to-talk floor queue on or off. Broadcast to the whole channel so everyone
+	/// renders the state; when turned off the server also clears any waiting queue (reflected in a following
+	/// [FloorStatus]). `enabled` is the new state.
+	@JsonTypeName("floorQueueChanged")
+	record FloorQueueChanged(boolean enabled) implements ServerMessage {
 	}
 
 	/// The channel's owner changed its mode; clients adopt it, reset their talk state and re-render

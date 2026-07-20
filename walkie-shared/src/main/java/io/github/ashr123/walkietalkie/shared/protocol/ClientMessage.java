@@ -29,14 +29,27 @@ public sealed interface ClientMessage {
 	record Leave() implements ClientMessage {
 	}
 
-	/// Ask for the floor (permission to talk) in a push-to-talk channel.
+	/// Ask for the floor (permission to talk) in a push-to-talk channel. The server interprets it by the sender's
+	/// current floor state: grab the floor if it is free, claim it if the sender is the reserved head (its turn),
+	/// or — when the owner-toggleable floor queue is on and the floor is busy — join the FIFO queue.
 	@JsonTypeName("requestFloor")
 	record RequestFloor() implements ClientMessage {
 	}
 
-	/// Give up the floor in a push-to-talk channel.
+	/// Give up the floor in a push-to-talk channel. Interpreted by state: stop talking if the sender holds the
+	/// floor, or leave the queue / decline its turn if the sender is waiting or reserved.
 	@JsonTypeName("releaseFloor")
 	record ReleaseFloor() implements ClientMessage {
+	}
+
+	/// Owner-only: turn the push-to-talk floor queue on or off for the channel. `enabled` is the new state. A
+	/// non-owner gets `NOT_OWNER`; sending it before joining gets `NOT_IN_CHANNEL`. When enabled, a member that
+	/// requests a busy floor is queued (and offered the floor in turn) rather than refused; when disabled, the
+	/// server clears any waiting queue. On success the server broadcasts a [ServerMessage.FloorQueueChanged] and a
+	/// [ServerMessage.FloorStatus]. The server-managed `global` room has a sentinel owner, so a toggle there is
+	/// refused.
+	@JsonTypeName("setFloorQueue")
+	record SetFloorQueue(boolean enabled) implements ClientMessage {
 	}
 
 	/// Ask the server to change the current channel's mode. Honored only for the channel owner.

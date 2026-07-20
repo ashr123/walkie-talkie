@@ -38,33 +38,35 @@ public class ChannelRegistry {
 	/// `null` (the caller reports a passphrase mismatch). The whole check-add-and-snapshot happens inside the
 	/// atomic map update, so it cannot race with a concurrent create or [#leave].
 	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session) {
-		return joinOrCreate(name, mode, keyCheck, session, session.id(), NO_OP);
+		return joinOrCreate(name, mode, keyCheck, session, session.id(), false, NO_OP);
 	}
 
 	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], but stamps a newly-created channel with
 	/// an explicit `ownerId` instead of the joiner's session id — used to give the server-managed "global"
 	/// channel a sentinel owner that no participant can match. An existing channel keeps its own owner.
 	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId) {
-		return joinOrCreate(name, mode, keyCheck, session, ownerId, NO_OP);
+		return joinOrCreate(name, mode, keyCheck, session, ownerId, false, NO_OP);
 	}
 
-	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], plus a hook run on a successful add. See
-	/// the six-argument form for what `onJoinUnderLock` guarantees.
-	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, Consumer<? super JoinResult> onJoinUnderLock) {
-		return joinOrCreate(name, mode, keyCheck, session, session.id(), onJoinUnderLock);
+	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], plus the queue default a newly-created
+	/// channel adopts and a hook run on a successful add. See the full form for what `onJoinUnderLock` guarantees.
+	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, boolean floorQueueEnabled, Consumer<? super JoinResult> onJoinUnderLock) {
+		return joinOrCreate(name, mode, keyCheck, session, session.id(), floorQueueEnabled, onJoinUnderLock);
 	}
 
-	/// Full form. On a successful add, `onJoinUnderLock` is invoked exactly once with the captured [JoinResult]
-	/// **while the channel monitor is still held** (and before any concurrent floor transition can run) — the
-	/// caller uses it to emit the joiner's initial state (its `Joined` snapshot and floor hint) so that emission
-	/// is serialized with floor grants/releases: a release can't slip a `FloorIdle` in before the hint (orphaning
-	/// it) and a grant/preempt can't leave the hint naming a stale holder. The hook MUST be short and
-	/// non-blocking — it runs under the registry bin lock and the channel monitor, and must NOT call back into
-	/// the registry (that would invert the bin→monitor order). It is skipped entirely on a key-check mismatch.
-	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, Consumer<? super JoinResult> onJoinUnderLock) {
+	/// Full form. `floorQueueEnabled` is the owner-toggleable push-to-talk floor-queue default a **newly created**
+	/// channel adopts (an existing channel keeps its own state, like its mode/owner). On a successful add,
+	/// `onJoinUnderLock` is invoked exactly once with the captured [JoinResult] **while the channel monitor is
+	/// still held** (and before any concurrent floor transition can run) — the caller uses it to emit the joiner's
+	/// initial state (its `Joined` snapshot and floor snapshot) so that emission is serialized with floor
+	/// grants/releases: a release can't slip a stale floor snapshot in before the hint and a grant/preempt can't
+	/// leave the hint naming a stale holder. The hook MUST be short and non-blocking — it runs under the registry
+	/// bin lock and the channel monitor, and must NOT call back into the registry (that would invert the
+	/// bin→monitor order). It is skipped entirely on a key-check mismatch.
+	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, boolean floorQueueEnabled, Consumer<? super JoinResult> onJoinUnderLock) {
 		AtomicReference<JoinResult> joined = new AtomicReference<>();
 		channels.compute(name, (key, existing) -> {
-			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck) : existing;
+			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck, floorQueueEnabled) : existing;
 			// A channel its owner LOCKED admits no new members — refuse before the key-check (a locked door doesn't
 			// care about the key). Only reachable for a NEWCOMER: a re-join to the member's CURRENT channel
 			// short-circuits in ConnectionService.handleJoin and never gets here. This read is under the bin lock,
@@ -85,10 +87,10 @@ public class ChannelRegistry {
 				// the channel monitor (bin→monitor, the established lock order — never the reverse). Doing the
 				// add (which makes the joiner broadcast-eligible), the snapshot, and the joiner's initial-state
 				// emission in one monitor span means no floor transition can interleave between the joiner becoming
-				// eligible and being told the floor state: a concurrent grant can't both fan a FloorTaken to the
-				// fresh member AND have the hint resend it, a concurrent release can't slip a FloorIdle in before
-				// the hint, and a concurrent leave (also bin-serialized on this key) can't leave the captured
-				// roster disagreeing with the leaver's MemberLeft.
+				// eligible and being told the floor state: a concurrent grant/release/reserve can't land a floor
+				// broadcast that races the joiner's own initial FloorStatus hint (leaving it naming a stale holder
+				// or an out-of-date queue), and a concurrent leave (also bin-serialized on this key) can't leave the
+				// captured roster disagreeing with the leaver's MemberLeft.
 				synchronized (channel) {
 					channel.add(session);
 					JoinResult result = new JoinResult(channel, existing == null, channel.memberInfos(), channel.floorHolder());

@@ -24,11 +24,15 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		send(sb, new ClientMessage.Join(channel, mode, "Bob", null));
 		ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 		awaitType(a.messages, ServerMessage.MemberJoined.class);
+		// Every real join now seeds the joiner with an authoritative FloorStatus snapshot (toOne). Drain Bob's here
+		// (Alice's was consumed by the MemberJoined await above) so later per-test awaits see the EVENT-driven
+		// FloorStatus broadcasts, not the leftover join snapshot.
+		awaitType(b.messages, ServerMessage.FloorStatus.class);
 		return new String[]{joinedA.selfId(), joinedB.selfId()};
 	}
 
 	@Test
-	void theOwnerChangingModeBroadcastsModeChangedAndFloorIdleToEveryoneIncludingSelf() throws Exception {
+	void theOwnerChangingModeBroadcastsModeChangedAndFloorStatusToEveryoneIncludingSelf() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
@@ -37,9 +41,9 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sa, new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
 
 			assertEquals(ChannelMode.FULL_DUPLEX, awaitType(a.messages, ServerMessage.ModeChanged.class).mode());
-			assertNotNull(awaitType(a.messages, ServerMessage.FloorIdle.class), "the owner is reset too");
+			assertNull(awaitType(a.messages, ServerMessage.FloorStatus.class).holderId(), "the owner's floor is reset too");
 			assertEquals(ChannelMode.FULL_DUPLEX, awaitType(b.messages, ServerMessage.ModeChanged.class).mode());
-			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class));
+			assertNull(awaitType(b.messages, ServerMessage.FloorStatus.class).holderId());
 		}
 	}
 
@@ -49,11 +53,12 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			joinPair("mode-clear", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
+			String[] ids = joinPair("mode-clear", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			// Bob takes the floor.
 			send(sb, new ClientMessage.RequestFloor());
 			awaitType(b.messages, ServerMessage.FloorGranted.class);
-			awaitType(a.messages, ServerMessage.FloorTaken.class);
+			assertEquals(ids[1], awaitType(a.messages, ServerMessage.FloorStatus.class).holderId(),
+					"the others see Bob holding the floor via the snapshot");
 
 			// The owner cycles the mode away and back; each change clears the floor.
 			send(sa, new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
@@ -133,7 +138,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
-	void anOwnerLeavingWhileHoldingTheFloorBroadcastsBothFloorIdleAndOwnerChanged() throws Exception {
+	void anOwnerLeavingWhileHoldingTheFloorBroadcastsBothFloorStatusAndOwnerChanged() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
@@ -141,15 +146,17 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			String[] ids = joinPair("owner-floor-leave", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
-			awaitType(b.messages, ServerMessage.FloorTaken.class);
+			assertEquals(ids[0], awaitType(b.messages, ServerMessage.FloorStatus.class).holderId());
 
 			send(sa, new ClientMessage.Leave());
-			// Broadcast order on an owner-holder leaving is FloorIdle → MemberLeft → OwnerChanged: the floor is
-			// freed atomically with the release (before removal); MemberLeft + OwnerChanged are sent after removal
-			// (ghost-member fix), OwnerChanged carrying the live owner so concurrent owner churn converges.
-			assertNotNull(awaitType(b.messages, ServerMessage.FloorIdle.class), "the held floor is released");
+			// Broadcast order on an owner-holder leaving is now MemberLeft → OwnerChanged → FloorStatus: the member
+			// is removed first (which clears the holder + scrubs the queue), then the survivors are told it left and
+			// the new owner elected, then the (now free) floor snapshot is re-broadcast. Order is benign — the
+			// updates are independent state — but the awaits below match the emission order (awaitType consumes any
+			// message it skips).
 			assertEquals(ids[0], awaitType(b.messages, ServerMessage.MemberLeft.class).memberId());
 			assertEquals(ids[1], awaitType(b.messages, ServerMessage.OwnerChanged.class).ownerId());
+			assertNull(awaitType(b.messages, ServerMessage.FloorStatus.class).holderId(), "the held floor is released");
 		}
 	}
 

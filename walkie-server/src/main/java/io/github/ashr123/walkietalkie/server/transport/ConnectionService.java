@@ -49,6 +49,10 @@ public class ConnectionService {
 	private final Clock clock;
 	private final Duration floorIdleRelease;
 	private final Duration floorMaxHold;
+	/// The push-to-talk floor-queue claim window: how long the reserved head is given to CLAIM its turn before the
+	/// reservation-expiry sweep drops it and offers the floor to the next in line. Carried to the reserved head in
+	/// [ServerMessage.FloorReserved] so its client can run the countdown (see docs/FLOOR_QUEUE.md).
+	private final Duration floorReservation;
 
 	@Autowired
 	public ConnectionService(ChannelRegistry channelRegistry,
@@ -73,6 +77,7 @@ public class ConnectionService {
 		this.clock = clock;
 		this.floorIdleRelease = Duration.ofSeconds(properties.floorIdleReleaseSeconds());
 		this.floorMaxHold = Duration.ofSeconds(properties.floorMaxHoldSeconds());
+		this.floorReservation = Duration.ofSeconds(properties.floorReservationSeconds());
 	}
 
 	public static void onConnect(ClientSession session) {
@@ -111,6 +116,7 @@ public class ConnectionService {
 			case ClientMessage.MuteMember(String memberId, boolean muted) -> handleMuteMember(session, memberId, muted);
 			case ClientMessage.MuteAll(boolean muted) -> handleMuteAll(session, muted);
 			case ClientMessage.SetLocked(boolean locked) -> handleSetLocked(session, locked);
+			case ClientMessage.SetFloorQueue(boolean enabled) -> handleSetFloorQueue(session, enabled);
 			case ClientMessage.Offer(String target, String sdp) ->
 					relaySignal(session, target, new ServerMessage.SignalOffer(session.id(), sdp));
 			case ClientMessage.Answer(String target, String sdp) ->
@@ -145,6 +151,7 @@ public class ConnectionService {
 							current.mode(),
 							current.ownerId(),
 							current.isLocked(),
+							current.isFloorQueueEnabled(),
 							current.memberInfos()
 					)
 			);
@@ -201,12 +208,13 @@ public class ConnectionService {
 		// instead of name=-. The scope's restore-on-exit still cleans it up.
 		RequestContext.updateDisplayName(join.displayName());
 
-		// Emit the joiner's initial state — its Joined snapshot then, if the floor is held, the FloorTaken hint —
-		// from INSIDE the registry's add monitor span (see joinOrCreate's onJoinUnderLock). Sending it there,
-		// atomically with the joiner becoming broadcast-eligible, serializes it with floor transitions: a
-		// concurrent release can't slip a FloorIdle in before this hint (which would orphan it on a now-free
-		// floor), and a concurrent grant/preempt can't leave the hint naming a stale holder — the joiner instead
-		// receives the grant's own FloorTaken right after, via the normal broadcast, and converges on the truth.
+		// Emit the joiner's initial state — its Joined snapshot then an authoritative FloorStatus snapshot — from
+		// INSIDE the registry's add monitor span (see joinOrCreate's onJoinUnderLock). Sending it there, atomically
+		// with the joiner becoming broadcast-eligible, serializes it with floor transitions: a concurrent
+		// release/grant/reserve can't land a floor broadcast that races this hint (leaving the joiner seeing a stale
+		// holder or an out-of-date queue) — any subsequent change reaches the now-eligible joiner via the normal
+		// broadcast and it converges on the truth. Unconditional: FloorStatus renders the whole floor UI (holder +
+		// queue), so it seeds the joiner even when the floor is free (holderId == null, empty queue).
 		Consumer<ChannelRegistry.JoinResult> emitInitialState = joined -> {
 			Channel joinedChannel = joined.channel();
 			session.joinedChannel(joinedChannel.name());
@@ -218,19 +226,21 @@ public class ConnectionService {
 							joinedChannel.mode(),
 							joinedChannel.ownerId(),
 							joinedChannel.isLocked(),
+							joinedChannel.isFloorQueueEnabled(),
 							joined.roster()
 					)
 			);
-			if (joined.floorHolder() instanceof Some(String holder)) {
-				broadcaster.toOne(session, new ServerMessage.FloorTaken(holder));
-			}
+			broadcaster.toOne(session, floorStatusOf(joinedChannel));
 		};
 
 		// Global is server-owned (sentinel owner) and forced unencrypted (null key-check); every other channel
-		// is owned by its creator and adopts the joiner's key-check.
+		// is owned by its creator and adopts the joiner's key-check. Only a NON-global newly created channel adopts
+		// the server-wide floor-queue default — the sentinel-owned global room is created with the queue OFF (false)
+		// and can never be toggled on (its floor-queue toggle is NOT_OWNER), since it is unbounded and a large queue
+		// would mean heavy position-broadcast churn.
 		ChannelRegistry.JoinResult joined = join.mode() == ChannelMode.GLOBAL_PTT
-				? channelRegistry.joinOrCreate(requested, join.mode(), null, session, GLOBAL_CHANNEL_OWNER, emitInitialState)
-				: channelRegistry.joinOrCreate(requested, join.mode(), join.keyCheck(), session, emitInitialState);
+				? channelRegistry.joinOrCreate(requested, join.mode(), null, session, GLOBAL_CHANNEL_OWNER, false, emitInitialState)
+				: channelRegistry.joinOrCreate(requested, join.mode(), join.keyCheck(), session, properties.floorQueueDefault(), emitInitialState);
 		if (joined == null) {
 			// The atomic join refused to add us. joinOrCreate checks, in order, lock -> capacity -> key-check, so
 			// attribute the reason by re-reading the target. The enforcement itself was atomic inside joinOrCreate;
@@ -276,20 +286,14 @@ public class ConnectionService {
 			return;
 		}
 		Channel channel = channelRegistry.find(session.channelName()) instanceof Some(Channel found) ? found : null;
-		if (channel != null) {
-			// Free the leaver's floor (if held) and tell the others, under the floor monitor so this FloorIdle
-			// can't race a new holder's grant. Capture wasHolding HERE — registry.leave (below) also clears the
-			// floor as it removes the member, so reading it afterwards would always be false. (Must NOT call
-			// channelRegistry.leave while holding this monitor — see the lock-order note on Channel.)
-			synchronized (channel) {
-				if (channel.releaseFloor(session.id())) {
-					broadcaster.toOthers(channel, session.id(), new ServerMessage.FloorIdle());
-				}
-			}
-		}
 		// Remove the member + re-elect an owner atomically in the registry, THEN announce — broadcasting MemberLeft
 		// only AFTER the removal closes the ghost-member window: a member joining between an earlier broadcast and
 		// the removal could otherwise snapshot a roster still containing the leaver yet never receive its MemberLeft.
+		// The registry mutate (via Channel.remove) also tears the leaver off the floor: it clears the holder, scrubs
+		// it from the queue, and — if it was the reserved head — ends that reservation (resets the clock to EPOCH so
+		// the next head gets a fresh window). We must NOT hold the channel monitor across channelRegistry.leave (the
+		// registry takes its bin lock then this monitor, so the reverse order deadlocks — see the lock-order note on
+		// Channel), so the floor teardown runs AFTER the removal, on LIVE state.
 		boolean ownerChanged = channelRegistry.leave(session.channelName(), session.id()) instanceof Some(String _);
 		if (channel != null) {
 			// Announce to the survivors of the SAME channel object the leave acted on — NOT a fresh find()-by-name,
@@ -307,6 +311,14 @@ public class ConnectionService {
 					unmuteOwnerIfMuted(channel);
 					log.info("ownership transferred to session={}", channel.ownerId());
 				}
+				// Floor teardown on LIVE state, run UNCONDITIONALLY. This is safe despite the monitor gap around
+				// channelRegistry.leave precisely because reserveHead is IDEMPOTENT: it (re-)reserves + notifies the
+				// head only when the floor is free with NO running window, so it never re-stamps (never moves
+				// backward) a reservation a concurrent sweep may already have started for the current head, and the
+				// sweep's EPOCH guard stops it dropping a head this leave is about to reserve. broadcastFloorStatus
+				// always re-syncs the survivors (an unchanged floor just re-sends the same snapshot — harmless).
+                reserveAndNotify(channel, clock.instant());
+				broadcastFloorStatus(channel);
 			}
 		}
 		log.info("left");   // the channel left is in the MDC prefix; clear it for any later line in this scope
@@ -333,8 +345,8 @@ public class ConnectionService {
 			return;
 		}
 		Instant now = clock.instant();
-		// Acquire/preempt AND the grant broadcast happen under the floor monitor so the FloorGranted/FloorTaken
-		// can't interleave with a concurrent release's FloorIdle (which would otherwise reach the new holder).
+		// Acquire/enqueue/preempt AND the resulting broadcast happen under the floor monitor so the
+		// FloorGranted/FloorStatus can't interleave with a concurrent release/reserve reaching the new holder.
 		synchronized (channel) {
 			// Re-check the mute UNDER the monitor: the entry-gate isMuted read above is lock-free and can be stale
 			// (a concurrent mute can have landed since). setMuted runs under this same monitor, so this read is
@@ -345,18 +357,30 @@ public class ConnectionService {
 				log.debug("refused the floor to a member muted concurrently with its request");
 				return;
 			}
+			// tryAcquireFloor grants only if the floor is free AND (the queue is empty OR this caller is the reserved
+			// head claiming its turn) — so a plain grab and a reserved-head claim are the same path.
 			if (channel.tryAcquireFloor(session.id(), now)) {
 				grantFloor(channel, session);
 				log.debug("acquired the floor");
 				return;
 			}
-			// Denied — name the current holder (or null if it freed up between our failed acquire and this read).
+			// The floor is busy — held, or reserved by/offered to another member.
+			if (channel.isFloorQueueEnabled()) {
+				// Raise-hand: join the FIFO queue and re-broadcast positions. An enqueue never creates a reservation
+				// (the floor is still held/reserved by someone else); the head is offered the floor only when the
+				// floor next frees — the release/leave paths and the idle-release sweep do that via reserveAndNotify.
+				channel.enqueueFloor(session.id());
+				broadcastFloorStatus(channel);
+				log.debug("queued for the floor");
+				return;
+			}
+			// Queue off: the pre-queue behaviour. Try to reclaim an idle holder; else the request is refused and
+			// NOTHING is sent — the client already shows "busy" from the last FloorStatus (FloorDenied is retired).
 			String currentHolderId = channel.floorHolder() instanceof Some(String holder) ? holder : null;
 			if (preemptIfIdle(channel, session, currentHolderId, now)) {
 				log.info("preempted idle floor holder={}", currentHolderId);
 				grantFloor(channel, session);
 			} else {
-				broadcaster.toOne(session, new ServerMessage.FloorDenied(currentHolderId));
 				log.debug("denied the floor (held by session={})", currentHolderId);
 			}
 		}
@@ -377,12 +401,42 @@ public class ConnectionService {
 				&& channel.preemptFloorIfIdle(currentHolderId, requester.id(), now, now.minus(floorIdleRelease));
 	}
 
-	/// Confirms the (already-acquired) floor to `session` and announces the new holder to everyone else (the
-	/// acquire/activity marks were stamped atomically with the swap in [Channel]). The `FloorTaken` broadcast
-	/// doubles as the notice to a just-preempted ex-holder that the floor is no longer theirs.
+	/// Confirms the (already-acquired) floor to `session` with the imperative [ServerMessage.FloorGranted] "go live"
+	/// trigger, then broadcasts the authoritative [ServerMessage.FloorStatus] to the whole channel (the
+	/// acquire/activity marks were stamped atomically with the swap in [Channel]). The snapshot doubles as the
+	/// notice to a just-preempted ex-holder that the floor is no longer theirs (its id is no longer the holder).
 	private void grantFloor(Channel channel, ClientSession session) {
 		broadcaster.toOne(session, new ServerMessage.FloorGranted());
-		broadcaster.toOthers(channel, session.id(), new ServerMessage.FloorTaken(session.id()));
+		broadcastFloorStatus(channel);
+	}
+
+	/// The authoritative push-to-talk floor snapshot for `channel`: the live holder id (or `null` when the floor is
+	/// free) plus the FIFO waiting queue. Clients derive ALL floor UI from it (holder, your-turn, in-line position,
+	/// busy, free — see [ServerMessage.FloorStatus]). MUST be read under `synchronized(channel)` so the holder and
+	/// the queue are a single consistent snapshot.
+	private static ServerMessage.FloorStatus floorStatusOf(Channel channel) {
+		return new ServerMessage.FloorStatus(
+				channel.floorHolder() instanceof Some(String holder) ? holder : null,
+				channel.floorQueue());
+	}
+
+	/// Broadcasts the current [#floorStatusOf] snapshot to the whole channel. Call under `synchronized(channel)` so
+	/// the snapshot is consistent and its fan-out is ordered with the floor transition that triggered it.
+	private void broadcastFloorStatus(Channel channel) {
+		broadcaster.toAll(channel, floorStatusOf(channel));
+	}
+
+	/// The FREE -> RESERVED transition: offer the freed floor to the queue head and, if that head is still a
+	/// member, send it the imperative [ServerMessage.FloorReserved] "your turn — start the claim countdown"
+	/// trigger. A no-op when the floor is held or the queue is empty. The caller invokes this EXACTLY ONCE per
+	/// floor-free transition (release/decline/leave/idle/max-hold/expiry) so it never re-stamps a running
+	/// reservation — see [Channel#reserveHead]. MUST be called under `synchronized(channel)`; the caller
+	/// re-broadcasts [#broadcastFloorStatus] so everyone else sees the new reserved head as the queue head.
+	private void reserveAndNotify(Channel channel, Instant now) {
+		String head = channel.reserveHead(now);
+		if (head != null && channel.member(head) instanceof Some(ClientSession reserved)) {
+			broadcaster.toOne(reserved, new ServerMessage.FloorReserved(floorReservation.toSeconds()));
+		}
 	}
 
 	private void handleReleaseFloor(ClientSession session) {
@@ -390,44 +444,100 @@ public class ConnectionService {
 		if (channel == null || channel.mode() == ChannelMode.FULL_DUPLEX) {
 			return;
 		}
+		Instant now = clock.instant();
 		synchronized (channel) {
 			if (channel.releaseFloor(session.id())) {
-				broadcaster.toOthers(channel, session.id(), new ServerMessage.FloorIdle());
+				// The live holder gave up the floor: offer it to the queue head (if any) and re-broadcast.
+				reserveAndNotify(channel, now);
+				broadcastFloorStatus(channel);
 				log.debug("released the floor");
+				return;
+			}
+			// Not the holder — a waiter leaving the line, or the reserved head declining its turn. dequeueFloor
+			// resets the reservation clock IFF this caller was the reserved head (so the next head gets a fresh
+			// window; a mid-queue leave keeps the running head's window). reserveAndNotify is then unconditional but
+			// IDEMPOTENT: it re-reserves + notifies only when the floor is free with an unstamped head — i.e. only
+			// when the head genuinely changed — so a mid-queue leave is a reserve no-op that never re-stamps.
+			if (channel.dequeueFloor(session.id())) {
+				reserveAndNotify(channel, now);
+				broadcastFloorStatus(channel);
+				log.debug("left the floor queue");
 			}
 		}
 	}
 
-	/// Scheduled safety net for the push-to-talk max-hold cap. onAudio enforces the cap lazily on the holder's
-	/// next frame; this sweep also reclaims a holder that has STOPPED sending frames without releasing — the case
-	/// onAudio can't see — so the floor is freed even with idle auto-release disabled and no other member
-	/// contending. It keys off hold time only (never audio content), so it bounds **any** holder, including a
-	/// WebRTC member whose media never reaches the server. No-op while max-hold is disabled (0); the per-channel
-	/// release runs under the channel monitor, so it can't race a concurrent grant (and at most one of the sweep /
-	/// onAudio releases the same hold).
+	/// Scheduled safety net for the push-to-talk floor timers. Three per-channel steps run under the channel
+	/// monitor (so none can race a concurrent grant, and each transition is atomic with its broadcast):
+	///
+	/// 1. **Max-hold** — force-release any holder that has held past the cap. onAudio enforces this lazily on the
+	///    holder's next frame; the sweep also reclaims a holder that STOPPED sending frames without releasing (the
+	///    case onAudio can't see). Keys off hold time only (never audio content), so it bounds **any** holder,
+	///    including a WebRTC member whose media never reaches the server.
+	/// 2. **Idle-release (queue advance)** — when the queue is on and non-empty, free a relay holder gone silent
+	///    past the idle window so the floor can be offered to the queue head. Relay-only (WebRTC has no activity
+	///    signal). Skipped if max-hold already freed the floor this pass.
+	/// 3. **Reservation-expiry** — drop the reserved head that did not claim within the window and offer the floor
+	///    to the next in line.
+	///
+	/// Each step is individually guarded so the sweep still does useful work when max-hold is disabled (0) —
+	/// reservation-expiry always applies while the queue is on. Steps 1–2 run first on purpose: a fresh reservation
+	/// they create is stamped at `now`, which step 3 then correctly skips (its window has not elapsed).
 	@Scheduled(fixedDelay = 1, timeUnit = TimeUnit.SECONDS)
 	void releaseExpiredFloors() {
-		if (floorMaxHold.isZero()) {
-			return;
-		}
-		Instant cutoff = clock.instant().minus(floorMaxHold);
+		Instant now = clock.instant();
 		for (Channel channel : channelRegistry.channels()) {
-			// Release-and-notify under the floor monitor so a member acquiring the freed floor can't receive the
-			// sweep's stray FloorIdle. forEach notifies the whole channel incl. the (ex-)holder so its client stops.
 			synchronized (channel) {
-				String holder = channel.releaseIfExpired(cutoff);
-				if (holder != null) {
-					broadcaster.toAll(channel, new ServerMessage.FloorIdle());
-					// The sweep is a scheduled task, not bound to a session scope, and the holder is some OTHER
-					// session — so log its id + name explicitly rather than relying on the MDC.
+				boolean freed = false;
+				// 1. Max-hold cap (bounds any holder, incl. WebRTC).
+				if (!floorMaxHold.isZero()) {
+					String holder = channel.releaseIfExpired(now.minus(floorMaxHold));
+					if (holder != null) {
+						freed = true;
+						// The sweep is a scheduled task, not bound to a session scope, and the holder is some OTHER
+						// session — so log its id + name explicitly rather than relying on the MDC.
+						log.info(
+								"session={} ({}) reached the max floor-hold time on channel={}; floor released by sweep",
+								holder,
+								channel.member(holder) instanceof Some(ClientSession held) ? held.displayName() : "?",
+								channel.name());
+					}
+				}
+				// 2. Idle-release to advance the queue: only when nothing was freed above, the queue is on and
+				// non-empty, and the current holder is a relay member (WebRTC gives the server no activity signal,
+				// so an active WebRTC speaker must not be reclaimed as "idle").
+				if (!freed
+						&& !floorIdleRelease.isZero()
+						&& channel.isFloorQueueEnabled()
+						&& !channel.floorQueue().isEmpty()
+						&& channel.floorHolder() instanceof Some(String holderId)
+						&& channel.member(holderId) instanceof Some(ClientSession holder)
+						&& holder.supportsAudioRelay()) {
+					String released = channel.releaseIfIdle(now.minus(floorIdleRelease));
+					if (released != null) {
+						freed = true;
+						log.info(
+								"session={} ({}) idle past the release window on channel={}; floor offered to the queue",
+								released, holder.displayName(), channel.name());
+					}
+				}
+				// 3. Whatever freed the floor above, offer it to the queue head and re-broadcast the snapshot.
+				if (freed) {
+					reserveAndNotify(channel, now);
+					broadcastFloorStatus(channel);
+				}
+				// 4. Reservation-expiry: a reserved head that missed its claim window is dropped and the floor is
+				// offered to the next in line. Runs last so a reservation freshly stamped at `now` by steps 1–3 is
+				// not itself treated as expired.
+				String missed = channel.expiredReservationHead(now.minus(floorReservation));
+				if (missed != null) {
+					channel.dequeueFloor(missed);
+					reserveAndNotify(channel, now);
+					broadcastFloorStatus(channel);
 					log.info(
-							"session={} ({}) reached the max floor-hold time on channel={}; floor released by sweep",
-							holder,
-							channel.member(holder) instanceof Some(ClientSession held) ?
-									held.displayName() :
-									"?",
-							channel.name()
-					);
+							"session={} ({}) missed its floor reservation on channel={}; offered to the next in line",
+							missed,
+							channel.member(missed) instanceof Some(ClientSession m) ? m.displayName() : "?",
+							channel.name());
 				}
 			}
 		}
@@ -470,9 +580,11 @@ public class ConnectionService {
 				if (!floorMaxHold.isZero()
 						&& Duration.between(channel.floorAcquiredAt(), now).compareTo(floorMaxHold) >= 0
 						&& channel.releaseFloor(session.id())) {
-					// Talk-time limit reached: free the floor and tell the whole channel (incl. the (ex-)speaker
-					// so its client stops transmitting and resets); the speaker must re-request to continue.
-					broadcaster.toAll(channel, new ServerMessage.FloorIdle());
+					// Talk-time limit reached: free the floor, offer it to the queue head (if any), and re-broadcast
+					// the snapshot to the whole channel (incl. the (ex-)speaker so its client stops transmitting and
+					// resets); the speaker must re-request to continue.
+					reserveAndNotify(channel, now);
+					broadcastFloorStatus(channel);
 					// onAudio is intentionally not session-scoped (no per-frame MDC churn), so log id + name inline.
 					log.info("session={} ({}) reached the max floor-hold time on channel={}; floor released",
 							session.id(), session.displayName(), channel.name());
@@ -591,14 +703,14 @@ public class ConnectionService {
 		if (channel.mode() == mode) {
 			return;
 		}
-		// Mode switch + floor reset + the broadcast happen under the floor monitor, so the FloorIdle can't race a
+		// Mode switch + floor reset + the broadcast happen under the floor monitor, so the FloorStatus can't race a
 		// concurrent grant and the mode/floor everyone sees is consistent.
 		synchronized (channel) {
 			channel.setMode(mode);
-			channel.clearFloor();
-			// Broadcast to everyone (incl. the owner): the new mode and a floor reset, so any 'talking'
-			// indicator is superseded and a fresh push-to-talk floor is available.
-			broadcaster.toAll(channel, new ServerMessage.ModeChanged(mode), new ServerMessage.FloorIdle());
+			channel.clearFloor();   // resets ALL floor state: holder, waiting queue AND any running reservation
+			// Broadcast to everyone (incl. the owner): the new mode and a fresh (empty) floor snapshot, so any
+			// 'talking'/queued indicator is superseded and a fresh push-to-talk floor is available.
+			broadcaster.toAll(channel, new ServerMessage.ModeChanged(mode), floorStatusOf(channel));
 		}
 		log.info("changed mode to {}", mode);
 	}
@@ -725,7 +837,12 @@ public class ConnectionService {
 			if (!channel.setMuted(memberId, muted)) {
 				return;   // already in that state: nothing to free, nothing to broadcast
 			}
-			broadcastMute(channel, memberId, muted);
+			if (broadcastMute(channel, memberId, muted)) {
+				// Muting took the member off the floor (holder released, or a waiter / reserved head dequeued):
+				// offer the freed/advanced floor to the queue head and re-broadcast the snapshot, atomically here.
+				reserveAndNotify(channel, clock.instant());
+				broadcastFloorStatus(channel);
+			}
 		}
 		log.info("{} member {}", muted ? "muted" : "unmuted", memberId);
 	}
@@ -742,22 +859,36 @@ public class ConnectionService {
 		synchronized (channel) {
 			// setMutedForAllExcept flips the whole roster under the monitor and returns only the ids that changed,
 			// so we broadcast exactly one MemberMuted per genuine transition (idempotent for members already in-state).
+			boolean floorChanged = false;
 			for (String memberId : channel.setMutedForAllExcept(channel.ownerId(), muted)) {
-				broadcastMute(channel, memberId, muted);
+				floorChanged |= broadcastMute(channel, memberId, muted);
+			}
+			// If any muted member was on the floor (holder or waiting), advance/free it and re-broadcast the
+			// snapshot ONCE for the whole batch — not per member.
+			if (floorChanged) {
+				reserveAndNotify(channel, clock.instant());
+				broadcastFloorStatus(channel);
 			}
 		}
 		log.info("{} all members", muted ? "muted" : "unmuted");
 	}
 
 	/// Broadcasts one member's new mute state to the whole channel (so everyone renders it and the affected member
-	/// learns to disable its own talk control). MUST be called while holding the channel monitor. When muting takes
-	/// the floor from the muted member, the floor is freed first and a `FloorIdle` announced — so a member muted
-	/// mid-transmission stops talking and the floor reopens for others; unmuting never touches the floor.
-	private void broadcastMute(Channel channel, String memberId, boolean muted) {
-		if (muted && channel.releaseFloor(memberId)) {
-			broadcaster.toAll(channel, new ServerMessage.FloorIdle());
+	/// learns to disable its own talk control). MUST be called while holding the channel monitor. When MUTING, the
+	/// member is taken off the floor entirely: released if it was the live holder, AND dequeued from the waiting
+	/// line (which, if it was the reserved head, ends its claim window so the next head gets a fresh one — see
+	/// [Channel#dequeueFloor]). Returns whether the floor state changed, so the caller can offer the freed/advanced
+	/// floor to the queue head and re-broadcast the snapshot ONCE ([#handleMuteAll] batches that across the whole
+	/// roster). Unmuting never touches the floor.
+	private boolean broadcastMute(Channel channel, String memberId, boolean muted) {
+		boolean floorChanged = false;
+		if (muted) {
+			// A member is either the live holder or a waiter, never both, so at most one of these is true.
+			floorChanged = channel.releaseFloor(memberId);
+			floorChanged |= channel.dequeueFloor(memberId);
 		}
 		broadcaster.toAll(channel, new ServerMessage.MemberMuted(memberId, muted));
+		return floorChanged;
 	}
 
 	/// Restores the "the channel owner is never muted" invariant after an ownership change — a deliberate
@@ -797,6 +928,34 @@ public class ConnectionService {
 				log.info("channel {}", locked ? "locked" : "unlocked");
 			}
 		}
+	}
+
+	/// Turns the owner-toggleable push-to-talk floor queue on or off for the channel, on the OWNER's request only —
+	/// server-enforced, never trusted to the client (like [#handleSetLocked]). A non-owner gets `NOT_OWNER` (via
+	/// [#requireOwnedChannel]), so the sentinel-owned `global` room refuses it and stays unbounded/queue-off; a
+	/// request before joining gets `NOT_IN_CHANNEL`. Disabling CLEARS any waiting queue and running reservation
+	/// (there is nowhere to wait) — done inside [Channel#setFloorQueueEnabled] — so the following [FloorStatus]
+	/// shows an empty queue and dropped waiters re-derive "free/busy" from it. The flip, the clear and both
+	/// broadcasts run under the channel monitor (mirroring the mode/lock/mute discipline) so they are one atomic,
+	/// consistently-ordered transition; a [ServerMessage.FloorQueueChanged] renders the toggle and the
+	/// [ServerMessage.FloorStatus] renders the (possibly cleared) queue.
+	private void handleSetFloorQueue(ClientSession session, boolean enabled) {
+		Channel channel = requireOwnedChannel(session, "change the floor queue");
+		if (channel == null) {
+			return;
+		}
+		// Full-duplex has no talk floor, so a floor queue is meaningless there — refuse enabling it (mirrors
+		// handleChangeMode's mode-applicability guard). Disabling is harmless, but this channel can never have a
+		// non-empty queue anyway, so reject any toggle uniformly with the closest applicable code.
+		if (channel.mode() == ChannelMode.FULL_DUPLEX) {
+			sendError(session, ErrorCode.INVALID_MODE, "The floor queue applies only to push-to-talk channels");
+			return;
+		}
+		synchronized (channel) {
+			channel.setFloorQueueEnabled(enabled);   // clears the queue + reservation when disabling
+			broadcaster.toAll(channel, new ServerMessage.FloorQueueChanged(enabled), floorStatusOf(channel));
+		}
+		log.info("floor queue {}", enabled ? "enabled" : "disabled");
 	}
 
 	/// Changes the requester's display name — the human label only. The session id, which keys the floor,

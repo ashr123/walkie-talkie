@@ -31,23 +31,26 @@ class WebSocketRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 			send(sessionB, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
 			awaitType(handlerB.messages, ServerMessage.Joined.class);
 
-			// Alice's queue should see Bob arrive.
+			// Alice's queue should see Bob arrive (this also drains Alice's own join FloorStatus snapshot).
 			assertNotNull(awaitType(handlerA.messages, ServerMessage.MemberJoined.class));
+			// Drain Bob's join FloorStatus snapshot so the grant snapshot below is the one asserted.
+			awaitType(handlerB.messages, ServerMessage.FloorStatus.class);
 
-			// Alice grabs the floor; she is granted and Bob is told the floor is taken.
+			// Alice grabs the floor; she is granted and everyone sees the authoritative FloorStatus snapshot.
 			send(sessionA, new ClientMessage.RequestFloor());
 			assertNotNull(awaitType(handlerA.messages, ServerMessage.FloorGranted.class));
-			ServerMessage.FloorTaken taken = awaitType(handlerB.messages, ServerMessage.FloorTaken.class);
-			assertEquals(joinedA.selfId(), taken.holderId());
+			ServerMessage.FloorStatus taken = awaitType(handlerB.messages, ServerMessage.FloorStatus.class);
+			assertEquals(joinedA.selfId(), taken.holderId(), "Bob's snapshot shows Alice holding the floor");
 
 			// Alice transmits an audio frame; Bob receives it (body intact after the 1-byte stream-index prefix).
 			byte[] frame = "pcm-audio-frame".getBytes(StandardCharsets.UTF_8);
 			sendBinary(sessionA, frame);
 			assertPrefixedBody(frame, handlerB.audio.poll(5, TimeUnit.SECONDS), "Bob receives Alice's frame body");
 
-			// While Alice holds the floor, Bob is denied.
+			// While Alice holds the floor and the queue is off, Bob's request is refused with NOTHING sent — he
+			// keeps showing "busy" from the last FloorStatus (FloorDenied is retired).
 			send(sessionB, new ClientMessage.RequestFloor());
-			assertNotNull(awaitType(handlerB.messages, ServerMessage.FloorDenied.class));
+			assertNotReceived(handlerB.messages, ServerMessage.FloorGranted.class);
 		}
 	}
 

@@ -18,8 +18,11 @@ class WalkiePropertiesTest {
 				0,
 				-1,
 				-1,
-				null
-		, false);
+				10,
+				false,
+				null,
+				false
+		);
 		assertArrayEquals(new String[]{"*"}, p.allowedOrigins(), "null origins default to the wildcard");
 		assertEquals(8 * 1024, p.maxAudioFrameBytes(), "a non-positive audio size falls back to 8 KiB");
 		assertEquals(64 * 1024, p.maxTextMessageBytes(), "a non-positive text size falls back to 64 KiB");
@@ -42,8 +45,11 @@ class WalkiePropertiesTest {
 						1,
 						1,
 						1,
-						null
-				, false)
+						1,
+						false,
+						null,
+						false
+				)
 						.allowedOrigins()
 		);
 	}
@@ -58,8 +64,11 @@ class WalkiePropertiesTest {
 				250,
 				7,
 				42,
-				"secret"
-		, false);
+				15,
+				true,
+				"secret",
+				false
+		);
 		assertArrayEquals(new String[]{"https://example.test"}, p.allowedOrigins());
 		assertEquals(4096, p.maxAudioFrameBytes());
 		assertEquals(16384, p.maxTextMessageBytes());
@@ -67,6 +76,8 @@ class WalkiePropertiesTest {
 		assertEquals(250, p.maxControlMessagesPerSecond());
 		assertEquals(7, p.floorIdleReleaseSeconds());
 		assertEquals(42, p.floorMaxHoldSeconds());
+		assertEquals(15, p.floorReservationSeconds(), "a positive reservation window is kept as-is");
+		// floorQueueDefault passthrough is asserted once, in the dedicated defaults test below (no duplication).
 		assertEquals("secret", p.authSigningKey());
 	}
 
@@ -80,10 +91,32 @@ class WalkiePropertiesTest {
 				1,
 				0,
 				0,
-				null
-		, false);
+				10,
+				false,
+				null,
+				false
+		);
 		assertEquals(0, p.floorIdleReleaseSeconds(), "0 disables idle auto-release (not coerced to the default)");
 		assertEquals(0, p.floorMaxHoldSeconds(), "0 disables the max-hold cap (not coerced to the default)");
+	}
+
+	@Test
+	void theReservationWindowDefaultsWhenNonPositiveAndTheQueueDefaultPassesThrough() {
+		// Grant-to-claim needs a positive window, so — UNLIKE the idle/max-hold timers, where 0 means "off" — a
+		// 0 or negative reservation is coerced to the 10 s default rather than disabling anything. The queue
+		// on/off default is a plain flag with no coercion, so it passes through verbatim.
+		assertEquals(10, new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 0, false, null, false).floorReservationSeconds(),
+				"a zero reservation window falls back to the 10 s default");
+		assertEquals(10, new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, -1, false, null, false).floorReservationSeconds(),
+				"a negative reservation window falls back to the 10 s default");
+		assertTrue(new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, true, null, false).floorQueueDefault(),
+				"floorQueueDefault=true passes through");
+		assertFalse(new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, null, false).floorQueueDefault(),
+				"floorQueueDefault=false passes through");
 	}
 
 	@Test
@@ -98,8 +131,11 @@ class WalkiePropertiesTest {
 				2_000_000_000L,
 				5,
 				300,
-				null
-		, false);
+				10,
+				false,
+				null,
+				false
+		);
 		assertEquals(1_000_000_000L, p.maxAudioFramesPerSecond(), "audio rates above 1e9 are clamped to 1e9");
 		assertEquals(1_000_000_000L, p.maxControlMessagesPerSecond(), "control rates above 1e9 are clamped to 1e9");
 	}

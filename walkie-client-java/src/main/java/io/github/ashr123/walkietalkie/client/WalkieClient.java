@@ -78,6 +78,9 @@ public final class WalkieClient implements AutoCloseable {
 	/// it — to drain gracefully before forcing termination, so quitting can never hang on a slow or vanished
 	/// server. Two seconds is ample for a localhost/LAN close handshake while still feeling instant to a user.
 	private static final Duration HTTP_SHUTDOWN_GRACE = Duration.ofSeconds(2);
+	/// ASCII BEL (0x07): written to the terminal to audibly/visibly nudge an inattentive user the instant it is
+	/// their turn to talk (a console has no other way to grab attention). Mirrors the browser's "your turn" beep.
+	private static final char TERMINAL_BELL = '\u0007';
 	/// Fixed width of the help box's horizontal rule — a cosmetic frame (some command lines run longer than this).
 	private static final int HELP_RULE_WIDTH = 98;
 	private static final String HELP_RULE = "-".repeat(HELP_RULE_WIDTH);
@@ -85,7 +88,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// the owner instead sees [#OWNER_COMMANDS]. (`p` is role-split: a member ADOPTS a shared passphrase, an owner
 	/// CHANGES it.)
 	private static final String COMMON_COMMANDS = """
-			Commands:  t = talk/stop
+			Commands:  t = talk/stop — in push-to-talk it's state-driven: grab a free floor, claim your turn, or join/leave the queue when busy
 			           w = who's here
 			           c <channel> [mode] [key] = switch channel
 			           n <name> = rename
@@ -102,7 +105,8 @@ public final class WalkieClient implements AutoCloseable {
 			           p! [passphrase] = change the passphrase WITHOUT auto-sharing (members must re-enter it)
 			           o <#id> = give ownership to another member
 			           mute <#id|all> / unmute <#id|all> = mute or unmute members
-			           lock / unlock = lock or unlock the channel to new members""";
+			           lock / unlock = lock or unlock the channel to new members
+			           queue on / queue off = turn the push-to-talk floor queue on or off""";
 	/// The one passphrase command a NON-owner has: adopt a rotation the owner announced but didn't auto-share (an
 	/// owner instead changes the passphrase with `p`/`p!` — see [#OWNER_COMMANDS]). The 11 leading spaces align its
 	/// `p` under the command column of [#COMMON_COMMANDS] / [#OWNER_COMMANDS] after their text-block indent is
@@ -149,6 +153,20 @@ public final class WalkieClient implements AutoCloseable {
 	private volatile boolean warnedEncryptedNoKey; // warn-once (like warnedDecrypt): encrypted audio arrived while we hold no key
 	private volatile boolean welcomeShown;  // print the role-aware help once, after the first Joined reveals our role (same listener-thread-only-but-volatile rationale as warnedDecrypt)
 	private volatile boolean channelLocked; // whether the owner has locked the channel to new members (from Joined/ChannelLocked); volatile — set on the listener thread, read on the console thread for 'w'
+	// --- Push-to-talk floor snapshot (the authoritative ServerMessage.FloorStatus, from which ALL floor UI is
+	// derived — see floorStateFor). Published by the listener thread (handleFloorStatus / handleFloorQueueChanged /
+	// the Joined handler) and read on the console thread by the state-driven `t` control (toggleTalk). volatile for
+	// cross-thread visibility, mirroring currentMode/crypto; each field is read ONCE into a local before use.
+	private volatile String floorHolderId;   // the live holder's session id, or null when nobody is talking
+	// The FIFO floor queue in order (empty = the queue is off or nobody is waiting). Holds an IMMUTABLE copy
+	// (List.copyOf on every write) so a reader never observes a half-built list across the volatile publish.
+	private volatile List<String> floorWaiting = List.of();
+	private volatile boolean floorQueueEnabled;   // whether the owner-toggleable floor queue is on (from Joined / FloorQueueChanged)
+	// Set when the server tells us it's our turn (FloorReserved / a FloorStatus that makes us the reserved head);
+	// cleared when we claim (FloorGranted / a FloorStatus showing us live) or when the window lapses and the next
+	// FloorStatus drops us (then we log "[your turn passed]"). Listener-thread-only today, volatile for the same
+	// warn-once-survives-a-refactor rationale as warnedDecrypt.
+	private volatile boolean awaitingClaim;
 
 	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
 		this.options = options;
@@ -197,7 +215,7 @@ public final class WalkieClient implements AutoCloseable {
 	private static String modeHint(ChannelMode mode, boolean micLive) {
 		return mode == ChannelMode.FULL_DUPLEX
 				? "Full-duplex: mic is " + (micLive ? "live" : "muted") + " — type 't' to mute/unmute."
-				: "Push-to-talk: type 't' to grab/release the floor.";
+				: "Push-to-talk: type 't' to grab a free floor (or to join/leave the queue when it's busy; claim with 't' when it's your turn).";
 	}
 
 	/// Builds the AES-256-GCM frame cipher from `--key` (or the WALKIE_KEY env var), or null to disable
@@ -251,6 +269,39 @@ public final class WalkieClient implements AutoCloseable {
 				candidate != null && announcedKeyCheck.equals(candidate.keyCheck()) ?
 						RekeyAction.APPLY :
 						RekeyAction.KEEP;
+	}
+
+	/// Derives this client's floor state from the authoritative [ServerMessage.FloorStatus] snapshot (`holderId` +
+	/// `waiting`) and our own session id — the SAME rule the design mandates and the browser applies. Pure (no field
+	/// access) so the state-driven `t` decision built on it ([#floorActionFor]) is unit-testable without a live socket.
+	/// - `LIVE` — we hold the floor (`holderId == self`).
+	/// - `MY_TURN` — the floor is free and we are the reserved head (`holderId == null && waiting.get(0) == self`);
+	///   there is no separate "reserved" field because the server reserves the head the instant the floor frees.
+	/// - `IN_LINE` — we are waiting further back in the queue (in `waiting`, but not the reserved head).
+	/// - `IDLE` — none of the above: the floor is free, reserved for another, or held by another.
+	static FloorState floorStateFor(String selfId, String holderId, List<String> waiting) {
+		if (selfId.equals(holderId)) {
+			return FloorState.LIVE;
+		}
+		if (holderId == null && !waiting.isEmpty() && waiting.getFirst().equals(selfId)) {
+			return FloorState.MY_TURN;
+		}
+		return waiting.contains(selfId) ? FloorState.IN_LINE : FloorState.IDLE;
+	}
+
+	/// The [ClientMessage] the state-driven `t` control sends for a given [FloorState] in a push-to-talk channel —
+	/// the unified single control from the design (no separate queue command). Pure so the decision table is
+	/// unit-testable:
+	/// - `LIVE` → [ClientMessage.ReleaseFloor] (stop talking);
+	/// - `IN_LINE` → [ClientMessage.ReleaseFloor] (leave the queue);
+	/// - `MY_TURN` → [ClientMessage.RequestFloor] (claim it — the server grants and replies [ServerMessage.FloorGranted]);
+	/// - `IDLE` → [ClientMessage.RequestFloor] (grab if free; enqueue if busy and the queue is on; ignored by the
+	///   server if busy and the queue is off — the snapshot already shows it busy, so no state changes).
+	static ClientMessage floorActionFor(FloorState state) {
+		return switch (state) {
+			case LIVE, IN_LINE -> new ClientMessage.ReleaseFloor();
+			case MY_TURN, IDLE -> new ClientMessage.RequestFloor();
+		};
 	}
 
 	private static ChannelMode parseMode(String arg, ChannelMode fallback) {
@@ -338,6 +389,7 @@ public final class WalkieClient implements AutoCloseable {
 									  ChannelMode mode,
 									  String ownerId,
 									  boolean locked,
+									  boolean floorQueueEnabled,
 									  List<MemberInfo> members) -> {
 				boolean channelChanged = !channel.equals(this.currentChannel);
 				this.selfId = selfId;
@@ -345,12 +397,19 @@ public final class WalkieClient implements AutoCloseable {
 				this.currentMode = mode;
 				this.currentChannel = channel;
 				this.channelLocked = locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join)
+				this.floorQueueEnabled = floorQueueEnabled;   // adopt the channel's queue setting (authoritative on every Joined)
 				if (channelChanged) {
 					// Baseline the channel's announced key-check from the key we joined with — only on an ACTUAL
 					// channel change (a switch). switchTo deliberately doesn't advance it, so the transmit gate keeps
 					// suppressing plaintext through the switch round-trip; a same-channel re-snapshot must not reset
 					// it either (it would clobber a pending rotation), mirroring the browser's onJoined.
 					currentChannelKeyCheck = crypto == null ? null : crypto.keyCheck();
+					// Clear the stale floor snapshot from the OLD channel. The server sends a fresh authoritative
+					// FloorStatus right after this Joined (to-one), so it re-seeds immediately; this just stops the
+					// `t` control acting on the previous channel's holder/queue in the interim.
+					floorHolderId = null;
+					floorWaiting = List.of();
+					awaitingClaim = false;
 				}
 				memberNames.clear();
 				mutedMembers.clear();
@@ -401,25 +460,18 @@ public final class WalkieClient implements AutoCloseable {
 				// muted member, so this shouldn't arrive, but guard it like the browser's beginTransmit does.
 					log("[floor granted] but you are muted by the owner — mic stays closed until unmuted.");
 			case ServerMessage.FloorGranted _ -> {
+				awaitingClaim = false;   // we claimed — no longer waiting for our turn
 				audio.setTransmitting(true);
 				log("[floor granted] talking — type 't' to stop");
 			}
-			case ServerMessage.FloorDenied(String currentHolderId) ->
-					log("[floor busy] currently held by " + name(currentHolderId));
-			case ServerMessage.FloorTaken(String holderId)
-					when audio.isTransmitting() && currentMode != ChannelMode.FULL_DUPLEX && !holderId.equals(selfId) -> {
-				// We held the floor and the server handed it to someone ELSE (idle auto-release): stop. The
-				// !holderId.equals(selfId) guard mirrors the browser: a FloorTaken naming US must not stop our mic.
-				audio.setTransmitting(false);
-				log("[released] floor reassigned to " + name(holderId) + " — type 't' to request it again");
+			case ServerMessage.FloorStatus(String holderId, List<String> waiting) -> handleFloorStatus(holderId, waiting);
+			case ServerMessage.FloorReserved(long claimSeconds) -> handleFloorReserved(claimSeconds);
+			case ServerMessage.FloorQueueChanged(boolean enabled) -> {
+				floorQueueEnabled = enabled;
+				log(enabled
+						? "[floor queue enabled] a busy floor now forms a line — type 't' to join it"
+						: "[floor queue disabled] a busy floor now refuses new requests until it frees");
 			}
-			case ServerMessage.FloorTaken(String holderId) -> log("[talking] " + name(holderId));
-			case ServerMessage.FloorIdle _ when audio.isTransmitting() && currentMode != ChannelMode.FULL_DUPLEX -> {
-				// The server freed our floor (max talk-time reached): stop; re-request to keep talking.
-				audio.setTransmitting(false);
-				log("[released] your talk time was up — type 't' to request the floor again");
-			}
-			case ServerMessage.FloorIdle _ -> log("[floor free]");
 			case ServerMessage.ModeChanged(ChannelMode mode) -> {
 				currentMode = mode;
 				// Match the browser: switching to full-duplex opens the mic (unless --muted or owner-muted); else it
@@ -485,6 +537,61 @@ public final class WalkieClient implements AutoCloseable {
 				}
 			}
 		}
+	}
+
+	/// Applies the authoritative [ServerMessage.FloorStatus] snapshot: publishes it for the console thread's `t`
+	/// control, reconciles our local transmit state, and logs a concise status derived from it.
+	///
+	/// **Release reconciliation** — if we were live in a push-to-talk channel but the floor is no longer ours, the
+	/// server released us (idle preempt, max-hold, or an owner action) and we stop the mic. This is now the SINGLE
+	/// source of that "you were released" truth: the old imperative `FloorTaken`/`FloorIdle` triggers are retired, so
+	/// the only signal that our floor was taken away is the holder in the next snapshot no longer being us.
+	private void handleFloorStatus(String holderId, List<String> waiting) {
+		// Publish the snapshot. floorWaiting stores an immutable copy so the console thread never sees a half-built
+		// list; the two volatile writes are read back independently there (each once into a local).
+		floorHolderId = holderId;
+		floorWaiting = List.copyOf(waiting);
+
+		String self = selfId;
+		boolean released = audio.isTransmitting() && currentMode != ChannelMode.FULL_DUPLEX && !self.equals(holderId);
+		if (released) {
+			audio.setTransmitting(false);
+		}
+		FloorState state = floorStateFor(self, holderId, waiting);
+		switch (state) {
+			case LIVE -> { /* we hold the floor; FloorGranted already announced it — stay quiet on queue churn */ }
+			case MY_TURN -> { /* FloorReserved fires the prominent "your turn" alert; nothing to add from the snapshot */ }
+			case IN_LINE ->
+					log("[in line #" + (waiting.indexOf(self) + 1) + " of " + waiting.size() + "] — type 't' to leave the queue");
+			case IDLE -> {
+				if (awaitingClaim) {
+					// We were the reserved head and let the claim window lapse (or declined): the server dropped us and
+					// offered the floor onward (grant-to-claim, miss → dropped). Report it once; the flag resets below.
+					log("[your turn passed] you didn't claim in time — type 't' to rejoin the queue");
+				} else if (released) {
+					log("[released] the floor is no longer yours — type 't' to request it again");
+				} else if (holderId != null) {
+					log("[talking] " + name(holderId));
+				} else if (!waiting.isEmpty()) {
+					log("[floor reserved] being offered to " + name(waiting.getFirst()));
+				} else {
+					log("[floor free] — type 't' to talk");
+				}
+			}
+		}
+		// Remember whether it is now OUR turn, so a later snapshot that drops us can log "[your turn passed]" above.
+		awaitingClaim = state == FloorState.MY_TURN;
+	}
+
+	/// Handles [ServerMessage.FloorReserved]: it is our turn, reserved for `claimSeconds`. Alerts the user (terminal
+	/// BEL + a prominent line) but does NOT open the mic — grant-to-claim requires an explicit `t`. No client-side
+	/// countdown is run: the server is authoritative on the window, and if it lapses the next [ServerMessage.FloorStatus]
+	/// drops us and [#handleFloorStatus] logs "[your turn passed]".
+	private void handleFloorReserved(long claimSeconds) {
+		awaitingClaim = true;
+		System.out.print(TERMINAL_BELL);
+		System.out.flush();
+		log("*** YOUR TURN — type 't' within " + claimSeconds + "s to talk ***");
 	}
 
 	/// Resolves a member's display name from its session id, always suffixed with a short session-id prefix (the
@@ -613,6 +720,7 @@ public final class WalkieClient implements AutoCloseable {
 					case "unmute" -> muteMember(parts.length > 1 ? parts[1] : "", false);
 					case "lock" -> setChannelLock(true);
 					case "unlock" -> setChannelLock(false);
+					case "queue" -> setFloorQueue(parts.length > 1 ? parts[1] : "");
 					case "n", "name" -> rename(parts.length > 1 ? parts[1] : "");
 					case "f", "fidelity" -> toggleFidelity();
 					case "w", "who", "members" -> listMembers();
@@ -630,6 +738,11 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
+	/// The unified `t` control. In full-duplex `t` just toggles the local mic (there is no floor). In a push-to-talk
+	/// channel it is STATE-DRIVEN: its meaning (and the message it sends) is derived from the latest
+	/// [ServerMessage.FloorStatus] snapshot via [#floorStateFor] / [#floorActionFor] — release when we hold it or are
+	/// queued, claim when it's our turn, grab-or-enqueue otherwise. The owner-mute guard and the full-duplex behaviour
+	/// are unchanged.
 	private void toggleTalk() {
 		if (mutedMembers.contains(selfId)) {
 			// Owner-muted: refuse. We already stopped the mic on MemberMuted, so we're not transmitting here; this
@@ -637,19 +750,41 @@ public final class WalkieClient implements AutoCloseable {
 			log("[muted] you are muted by the channel owner — you can't talk until unmuted.");
 			return;
 		}
-		if (audio.isTransmitting()) {
-			audio.setTransmitting(false);
-			if (currentMode != ChannelMode.FULL_DUPLEX) {
-				enqueue(new ClientMessage.ReleaseFloor());
-			}
-			log("[stopped]");
-		} else if (currentMode == ChannelMode.FULL_DUPLEX) {
-			audio.setTransmitting(true);
-			log("[talking]");
-		} else {
-			enqueue(new ClientMessage.RequestFloor());
-			log("[requesting floor...]");
+		if (currentMode == ChannelMode.FULL_DUPLEX) {
+			// Full-duplex has no floor: `t` is a plain mic mute/unmute toggle (unchanged).
+			boolean live = !audio.isTransmitting();
+			audio.setTransmitting(live);
+			log(live ? "[talking]" : "[stopped]");
+			return;
 		}
+		// Push-to-talk: read the floor snapshot ONCE off the volatiles (the listener thread may update it under us),
+		// derive our state, and send the message that state dictates.
+		String self = selfId;
+		String holder = floorHolderId;
+		List<String> waiting = floorWaiting;
+		FloorState state = floorStateFor(self, holder, waiting);
+		switch (state) {
+			case LIVE -> {
+				// We hold the floor: stop the mic at once for immediate feedback, then release it. The following
+				// FloorStatus(holderId=null) needs no reconciliation because we've already stopped here.
+				audio.setTransmitting(false);
+				log("[stopped]");
+			}
+			case MY_TURN -> log("[claiming the floor...]");   // grant-to-claim: the mic opens on FloorGranted, never here
+			case IN_LINE -> log("[leaving the queue...]");
+			case IDLE -> {
+				if (holder == null && waiting.isEmpty()) {
+					log("[requesting floor...]");
+				} else if (floorQueueEnabled) {
+					log("[joining the queue...]");
+				} else {
+					// Busy and the queue is off: the server ignores our RequestFloor; the snapshot already shows it busy.
+					log("[floor busy] " + (holder != null ? name(holder) + " is talking" : "reserved for " + name(waiting.getFirst()))
+							+ " — the queue is off; try again when it's free");
+				}
+			}
+		}
+		enqueue(floorActionFor(state));
 	}
 
 	/// Flips the hi-fi (Opus music vs voice) profile live; [AudioEngine] rebuilds the encoder on its next
@@ -973,6 +1108,34 @@ public final class WalkieClient implements AutoCloseable {
 		log("[" + (locked ? "lock" : "unlock") + "] requesting to " + (locked ? "lock" : "unlock") + " the channel...");
 	}
 
+	/// `queue on` / `queue off` — owner-only: turn this channel's push-to-talk floor queue on or off. When on, a
+	/// member that requests a busy floor joins a FIFO line (and is offered the floor in turn) rather than being
+	/// refused; when off, the server clears any waiting queue. Full-duplex has no floor, so it's rejected locally.
+	/// Otherwise gated locally to the owner — the server also enforces `NOT_OWNER` (and refuses the sentinel-owned
+	/// `global` room and full-duplex) — and the echoed [ServerMessage.FloorQueueChanged] is what actually flips
+	/// everyone's state. Mirrors `lock`/`unlock`.
+	private void setFloorQueue(String arg) {
+		if (currentMode == ChannelMode.FULL_DUPLEX) {
+			log("[queue] full-duplex has no floor, so there's no queue to toggle.");
+			return;
+		}
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can turn the floor queue on or off");
+			return;
+		}
+		switch (arg.strip().toLowerCase(Locale.ROOT)) {
+			case "on" -> {
+				enqueue(new ClientMessage.SetFloorQueue(true));
+				log("[queue] requesting to turn the floor queue on...");
+			}
+			case "off" -> {
+				enqueue(new ClientMessage.SetFloorQueue(false));
+				log("[queue] requesting to turn the floor queue off...");
+			}
+			default -> System.out.println("Usage: queue <on|off>");
+		}
+	}
+
 	private WebSocket connect(String token) {
 		// Carry the effective channel as the ?channel= routing key so a channel-affinity ingress can pin this
 		// socket to the instance that owns the channel (see the server's ChannelHandshakeInterceptor). Harmless
@@ -1100,6 +1263,19 @@ public final class WalkieClient implements AutoCloseable {
 	/// — is unit-testable without a live socket. `APPLY`: adopt `candidate`. `KEEP`: hold the current key (we
 	/// don't have the new passphrase yet, or it mismatched). `DISABLE`: the owner turned encryption off.
 	enum RekeyAction {APPLY, KEEP, DISABLE}
+
+	/// This client's push-to-talk floor state, derived from the latest [ServerMessage.FloorStatus] via
+	/// [#floorStateFor]. Drives both the status log and the state-driven `t` control ([#floorActionFor]).
+	enum FloorState {
+		/// We hold the floor and are live (`holderId == self`).
+		LIVE,
+		/// It is our turn: the floor is free and we are the reserved head (`holderId == null && waiting.get(0) == self`).
+		MY_TURN,
+		/// We are waiting further back in the queue (in `waiting`, but not the reserved head).
+		IN_LINE,
+		/// Nobody has offered us the floor: it is free, reserved for another, or held by another.
+		IDLE
+	}
 
 	private sealed interface Outbound {
 		record Text(String json) implements Outbound {

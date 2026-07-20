@@ -37,6 +37,14 @@ walkie:
   # the holder has sent no audio for this long. max-hold: force-release after this much continuous holding.
   floor-idle-release-seconds: 5
   floor-max-hold-seconds: 300
+  # Push-to-talk floor QUEUE ("raise hand", owner-toggleable per channel — see docs/FLOOR_QUEUE.md).
+  # floor-reservation-seconds: when the queue is on, how long the head is given to CLAIM the floor once it is
+  # offered (its turn) before the server drops it and offers the next member. Grant-to-claim needs a positive
+  # window, so — UNLIKE the timers above — 0/blank falls back to the default (10), it is not "disabled".
+  # floor-queue-default: the on/off state a NEWLY created channel adopts (its owner can then toggle it); default
+  # false preserves the plain busy-floor-refused behaviour.
+  floor-reservation-seconds: 10
+  floor-queue-default: false
 
 management:
   endpoints:

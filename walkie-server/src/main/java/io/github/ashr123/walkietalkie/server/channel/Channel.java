@@ -9,6 +9,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 
 import java.time.Instant;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -92,12 +93,32 @@ public final class Channel {
 	// monitor — the registry takes its bin lock then this monitor (via add/remove), so the reverse order deadlocks.
 	private volatile Instant floorAcquiredAt = Instant.EPOCH;
 	private volatile Instant floorActivityAt = Instant.EPOCH;
+	// --- floor queue (push-to-talk "raise hand", owner-toggleable) --------------------------------
+	// See docs/FLOOR_QUEUE.md. When enabled, a member that presses talk while the floor is busy is ENQUEUED
+	// (FIFO) instead of denied; when the floor frees, it is RESERVED to the head for a bounded claim window
+	// (the head must claim by acquiring, else the reservation-expiry sweep drops it and offers the floor to the
+	// next head). Default off — behaviour then matches the pre-queue model (busy floor => acquire fails).
+	//
+	// Serialization: `floorQueue` is guarded by THIS monitor — every read/mutation runs under `synchronized
+	// (channel)`, exactly like the floorHolder transitions it interleaves with (so an enqueue can't race a
+	// grant/release into an inconsistent queue+holder pair). The reserved member is the head WHENEVER the floor
+	// is free (`floorHolder == null`): the server reserves the head the instant the floor frees, so there is no
+	// "free, queue non-empty, nobody reserved" state — hence no stored reserved-id.
+	private volatile boolean floorQueueEnabled;
+	private final LinkedHashSet<String> floorQueue = new LinkedHashSet<>();
+	// When the current head's reservation (claim window) started — the basis for the reservation-expiry sweep;
+	// EPOCH when nobody is reserved. Stamped under the monitor by the reserve/acquire paths, read (under the
+	// monitor) by the sweep; volatile for cross-thread visibility of the last write.
+	private volatile Instant floorReservedAt = Instant.EPOCH;
 
-	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck) {
+	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck, boolean floorQueueEnabled) {
 		this.name = name;
 		this.mode = mode;
 		this.ownerId = ownerId;
 		this.keyCheck = keyCheck;
+		// Seed the queue on/off state from the server-wide default a new channel adopts (walkie.floor-queue-default);
+		// the owner can toggle it per channel afterwards. Set only at creation — an existing channel keeps its own.
+		this.floorQueueEnabled = floorQueueEnabled;
 	}
 
 	public String name() {
@@ -161,6 +182,18 @@ public final class Channel {
 			// the holder reference and the acquire/activity marks disagreeing.
 			if (sessionId.equals(floorHolder)) {
 				floorHolder = null;
+			}
+			// Drop a leaver from the floor queue too (under the same monitor), so a disconnect/switch can't leave a
+			// ghost id waiting for a turn it can never take. If the leaver was the RESERVED HEAD (floor free and it
+			// is first in line — computed AFTER the floorHolder-clear above, so a departing HOLDER, now
+			// floorHolder==null but not in the queue, is never misjudged, and BEFORE the removal so the head is
+			// still identifiable), end its claim window so the next head gets a fresh one from the caller's
+			// reserveHead. A mid-queue leaver does NOT reset (it keeps the running head's window). The caller
+			// (ConnectionService.handleLeave) then re-reserves + re-broadcasts FloorStatus after this removal.
+			boolean wasReservedHead = floorHolder == null && !floorQueue.isEmpty() && sessionId.equals(floorQueue.getFirst());
+			floorQueue.remove(sessionId);
+			if (wasReservedHead) {
+				floorReservedAt = Instant.EPOCH;
 			}
 			// Scrub the mute UNDER the monitor too, so a leave can't race a concurrent owner mute
 			// (setMuted / setMutedForAllExcept run under this same monitor): whichever runs second wins, and since
@@ -297,10 +330,16 @@ public final class Channel {
 		if (mode == ChannelMode.FULL_DUPLEX) {
 			return true;
 		}
-		if (floorHolder == null) {   // free? take it — atomic since the whole method holds the monitor
+		// Grant only if the floor is free AND either the queue is empty (a plain grab) or this caller is the
+		// reserved head claiming its turn. A non-head can NOT jump a reserved floor — it must enqueue instead —
+		// so the FIFO order the queue promises is honoured. Whole method holds the monitor, so the check-and-set
+		// (and the queue read) are atomic w.r.t. concurrent enqueue/release/reserve.
+		if (floorHolder == null && (floorQueue.isEmpty() || sessionId.equals(headOfQueue()))) {
 			floorHolder = sessionId;
+			floorQueue.remove(sessionId);       // the claimant leaves the queue (no-op for a plain grab)
 			floorAcquiredAt = now;
 			floorActivityAt = now;
+			floorReservedAt = Instant.EPOCH;    // acquiring ends any reservation
 			return true;
 		}
 		return false;
@@ -316,10 +355,14 @@ public final class Channel {
 		return true;
 	}
 
-	/// Unconditionally frees the floor (used when the mode changes). The single volatile write is itself atomic;
-	/// callers make it ordered with the other floor transitions by holding the monitor across mutate-and-notify.
-	public void clearFloor() {
+	/// Unconditionally resets ALL floor state — the holder, the waiting queue AND any running reservation — used
+	/// when the mode changes (a mode switch supersedes every talk indicator and starts a fresh floor). Synchronized
+	/// like the other queue mutators so the `floorQueue` clear runs under this monitor; callers make it ordered with
+	/// the other floor transitions and its broadcast by holding the monitor across mutate-and-notify.
+	public synchronized void clearFloor() {
 		floorHolder = null;
+		floorQueue.clear();
+		floorReservedAt = Instant.EPOCH;
 	}
 
 	/// Whether `sessionId` may currently transmit (always true in full-duplex mode).
@@ -378,6 +421,118 @@ public final class Channel {
 		}
 		floorHolder = null;
 		return holder;
+	}
+
+	// --- floor queue -----------------------------------------------------------------------------------
+
+	/// The head of the waiting queue; call only under the monitor with a non-empty queue.
+	private String headOfQueue() {
+		return floorQueue.getFirst();
+	}
+
+	public boolean isFloorQueueEnabled() {
+		return floorQueueEnabled;
+	}
+
+	/// Turns the owner-controlled floor queue on or off. Disabling also **clears** the queue and any reservation
+	/// (there is nowhere to wait), so the caller should snapshot [#floorQueue] first if it needs to notify the
+	/// dropped members, and re-broadcast `FloorStatus`. Call under the monitor so the flip, the clear and the
+	/// broadcast are one atomic transition (mirrors the mode/lock/passphrase discipline).
+	public synchronized void setFloorQueueEnabled(boolean enabled) {
+		floorQueueEnabled = enabled;
+		if (!enabled) {
+			floorQueue.clear();
+			floorReservedAt = Instant.EPOCH;
+		}
+	}
+
+	/// Appends `sessionId` to the tail of the floor queue — a no-op (returns `false`) if it already holds the
+	/// floor or is already waiting. Returns whether it was newly enqueued. The caller enforces the preconditions
+	/// (queue enabled, not full-duplex, not muted, floor busy) and re-broadcasts `FloorStatus`. Under the monitor.
+	public synchronized boolean enqueueFloor(String sessionId) {
+		return !sessionId.equals(floorHolder) && floorQueue.add(sessionId);
+	}
+
+	/// Removes `sessionId` from the floor queue (a member leaving the line, declining its turn, or disconnecting).
+	/// Returns whether it was queued. If the removed member was the RESERVED HEAD (floor free and it was first in
+	/// line), its running claim window is ended — `floorReservedAt` is reset to EPOCH — so the NEXT head gets a
+	/// fresh window from the caller's [#reserveHead]. A MID-QUEUE removal must NOT reset the clock (that would
+	/// unfairly restart the running head's window). Computed BEFORE the removal so the head is still identifiable.
+	/// Under the monitor.
+	public synchronized boolean dequeueFloor(String sessionId) {
+		boolean wasReservedHead = floorHolder == null && !floorQueue.isEmpty() && sessionId.equals(headOfQueue());
+		boolean removed = floorQueue.remove(sessionId);
+		if (removed && wasReservedHead) {
+			floorReservedAt = Instant.EPOCH;
+		}
+		return removed;
+	}
+
+	/// Starts the claim window for the head of the queue — the FREE -> RESERVED transition. Returns the reserved
+	/// head's id, or `null` if the floor is held, the queue is empty, OR a reservation is already running.
+	///
+	/// IDEMPOTENT by design: the guard enforces the invariant `floorReservedAt != EPOCH` iff the current head has a
+	/// running claim window, so a redundant call while a reservation runs is a no-op (returns `null`, no re-stamp).
+	/// That is what lets callers invoke it UNCONDITIONALLY on any floor-freeing event — even across the monitor gap
+	/// around a [ChannelRegistry] mutate — without ever moving a running reservation's clock backward or resetting
+	/// it: a fresh window is stamped only when the head genuinely changed (the previous head was claimed/removed,
+	/// which reset the clock to EPOCH — see [#tryAcquireFloor], [#dequeueFloor], [#remove]). Under the monitor.
+	public synchronized String reserveHead(Instant now) {
+		if (floorHolder != null || floorQueue.isEmpty() || !floorReservedAt.equals(Instant.EPOCH)) {
+			return null;
+		}
+		floorReservedAt = now;
+		return headOfQueue();
+	}
+
+	/// Idle auto-release for the queue path: frees the floor if the current holder has been silent since at or
+	/// before `idleBefore`, so the floor can be offered to the queue head (the caller then calls [#reserveHead]).
+	/// Returns the released holder id, or `null` if there is no holder, the hold is not yet idle, or the channel
+	/// is full-duplex. The caller restricts this to a **relay** holder (WebRTC has no activity signal) before
+	/// invoking — all under this monitor. (Distinct from [#preemptFloorIfIdle], which reassigns straight to a
+	/// named requester in the queue-DISABLED path; here the freed floor goes to whoever is next in line.)
+	public synchronized String releaseIfIdle(Instant idleBefore) {
+		String holder = floorHolder;
+		if (mode == ChannelMode.FULL_DUPLEX || holder == null || floorActivityAt.isAfter(idleBefore)) {
+			return null;
+		}
+		floorHolder = null;
+		return holder;
+	}
+
+	/// The reserved head whose claim window has expired (reserved since at or before `reservedAtOrBefore`), or
+	/// `null` if nobody is reserved or the window has not elapsed. The caller drops it ([#dequeueFloor]) and
+	/// offers the floor to the next head ([#reserveHead]). Under the monitor.
+	///
+	/// The `floorReservedAt == EPOCH` guard is critical: it means "no reservation is running", so this NEVER
+	/// expires an UNstamped head. That makes the sweep a no-op during the brief "floor free but head not yet
+	/// reserved" transient (the monitor gap in a leave/mute, before the caller's `reserveHead` runs), so the sweep
+	/// cannot drop the rightful head out from under a concurrent re-reservation.
+	public synchronized String expiredReservationHead(Instant reservedAtOrBefore) {
+		return floorHolder != null
+				|| floorQueue.isEmpty()
+				|| floorReservedAt.equals(Instant.EPOCH)
+				|| floorReservedAt.isAfter(reservedAtOrBefore)
+				? null
+				: headOfQueue();
+	}
+
+	/// A point-in-time copy of the waiting queue, in FIFO order (the reserved head is first when the floor is
+	/// free). This is the `waiting` list carried by `FloorStatus`.
+	public synchronized List<String> floorQueue() {
+		return List.copyOf(floorQueue);
+	}
+
+	/// The member currently offered the floor (the head, while the floor is free), or [io.github.ashr123.option.None].
+	/// Derived, not stored: reserved is exactly the head whenever `floorHolder == null` (the server reserves the
+	/// head the instant the floor frees). Under the monitor.
+	public synchronized Option<String> reservedHolder() {
+		return Option.of(floorHolder == null && !floorQueue.isEmpty() ? headOfQueue() : null);
+	}
+
+	/// When the current head's reservation started (basis for the claim-window expiry); EPOCH if nobody reserved.
+	public Instant floorReservedAt() {
+		return floorReservedAt;
 	}
 
 	/// A channel member: the session plus its per-channel stream index — the compact `uint8` identity the server
