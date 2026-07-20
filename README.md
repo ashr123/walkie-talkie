@@ -88,7 +88,7 @@ once, for Bob.)
   │    overflow → drop THIS frame   (a momentary click; the next frame heals)           │
   │                                                                                     │
   │      │   drainLoop — ONE virtual thread:                                            │
-  │      ▼   poll controlOut FIRST (state stays timely), then audioOut (200 ms), FIFO   │
+  │      ▼   drain controlOut FIRST, then audioOut — parked on a permit, no polling     │
   │ ConcurrentWebSocketSessionDecorator    —  socket-layer backstop                     │
   │      │   bounds a wedged in-flight write; write errors are swallowed,               │
   │      ▼   so one bad recipient never affects the others                              │

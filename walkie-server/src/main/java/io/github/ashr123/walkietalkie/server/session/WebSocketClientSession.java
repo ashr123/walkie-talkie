@@ -8,7 +8,7 @@ import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorato
 import java.io.IOException;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /// [ClientSession] backed by a Spring [WebSocketSession] (expected to be a
@@ -46,8 +46,6 @@ public final class WebSocketClientSession implements ClientSession {
 	/// Control mailbox depth. Control is sparse, so this is large headroom; overflowing it means the client
 	/// cannot even drain state updates and is treated as hopelessly behind (the session is closed).
 	private static final int CONTROL_CAPACITY = 1024;
-	/// How long the drainer parks waiting for the next audio frame; bounds how quickly it notices [#close].
-	private static final long POLL_TIMEOUT_MS = 200;
 
 	private final WebSocketSession session;
 	private final Transport transport;
@@ -57,9 +55,10 @@ public final class WebSocketClientSession implements ClientSession {
 	private final BlockingQueue<Runnable> controlOut = new LinkedBlockingQueue<>(CONTROL_CAPACITY);
 	private final BlockingQueue<Runnable> audioOut = new LinkedBlockingQueue<>(AUDIO_CAPACITY);
 	private final AtomicBoolean closed = new AtomicBoolean();
-	// volatile so stopPump()/close() on another thread reliably observes the drainer assigned by start()
-	// (their only happens-before edge is the session's publication, which precedes the drainer write).
-	private volatile Thread drainer;   // the single consumer; started by start() after the session is registered
+	/// Counts frames waiting across both queues: a permit is released for each accepted enqueue and consumed
+	/// one-per-drain, so the single consumer parks on it (never busy-waits) and wakes only on real work. [#stopPump]
+	/// releases one extra permit at close so a parked drainer unblocks, observes `closed`, and exits.
+	private final Semaphore work = new Semaphore(0);
 
 	// Set when the client joins a channel (from the validated Join.displayName); "" until then.
 	private volatile String displayName = "";
@@ -78,28 +77,47 @@ public final class WebSocketClientSession implements ClientSession {
 		return handshakeChannel;
 	}
 
-	/// Starts the single outbound drainer virtual thread. Called once, AFTER the session has been registered
-	/// for lookup, so a disconnect can always find and [#close] it (no construct-before-register leak window).
+	/// Starts the single outbound drainer virtual thread. Called once, AFTER the session has been registered for
+	/// lookup, so a disconnect can always find the session and [#close] it — which flips `closed` and releases a
+	/// wake permit, so a drainer parked (or not yet parked) always unblocks and exits. Because the wake is a
+	/// permit and not an interrupt, it can't be lost to a start-vs-close race (the permit sticks until acquired).
 	public void start() {
-		this.drainer = Thread.ofVirtual().name("ws-out-" + id()).start(this::drainLoop);
+		Thread.ofVirtual().name("ws-out-" + id()).start(this::drainLoop);
 	}
 
-	/// The sole consumer: drains control with priority (state updates stay timely even when audio is backed
-	/// up), then audio, performing the (blocking) socket write in FIFO order. Drains anything already queued
-	/// at [#close] before exiting, so a graceful close still flushes in-flight frames.
+	/// The sole consumer: parks on [#work] until a frame is enqueued (or [#close] releases a wake permit), then
+	/// drains exactly ONE task via [#drainOne] — control first, so state updates stay timely even when audio is
+	/// backed up. Fully event-driven: one permit exists per queued frame and is consumed one-per-drain, so an
+	/// idle session blocks indefinitely with no polling or busy-wait. On [#close] it stops taking new work and
+	/// flushes whatever is still queued — best-effort: the flush reaches the client only while the socket is still
+	/// writable (e.g. a server-initiated [#terminateForBacklog] close), whereas on a peer-initiated disconnect the
+	/// socket is already gone and those sends fail fast and are swallowed.
 	private void drainLoop() {
-		while (!closed.get() || !controlOut.isEmpty() || !audioOut.isEmpty()) {
-			try {
-				Runnable task = controlOut.poll();
-				if (task == null) {
-					task = audioOut.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-				}
-				if (task != null) {
-					task.run();
-				}
-			} catch (InterruptedException _) {
-				// close()/terminate interrupted the wait; the loop re-checks, drains the remainder, then exits.
-			}
+		while (!closed.get()) {
+			work.acquireUninterruptibly();   // park until a frame is enqueued, or close() releases a wake permit
+			drainOne();
+		}
+		// close() flips `closed` before releasing its wake permit, and `send*` refuse once `closed` is set, so no
+		// new frame can arrive here; deliver whatever is already queued — control fully first, then audio — before
+		// the thread exits.
+		for (Runnable task; (task = controlOut.poll()) != null; ) {
+			task.run();
+		}
+		for (Runnable task; (task = audioOut.poll()) != null; ) {
+			task.run();
+		}
+	}
+
+	/// Runs one queued task — control first (priority), else audio — performing the (blocking) socket write. A
+	/// no-op when the acquired permit was the one [#stopPump] released to wake the drainer for shutdown and both
+	/// queues are already empty.
+	private void drainOne() {
+		Runnable task = controlOut.poll();
+		if (task == null) {
+			task = audioOut.poll();
+		}
+		if (task != null) {
+			task.run();
 		}
 	}
 
@@ -148,7 +166,9 @@ public final class WebSocketClientSession implements ClientSession {
 		if (closed.get()) {
 			return;
 		}
-		if (!controlOut.offer(() -> sendQuietly(new TextMessage(encoded)))) {
+		if (controlOut.offer(() -> sendQuietly(new TextMessage(encoded)))) {
+			work.release();   // signal the drainer that one more frame is ready
+		} else {
 			// A state-changing message is never silently dropped: if it can't even be queued, the client is
 			// hopelessly behind, so disconnect it to force a clean reconnect + Joined re-sync.
 			terminateForBacklog();
@@ -163,7 +183,9 @@ public final class WebSocketClientSession implements ClientSession {
 		// BinaryMessage(byte[]) wraps the array without copying (ByteBuffer.wrap under the hood) and the frame is
 		// sent exactly once, so build it directly in the send task. The relay never mutates a payload it forwards,
 		// so the shared no-copy wrap is safe even though this same array is fanned out to every recipient.
-		if (!audioOut.offer(() -> sendQuietly(new BinaryMessage(audio)))) {
+		if (audioOut.offer(() -> sendQuietly(new BinaryMessage(audio)))) {
+			work.release();   // signal the drainer that one more frame is ready
+		} else {
 			log.debug("Audio backlog overflow for {}; dropping a frame", id());
 		}
 	}
@@ -195,12 +217,15 @@ public final class WebSocketClientSession implements ClientSession {
 		}
 	}
 
-	/// Stops the drainer, idempotently. Returns whether this call is the one that transitioned the session to
-	/// closed, so a caller can run one-shot teardown (e.g. the socket close above) exactly once.
+	/// Marks the session closed and wakes the drainer, idempotently. Flips `closed` (so `send*` refuse further
+	/// frames and the drain loop will exit) then releases one wake permit so a parked drainer unblocks, observes
+	/// `closed`, flushes what's left, and terminates. A permit (not an interrupt) so the wake can't be lost to a
+	/// start-vs-close race. Returns whether THIS call is the one that closed it, so one-shot teardown (e.g. the
+	/// socket close in [#terminateForBacklog]) runs exactly once.
 	private boolean stopPump() {
 		boolean firstClose = closed.compareAndSet(false, true);
-		if (firstClose && drainer != null) {
-			drainer.interrupt();
+		if (firstClose) {
+			work.release();   // unblock the drainer's acquire; it re-checks `closed` and stops (no interrupt needed)
 		}
 		return firstClose;
 	}
