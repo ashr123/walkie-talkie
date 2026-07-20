@@ -305,11 +305,13 @@ public class ConnectionService {
 					// leave back-to-back, the monitor orders the OwnerChanged broadcasts and each carries the
 					// latest elected owner, so a survivor converges on the real owner rather than ending up
 					// believing it is a member who has already left.
-					broadcaster.toOthers(channel, session.id(), new ServerMessage.OwnerChanged(channel.ownerId()));
+					String newOwnerId = channel.ownerId();   // the live elected owner (see the note above), read once under the monitor
+					broadcaster.toOthers(channel, session.id(), new ServerMessage.OwnerChanged(newOwnerId));
 					// Auto-election can promote a muted member (it picks any remaining member): the new owner is
 					// never muted, so unmute it if needed — else it would be a muted owner nobody can unmute.
 					unmuteOwnerIfMuted(channel);
-					log.info("ownership transferred to session={}", channel.ownerId());
+					log.info("ownership transferred to session={} ({})", newOwnerId,
+							channel.member(newOwnerId) instanceof Some(ClientSession newOwner) ? newOwner.displayName() : "?");
 				}
 				// Floor teardown on LIVE state, run UNCONDITIONALLY. This is safe despite the monitor gap around
 				// channelRegistry.leave precisely because reserveHead is IDEMPOTENT: it (re-)reserves + notifies the
