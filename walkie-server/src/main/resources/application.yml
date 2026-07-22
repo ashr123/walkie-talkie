@@ -22,7 +22,10 @@ walkie:
   allowed-origins:
     - "*"
   max-audio-frame-bytes: 8192
-  max-text-message-bytes: 65536
+  # Largest inbound control/signaling text frame. Tomcat eagerly allocates a per-session CharBuffer of this size
+  # (~2 bytes/char), so it is a direct per-connection RAM cost — keep it just above the largest real inbound
+  # message (a WebRTC SDP offer/answer, a few KB), not generous. 64 KiB previously cost ~128 KB per connection.
+  max-text-message-bytes: 16384
   # Per-sender flood guard: drop relayed audio frames beyond this many per second (nominal traffic is ~50 fps,
   # one 20 ms frame per tick). Excess is dropped before fan-out; counts frames without inspecting them, so it
   # works on encrypted channels too. See SessionRateLimiter. Always on — 0/blank uses the default, it can't be

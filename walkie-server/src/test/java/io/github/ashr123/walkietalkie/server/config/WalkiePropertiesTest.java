@@ -25,7 +25,7 @@ class WalkiePropertiesTest {
 		);
 		assertArrayEquals(new String[]{"*"}, p.allowedOrigins(), "null origins default to the wildcard");
 		assertEquals(8 * 1024, p.maxAudioFrameBytes(), "a non-positive audio size falls back to 8 KiB");
-		assertEquals(64 * 1024, p.maxTextMessageBytes(), "a non-positive text size falls back to 64 KiB");
+		assertEquals(16 * 1024, p.maxTextMessageBytes(), "a non-positive text size falls back to 16 KiB");
 		assertEquals(100, p.maxAudioFramesPerSecond(), "a non-positive frame rate falls back to 100 fps");
 		assertEquals(200, p.maxControlMessagesPerSecond(), "a non-positive control rate falls back to 200 msg/s");
 		assertEquals(5, p.floorIdleReleaseSeconds(), "a negative idle-release falls back to 5 s");

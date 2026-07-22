@@ -71,7 +71,10 @@ public record WalkieProperties(
 			maxAudioFrameBytes = 8 * 1024;
 		}
 		if (maxTextMessageBytes <= 0) {
-			maxTextMessageBytes = 64 * 1024;
+			// Fits the largest inbound control/signaling frame (a WebRTC SDP offer/answer, a few KB) with headroom.
+			// Kept modest: Tomcat eagerly allocates a per-session CharBuffer of this size, so it is a direct
+			// per-connection memory cost (see WebSocketConfig / application.yml).
+			maxTextMessageBytes = 16 * 1024;
 		}
 		if (maxAudioFramesPerSecond <= 0) {
 			// Always-on flood guard: 0/blank means "use the default", never "disable" (unlike the floor timers
