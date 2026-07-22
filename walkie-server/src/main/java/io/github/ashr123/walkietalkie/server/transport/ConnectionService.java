@@ -329,7 +329,7 @@ public class ConnectionService {
 						events.add(new ServerMessage.MemberMuted(newOwnerId, false));
 					}
 					log.info(
-							"ownership transferred to session={} ({})",
+							"ownership transferred to {} ({})",
 							newOwnerId,
 							channel.member(newOwnerId) instanceof Some(ClientSession newOwner)
 									? newOwner.displayName()
@@ -403,10 +403,16 @@ public class ConnectionService {
 			// NOTHING is sent — the client already shows "busy" from the last FloorStatus (FloorDenied is retired).
 			String currentHolderId = channel.floorHolder() instanceof Some(String holder) ? holder : null;
 			if (preemptIfIdle(channel, session, currentHolderId, now)) {
-				log.info("preempted idle floor holder={}", currentHolderId);
+				log.info(
+						"preempted idle floor holder {} ({})",
+						currentHolderId,
+						currentHolderId != null && channel.member(currentHolderId) instanceof Some(ClientSession held) ? held.displayName() : "?");
 				grantFloor(channel, session);
 			} else {
-				log.debug("denied the floor (held by session={})", currentHolderId);
+				log.debug(
+						"denied the floor (held by {} ({}))",
+						currentHolderId,
+						currentHolderId != null && channel.member(currentHolderId) instanceof Some(ClientSession held) ? held.displayName() : "?");
 			}
 		}
 	}
@@ -522,7 +528,7 @@ public class ConnectionService {
 						String holder = channel.releaseIfExpired(now.minus(floorMaxHold));
 						if (holder != null) {
 							freed = true;
-							log.info("session={} ({}) reached the max floor-hold time; floor released by sweep",
+							log.info("{} ({}) reached the max floor-hold time; floor released by sweep",
 									holder,
 									channel.member(holder) instanceof Some(ClientSession held) ? held.displayName() : "?");
 						}
@@ -540,7 +546,7 @@ public class ConnectionService {
 						String released = channel.releaseIfIdle(now.minus(floorIdleRelease));
 						if (released != null) {
 							freed = true;
-							log.info("session={} ({}) idle past the release window; floor offered to the queue",
+							log.info("{} ({}) idle past the release window; floor offered to the queue",
 									released, holder.displayName());
 						}
 					}
@@ -561,7 +567,7 @@ public class ConnectionService {
 						// member: a present reservedHolder() means the floor was handed on; an absent one means the
 						// queue emptied and the floor is simply free. The {} tail reflects which.
 						log.info(
-								"session={} ({}) missed its floor reservation; {}",
+								"{} ({}) missed its floor reservation; {}",
 								missed,
 								channel.member(missed) instanceof Some(ClientSession m) ? m.displayName() : "?",
 								channel.reservedHolder() instanceof Some<String>
@@ -620,7 +626,7 @@ public class ConnectionService {
 					// are logged inline; the channel is mirrored into the MDC (channelScope) so this line carries
 					// channel=… like the handler lines rather than repeating it in the message.
 					try (RequestContext.Scope _ = RequestContext.channelScope(channel)) {
-						log.info("session={} ({}) reached the max floor-hold time; floor released",
+						log.info("{} ({}) reached the max floor-hold time; floor released",
 								session.id(), session.displayName());
 					}
 					return;
@@ -650,7 +656,7 @@ public class ConnectionService {
 					try {
 						other.sendAudio(prefixed);
 					} catch (RuntimeException e) {
-						log.debug("Audio relay to {} failed: {}", other.id(), e.getMessage());
+						log.debug("Audio relay to {} ({}) failed: {}", other.id(), other.displayName(), e.getMessage());
 					}
 				}
 			});
@@ -825,7 +831,10 @@ public class ConnectionService {
 					}
 					broadcaster.toAll(channel, events.toArray(ServerMessage[]::new));
 				}
-				log.info("transferred ownership to {}", newOwnerId);
+				log.info(
+						"transferred ownership to {} ({})",
+						newOwnerId,
+						channel.member(newOwnerId) instanceof Some(ClientSession newOwner) ? newOwner.displayName() : "?");
 			}
 		}
 	}
@@ -881,7 +890,11 @@ public class ConnectionService {
 			}
 			broadcaster.toAll(channel, events.toArray(ServerMessage[]::new));
 		}
-		log.info("{} member {}", muted ? "muted" : "unmuted", memberId);
+		log.info(
+				"{} member {} ({})",
+				muted ? "muted" : "unmuted",
+				memberId,
+				channel.member(memberId) instanceof Some(ClientSession m) ? m.displayName() : "?");
 	}
 
 	/// Mutes or unmutes EVERY other member of the channel at once, on the owner's request. The owner is never

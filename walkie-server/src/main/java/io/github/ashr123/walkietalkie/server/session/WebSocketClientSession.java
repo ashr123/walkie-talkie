@@ -186,7 +186,7 @@ public final class WebSocketClientSession implements ClientSession {
 		if (audioOut.offer(() -> sendQuietly(new BinaryMessage(audio)))) {
 			work.release();   // signal the drainer that one more frame is ready
 		} else {
-			log.debug("Audio backlog overflow for {}; dropping a frame", id());
+			log.debug("Audio backlog overflow for {} ({}); dropping a frame", id(), displayName());
 		}
 	}
 
@@ -197,7 +197,7 @@ public final class WebSocketClientSession implements ClientSession {
 		try {
 			session.sendMessage(message);
 		} catch (RuntimeException | IOException e) {
-			log.debug("Dropping outbound frame to {}: {}", id(), e.getMessage());
+			log.debug("Dropping outbound frame to {} ({}): {}", id(), displayName(), e.getMessage());
 		}
 	}
 
@@ -206,7 +206,7 @@ public final class WebSocketClientSession implements ClientSession {
 	/// fan-out caller never blocks. Membership cleanup then happens via the normal afterConnectionClosed path.
 	private void terminateForBacklog() {
 		if (stopPump()) {   // the first caller to close the session also disconnects the socket
-			log.debug("Control backlog overflow for {}; closing the hopelessly-behind session", id());
+			log.debug("Control backlog overflow for {} ({}); closing the hopelessly-behind session", id(), displayName());
 			Thread.ofVirtual().name("ws-close-" + id()).start(() -> {
 				try {
 					session.close(CloseStatus.POLICY_VIOLATION.withReason("send backlog"));

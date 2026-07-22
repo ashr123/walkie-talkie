@@ -41,7 +41,7 @@ public class MessageBroadcaster {
 			try {
 				member.sendEncoded(frame);
 			} catch (RuntimeException e) {
-				log.debug("Control fan-out to {} failed: {}", member.id(), e.getMessage());
+				log.debug("Control fan-out to {} ({}) failed: {}", member.id(), member.displayName(), e.getMessage());
 			}
 		}
 	}

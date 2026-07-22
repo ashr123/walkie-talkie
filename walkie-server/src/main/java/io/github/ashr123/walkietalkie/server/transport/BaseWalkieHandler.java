@@ -4,6 +4,7 @@ import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.server.session.WebSocketClientSession;
+import io.github.ashr123.walkietalkie.server.support.RequestContext;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.jspecify.annotations.NonNull;
@@ -46,7 +47,11 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 		try {
 			connectionService.onMessage(clientSession, codec.decode(message.getPayload()));
 		} catch (RuntimeException e) {
-			getLogger().debug("Bad control message from {}: {}", clientSession.id(), e.getMessage());
+			// Scope the line so it carries the member's name (and session/channel) in the MDC, like the per-message
+			// lines, instead of just the raw session id.
+			try (RequestContext.Scope _ = RequestContext.scope(clientSession)) {
+				getLogger().debug("Bad control message: {}", e.getMessage());
+			}
 			// Encode the parse-error reply with the handler's own codec (already held for decode above) — this is a
 			// transport-boundary error for a message ConnectionService never saw, so it doesn't route via the broadcaster.
 			clientSession.sendEncoded(codec.encode(new ServerMessage.ErrorMessage(ErrorCode.BAD_MESSAGE, "Could not parse control message")));
@@ -96,13 +101,20 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 	}
 
 	@Override
-	public void handleTransportError(WebSocketSession session, Throwable exception) {
-		getLogger().debug("Transport error on session {}: {}", session.getId(), exception.toString());
-		// A transport error may precede afterConnectionClosed; close the pump now (idempotent) so it can't leak.
+	public void handleTransportError(@NonNull WebSocketSession session, @NonNull Throwable exception) {
 		ClientSession clientSession = lookup(session);
-		if (clientSession != null) {
-			clientSession.close();
+		if (clientSession == null) {
+			// No registered session yet (e.g. an error around the handshake) — no member to name, nothing to close.
+			getLogger().debug("Transport error on session {}: {}", session.getId(), exception.toString());
+			return;
 		}
+		// Scope the line so it carries the member's name (and session/channel) in the MDC, like the per-message
+		// lines, instead of just the raw session id.
+		try (RequestContext.Scope _ = RequestContext.scope(clientSession)) {
+			getLogger().debug("Transport error: {}", exception.toString());
+		}
+		// A transport error may precede afterConnectionClosed; close the pump now (idempotent) so it can't leak.
+		clientSession.close();
 	}
 
 	private static void closeUnauthenticated(WebSocketSession session) {
