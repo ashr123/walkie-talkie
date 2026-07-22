@@ -13,7 +13,7 @@ plugins {
 	// (so a context that can't be AOT-processed fails the ordinary build — cheap native-readiness insurance). The
 	// `test` task still EXECUTES reflectively; `bootRun` and the boot jar execute AOT-processed (wired below);
 	// only the `native*` tasks build/run an actual native image and need a GraalVM JDK on PATH.
-	id("org.graalvm.buildtools.native") version "1.1.5"
+	id("org.graalvm.buildtools.native") version "1.1.6"
 }
 
 dependencies {
