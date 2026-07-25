@@ -1323,38 +1323,53 @@ public final class WalkieClient implements AutoCloseable {
 
 		@Override
 		public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
-			byte[] chunk = new byte[data.remaining()];
-			data.get(chunk);
-			binaryBuffer.writeBytes(chunk);
-			if (last) {
-				byte[] frame = binaryBuffer.toByteArray();
-				binaryBuffer.reset();
-				// Demultiplex by the server-prepended stream index, then strip it (before the decrypt branch)
-				// so the body handed to the engine is the same [tag][payload] / E2EE envelope a sender produced.
-				if (frame.length >= 2) {
-					int sid = frame[0] & 0xFF;
-					byte[] body = Arrays.copyOfRange(frame, 1, frame.length);
-					FrameCrypto key = crypto;   // read the volatile once — a concurrent channel switch may swap it
-					if (key == null) {
-						if (body.length > 0 && (body[0] & 0xFF) == E2EE_SCHEME) {
-							// Encrypted audio arriving while we hold no key (a plaintext->encrypted enable we haven't
-							// adopted): drop it — the engine would treat 0xE2 as an unknown codec tag and silently emit
-							// nothing — and explain once, like the browser's warnedEncryptedNoKey path.
-							if (!warnedEncryptedNoKey) {
-								warnedEncryptedNoKey = true;
-								log("[warn] received end-to-end-encrypted audio but no passphrase is set — run 'p <passphrase>' to hear it.");
-							}
-						} else {
-							audio.play(sid, body);
+			int sid = 0;
+			byte[] body = null;
+			if (last && binaryBuffer.size() == 0) {
+				// Fast path (the common case): a whole frame in one fragment — read the stream index + body straight
+				// from the ByteBuffer, skipping the BAOS accumulate + toByteArray + copyOfRange the slow path needs.
+				if (data.remaining() >= 2) {
+					sid = data.get() & 0xFF;
+					body = new byte[data.remaining()];
+					data.get(body);
+				}
+			} else {
+				// Real fragmentation: accumulate, and demultiplex only once the last fragment has arrived.
+				byte[] chunk = new byte[data.remaining()];
+				data.get(chunk);
+				binaryBuffer.writeBytes(chunk);
+				if (last) {
+					byte[] frame = binaryBuffer.toByteArray();
+					binaryBuffer.reset();
+					if (frame.length >= 2) {
+						sid = frame[0] & 0xFF;
+						body = Arrays.copyOfRange(frame, 1, frame.length);
+					}
+				}
+			}
+			// Demultiplex by the server-prepended stream index (stripped above): the body handed to the engine is
+			// the same [tag][payload] / E2EE envelope a sender produced.
+			if (body != null) {
+				FrameCrypto key = crypto;   // read the volatile once — a concurrent channel switch may swap it
+				if (key == null) {
+					if (body.length > 0 && (body[0] & 0xFF) == E2EE_SCHEME) {
+						// Encrypted audio arriving while we hold no key (a plaintext->encrypted enable we haven't
+						// adopted): drop it — the engine would treat 0xE2 as an unknown codec tag and silently emit
+						// nothing — and explain once, like the browser's warnedEncryptedNoKey path.
+						if (!warnedEncryptedNoKey) {
+							warnedEncryptedNoKey = true;
+							log("[warn] received end-to-end-encrypted audio but no passphrase is set — run 'p <passphrase>' to hear it.");
 						}
 					} else {
-						try {
-							audio.play(sid, key.decrypt(body));
-						} catch (GeneralSecurityException _) {
-							if (!warnedDecrypt) {
-								warnedDecrypt = true;
-								log("[warn] could not decrypt audio — confirm everyone uses the same --key, --channel, and --mode");
-							}
+						audio.play(sid, body);
+					}
+				} else {
+					try {
+						audio.play(sid, key.decrypt(body));
+					} catch (GeneralSecurityException _) {
+						if (!warnedDecrypt) {
+							warnedDecrypt = true;
+							log("[warn] could not decrypt audio — confirm everyone uses the same --key, --channel, and --mode");
 						}
 					}
 				}

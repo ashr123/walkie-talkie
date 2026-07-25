@@ -53,7 +53,7 @@ public final class WebSocketClientSession implements ClientSession {
 	private final String handshakeChannel;
 
 	private final BlockingQueue<Runnable> controlOut = new LinkedBlockingQueue<>(CONTROL_CAPACITY);
-	private final BlockingQueue<Runnable> audioOut = new LinkedBlockingQueue<>(AUDIO_CAPACITY);
+	private final BlockingQueue<byte[]> audioOut = new LinkedBlockingQueue<>(AUDIO_CAPACITY);
 	private final AtomicBoolean closed = new AtomicBoolean();
 	/// Counts frames waiting across both queues: a permit is released for each accepted enqueue and consumed
 	/// one-per-drain, so the single consumer parks on it (never busy-waits) and wakes only on real work. [#stopPump]
@@ -103,8 +103,8 @@ public final class WebSocketClientSession implements ClientSession {
 		for (Runnable task; (task = controlOut.poll()) != null; ) {
 			task.run();
 		}
-		for (Runnable task; (task = audioOut.poll()) != null; ) {
-			task.run();
+		for (byte[] audio; (audio = audioOut.poll()) != null; ) {
+			sendQuietly(new BinaryMessage(audio));
 		}
 	}
 
@@ -112,12 +112,14 @@ public final class WebSocketClientSession implements ClientSession {
 	/// no-op when the acquired permit was the one [#stopPump] released to wake the drainer for shutdown and both
 	/// queues are already empty.
 	private void drainOne() {
-		Runnable task = controlOut.poll();
-		if (task == null) {
-			task = audioOut.poll();
+		Runnable control = controlOut.poll();
+		if (control != null) {
+			control.run();
+			return;
 		}
-		if (task != null) {
-			task.run();
+		byte[] audio = audioOut.poll();
+		if (audio != null) {
+			sendQuietly(new BinaryMessage(audio));
 		}
 	}
 
@@ -180,10 +182,10 @@ public final class WebSocketClientSession implements ClientSession {
 		if (closed.get()) {
 			return;
 		}
-		// BinaryMessage(byte[]) wraps the array without copying (ByteBuffer.wrap under the hood) and the frame is
-		// sent exactly once, so build it directly in the send task. The relay never mutates a payload it forwards,
-		// so the shared no-copy wrap is safe even though this same array is fanned out to every recipient.
-		if (audioOut.offer(() -> sendQuietly(new BinaryMessage(audio)))) {
+		// Enqueue the payload directly — no per-frame capturing Runnable on the fan-out hot path; the drainer wraps
+		// it in a BinaryMessage (a no-copy ByteBuffer.wrap) at send time. The relay never mutates a payload it
+		// forwards, so sharing this same array across every recipient's queue is safe.
+		if (audioOut.offer(audio)) {
 			work.release();   // signal the drainer that one more frame is ready
 		} else {
 			log.debug("Audio backlog overflow for {} ({}); dropping a frame", id(), displayName());

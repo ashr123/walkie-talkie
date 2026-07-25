@@ -1409,12 +1409,23 @@ function onCapturedFrame(pcmBuffer) {
 }
 
 function sendEncoded(chunk) {
-	const buf = new ArrayBuffer(chunk.byteLength);
-	chunk.copyTo(buf);
-	sendTagged(CODEC_OPUS, new Uint8Array(buf));
+	// Build [tag][opus] in one buffer and copy the encoded chunk straight in after the tag byte — one copy,
+	// versus copying it into a throwaway ArrayBuffer and then again to prepend the tag (the sendTagged path).
+	const out = new Uint8Array(chunk.byteLength + 1);
+	out[0] = CODEC_OPUS;
+	chunk.copyTo(out.subarray(1));
+	sendFrame(out);
 }
 
 function sendTagged(tag, payloadBytes) {
+	const out = new Uint8Array(payloadBytes.length + 1);
+	out[0] = tag;
+	out.set(payloadBytes, 1);
+	sendFrame(out);
+}
+
+/// Ships one already-tagged frame (`[codec tag][payload]`), applying the transmit-gate decision and E2EE.
+function sendFrame(out) {
 	if (!isOpen()) {
 		return;
 	}
@@ -1426,9 +1437,6 @@ function sendTagged(tag, payloadBytes) {
 	if (disposition === 'drop') {
 		return;
 	}
-	const out = new Uint8Array(payloadBytes.length + 1);
-	out[0] = tag;
-	out.set(payloadBytes, 1);
 	if (disposition === 'plaintext') {
 		state.ws.send(out.buffer);
 		return;
@@ -1532,15 +1540,22 @@ function processFrame(lane, body) {
 function playbackDecoded(lane, audioData) {
 	const frames = audioData.numberOfFrames;
 	// The lane's decoder is configured to match its stream (see processFrame), so numberOfChannels is the
-	// stream's count. Copy each channel plane as f32-planar and interleave manually — the reliably supported
-	// WebCodecs path; interleaved-'f32' copyTo can mis-extract a multi-channel AudioData.
+	// stream's count.
 	const srcChannels = audioData.numberOfChannels;
 	const interleaved = new Float32Array(frames * srcChannels);
-	const plane = new Float32Array(frames);
-	for (let c = 0; c < srcChannels; c++) {
-		audioData.copyTo(plane, {planeIndex: c, format: 'f32-planar'});
-		for (let i = 0; i < frames; i++) {
-			interleaved[i * srcChannels + c] = plane[i];
+	if (srcChannels === 1) {
+		// Mono (the common case): the sole plane IS the interleaved buffer, so copy it straight in — no
+		// throwaway `plane` scratch array and no per-sample interleave loop that just copies plane[i] across.
+		audioData.copyTo(interleaved, {planeIndex: 0, format: 'f32-planar'});
+	} else {
+		// Multi-channel: copy each channel plane as f32-planar and interleave manually — the reliably
+		// supported WebCodecs path; interleaved-'f32' copyTo can mis-extract a multi-channel AudioData.
+		const plane = new Float32Array(frames);
+		for (let c = 0; c < srcChannels; c++) {
+			audioData.copyTo(plane, {planeIndex: c, format: 'f32-planar'});
+			for (let i = 0; i < frames; i++) {
+				interleaved[i * srcChannels + c] = plane[i];
+			}
 		}
 	}
 	audioData.close();

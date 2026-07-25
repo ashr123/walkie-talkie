@@ -31,7 +31,14 @@ public final class SessionRateLimiter {
 	/// the event should be dropped.
 	public boolean tryAcquire(String sessionId) {
 		Instant now = clock.instant();
-		return buckets.computeIfAbsent(sessionId, _ -> new TokenBucket(capacity, perToken, now)).tryConsume(now);
+		// Get-before-compute: in steady state the bucket already exists, so the per-frame common path skips
+		// computeIfAbsent's mapping-lambda allocation (it is built only on first touch). The miss path is still an
+		// atomic put-if-absent.
+		TokenBucket bucket = buckets.get(sessionId);
+		if (bucket == null) {
+			bucket = buckets.computeIfAbsent(sessionId, _ -> new TokenBucket(capacity, perToken, now));
+		}
+		return bucket.tryConsume(now);
 	}
 
 	/// Drops a disconnected session's bucket so the per-session map can't grow without bound.

@@ -9,7 +9,6 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
-import java.util.Arrays;
 import java.util.Base64;
 import java.util.HexFormat;
 
@@ -95,11 +94,11 @@ final class FrameCrypto {
 	byte[] encrypt(byte[] plaintext) throws GeneralSecurityException {
 		byte[] iv = new byte[IV_BYTES];
 		random.nextBytes(iv);
-		byte[] ciphertext = cipher(Cipher.ENCRYPT_MODE, iv).doFinal(plaintext);
-		byte[] out = new byte[1 + IV_BYTES + ciphertext.length];
+		byte[] out = new byte[1 + IV_BYTES + plaintext.length + TAG_BITS / Byte.SIZE];
 		out[0] = SCHEME;
 		System.arraycopy(iv, 0, out, 1, IV_BYTES);
-		System.arraycopy(ciphertext, 0, out, 1 + IV_BYTES, ciphertext.length);
+		// Write the GCM ciphertext+tag straight into the envelope — no throwaway ciphertext array + second copy.
+		cipher(Cipher.ENCRYPT_MODE, iv, 0).doFinal(plaintext, 0, plaintext.length, out, 1 + IV_BYTES);
 		return out;
 	}
 
@@ -112,14 +111,15 @@ final class FrameCrypto {
 		if (frame[0] != SCHEME) {
 			throw new GeneralSecurityException("not an end-to-end-encrypted frame (unencrypted peer or wrong scheme)");
 		}
-		return cipher(Cipher.DECRYPT_MODE, Arrays.copyOfRange(frame, 1, 1 + IV_BYTES))
+		// Point the GCM spec at the IV in place (frame[1 .. 1+IV_BYTES]) — no Arrays.copyOfRange.
+		return cipher(Cipher.DECRYPT_MODE, frame, 1)
 				.doFinal(frame, 1 + IV_BYTES, frame.length - 1 - IV_BYTES);
 	}
 
 	/// Deterministic encryption with a caller-supplied IV, returning just the raw GCM output (ciphertext+tag,
 	/// no scheme/IV envelope) — only for the cross-platform known-answer test, which pins the bare crypto.
 	byte[] encryptWithIv(byte[] iv, byte[] plaintext) throws GeneralSecurityException {
-		return cipher(Cipher.ENCRYPT_MODE, iv).doFinal(plaintext);
+		return cipher(Cipher.ENCRYPT_MODE, iv, 0).doFinal(plaintext);
 	}
 
 	/// Wrap a passphrase under THIS key for an owner-initiated re-key: base64 of the frame envelope around the
@@ -136,9 +136,9 @@ final class FrameCrypto {
 		return new String(decrypt(Base64.getDecoder().decode(wrapped)), StandardCharsets.UTF_8);
 	}
 
-	private Cipher cipher(int mode, byte[] iv) throws GeneralSecurityException {
+	private Cipher cipher(int mode, byte[] ivSource, int ivOffset) throws GeneralSecurityException {
 		Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-		cipher.init(mode, key, new GCMParameterSpec(TAG_BITS, iv));
+		cipher.init(mode, key, new GCMParameterSpec(TAG_BITS, ivSource, ivOffset, IV_BYTES));
 		cipher.updateAAD(AAD);   // bind the scheme byte into the tag — a tampered/forged envelope then fails the auth check
 		return cipher;
 	}

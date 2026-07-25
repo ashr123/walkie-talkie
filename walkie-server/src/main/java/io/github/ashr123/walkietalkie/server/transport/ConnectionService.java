@@ -516,6 +516,12 @@ public class ConnectionService {
 	void releaseExpiredFloors() {
 		Instant now = clock.instant();
 		for (Channel channel : channelRegistry.channels()) {
+			// Cheap lock-free skip: a provably-idle channel (no holder, no running reservation) has zero sweep work,
+			// so avoid opening a logging scope and taking its monitor for it. Every step below still re-checks under
+			// the monitor, so a channel that turns active right after this read is simply handled on the next tick.
+			if (channel.hasNoSweepWork()) {
+				continue;
+			}
 			// Tag every line this per-channel pass logs with channel=… in the MDC, the way the per-message handler
 			// lines are (the channel is logging context, not identity — see RequestContext). The sweep runs on a
 			// scheduler thread with no acting client, so identity stays "system"; the AFFECTED member is named as
@@ -539,7 +545,7 @@ public class ConnectionService {
 					if (!freed
 							&& !floorIdleRelease.isZero()
 							&& channel.isFloorQueueEnabled()
-							&& !channel.floorQueue().isEmpty()
+							&& !channel.isFloorQueueEmpty()
 							&& channel.floorHolder() instanceof Some(String holderId)
 							&& channel.member(holderId) instanceof Some(ClientSession holder)
 							&& holder.supportsAudioRelay()) {

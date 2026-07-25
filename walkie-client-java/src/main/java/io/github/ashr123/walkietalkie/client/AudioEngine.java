@@ -278,7 +278,11 @@ final class AudioEngine implements AutoCloseable {
 					// keep the existing encoder if the rebuild fails
 				}
 			}
-			ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(pcm);
+			// Widen the little-endian S16LE capture bytes into the reused pcm[] by hand — avoids a per-frame
+			// HeapByteBuffer (wrap) + ShortBuffer view allocation.
+			for (int i = 0; i < pcm.length; i++) {
+				pcm[i] = (short) ((buffer[2 * i] & 0xFF) | (buffer[2 * i + 1] << 8));
+			}
 			try {
 				// frame size is samples *per channel*; pcm holds frameSamples interleaved shorts.
 				int len = encoder.encode(pcm, 0, SAMPLES_PER_CHANNEL, packet, 0, packet.length);

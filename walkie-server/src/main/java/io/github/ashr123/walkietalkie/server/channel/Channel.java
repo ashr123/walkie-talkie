@@ -5,14 +5,12 @@ import io.github.ashr123.option.Option;
 import io.github.ashr123.option.OptionInt;
 import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
+import io.github.ashr123.walkietalkie.server.transport.ConnectionService;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 
 import java.time.Instant;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
@@ -32,7 +30,7 @@ public final class Channel {
 	/// whose identifier is missing. (They used to live in two maps mutated in separate steps, which let such a
 	/// reader catch a member mid-join/mid-leave without an index.)
 	private final Map<String, Member> members = new ConcurrentHashMap<>();
-	/// Stream-index pool for [#allocateStreamIndex]/[#freeStreamIndex] (both synchronized): a monotonic rotating
+	/// Stream-index pool for [#allocateStreamIndex]/[#freeStreamIndex] (both under the channel monitor): a monotonic rotating
 	/// cursor that skips live indices avoids reusing a just-freed index until it has cycled the whole range —
 	/// quarantining recycled indices so a new talker can't inherit a departed member's still-in-flight frames.
 	private final boolean[] indexInUse = new boolean[STREAM_INDEX_RANGE];
@@ -105,7 +103,7 @@ public final class Channel {
 	// is free (`floorHolder == null`): the server reserves the head the instant the floor frees, so there is no
 	// "free, queue non-empty, nobody reserved" state — hence no stored reserved-id.
 	private volatile boolean floorQueueEnabled;
-	private final LinkedHashSet<String> floorQueue = new LinkedHashSet<>();
+	private final SequencedSet<String> floorQueue = new LinkedHashSet<>();
 	// When the current head's reservation (claim window) started — the basis for the reservation-expiry sweep;
 	// EPOCH when nobody is reserved. Stamped under the monitor by the reserve/acquire paths, read (under the
 	// monitor) by the sweep; volatile for cross-thread visibility of the last write.
@@ -168,10 +166,11 @@ public final class Channel {
 	/// remapping (which also holds this channel's monitor): same-channel add/remove are serialized by that bin
 	/// lock, which makes the idempotency check-then-put race-free (a re-add keeps the existing index).
 	public void add(ClientSession session) {
-		if (members.containsKey(session.id())) {
-			return;   // idempotent — the member keeps the index it already has
-		}
-		members.put(session.id(), new Member(session, allocateStreamIndex()));
+		// Atomic put-if-absent on the members map's own bin lock (one lookup, not containsKey + put). The value
+		// factory runs ONLY on the absent path, so an idempotent re-add keeps the existing Member — and its stream
+		// index — and never allocates a fresh index. allocateStreamIndex mutates the index pool under the caller's
+		// channel monitor (ChannelRegistry.joinOrCreate holds it), so it is safe inside the compute lambda.
+		members.computeIfAbsent(session.id(), _ -> new Member(session, allocateStreamIndex()));
 	}
 
 	public void remove(String sessionId) {
@@ -190,7 +189,7 @@ public final class Channel {
 			// still identifiable), end its claim window so the next head gets a fresh one from the caller's
 			// reserveHead. A mid-queue leaver does NOT reset (it keeps the running head's window). The caller
 			// (ConnectionService.handleLeave) then re-reserves + re-broadcasts FloorStatus after this removal.
-			boolean wasReservedHead = floorHolder == null && !floorQueue.isEmpty() && sessionId.equals(floorQueue.getFirst());
+			boolean wasReservedHead = isHeadOfferedFloor(sessionId);
 			floorQueue.remove(sessionId);
 			if (wasReservedHead) {
 				floorReservedAt = Instant.EPOCH;
@@ -202,7 +201,7 @@ public final class Channel {
 			// its member (a leak that would otherwise linger for the channel's lifetime, session ids being unique).
 			mutedMembers.remove(sessionId);
 			if (removed != null) {
-				freeStreamIndex(removed.streamIndex());   // return the slot to the pool (reentrant — also synchronized)
+				freeStreamIndex(removed.streamIndex());   // return the slot to the pool (under this monitor)
 			}
 		}
 	}
@@ -254,7 +253,9 @@ public final class Channel {
 		return members.size() >= STREAM_INDEX_RANGE;
 	}
 
-	private synchronized int allocateStreamIndex() {
+	/// Takes a fresh stream index from the pool. Call ONLY under the channel monitor: `indexInUse`/`rotation` are
+	/// guarded by the monitor (the sole path joinOrCreate -> add holds it), not by this method itself.
+	private int allocateStreamIndex() {
 		for (int probe = 0; probe < STREAM_INDEX_RANGE; probe++) {
 			int candidate = rotation;
 			rotation = (rotation + 1) % STREAM_INDEX_RANGE;
@@ -269,7 +270,8 @@ public final class Channel {
 		throw new IllegalStateException("stream-index space exhausted for channel '" + name + "' despite the membership cap");
 	}
 
-	private synchronized void freeStreamIndex(int index) {
+	/// Returns a stream index to the pool. Call ONLY under the channel monitor (see [#allocateStreamIndex]).
+	private void freeStreamIndex(int index) {
 		indexInUse[index] = false;
 	}
 
@@ -309,18 +311,22 @@ public final class Channel {
 
 	/// Applies an action to every member except the one with `excludeSessionId`.
 	public void forEachOther(String excludeSessionId, Consumer<? super ClientSession> action) {
-		members.values().stream()
-				.map(Member::session)
-				.filter(session -> !session.id().equals(excludeSessionId))
-				.forEach(action);
+		// Plain loop over the members view (weakly-consistent, same as a stream) — no per-frame Stream pipeline,
+		// map/filter stage objects, spliterator, or capturing filter lambda on the audio fan-out hot path.
+		for (Member member : members.values()) {
+			ClientSession session = member.session();
+			if (!session.id().equals(excludeSessionId)) {
+				action.accept(session);
+			}
+		}
 	}
 
 	/// Applies an action to **every** member (including any current floor holder) — used to broadcast a floor
 	/// release/reset to the whole channel.
 	public void forEach(Consumer<? super ClientSession> action) {
-		members.values().stream()
-				.map(Member::session)
-				.forEach(action);
+		for (Member member : members.values()) {
+			action.accept(member.session());
+		}
 	}
 
 	/// Attempts to acquire the talk floor, stamping the acquire + activity marks **atomically** with the holder
@@ -334,7 +340,7 @@ public final class Channel {
 		// reserved head claiming its turn. A non-head can NOT jump a reserved floor — it must enqueue instead —
 		// so the FIFO order the queue promises is honoured. Whole method holds the monitor, so the check-and-set
 		// (and the queue read) are atomic w.r.t. concurrent enqueue/release/reserve.
-		if (floorHolder == null && (floorQueue.isEmpty() || sessionId.equals(headOfQueue()))) {
+		if (canAcquireFreeFloor(sessionId)) {
 			floorHolder = sessionId;
 			floorQueue.remove(sessionId);       // the claimant leaves the queue (no-op for a plain grab)
 			floorAcquiredAt = now;
@@ -430,6 +436,23 @@ public final class Channel {
 		return floorQueue.getFirst();
 	}
 
+	/// Whether the floor is free and the queue head is therefore the member currently offered the next turn.
+	/// Call only under the monitor.
+	private boolean hasHeadOfferedFloor() {
+		return floorHolder == null && !isFloorQueueEmpty();
+	}
+
+	/// Whether `sessionId` is that currently-offered queue head; call only under the monitor.
+	private boolean isHeadOfferedFloor(String sessionId) {
+		return hasHeadOfferedFloor() && sessionId.equals(headOfQueue());
+	}
+
+	/// Whether `sessionId` may take the floor right now: a plain grab on a free floor with no queue, or the
+	/// currently-offered head claiming its reserved turn. Call only under the monitor.
+	private boolean canAcquireFreeFloor(String sessionId) {
+		return floorHolder == null && (isFloorQueueEmpty() || sessionId.equals(headOfQueue()));
+	}
+
 	public boolean isFloorQueueEnabled() {
 		return floorQueueEnabled;
 	}
@@ -460,7 +483,7 @@ public final class Channel {
 	/// unfairly restart the running head's window). Computed BEFORE the removal so the head is still identifiable.
 	/// Under the monitor.
 	public synchronized boolean dequeueFloor(String sessionId) {
-		boolean wasReservedHead = floorHolder == null && !floorQueue.isEmpty() && sessionId.equals(headOfQueue());
+		boolean wasReservedHead = isHeadOfferedFloor(sessionId);
 		boolean removed = floorQueue.remove(sessionId);
 		if (removed && wasReservedHead) {
 			floorReservedAt = Instant.EPOCH;
@@ -478,7 +501,7 @@ public final class Channel {
 	/// it: a fresh window is stamped only when the head genuinely changed (the previous head was claimed/removed,
 	/// which reset the clock to EPOCH — see [#tryAcquireFloor], [#dequeueFloor], [#remove]). Under the monitor.
 	public synchronized String reserveHead(Instant now) {
-		if (floorHolder != null || floorQueue.isEmpty() || !floorReservedAt.equals(Instant.EPOCH)) {
+		if (!hasHeadOfferedFloor() || !floorReservedAt.equals(Instant.EPOCH)) {
 			return null;
 		}
 		floorReservedAt = now;
@@ -509,8 +532,7 @@ public final class Channel {
 	/// reserved" transient (the monitor gap in a leave/mute, before the caller's `reserveHead` runs), so the sweep
 	/// cannot drop the rightful head out from under a concurrent re-reservation.
 	public synchronized String expiredReservationHead(Instant reservedAtOrBefore) {
-		return floorHolder != null
-				|| floorQueue.isEmpty()
+		return !hasHeadOfferedFloor()
 				|| floorReservedAt.equals(Instant.EPOCH)
 				|| floorReservedAt.isAfter(reservedAtOrBefore)
 				? null
@@ -523,11 +545,23 @@ public final class Channel {
 		return List.copyOf(floorQueue);
 	}
 
+	public synchronized boolean isFloorQueueEmpty() {
+		return floorQueue.isEmpty();
+	}
+
+	/// Cheap lock-free check for the 1 Hz [ConnectionService] floor sweep: true when this channel can have NO floor
+	/// work — no holder (nothing to max-hold or idle-release) and no running reservation (nothing to expire), so the
+	/// sweep can skip it without opening a logging scope or taking the monitor. Reads the two volatiles directly; a
+	/// racy false result (the channel turns active right after the read) is harmless — the next 1 s tick catches it.
+	public boolean hasNoSweepWork() {
+		return floorHolder == null && floorReservedAt.equals(Instant.EPOCH);
+	}
+
 	/// The member currently offered the floor (the head, while the floor is free), or [io.github.ashr123.option.None].
 	/// Derived, not stored: reserved is exactly the head whenever `floorHolder == null` (the server reserves the
 	/// head the instant the floor frees). Under the monitor.
 	public synchronized Option<String> reservedHolder() {
-		return Option.of(floorHolder == null && !floorQueue.isEmpty() ? headOfQueue() : null);
+		return Option.of(hasHeadOfferedFloor() ? headOfQueue() : null);
 	}
 
 	/// When the current head's reservation started (basis for the claim-window expiry); EPOCH if nobody reserved.
