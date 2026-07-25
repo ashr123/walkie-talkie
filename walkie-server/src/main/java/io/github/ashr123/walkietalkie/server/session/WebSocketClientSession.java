@@ -164,6 +164,15 @@ public final class WebSocketClientSession implements ClientSession {
 	}
 
 	@Override
+	public boolean isOpen() {
+		// `closed` is flipped by close()/terminateForBacklog() at teardown; once set, a late inbound frame must not
+		// resurrect per-session server state. afterConnectionClosed calls close() BEFORE ConnectionService.onClose
+		// (which forgets the rate-limiter buckets), so this reads false throughout that forget() — the control-path
+		// guard in onMessage is authoritative, not merely reliant on the container serializing inbound vs. close.
+		return !closed.get();
+	}
+
+	@Override
 	public void sendEncoded(String encoded) {
 		if (closed.get()) {
 			return;

@@ -139,10 +139,13 @@ public final class WalkieClient implements AutoCloseable {
 	private volatile ChannelMode currentMode;
 	private volatile String currentChannel;     // server-confirmed current channel (updated on Joined)
 	// The channel/mode this socket (re)connects and joins as: the ?channel= routing key at the handshake AND the
-	// Join sent from onOpen. Distinct from currentChannel/currentMode (server-CONFIRMED) — switchTo advances these
-	// to the target OPTIMISTICALLY so a CHANNEL_ROUTING_MISMATCH reconnect rebuilds against the channel we asked for.
-	private volatile String connectChannel;
-	private volatile ChannelMode connectMode;
+	// Join sent from onOpen. Distinct from currentChannel/currentMode (server-CONFIRMED) — switchTo advances this
+	// to the target OPTIMISTICALLY so a CHANNEL_ROUTING_MISMATCH reconnect rebuilds against the channel we asked
+	// for. Held as ONE volatile record (like floorSnapshot) so channel + mode always move together: the console
+	// thread writes it in switchTo while the reconnect/onOpen thread reads it in connect()/sendJoin(), and two
+	// separate volatiles let a second switchTo racing an in-flight reconnect pair a new channel with the old mode
+	// (only under channel-affinity, and self-healing, but the record removes the class outright).
+	private volatile ConnectTarget connectTarget;
 	private volatile String currentPassphrase;   // passphrase backing the current channel's key (for switch defaults)
 	private volatile String currentChannelKeyCheck;   // the channel's currently-announced key-check (null = unencrypted); the yardstick a member re-keys against
 	private volatile boolean rekeyInFlight;      // true between sending our own ChangePassphrase (owner) and its echoed PassphraseChanged
@@ -154,13 +157,13 @@ public final class WalkieClient implements AutoCloseable {
 	private volatile boolean welcomeShown;  // print the role-aware help once, after the first Joined reveals our role (same listener-thread-only-but-volatile rationale as warnedDecrypt)
 	private volatile boolean channelLocked; // whether the owner has locked the channel to new members (from Joined/ChannelLocked); volatile — set on the listener thread, read on the console thread for 'w'
 	// --- Push-to-talk floor snapshot (the authoritative ServerMessage.FloorStatus, from which ALL floor UI is
-	// derived — see floorStateFor). Published by the listener thread (handleFloorStatus / handleFloorQueueChanged /
-	// the Joined handler) and read on the console thread by the state-driven `t` control (toggleTalk). volatile for
-	// cross-thread visibility, mirroring currentMode/crypto; each field is read ONCE into a local before use.
-	private volatile String floorHolderId;   // the live holder's session id, or null when nobody is talking
-	// The FIFO floor queue in order (empty = the queue is off or nobody is waiting). Holds an IMMUTABLE copy
-	// (List.copyOf on every write) so a reader never observes a half-built list across the volatile publish.
-	private volatile List<String> floorWaiting = List.of();
+	// derived — see floorStateFor). Published by the listener thread (handleFloorStatus / the Joined handler) and
+	// read on the console thread by the state-driven `t` control (toggleTalk). Held as ONE volatile record so the
+	// holder and the queue always move together: two separate volatiles let the console thread pair a freshly
+	// published holder with the OLD queue (or vice versa) mid-publish and derive the wrong FloorState — e.g. sending
+	// ReleaseFloor instead of RequestFloor and dropping a floor the user just reserved. volatile for cross-thread
+	// visibility, mirroring currentMode/crypto; read ONCE into a local before use.
+	private volatile FloorSnapshot floorSnapshot = FloorSnapshot.IDLE;
 	private volatile boolean floorQueueEnabled;   // whether the owner-toggleable floor queue is on (from Joined / FloorQueueChanged)
 	// Set when the server tells us it's our turn (FloorReserved / a FloorStatus that makes us the reserved head);
 	// cleared when we claim (FloorGranted / a FloorStatus showing us live) or when the window lapses and the next
@@ -185,8 +188,7 @@ public final class WalkieClient implements AutoCloseable {
 				.build();
 		this.currentMode = options.mode();
 		this.currentChannel = options.channel();
-		this.connectChannel = options.channel();
-		this.connectMode = options.mode();
+		this.connectTarget = new ConnectTarget(options.channel(), options.mode());
 		this.currentPassphrase = options.key();
 		this.audio = new AudioEngine(options, this::sendAudioFrame);
 		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
@@ -304,6 +306,19 @@ public final class WalkieClient implements AutoCloseable {
 		};
 	}
 
+	/// The authoritative floor snapshot — the live holder's id (`null` when nobody is talking) and the FIFO queue —
+	/// held as ONE immutable value so the console thread's `t` control always reads a consistent (holder, waiting)
+	/// pair (see [#floorSnapshot]). The publisher stores `waiting` as an immutable copy.
+	record FloorSnapshot(String holder, List<String> waiting) {
+		static final FloorSnapshot IDLE = new FloorSnapshot(null, List.of());
+	}
+
+	/// The channel + mode this socket (re)connects and joins as (see [#connectTarget]) — one immutable value so the
+	/// console thread (switchTo) and the reconnect/onOpen thread (connect / sendJoin) never pair a fresh channel
+	/// with a stale mode.
+	record ConnectTarget(String channel, ChannelMode mode) {
+	}
+
 	private static ChannelMode parseMode(String arg, ChannelMode fallback) {
 		return switch (arg.toLowerCase(Locale.ROOT)) {
 			case "ptt", "multi" -> ChannelMode.MULTI_CHANNEL_PTT;
@@ -407,8 +422,7 @@ public final class WalkieClient implements AutoCloseable {
 					// Clear the stale floor snapshot from the OLD channel. The server sends a fresh authoritative
 					// FloorStatus right after this Joined (to-one), so it re-seeds immediately; this just stops the
 					// `t` control acting on the previous channel's holder/queue in the interim.
-					floorHolderId = null;
-					floorWaiting = List.of();
+					floorSnapshot = FloorSnapshot.IDLE;
 					awaitingClaim = false;
 				}
 				memberNames.clear();
@@ -526,7 +540,7 @@ public final class WalkieClient implements AutoCloseable {
 					case CHANNEL_FULL -> exitGracefully("This channel is full — it has reached its member limit.");
 					// The target channel lives on another instance (channel affinity): an in-place switch can't reach
 					// it, so reconnect — a fresh handshake carrying ?channel=<target> is routed to the owning instance,
-					// and switchTo already applied the target's mode/key + advanced connectChannel/connectMode so the
+					// and switchTo already applied the target's mode/key + advanced connectTarget so the
 					// re-join lands us in it. A single instance never emits this code, so this path stays dormant there.
 					case CHANNEL_ROUTING_MISMATCH -> reconnect();
 					// Every other code — including UNKNOWN, the fallback the mapper substitutes for a code a NEWER
@@ -547,10 +561,10 @@ public final class WalkieClient implements AutoCloseable {
 	/// source of that "you were released" truth: the old imperative `FloorTaken`/`FloorIdle` triggers are retired, so
 	/// the only signal that our floor was taken away is the holder in the next snapshot no longer being us.
 	private void handleFloorStatus(String holderId, List<String> waiting) {
-		// Publish the snapshot. floorWaiting stores an immutable copy so the console thread never sees a half-built
-		// list; the two volatile writes are read back independently there (each once into a local).
-		floorHolderId = holderId;
-		floorWaiting = List.copyOf(waiting);
+		// Publish the snapshot in ONE volatile write, holder + queue together, so the console thread's `t` control
+		// can't pair a new holder with the old queue. The queue is an immutable copy, so a reader never sees a
+		// half-built list.
+		floorSnapshot = new FloorSnapshot(holderId, List.copyOf(waiting));
 
 		String self = selfId;
 		boolean released = audio.isTransmitting() && currentMode != ChannelMode.FULL_DUPLEX && !self.equals(holderId);
@@ -754,17 +768,27 @@ public final class WalkieClient implements AutoCloseable {
 			return;
 		}
 		if (currentMode == ChannelMode.FULL_DUPLEX) {
-			// Full-duplex has no floor: `t` is a plain mic mute/unmute toggle (unchanged).
+			// Full-duplex has no floor: `t` is a plain mic mute/unmute toggle. Opening the mic races the listener
+			// thread's owner-mute handler (handleMuteChange adds us to mutedMembers, THEN stops the mic): a mute that
+			// lands after the guard above but before this write would otherwise be overwritten, leaving the mic live
+			// while muted — a privacy leak. So after opening, re-check mutedMembers and back off. Because the handler
+			// adds to the set before it stops the mic, either the mute is already visible here (we undo it) or it
+			// isn't yet and its later setTransmitting(false) runs after ours and wins — the mic ends OFF either way.
 			boolean live = !audio.isTransmitting();
 			audio.setTransmitting(live);
+			if (live && mutedMembers.contains(selfId)) {
+				audio.setTransmitting(false);
+				live = false;
+			}
 			log(live ? "[talking]" : "[stopped]");
 			return;
 		}
-		// Push-to-talk: read the floor snapshot ONCE off the volatiles (the listener thread may update it under us),
-		// derive our state, and send the message that state dictates.
+		// Push-to-talk: read the floor snapshot ONCE (the listener thread may replace it under us), derive our
+		// state, and send the message that state dictates. One volatile read gives a consistent holder+queue pair.
 		String self = selfId;
-		String holder = floorHolderId;
-		List<String> waiting = floorWaiting;
+		FloorSnapshot snap = floorSnapshot;
+		String holder = snap.holder();
+		List<String> waiting = snap.waiting();
 		FloorState state = floorStateFor(self, holder, waiting);
 		switch (state) {
 			case LIVE -> {
@@ -992,8 +1016,7 @@ public final class WalkieClient implements AutoCloseable {
 			// Advance the (re)connect target too, optimistically like crypto above: if the server refuses this
 			// in-place switch with CHANNEL_ROUTING_MISMATCH (the target lives on another instance under channel
 			// affinity), reconnect() rebuilds the socket against exactly this channel/mode and onOpen re-joins it.
-			connectChannel = channel;
-			connectMode = mode;
+			connectTarget = new ConnectTarget(channel, mode);   // one volatile write: channel + mode never tear apart for the reconnect thread
 			// Do NOT advance currentChannelKeyCheck here: leave it at the OLD channel's value until the server
 			// confirms the switch (the Joined handler baselines it). The server still routes our audio to the OLD
 			// channel during the join round-trip, so if we're switching OUT of an encrypted channel to a plaintext
@@ -1144,7 +1167,8 @@ public final class WalkieClient implements AutoCloseable {
 		// socket to the instance that owns the channel (see the server's ChannelHandshakeInterceptor). Harmless
 		// single-instance. Global forces the routing key to "global", matching the Join's effective channel. Reads
 		// the connect target (not options) so a reconnect routes to the channel we switched to, not the startup one.
-		String routingChannel = connectMode == ChannelMode.GLOBAL_PTT ? "global" : connectChannel;
+		ConnectTarget target = connectTarget;   // read the pair once — channel + mode consistent
+		String routingChannel = target.mode() == ChannelMode.GLOBAL_PTT ? "global" : target.channel();
 		return httpClient.newWebSocketBuilder()
 				.buildAsync(
 						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio"
@@ -1160,11 +1184,12 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	private void sendJoin() {
-		// (Re)announce us on this socket's target channel. connectChannel/connectMode (not options) so a reconnect
-		// joins the channel we switched to; the current display (not options.display()) so a rename survives it.
+		// (Re)announce us on this socket's target channel. connectTarget (not options) so a reconnect joins the
+		// channel we switched to; the current display (not options.display()) so a rename survives it.
+		ConnectTarget target = connectTarget;   // read the pair once — channel + mode consistent
 		enqueue(new ClientMessage.Join(
-				connectChannel,
-				connectMode,
+				target.channel(),
+				target.mode(),
 				memberNames.getOrDefault(selfId, options.display()),
 				crypto == null ? null : crypto.keyCheck()
 		));
@@ -1205,7 +1230,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// Rebuilds the relay socket against the current connect target and re-joins it. Triggered by
 	/// `CHANNEL_ROUTING_MISMATCH`: under channel affinity the target channel lives on another instance, so only a
 	/// fresh handshake — carrying `?channel=<target>` — is routed to the owning instance; an in-place switch can't
-	/// reach it. [#switchTo] already applied the target's mode/key and advanced [#connectChannel]/[#connectMode], so
+	/// reach it. [#switchTo] already applied the target's mode/key and advanced [#connectTarget], so
 	/// [ClientListener#onOpen]'s [#sendJoin] lands us straight in it.
 	///
 	/// Runs on its own virtual thread — never the listener callback thread (whose executor [#connect]'s `join()`
@@ -1216,7 +1241,7 @@ public final class WalkieClient implements AutoCloseable {
 		if (!reconnecting.compareAndSet(false, true)) {
 			return;   // a reconnect is already in flight; ignore piled-up mismatches
 		}
-		log("[switch] \"" + connectChannel + "\" is served by another instance — reconnecting to reach it...");
+		log("[switch] \"" + connectTarget.channel() + "\" is served by another instance — reconnecting to reach it...");
 		Thread.ofVirtual().name("ptt-reconnect").start(() -> {
 			try {
 				WebSocket previous = webSocket;
@@ -1225,7 +1250,7 @@ public final class WalkieClient implements AutoCloseable {
 				}
 				webSocket = connect(login());   // onOpen publishes the new socket + re-joins the target via sendJoin()
 			} catch (IOException | RuntimeException e) {
-				log("[reconnect] could not switch to \"" + connectChannel + "\": " + e.getMessage());
+				log("[reconnect] could not switch to \"" + connectTarget.channel() + "\": " + e.getMessage());
 				onConnectionLost();
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();

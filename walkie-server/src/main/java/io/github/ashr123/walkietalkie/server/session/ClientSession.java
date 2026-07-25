@@ -27,6 +27,15 @@ public interface ClientSession {
 
 	boolean supportsAudioRelay();
 
+	/// Whether this session is still live (its socket open / not torn down). Unlike [#channelName] (which is also
+	/// null before the first join), this is a lifecycle-wide signal, so a control-path caller can drop a late frame
+	/// from an already-closed session before it resurrects per-session state (e.g. a [SessionRateLimiter] bucket
+	/// after [io.github.ashr123.walkietalkie.server.transport.ConnectionService#onClose] forgot it). In-memory
+	/// fakes send synchronously and are always considered open.
+	default boolean isOpen() {
+		return true;
+	}
+
 	/// Enqueues an already-serialized control message (its JSON wire form) as a text frame. All control goes out
 	/// through [io.github.ashr123.walkietalkie.server.transport.MessageBroadcaster], which owns the codec and
 	/// encodes ONCE (so a channel fan-out costs one encode, not one per recipient); this session is a dumb sink

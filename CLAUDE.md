@@ -320,8 +320,9 @@ it already hosts (`channelRegistry.find` present ⇒ that channel routes here by
 refuses a switch to a channel owned elsewhere with `CHANNEL_ROUTING_MISMATCH` (client reconnects, ingress
 re-pins). The flag defaults **false** (single instance): the check is skipped and in-place switches work as
 before. Tokens are already stateless (share `WALKIE_AUTH_SIGNING_KEY`). **The Java client auto-reconnects on
-`CHANNEL_ROUTING_MISMATCH`**: `WalkieClient.switchTo` advances the connect target (`connectChannel`/`connectMode`,
-distinct from the server-confirmed `currentChannel`/`currentMode`) and applies the target's key optimistically;
+`CHANNEL_ROUTING_MISMATCH`**: `WalkieClient.switchTo` advances the connect target (`connectTarget`, a single
+`ConnectTarget(channel, mode)` record so the pair can't tear across the console/reconnect threads; distinct from
+the server-confirmed `currentChannel`/`currentMode`) and applies the target's key optimistically;
 on the mismatch, `reconnect()` (its own virtual thread — not the listener callback) closes the socket and opens a
 fresh one carrying `?channel=<target>`, whose `onOpen` re-joins the target. A `reconnecting` flag makes the old
 socket's `onClose` a no-op (not a lost connection → no process exit) and collapses a burst of mismatches into one

@@ -96,6 +96,13 @@ public class ConnectionService {
 	/// surfaced on the log lines emitted while handling it (via the MDC) — see [RequestContext#scope]. The audio
 	/// relay path ([#onAudio]) is deliberately not scoped, to avoid per-frame MDC churn.
 	public void onMessage(ClientSession session, ClientMessage message) {
+		// Drop a late frame from an already-closed session before touching the rate limiter: tryAcquire's
+		// computeIfAbsent would otherwise re-create a bucket for a session onClose already forgot, leaking one map
+		// entry that is never forgotten again (the audio path guards the same resurrection at its own tryAcquire,
+		// keyed off channelName — which can't be used here, since Join arrives before this session has a channel).
+		if (!session.isOpen()) {
+			return;
+		}
 		// Per-session control-plane flood guard: drop messages from a sender over its rate ceiling BEFORE doing
 		// any work (dispatch, broadcasts, the MDC scope), so a control flood — e.g. a rename storm fanning out to
 		// the whole channel — can't amplify cost. Dropped silently, like the audio guard (replying would itself
@@ -294,10 +301,14 @@ public class ConnectionService {
 	}
 
 	private void handleLeave(ClientSession session) {
-		if (session.channelName() == null) {
+		// Snapshot channelName ONCE: it feeds the null-guard, find(), and leave() below, and a concurrent
+		// onClose/switch nulling it between those reads would turn find(null)/leave(null) into a ConcurrentHashMap
+		// null-key NPE (the same hazard fixed in onAudio / handleTransferOwnership's local-first form).
+		String channelName = session.channelName();
+		if (channelName == null) {
 			return;
 		}
-		Option<Channel> channelBeforeLeave = channelRegistry.find(session.channelName());
+		Option<Channel> channelBeforeLeave = channelRegistry.find(channelName);
 		// Remove the member + re-elect an owner atomically in the registry, THEN announce — broadcasting MemberLeft
 		// only AFTER the removal closes the ghost-member window: a member joining between an earlier broadcast and
 		// the removal could otherwise snapshot a roster still containing the leaver yet never receive its MemberLeft.
@@ -306,7 +317,7 @@ public class ConnectionService {
 		// the next head gets a fresh window). We must NOT hold the channel monitor across channelRegistry.leave (the
 		// registry takes its bin lock then this monitor, so the reverse order deadlocks — see the lock-order note on
 		// Channel), so the floor teardown runs AFTER the removal, on LIVE state.
-		boolean ownerChanged = channelRegistry.leave(session.channelName(), session.id()) instanceof Some<String>;
+		boolean ownerChanged = channelRegistry.leave(channelName, session.id()) instanceof Some<String>;
 		if (channelBeforeLeave instanceof Some(Channel channel)) {
 			// Announce to the survivors of the SAME channel object the leave acted on — NOT a fresh find()-by-name,
 			// which could resolve a dropped-and-recreated same-named channel and notify its members instead.
@@ -590,11 +601,16 @@ public class ConnectionService {
 	/// is dropped when the sender is not currently authorized to talk (push-to-talk floor not held), when
 	/// the owner has muted the sender, or when it violates the configured size bounds.
 	public void onAudio(ClientSession session, byte[] audio) {
+		// Read channelName ONCE into a local: the null-check and the registry lookup below both need it, and a
+		// concurrent onClose/leave (leftChannel() → null) landing between two separate reads would turn the second
+		// into find(null) → ConcurrentHashMap.get(null) → NPE, thrown on the per-frame audio hot path with no
+		// try/catch above it (handleBinaryMessage doesn't catch). One read also keeps the whole gate consistent.
+		String channelName = session.channelName();
 		if (!session.supportsAudioRelay()
 				|| audio.length == 0
 				|| audio.length > properties.maxAudioFrameBytes()
-				|| session.channelName() == null
-				|| !(channelRegistry.find(session.channelName()) instanceof Some(Channel channel))
+				|| channelName == null
+				|| !(channelRegistry.find(channelName) instanceof Some(Channel channel))
 				|| !channel.holdsFloor(session.id())
 				// Owner-enforced mute: drop the frame server-side so a muted member (PTT holder or any
 				// full-duplex talker) can't route audio around a client that ignores its own mute. This is a
@@ -776,11 +792,12 @@ public class ConnectionService {
 	/// so a brief transition where some members hold the new key and others the old just drops a few GCM-failing
 	/// frames, exactly as a channel switch does.
 	private void handleChangePassphrase(ClientSession session, String keyCheck, String wrappedKey) {
-		if (session.channelName() == null) {
+		String channelName = session.channelName();   // snapshot once: a concurrent leave nulling it would make changePassphrase(null,…) NPE
+		if (channelName == null) {
 			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			return;
 		}
-		switch (channelRegistry.changePassphrase(session.channelName(), session.id(), keyCheck)) {
+		switch (channelRegistry.changePassphrase(channelName, session.id(), keyCheck)) {
 			case ChannelRegistry.RekeyResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.RekeyResult.NotOwner _ ->
 					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can change the passphrase");
@@ -972,11 +989,12 @@ public class ConnectionService {
 	/// channel's LIVE lock state, so two back-to-back toggles converge — a delayed broadcast carries the current
 	/// value rather than leaving a member gating against a stale one.
 	private void handleSetLocked(ClientSession session, boolean locked) {
-		if (session.channelName() == null) {
+		String channelName = session.channelName();   // snapshot once: a concurrent leave nulling it would make setLocked(null,…) NPE
+		if (channelName == null) {
 			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			return;
 		}
-		switch (channelRegistry.setLocked(session.channelName(), session.id(), locked)) {
+		switch (channelRegistry.setLocked(channelName, session.id(), locked)) {
 			case ChannelRegistry.LockResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.LockResult.NotOwner _ ->
 					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can lock the channel");
@@ -1042,7 +1060,8 @@ public class ConnectionService {
 			// harmlessly rather than rejected.
 			return;
 		}
-		if (session.channelName() != null && channelRegistry.find(session.channelName()) instanceof Some(Channel channel)) {
+		String channelName = session.channelName();   // snapshot once: null-check then a second read feeding find() would let a concurrent leave force find(null) → NPE
+		if (channelName != null && channelRegistry.find(channelName) instanceof Some(Channel channel)) {
 			synchronized (channel) {
 				session.setDisplayName(displayName);
 				broadcaster.toAll(channel, new ServerMessage.MemberRenamed(session.id(), displayName));

@@ -62,11 +62,15 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 	public void afterConnectionClosed(@NonNull WebSocketSession session, @NonNull CloseStatus status) {
 		ClientSession clientSession = lookup(session);
 		if (clientSession != null) {
-			try {
-				connectionService.onClose(clientSession, describeClose(status));
-			} finally {
-				clientSession.close();   // tear down the outbound pump even if onClose throws
-			}
+			// Flip the session closed (stops the outbound pump AND makes isOpen() false) BEFORE onClose forgets the
+			// per-session rate-limiter buckets, so onMessage's isOpen() guard is authoritative: a straggler inbound
+			// control frame can't slip through during forget() and resurrect a just-forgotten bucket. This no longer
+			// leans on the container serializing inbound callbacks against this close. Safe — and idempotent with the
+			// early close() handleTransportError/terminateForBacklog already do — because onClose only broadcasts to
+			// OTHER members, never to this (leaving) session, so closing its pump first changes nothing it needs.
+			// close() first also inherently satisfies the old "tear down even if onClose throws" guarantee.
+			clientSession.close();
+			connectionService.onClose(clientSession, describeClose(status));
 		}
 		// The bearer token is stateless and self-expiring, so there is nothing to revoke here: closing the
 		// WebSocket already ends the session (membership is dropped in onClose).
