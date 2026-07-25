@@ -52,7 +52,7 @@ public final class WebSocketClientSession implements ClientSession {
 	/// The `channel` query param captured at the handshake (see [ClientSession#handshakeChannel]); may be null.
 	private final String handshakeChannel;
 
-	private final BlockingQueue<Runnable> controlOut = new LinkedBlockingQueue<>(CONTROL_CAPACITY);
+	private final BlockingQueue<String> controlOut = new LinkedBlockingQueue<>(CONTROL_CAPACITY);
 	private final BlockingQueue<byte[]> audioOut = new LinkedBlockingQueue<>(AUDIO_CAPACITY);
 	private final AtomicBoolean closed = new AtomicBoolean();
 	/// Counts frames waiting across both queues: a permit is released for each accepted enqueue and consumed
@@ -100,21 +100,21 @@ public final class WebSocketClientSession implements ClientSession {
 		// close() flips `closed` before releasing its wake permit, and `send*` refuse once `closed` is set, so no
 		// new frame can arrive here; deliver whatever is already queued — control fully first, then audio — before
 		// the thread exits.
-		for (Runnable task; (task = controlOut.poll()) != null; ) {
-			task.run();
+		for (String control; (control = controlOut.poll()) != null; ) {
+			sendQuietly(new TextMessage(control));
 		}
 		for (byte[] audio; (audio = audioOut.poll()) != null; ) {
 			sendQuietly(new BinaryMessage(audio));
 		}
 	}
 
-	/// Runs one queued task — control first (priority), else audio — performing the (blocking) socket write. A
-	/// no-op when the acquired permit was the one [#stopPump] released to wake the drainer for shutdown and both
-	/// queues are already empty.
+	/// Sends one queued frame — control first (priority), else audio — wrapping the raw payload in its message type
+	/// and performing the (blocking) socket write. A no-op when the acquired permit was the one [#stopPump] released
+	/// to wake the drainer for shutdown and both queues are already empty.
 	private void drainOne() {
-		Runnable control = controlOut.poll();
+		String control = controlOut.poll();
 		if (control != null) {
-			control.run();
+			sendQuietly(new TextMessage(control));
 			return;
 		}
 		byte[] audio = audioOut.poll();
@@ -177,7 +177,10 @@ public final class WebSocketClientSession implements ClientSession {
 		if (closed.get()) {
 			return;
 		}
-		if (controlOut.offer(() -> sendQuietly(new TextMessage(encoded)))) {
+		// Enqueue the encoded JSON directly — no per-message capturing Runnable; the drainer wraps it in a
+		// TextMessage at send time, mirroring how sendAudio hands off a raw byte[] the drainer wraps in a
+		// BinaryMessage (both queues are dumb payload sinks, the drainer owns the message type).
+		if (controlOut.offer(encoded)) {
 			work.release();   // signal the drainer that one more frame is ready
 		} else {
 			// A state-changing message is never silently dropped: if it can't even be queued, the client is
