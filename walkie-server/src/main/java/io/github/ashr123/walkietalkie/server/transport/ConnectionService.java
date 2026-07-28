@@ -228,7 +228,7 @@ public class ConnectionService {
 		// holder or an out-of-date queue) — any subsequent change reaches the now-eligible joiner via the normal
 		// broadcast and it converges on the truth. Unconditional: FloorStatus renders the whole floor UI (holder +
 		// queue), so it seeds the joiner even when the floor is free (holderId == null, empty queue).
-		Consumer<ChannelRegistry.JoinResult> emitInitialState = joined -> {
+		Consumer<ChannelRegistry.JoinOutcome.Admitted> emitInitialState = joined -> {
 			Channel joinedChannel = joined.channel();
 			session.joinedChannel(joinedChannel.name());
 			broadcaster.toOne(
@@ -251,34 +251,45 @@ public class ConnectionService {
 		// the server-wide floor-queue default — the sentinel-owned global room is created with the queue OFF (false)
 		// and can never be toggled on (its floor-queue toggle is NOT_OWNER), since it is unbounded and a large queue
 		// would mean heavy position-broadcast churn.
-		ChannelRegistry.JoinResult joined = join.mode() == ChannelMode.GLOBAL_PTT
+		ChannelRegistry.JoinOutcome outcome = join.mode() == ChannelMode.GLOBAL_PTT
 				? channelRegistry.joinOrCreate(requested, join.mode(), null, session, GLOBAL_CHANNEL_OWNER, false, emitInitialState)
 				: channelRegistry.joinOrCreate(requested, join.mode(), join.keyCheck(), session, properties.floorQueueDefault(), emitInitialState);
-		if (joined == null) {
-			// The atomic join refused to add us. joinOrCreate checks, in order, lock -> capacity -> key-check, so
-			// attribute the reason by re-reading the target. The enforcement itself was atomic inside joinOrCreate;
-			// this re-read only picks which equally-true "can't join" message to show, so a state change in the
-			// instant after the failed join at worst shows another true reason — never a wrong admit/reject.
-			switch (channelRegistry.find(requested)) {
-				case Some(Channel target) when target.isLocked() -> sendError(
-						session,
-						ErrorCode.CHANNEL_LOCKED,
-						"This channel is locked by its owner — you can't join it right now."
-				);
-				case Some(Channel target) when target.isFull() -> sendError(
-						session,
-						ErrorCode.CHANNEL_FULL,
-						"This channel is full — it has reached its member limit."
-				);
-				default -> sendError(
-						session,
-						ErrorCode.PASSPHRASE_MISMATCH,
-						"This channel is using a different encryption passphrase (or none) — you can't join it."
-				);
-			}
-			return;
+		// The atomic join carries its own verdict, decided under the registry bin lock, so a refusal names its EXACT
+		// reason — no re-reading the channel afterwards to guess which of the three rules rejected us (a re-read
+		// could report a reason that only became true in the instant after the failed join).
+		switch (outcome) {
+			case ChannelRegistry.JoinOutcome.Refused(ChannelRegistry.JoinOutcome.Reason reason) ->
+					refuseJoin(session, reason);
+			case ChannelRegistry.JoinOutcome.Admitted admitted -> announceJoin(session, admitted);
 		}
-		// Advance the MDC channel so this handler's "joined" line (and anything after it in this scope) is tagged
+	}
+
+	/// Reports a refused join to the would-be joiner. The reason is the one the atomic join itself decided, so each
+	/// arm states a fact rather than a guess. The client is left connected and simply not in a channel.
+	private void refuseJoin(ClientSession session, ChannelRegistry.JoinOutcome.Reason reason) {
+		switch (reason) {
+			case LOCKED -> sendError(
+					session,
+					ErrorCode.CHANNEL_LOCKED,
+					"This channel is locked by its owner — you can't join it right now."
+			);
+			case FULL -> sendError(
+					session,
+					ErrorCode.CHANNEL_FULL,
+					"This channel is full — it has reached its member limit."
+			);
+			case PASSPHRASE_MISMATCH -> sendError(
+					session,
+					ErrorCode.PASSPHRASE_MISMATCH,
+					"This channel is using a different encryption passphrase (or none) — you can't join it."
+			);
+		}
+	}
+
+	/// Completes a successful join: the joiner's own initial state was already emitted inside the registry's monitor
+	/// span (see `emitInitialState`), so what remains is making it visible to everyone else and logging it.
+	private void announceJoin(ClientSession session, ChannelRegistry.JoinOutcome.Admitted joined) {
+		// Advance the MDC channel so the "joined" line below (and anything after it in this scope) is tagged
 		// with the channel just joined, instead of repeating channel=… in the body.
 		RequestContext.updateChannel(joined.channel().name());
 
@@ -295,8 +306,8 @@ public class ConnectionService {
 				))
 		);
 
-		// Identity (session + name) and the channel are carried by the MDC prefix now (the name advanced above,
-		// the channel just updated). "created" when this join brought the channel into being; else "joined".
+		// Identity (session + name) and the channel are carried by the MDC prefix now (the name advanced in
+		// handleJoin, the channel just updated). "created" when this join brought the channel into being.
 		log.info("{} mode={}", joined.created() ? "created" : "joined", joined.channel().mode());
 	}
 

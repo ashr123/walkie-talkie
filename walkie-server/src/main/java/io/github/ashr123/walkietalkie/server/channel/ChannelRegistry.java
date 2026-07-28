@@ -18,68 +18,97 @@ import java.util.function.Consumer;
 @Component
 public class ChannelRegistry {
 
-	private static final Consumer<JoinResult> NO_OP = _ -> {
+	private static final Consumer<JoinOutcome.Admitted> NO_OP = _ -> {
 	};
 
 	private final Map<String, Channel> channels = new ConcurrentHashMap<>();
 
-	/// The outcome of a successful join: the joined `channel`, whether this join `created` it (vs joining one
-	/// that already existed), plus the joiner's view of the channel captured **atomically with its add** — the
-	/// member `roster` (including the joiner) and the current `floorHolder` (the talk-floor hint). The roster and
-	/// hint are snapshotted inside the map update under the channel monitor, so the `Joined` roster and floor
-	/// hint the caller sends can't be torn by a concurrent floor grant or leave.
-	public record JoinResult(Channel channel, boolean created, List<MemberInfo> roster, Option<String> floorHolder) {
+	/// The outcome of a join attempt, decided **inside** the atomic map update so it can't race a concurrent
+	/// create/join/leave/`setLocked`/rekey. Sealed, so a caller's `switch` is exhaustive and the reason for a
+	/// refusal is carried explicitly rather than re-derived: this replaces an earlier `null` return that meant
+	/// *any* of three different refusals, which forced the caller to re-read the channel afterwards and GUESS
+	/// which one applied — an approximation that could name a reason that only became true after the fact.
+	///
+	/// The `Channel` appears ONLY on the success variant, mirroring [RekeyResult]/[TransferResult]/[LockResult]:
+	/// a refusal added nobody, so there is no joined channel to hand back and nothing for a caller to null-check.
+	public sealed interface JoinOutcome {
+
+		/// The joiner was added: `created` says whether this join brought the channel into being, and the
+		/// `roster` (including the joiner) + `floorHolder` hint are the joiner's view of the channel captured
+		/// **atomically with its add**, under the channel monitor — so the `Joined` snapshot the caller sends
+		/// can't be torn by a concurrent floor grant or leave.
+		record Admitted(Channel channel, boolean created, List<MemberInfo> roster, Option<String> floorHolder)
+				implements JoinOutcome {
+		}
+
+		/// The joiner was NOT added, for exactly this `reason`. The channel is left unchanged and still registered.
+		record Refused(Reason reason) implements JoinOutcome {
+		}
+
+		/// Why a join was refused, in the order [ChannelRegistry#joinOrCreate] evaluates them: the owner locked
+		/// the channel to new members; it is at its member cap (one stream index per member); or the joiner's
+		/// key-check differs from the channel's (wrong or missing end-to-end-encryption passphrase).
+		enum Reason {
+			LOCKED,
+			FULL,
+			PASSPHRASE_MISMATCH
+		}
 	}
 
 	/// Adds `session` to the named channel — creating it (owned by `session`, with `mode` and the joiner's
-	/// `keyCheck`) when absent — and returns a [JoinResult] with the joiner's atomically-captured roster + floor
-	/// hint. An existing channel keeps its own mode and owner (the joiner adopts them), but the joiner's
-	/// `keyCheck` must **match** the channel's, or the join is refused: the member is not added and this returns
-	/// `null` (the caller reports a passphrase mismatch). The whole check-add-and-snapshot happens inside the
-	/// atomic map update, so it cannot race with a concurrent create or [#leave].
-	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session) {
+	/// `keyCheck`) when absent — and returns the [JoinOutcome]: [JoinOutcome.Admitted] with the joiner's
+	/// atomically-captured roster + floor hint, or [JoinOutcome.Refused] carrying exactly why. An existing channel
+	/// keeps its own mode and owner (the joiner adopts them), but the joiner's `keyCheck` must **match** the
+	/// channel's. The whole check-add-and-snapshot happens inside the atomic map update, so it cannot race with a
+	/// concurrent create or [#leave].
+	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session) {
 		return joinOrCreate(name, mode, keyCheck, session, session.id(), false, NO_OP);
 	}
 
 	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], but stamps a newly-created channel with
 	/// an explicit `ownerId` instead of the joiner's session id — used to give the server-managed "global"
 	/// channel a sentinel owner that no participant can match. An existing channel keeps its own owner.
-	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId) {
+	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId) {
 		return joinOrCreate(name, mode, keyCheck, session, ownerId, false, NO_OP);
 	}
 
 	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], plus the queue default a newly-created
 	/// channel adopts and a hook run on a successful add. See the full form for what `onJoinUnderLock` guarantees.
-	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, boolean floorQueueEnabled, Consumer<? super JoinResult> onJoinUnderLock) {
+	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, boolean floorQueueEnabled, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
 		return joinOrCreate(name, mode, keyCheck, session, session.id(), floorQueueEnabled, onJoinUnderLock);
 	}
 
 	/// Full form. `floorQueueEnabled` is the owner-toggleable push-to-talk floor-queue default a **newly created**
 	/// channel adopts (an existing channel keeps its own state, like its mode/owner). On a successful add,
-	/// `onJoinUnderLock` is invoked exactly once with the captured [JoinResult] **while the channel monitor is
-	/// still held** (and before any concurrent floor transition can run) — the caller uses it to emit the joiner's
-	/// initial state (its `Joined` snapshot and floor snapshot) so that emission is serialized with floor
+	/// `onJoinUnderLock` is invoked exactly once with the captured [JoinOutcome.Admitted] **while the channel
+	/// monitor is still held** (and before any concurrent floor transition can run) — the caller uses it to emit the
+	/// joiner's initial state (its `Joined` snapshot and floor snapshot) so that emission is serialized with floor
 	/// grants/releases: a release can't slip a stale floor snapshot in before the hint and a grant/preempt can't
 	/// leave the hint naming a stale holder. The hook MUST be short and non-blocking — it runs under the registry
 	/// bin lock and the channel monitor, and must NOT call back into the registry (that would invert the
-	/// bin→monitor order). It is skipped entirely on a key-check mismatch.
-	public JoinResult joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, boolean floorQueueEnabled, Consumer<? super JoinResult> onJoinUnderLock) {
-		AtomicReference<JoinResult> joined = new AtomicReference<>();
+	/// bin→monitor order). It is skipped entirely on a refusal.
+	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, boolean floorQueueEnabled, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
+		AtomicReference<JoinOutcome> outcome = new AtomicReference<>();
 		channels.compute(name, (key, existing) -> {
 			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck, floorQueueEnabled) : existing;
+			// Each refusal below records its OWN reason while still under the bin lock, so the caller never has to
+			// re-read the channel to work out which rule rejected the joiner.
+			//
 			// A channel its owner LOCKED admits no new members — refuse before the key-check (a locked door doesn't
 			// care about the key). Only reachable for a NEWCOMER: a re-join to the member's CURRENT channel
 			// short-circuits in ConnectionService.handleJoin and never gets here. This read is under the bin lock,
-			// so it is atomic with a concurrent setLocked/leave/join. `joined` stays null; the caller attributes the
-			// rejection to CHANNEL_LOCKED (a freshly created channel is never locked, so this only affects joins).
+			// so it is atomic with a concurrent setLocked/leave/join (a freshly created channel is never locked, so
+			// this only affects joins).
 			if (existing != null && channel.isLocked()) {
+				outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.LOCKED));
 				return channel;   // keep the channel; do not add the joiner
 			}
 			// Refuse a newcomer once the channel is at capacity (one stream index per member, range 0..254) rather
 			// than assign a colliding index. Under the bin lock, so the capacity check + the add are atomic w.r.t.
 			// concurrent joins/leaves. Only newcomers reach here (a current member's re-join short-circuits before
-			// joinOrCreate). `joined` stays null; the caller attributes the rejection to CHANNEL_FULL.
+			// joinOrCreate).
 			if (existing != null && channel.isFull()) {
+				outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.FULL));
 				return channel;
 			}
 			if (Objects.equals(channel.keyCheck(), keyCheck)) {
@@ -93,14 +122,17 @@ public class ChannelRegistry {
 				// captured roster disagreeing with the leaver's MemberLeft.
 				synchronized (channel) {
 					channel.add(session);
-					JoinResult result = new JoinResult(channel, existing == null, channel.memberInfos(), channel.floorHolder());
-					onJoinUnderLock.accept(result);
-					joined.set(result);
+					JoinOutcome.Admitted admitted =
+							new JoinOutcome.Admitted(channel, existing == null, channel.memberInfos(), channel.floorHolder());
+					onJoinUnderLock.accept(admitted);
+					outcome.set(admitted);
 				}
+			} else {
+				outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.PASSPHRASE_MISMATCH));
 			}
 			return channel;   // keep the channel even on a key-check mismatch (don't drop it)
 		});
-		return joined.get();   // null when the joiner's key-check didn't match the channel's
+		return outcome.get();
 	}
 
 	public Option<Channel> find(String name) {

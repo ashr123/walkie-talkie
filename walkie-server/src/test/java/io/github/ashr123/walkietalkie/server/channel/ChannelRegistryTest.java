@@ -22,18 +22,36 @@ class ChannelRegistryTest {
 		return new FakeClientSession(id, Transport.AUDIO_RELAY, id);
 	}
 
+	/// Narrows a join outcome to [ChannelRegistry.JoinOutcome.Admitted], failing the test if the join was refused —
+	/// the sealed-outcome equivalent of the old `assertNotNull` on a nullable result.
+	private static ChannelRegistry.JoinOutcome.Admitted admitted(ChannelRegistry.JoinOutcome outcome) {
+		return assertInstanceOf(ChannelRegistry.JoinOutcome.Admitted.class, outcome);
+	}
+
+	/// Asserts the join was refused for EXACTLY `reason`. This is what the sealed outcome buys over the old `null`
+	/// return, which could not distinguish a locked channel from a full one from a key-check mismatch.
+	private static void assertRefused(ChannelRegistry.JoinOutcome.Reason reason,
+	                                  ChannelRegistry.JoinOutcome outcome,
+	                                  String message) {
+		assertEquals(
+				reason,
+				assertInstanceOf(ChannelRegistry.JoinOutcome.Refused.class, outcome, message).reason(),
+				message
+		);
+	}
+
 	@Test
 	void reusesChannelForSameMode() {
-		Channel first = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
-		Channel second = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b")).channel();
+		Channel first = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"))).channel();
+		Channel second = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"))).channel();
 		assertSame(first, second);
 		assertEquals(2, second.size());
 	}
 
 	@Test
 	void adoptsExistingModeAndOwnerOnJoin() {
-		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
-		Channel joined = registry.joinOrCreate("team", ChannelMode.FULL_DUPLEX, null, session("b")).channel();
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"))).channel();
+		Channel joined = admitted(registry.joinOrCreate("team", ChannelMode.FULL_DUPLEX, null, session("b"))).channel();
 		assertSame(created, joined);
 		assertEquals(ChannelMode.MULTI_CHANNEL_PTT, joined.mode(), "the channel keeps its original mode");
 		assertEquals("a", joined.ownerId(), "the creator stays the owner");
@@ -51,7 +69,7 @@ class ChannelRegistryTest {
 
 	@Test
 	void theExplicitOwnerOverloadStampsTheGivenOwnerNotTheSession() {
-		Channel global = registry.joinOrCreate("global", ChannelMode.GLOBAL_PTT, null, session("a"), "server").channel();
+		Channel global = admitted(registry.joinOrCreate("global", ChannelMode.GLOBAL_PTT, null, session("a"), "server")).channel();
 		assertEquals("server", global.ownerId(), "the 5-arg form uses the explicit owner, not the joiner's id");
 		assertEquals(1, global.size());
 		assertNull(global.keyCheck());
@@ -59,50 +77,57 @@ class ChannelRegistryTest {
 
 	@Test
 	void refusesAJoinerWhoseKeyCheckDoesNotMatch() {
-		ChannelRegistry.JoinResult created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"));
-		assertNotNull(created, "the creator establishes the channel's key-check");
+		ChannelRegistry.JoinOutcome.Admitted created =
+				admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a")));
 
-		assertNull(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-B", session("b")),
+		assertRefused(ChannelRegistry.JoinOutcome.Reason.PASSPHRASE_MISMATCH,
+				registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-B", session("b")),
 				"a different key-check (wrong passphrase) is refused");
-		assertNull(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("c")),
+		assertRefused(ChannelRegistry.JoinOutcome.Reason.PASSPHRASE_MISMATCH,
+				registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("c")),
 				"an unencrypted joiner is refused from an encrypted channel");
 		assertEquals(1, created.channel().size(), "refused joiners are not added");
 
-		assertSame(created.channel(), registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("d")).channel(),
+		assertSame(created.channel(), admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("d"))).channel(),
 				"a matching key-check joins normally");
 		assertEquals(2, created.channel().size());
 	}
 
 	@Test
-	void joinResultSnapshotsTheRosterIncludingTheJoiner() {
-		ChannelRegistry.JoinResult first = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"));
+	void admittedOutcomeSnapshotsTheRosterIncludingTheJoiner() {
+		ChannelRegistry.JoinOutcome.Admitted first =
+				admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")));
 		assertEquals(Set.of("a"), ids(first), "the creator's roster snapshot contains just itself");
 		assertInstanceOf(None.class, first.floorHolder(), "no floor is held yet, so no hint");
 
-		ChannelRegistry.JoinResult second = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
+		ChannelRegistry.JoinOutcome.Admitted second =
+				admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b")));
 		assertEquals(Set.of("a", "b"), ids(second),
 				"the second joiner's roster snapshot includes itself and the existing member");
 	}
 
 	@Test
-	void joinResultFlagsWhetherThisJoinCreatedTheChannel() {
-		ChannelRegistry.JoinResult creator = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"));
+	void admittedOutcomeFlagsWhetherThisJoinCreatedTheChannel() {
+		ChannelRegistry.JoinOutcome.Admitted creator =
+				admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")));
 		assertTrue(creator.created(), "the first joiner brought the channel into being");
 
-		ChannelRegistry.JoinResult later = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
+		ChannelRegistry.JoinOutcome.Admitted later =
+				admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b")));
 		assertFalse(later.created(), "a joiner of an already-existing channel did not create it");
 	}
 
 	@Test
-	void joinResultCapturesTheCurrentFloorHolderAsTheHint() {
-		Channel channel = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+	void admittedOutcomeCapturesTheCurrentFloorHolderAsTheHint() {
+		Channel channel = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"))).channel();
 		channel.tryAcquireFloor("a", Instant.EPOCH);
 
-		ChannelRegistry.JoinResult joiner = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
+		ChannelRegistry.JoinOutcome.Admitted joiner =
+				admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b")));
 		assertEquals(Option.of("a"), joiner.floorHolder(), "the joiner's floor hint reflects the active holder");
 	}
 
-	private static Set<String> ids(ChannelRegistry.JoinResult result) {
+	private static Set<String> ids(ChannelRegistry.JoinOutcome.Admitted result) {
 		return result.roster().stream().map(MemberInfo::id).collect(Collectors.toSet());
 	}
 
@@ -110,7 +135,7 @@ class ChannelRegistryTest {
 
 	@Test
 	void changePassphraseRotatesForTheOwnerAndReturnsTheSameChannel() {
-		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a")).channel();
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"))).channel();
 		ChannelRegistry.RekeyResult.Ok result = assertInstanceOf(ChannelRegistry.RekeyResult.Ok.class,
 				registry.changePassphrase("team", "a", "kcv-B"));
 		assertSame(created, result.channel(), "Ok carries the exact mutated channel instance (not a fresh find())");
@@ -119,7 +144,7 @@ class ChannelRegistryTest {
 
 	@Test
 	void changePassphraseRefusesANonOwnerAndLeavesTheKeyCheck() {
-		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a")).channel();
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"))).channel();
 		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("b"));
 		// NotOwner carries no channel by construction (sealed), so there's nothing to null-check.
 		assertInstanceOf(ChannelRegistry.RekeyResult.NotOwner.class, registry.changePassphrase("team", "b", "kcv-B"));
@@ -135,7 +160,7 @@ class ChannelRegistryTest {
 
 	@Test
 	void transferOwnershipMovesTheOwnerForTheOwnerAndReturnsTheSameChannel() {
-		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"))).channel();
 		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
 		ChannelRegistry.TransferResult.Ok result = assertInstanceOf(ChannelRegistry.TransferResult.Ok.class,
 				registry.transferOwnership("team", "a", "b"));
@@ -145,7 +170,7 @@ class ChannelRegistryTest {
 
 	@Test
 	void transferOwnershipRefusesANonOwner() {
-		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"))).channel();
 		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
 		assertInstanceOf(ChannelRegistry.TransferResult.NotOwner.class, registry.transferOwnership("team", "b", "b"));
 		assertEquals("a", created.ownerId(), "ownership is unchanged");
@@ -153,7 +178,7 @@ class ChannelRegistryTest {
 
 	@Test
 	void transferOwnershipToANonMemberIsRejected() {
-		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"))).channel();
 		assertInstanceOf(ChannelRegistry.TransferResult.NotAMember.class, registry.transferOwnership("team", "a", "ghost"));
 		assertEquals("a", created.ownerId(), "ownership is unchanged");
 	}
@@ -165,23 +190,23 @@ class ChannelRegistryTest {
 
 	@Test
 	void aLockedChannelRefusesANewcomerButNotTheCreate() {
-		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"))).channel();
 		assertInstanceOf(ChannelRegistry.LockResult.Ok.class, registry.setLocked("team", "a", true));
 		assertTrue(created.isLocked());
 
-		assertNull(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b")),
-				"a locked channel refuses a newcomer (returns null, like a key-check mismatch)");
+		assertRefused(ChannelRegistry.JoinOutcome.Reason.LOCKED,
+				registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b")),
+				"a locked channel refuses a newcomer, and says so — LOCKED, not a key-check mismatch");
 		assertEquals(1, created.size(), "the newcomer was not added");
 
 		assertInstanceOf(ChannelRegistry.LockResult.Ok.class, registry.setLocked("team", "a", false));
-		assertNotNull(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("c")),
-				"once unlocked, a newcomer joins");
+		admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("c")));
 		assertEquals(2, created.size());
 	}
 
 	@Test
 	void setLockedIsRejectedForANonOwnerAndMissingChannel() {
-		Channel created = registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a")).channel();
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("a"))).channel();
 		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, null, session("b"));
 
 		assertInstanceOf(ChannelRegistry.LockResult.NotOwner.class, registry.setLocked("team", "b", true));
