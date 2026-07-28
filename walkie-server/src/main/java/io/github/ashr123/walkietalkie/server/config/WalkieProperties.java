@@ -30,7 +30,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 ///                               CLAIM the floor once it is offered (its turn) before the server drops it and
 ///                               offers the next member. A positive window — grant-to-claim needs one — so
 ///                               0/absent falls back to the default (10), it is not "disabled". See
-///                               docs/FLOOR_QUEUE.md
+///                               docs/CLIENT_PROTOCOL.md §3b
 /// @param floorQueueDefault      the floor-queue on/off state a NEWLY created channel adopts (its owner can then
 ///                               toggle it per channel via `setFloorQueue`); default false, preserving the plain
 ///                               busy-floor-refused behaviour

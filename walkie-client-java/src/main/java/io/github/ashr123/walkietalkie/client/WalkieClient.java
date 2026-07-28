@@ -1099,9 +1099,9 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	/// Re-derives the E2EE key for the new channel (the key salts on the channel name) and sends the Join; the
-	/// resulting Joined snapshot resets the roster/mode like the initial join. NOTE: switching to a channel whose
-	/// passphrase doesn't match drops you from the current channel — the server leaves the old channel before the
-	/// new join is validated — so supply the right passphrase for the target.
+	/// resulting Joined snapshot resets the roster/mode like the initial join. A switch is all-or-nothing server-side:
+	/// if it is refused — wrong passphrase, full, or parked for a locked channel's owner to approve — we KEEP the
+	/// channel we are in, and [#joinRefused] puts back the key this optimistically applied.
 	private void switchTo(String channel, ChannelMode mode, String passphrase) {
 		String effective = mode == ChannelMode.GLOBAL_PTT ? "global" : channel;
 		if (effective.equals(currentChannel)) {

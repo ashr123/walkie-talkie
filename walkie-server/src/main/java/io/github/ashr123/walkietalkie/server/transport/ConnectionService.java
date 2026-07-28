@@ -55,7 +55,7 @@ public class ConnectionService {
 	private final Duration floorMaxHold;
 	/// The push-to-talk floor-queue claim window: how long the reserved head is given to CLAIM its turn before the
 	/// reservation-expiry sweep drops it and offers the floor to the next in line. Carried to the reserved head in
-	/// [ServerMessage.FloorReserved] so its client can run the countdown (see docs/FLOOR_QUEUE.md).
+	/// [ServerMessage.FloorReserved] so its client can run the countdown (see docs/CLIENT_PROTOCOL.md §3b).
 	private final Duration floorReservation;
 	/// The server-wide settings a newly created channel adopts — the floor-queue default and the join-request cap.
 	/// Built once here (rather than per join) because they are fixed for the process; the sentinel-owned `global`

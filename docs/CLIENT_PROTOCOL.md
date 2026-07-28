@@ -89,48 +89,58 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 
 ### Client → server
 
-| `type`              | Fields                                           | Meaning                                                                                                                                                                                                                                                      |
-|---------------------|--------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `join`              | `channel`, `mode`, `displayName`, `keyCheck`     | Join/create — or **switch** channel in place when re-sent on a live socket (§3c); `keyCheck` per §7                                                                                                                                                          |
-| `leave`             | —                                                | Leave the current channel (keep the socket)                                                                                                                                                                                                                  |
-| `requestFloor`      | —                                                | Ask for the talk floor (PTT modes). **State-interpreted** by your floor state: grab a free floor, claim your reserved turn, or — when the queue is on and the floor is busy — join the FIFO queue (§3b)                                                      |
-| `releaseFloor`      | —                                                | Give up the floor. **State-interpreted**: stop talking if you hold it, or leave the queue / decline your turn if you are waiting or reserved (§3b)                                                                                                           |
-| `changeMode`        | `mode`                                           | Owner-only: change the channel mode                                                                                                                                                                                                                          |
-| `rename`            | `displayName`                                    | Change your own display name in place (→ `memberRenamed`, §3c)                                                                                                                                                                                               |
-| `changePassphrase`  | `keyCheck`, `wrappedKey`                         | Owner-only: rotate/clear the channel passphrase; `keyCheck` = the new one's KCV, or `null` to make it plaintext. Optional `wrappedKey` = the new passphrase encrypted under the OLD key so members auto-adopt; `null` opts out (§3c) (→ `passphraseChanged`) |
-| `transferOwnership` | `newOwnerId`                                     | Owner-only: hand ownership to another current member (→ `ownerChanged`, §3c)                                                                                                                                                                                 |
-| `muteMember`        | `memberId`, `muted`                              | Owner-only: mute/unmute one member's relay audio; server-enforced (→ `memberMuted`, §3d)                                                                                                                                                                     |
-| `muteAll`           | `muted`                                          | Owner-only: mute/unmute every member but the owner at once (→ one `memberMuted` per changed member, §3d)                                                                                                                                                     |
-| `setLocked`         | `locked`                                         | Owner-only: lock/unlock the channel to NEW members (→ `channelLocked`, §3e); existing members unaffected                                                                                                                                                     |
-| `setFloorQueue`     | `enabled`                                        | Owner-only: turn this channel's push-to-talk floor queue on/off (→ `floorQueueChanged` + a fresh `floorStatus`, §3b); disabling clears any waiting queue. Full-duplex → `INVALID_MODE`; non-owner / `global` → `NOT_OWNER`                                   |
-| `offer`             | `target`, `sdp`                                  | WebRTC (see §3a)                                                                                                                                                                                                                                             |
-| `answer`            | `target`, `sdp`                                  | WebRTC                                                                                                                                                                                                                                                       |
-| `ice`               | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                                                                                                                                                                                                                                       |
+| `type`                   | Fields                                           | Meaning                                                                                                                                                                                                                                                      |
+|--------------------------|--------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `join`                   | `channel`, `mode`, `displayName`, `keyCheck`     | Join/create — or **switch** channel in place when re-sent on a live socket (§3c); `keyCheck` per §7                                                                                                                                                          |
+| `leave`                  | —                                                | Leave the current channel (keep the socket)                                                                                                                                                                                                                  |
+| `requestFloor`           | —                                                | Ask for the talk floor (PTT modes). **State-interpreted** by your floor state: grab a free floor, claim your reserved turn, or — when the queue is on and the floor is busy — join the FIFO queue (§3b)                                                      |
+| `releaseFloor`           | —                                                | Give up the floor. **State-interpreted**: stop talking if you hold it, or leave the queue / decline your turn if you are waiting or reserved (§3b)                                                                                                           |
+| `changeMode`             | `mode`                                           | Owner-only: change the channel mode                                                                                                                                                                                                                          |
+| `rename`                 | `displayName`                                    | Change your own display name in place (→ `memberRenamed`, §3c)                                                                                                                                                                                               |
+| `changePassphrase`       | `keyCheck`, `wrappedKey`                         | Owner-only: rotate/clear the channel passphrase; `keyCheck` = the new one's KCV, or `null` to make it plaintext. Optional `wrappedKey` = the new passphrase encrypted under the OLD key so members auto-adopt; `null` opts out (§3c) (→ `passphraseChanged`) |
+| `transferOwnership`      | `newOwnerId`                                     | Owner-only: hand ownership to another current member (→ `ownerChanged`, §3c)                                                                                                                                                                                 |
+| `muteMember`             | `memberId`, `muted`                              | Owner-only: mute/unmute one member's relay audio; server-enforced (→ `memberMuted`, §3d)                                                                                                                                                                     |
+| `muteAll`                | `muted`                                          | Owner-only: mute/unmute every member but the owner at once (→ one `memberMuted` per changed member, §3d)                                                                                                                                                     |
+| `setLocked`              | `locked`                                         | Owner-only: lock/unlock the channel to NEW members (→ `channelLocked`, §3e); existing members unaffected                                                                                                                                                     |
+| `setFloorQueue`          | `enabled`                                        | Owner-only: turn this channel's push-to-talk floor queue on/off (→ `floorQueueChanged` + a fresh `floorStatus`, §3b); disabling clears any waiting queue. Full-duplex → `INVALID_MODE`; non-owner / `global` → `NOT_OWNER`                                   |
+| `resolveJoinRequest`     | `sessionId`, `admit`                             | Owner-only: admit or deny ONE newcomer waiting at this locked channel (§3f). Admitting records a one-shot approval and sends that newcomer `joinApproved` — it is its own re-sent `join` that completes the join                                             |
+| `resolveAllJoinRequests` | `admit`                                          | Owner-only: admit or deny EVERY waiting newcomer, in arrival order (§3f). A no-op when nobody is waiting                                                                                                                                                     |
+| `withdrawJoinRequest`    | —                                                | Stop waiting to be admitted (§3f). Sent by the waiting client itself, so it takes no arguments — a session waits at only one door. A no-op when not waiting                                                                                                  |
+| `offer`                  | `target`, `sdp`                                  | WebRTC (see §3a)                                                                                                                                                                                                                                             |
+| `answer`                 | `target`, `sdp`                                  | WebRTC                                                                                                                                                                                                                                                       |
+| `ice`                    | `target`, `candidate`, `sdpMid`, `sdpMLineIndex` | WebRTC                                                                                                                                                                                                                                                       |
 
 ### Server → client
 
-| `type`              | Fields                                                                             | Meaning                                                                                                                                                                                                                                 |
-|---------------------|------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `joined`            | `selfId`, `channel`, `mode`, `ownerId`, `locked`, `floorQueueEnabled`, `members[]` | Join ack + full snapshot (re-sync on every join); `locked` = channel locked to new members (§3e); `floorQueueEnabled` = the PTT floor queue is on (§3b). A `floorStatus` follows immediately                                            |
-| `memberJoined`      | `member` (`MemberInfo`)                                                            | A participant joined                                                                                                                                                                                                                    |
-| `memberLeft`        | `memberId`                                                                         | A participant left/disconnected                                                                                                                                                                                                         |
-| `floorGranted`      | —                                                                                  | You hold the floor; you may transmit. Imperative "go live" trigger to the new holder only — the broadcast `floorStatus` renders who holds it (§3b)                                                                                      |
-| `floorStatus`       | `holderId`, `waiting`                                                              | Authoritative PTT floor snapshot: `holderId` = live holder or `null`; `waiting` = FIFO queue. Broadcast on every floor change + after join; clients derive ALL floor UI from it (§3b)                                                   |
-| `floorReserved`     | `claimSeconds`                                                                     | It's your turn: the floor is reserved for you for `claimSeconds`. Claim with `requestFloor` before the window lapses or it passes to the next in line. To-one trigger to the reserved head (§3b)                                        |
-| `floorQueueChanged` | `enabled`                                                                          | The owner turned the floor queue on/off (broadcast; also in `joined.floorQueueEnabled`). When off the queue is cleared — a following `floorStatus` reflects it (§3b)                                                                    |
-| `modeChanged`       | `mode`                                                                             | The channel mode changed; reset talk state                                                                                                                                                                                              |
-| `ownerChanged`      | `ownerId`                                                                          | New owner (e.g. previous owner left)                                                                                                                                                                                                    |
-| `memberRenamed`     | `memberId`, `displayName`                                                          | A member changed its display name (incl. you — §3c)                                                                                                                                                                                     |
-| `memberMuted`       | `memberId`, `muted`                                                                | The owner muted/unmuted a member (broadcast to all, incl. the muted member — §3d)                                                                                                                                                       |
-| `channelLocked`     | `locked`                                                                           | The owner locked/unlocked the channel to new members (broadcast to all — §3e)                                                                                                                                                           |
-| `passphraseChanged` | `keyCheck`, `wrappedKey`                                                           | The owner changed/cleared the channel passphrase (`null` = now unencrypted). If `wrappedKey` is present, decrypt it with your old key to auto-adopt; else re-derive from the out-of-band passphrase and verify against `keyCheck` (§3c) |
-| `signalOffer`       | `from`, `sdp`                                                                      | WebRTC (see §3a)                                                                                                                                                                                                                        |
-| `signalAnswer`      | `from`, `sdp`                                                                      | WebRTC                                                                                                                                                                                                                                  |
-| `signalIce`         | `from`, `candidate`, `sdpMid`, `sdpMLineIndex`                                     | WebRTC                                                                                                                                                                                                                                  |
-| `error`             | `code`, `message`                                                                  | A request failed (see §13 for codes)                                                                                                                                                                                                    |
+| `type`              | Fields                                                                             | Meaning                                                                                                                                                                                                                                  |
+|---------------------|------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `joined`            | `selfId`, `channel`, `mode`, `ownerId`, `locked`, `floorQueueEnabled`, `members[]` | Join ack + full snapshot (re-sync on every join); `locked` = channel locked to new members (§3e); `floorQueueEnabled` = the PTT floor queue is on (§3b). A `floorStatus` follows immediately                                             |
+| `memberJoined`      | `member` (`MemberInfo`)                                                            | A participant joined                                                                                                                                                                                                                     |
+| `memberLeft`        | `memberId`                                                                         | A participant left/disconnected                                                                                                                                                                                                          |
+| `floorGranted`      | —                                                                                  | You hold the floor; you may transmit. Imperative "go live" trigger to the new holder only — the broadcast `floorStatus` renders who holds it (§3b)                                                                                       |
+| `floorStatus`       | `holderId`, `waiting`                                                              | Authoritative PTT floor snapshot: `holderId` = live holder or `null`; `waiting` = FIFO queue. Broadcast on every floor change + after join; clients derive ALL floor UI from it (§3b)                                                    |
+| `floorReserved`     | `claimSeconds`                                                                     | It's your turn: the floor is reserved for you for `claimSeconds`. Claim with `requestFloor` before the window lapses or it passes to the next in line. To-one trigger to the reserved head (§3b)                                         |
+| `floorQueueChanged` | `enabled`                                                                          | The owner turned the floor queue on/off (broadcast; also in `joined.floorQueueEnabled`). When off the queue is cleared — a following `floorStatus` reflects it (§3b)                                                                     |
+| `modeChanged`       | `mode`                                                                             | The channel mode changed; reset talk state                                                                                                                                                                                               |
+| `ownerChanged`      | `ownerId`                                                                          | New owner (e.g. previous owner left)                                                                                                                                                                                                     |
+| `memberRenamed`     | `memberId`, `displayName`                                                          | A member changed its display name (incl. you — §3c)                                                                                                                                                                                      |
+| `memberMuted`       | `memberId`, `muted`                                                                | The owner muted/unmuted a member (broadcast to all, incl. the muted member — §3d)                                                                                                                                                        |
+| `channelLocked`     | `locked`                                                                           | The owner locked/unlocked the channel to new members (broadcast to all — §3e)                                                                                                                                                            |
+| `joinPending`       | `channel`                                                                          | Your `join` reached a locked channel that PARKS newcomers, so you are on its waiting list and its owner decides (§3f). You are not a member of it; if this was a switch you are still in the channel you were already in. Stay connected |
+| `joinApproved`      | `channel`                                                                          | You are cleared to join — **re-send `join`** to complete it (§3f). One trigger for three causes it deliberately does not distinguish: the owner admitted you, the owner unlocked, or the channel was dropped (your `join` recreates it)  |
+| `joinRequests`      | `requests[]` (`JoinRequestInfo`)                                                   | The channel's waiting list in arrival order — authoritative snapshot, re-sent on every change. Sent **to the owner only** (§3f); entries already approved but not yet claimed stay listed, so an approval can be revoked                 |
+| `passphraseChanged` | `keyCheck`, `wrappedKey`                                                           | The owner changed/cleared the channel passphrase (`null` = now unencrypted). If `wrappedKey` is present, decrypt it with your old key to auto-adopt; else re-derive from the out-of-band passphrase and verify against `keyCheck` (§3c)  |
+| `signalOffer`       | `from`, `sdp`                                                                      | WebRTC (see §3a)                                                                                                                                                                                                                         |
+| `signalAnswer`      | `from`, `sdp`                                                                      | WebRTC                                                                                                                                                                                                                                   |
+| `signalIce`         | `from`, `candidate`, `sdpMid`, `sdpMLineIndex`                                     | WebRTC                                                                                                                                                                                                                                   |
+| `error`             | `code`, `message`                                                                  | A request failed (see §13 for codes)                                                                                                                                                                                                     |
 
 `MemberInfo` = `{ id, displayName, streamId, muted }` (see §4; `muted` = whether the owner has muted this
 member — §3d).
+
+`JoinRequestInfo` = `{ id, displayName }` — a newcomer waiting to be admitted (§3f). Deliberately **not** a
+`MemberInfo`: a waiting session is not a member and has no stream index, and inventing one would alias a real
+member's audio lane (§4).
 
 Typical flow: `login` → open `/ws/audio?token=…` → send `join` → receive `joined` (snapshot) → exchange
 floor/audio → `leave`/close. (Re-send `join` any time to **switch** channels without reconnecting — §3c.)
@@ -222,7 +232,9 @@ None of these needs a new socket — they all reuse the live connection (and its
 - **Validation happens before the leave**, so a bad target — `INVALID_CHANNEL`, `INVALID_DISPLAY_NAME`,
   `RESERVED_CHANNEL`, `ENCRYPTION_NOT_ALLOWED` — is refused and you **stay** in your current channel. The one
   exception is **`PASSPHRASE_MISMATCH`**: it is only detectable while joining the target (after the leave), so
-  a wrong passphrase for the target channel **does** drop you from the old one — supply the correct passphrase.
+  a wrong passphrase for the target channel no longer drops you from the old one: a switch is **all-or-nothing**
+  (the server gives up your current channel only once the join has actually succeeded), so a refused switch
+  leaves your membership, floor and roster entry untouched — supply the correct passphrase and try again.
 - **Transport** (relay ↔ WebRTC) **cannot** switch in place — it is a different endpoint and audio pipeline; to
   change it a client must reconnect (a new socket, hence a new `selfId`). The reference browser client does
   this transparently on a transport change.
@@ -326,15 +338,75 @@ re-snapshot renders it). Locking blocks only **new joins** — existing members 
 - **Only newcomers.** An existing member re-joining its **current** channel (the idempotent re-snapshot, §3c)
   is never blocked. But a member who **leaves** a locked channel can't rejoin until it's unlocked (it's a
   newcomer again).
-- **Same drop semantics as `PASSPHRASE_MISMATCH`.** Both are detectable only inside the atomic join, so a
-  switch INTO a locked channel drops you from your current one; an initial connect just fails. The reference
-  clients handle `CHANNEL_LOCKED` like `PASSPHRASE_MISMATCH` (browser disconnects with a message, Java exits).
+- **A locked channel PARKS newcomers by default** (§3f): instead of `CHANNEL_LOCKED`, a newcomer receives
+  `joinPending` and its owner decides. `CHANNEL_LOCKED` is then only returned when the server is configured NOT
+  to park them (`walkie.max-join-requests: 0`), which is the "closed, don't even ask" setting.
+- **No failure drops a switcher.** A switch is all-or-nothing (§3c): being refused — or parked — leaves you in
+  the channel you were already in, with your floor and roster entry intact.
 - **Authorization & lifetime.** Only the owner may lock (`NOT_OWNER` otherwise; `NOT_IN_CHANNEL` before
   joining). The lock persists across a departure-triggered ownership change — the new owner inherits it and can
   unlock. The server-managed `global` room has a sentinel owner, so locking there is `NOT_OWNER`.
 
 The browser exposes an owner-only **Lock/Unlock channel** toggle in the Members header and a **🔒 Locked** badge
 shown to everyone; the Java client uses `lock` / `unlock` and shows a 🔒 marker in `w` and the join line.
+
+---
+
+## 3f. Owner-approved join requests ("requests to join")
+
+A locked channel does not turn newcomers away — it **parks** them for its owner to admit or deny. Bounded by
+`walkie.max-join-requests` (default 16); set it to `0` and a locked channel refuses outright with
+`CHANNEL_LOCKED` instead, which is the "closed, don't even ask" setting. There is no separate toggle: the lock
+*is* the switch.
+
+**The knocker's side.**
+
+1. Send `join` as normal. If the target is locked and parks newcomers, you get `joinPending { channel }` instead
+   of `joined` or an error. You are **not** a member of it — no roster, no floor state, no audio — and if this
+   `join` was a switch you are **still in the channel you were already in** (§3c).
+2. Show a waiting state and **stay connected**. Exactly one of these follows: `joinApproved`, an `error` with
+   `JOIN_REQUEST_DENIED`, or nothing at all if you withdraw or disconnect.
+3. On `joinApproved { channel }`, **re-send `join`** to complete it. This last step is yours by design: the
+   server cannot add you itself, because a waiting newcomer may still be a member of another channel and
+   leaving that one from inside the atomic join is not permitted. It also means *your* client, not the server,
+   chooses the moment your audio context switches channels.
+4. `withdrawJoinRequest` gives up. A session waits at only one door, so knocking elsewhere withdraws the first
+   request automatically, and disconnecting scrubs it.
+
+Re-sending `join` while waiting is harmless and idempotent — you stay in place and the owner is not re-notified,
+so a client that retries cannot flood them. But re-sending it is **not** a way in: only an approval the owner
+actually granted admits you.
+
+**The owner's side.**
+
+- `joinRequests { requests[] }` is the authoritative waiting list, in arrival order, re-sent on **every** change
+  (the same doctrine as `floorStatus`: one snapshot, no incremental add/remove to drift). It is sent **to the
+  owner only** — nobody else can act on it, and broadcasting it would tell every member who is knocking.
+- `resolveJoinRequest { sessionId, admit }` decides one; `resolveAllJoinRequests { admit }` decides all.
+  Non-owner → `NOT_OWNER`; an id that isn't waiting → `UNKNOWN_TARGET`.
+- An approval is a **one-shot grant**, not an addition. It bypasses the lock only — capacity and the key-check
+  still apply — and it is consumed by the newcomer's own re-sent `join`. An approval whose client never comes
+  back therefore **stays on the list**, which is deliberate: it is exactly the entry an owner may want to revoke
+  (`admit: false` works on it).
+- A newly elected owner is handed the current list; the outgoing one is not expected to keep it.
+
+**Lifecycle.** A request lives until the owner decides, the owner unlocks, the newcomer withdraws or
+disconnects, or the channel is dropped. Nothing about it is time-driven — there is no expiry:
+
+| Event                                | What waiting newcomers get                                                                                                                                     |
+|--------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Owner admits                         | `joinApproved` (then their own `join` completes it)                                                                                                            |
+| Owner denies                         | `error` `JOIN_REQUEST_DENIED`                                                                                                                                  |
+| Owner **unlocks**                    | `joinApproved` — an unlocked channel admits anyone, so leaving them parked would be incoherent                                                                 |
+| Last member leaves (channel dropped) | `joinApproved` — the lock died with the channel, and whoever re-sends `join` first **recreates it and owns it**                                                |
+| Waiting list already full            | `error` `TOO_MANY_JOIN_REQUESTS` (transient)                                                                                                                   |
+| Wrong passphrase                     | `error` `PASSPHRASE_MISMATCH` — the key-check is validated **before** parking, so an owner is never asked to approve somebody who could not have got in anyway |
+
+The `global` room has a sentinel owner and so can never be locked, which means it never has a waiting list.
+
+The browser shows the owner a **Requests to join (N)** block above the roster with per-row Admit/Deny (plus
+Admit all / Deny all), and a waiting newcomer a banner with **Cancel**. The Java client uses `requests` to list,
+`admit <#id|all>` / `deny <#id|all>` to decide, and `cancel` to stop waiting; `w` carries the waiting count.
 
 ---
 
@@ -582,20 +654,22 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
   Jackson's read-unknown-enum-values-as-default + `@JsonEnumDefaultValue`; the browser's string matches simply
   fall through).
 
-| Code                     | Triggered by                                                                                                                                                                |
-|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `BAD_MESSAGE`            | Unparseable / unknown-type control frame                                                                                                                                    |
-| `INVALID_CHANNEL`        | `join` with a channel name not matching the pattern                                                                                                                         |
-| `INVALID_DISPLAY_NAME`   | `join` or `rename` with a display name not matching the pattern                                                                                                             |
-| `INVALID_MODE`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel, or `setFloorQueue` in a full-duplex channel                                                                      |
-| `RESERVED_CHANNEL`       | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode                                                                                        |
-| `ENCRYPTION_NOT_ALLOWED` | a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext)                                                                                  |
-| `NOT_IN_CHANNEL`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / `setLocked` / `setFloorQueue` / signal before `join` |
-| `NOT_OWNER`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember`, `muteAll`, `setLocked` or `setFloorQueue` by a non-owner                                               |
-| `PASSPHRASE_MISMATCH`    | `join` with a `keyCheck` differing from the channel's (E2EE §7); on an in-place switch (§3c) it also drops you from the old channel                                         |
-| `CHANNEL_LOCKED`         | `join` (or in-place switch) to a channel the owner has locked to new members (§3e); like `PASSPHRASE_MISMATCH`, a locked switch drops you                                   |
-| `CHANNEL_FULL`           | `join` (or in-place switch) to a channel already at its member cap (one stream index per member, 0..254 → 255 members); like `PASSPHRASE_MISMATCH`, a full switch drops you |
-| `UNKNOWN_TARGET`         | WebRTC signal, `transferOwnership`, or `muteMember` (unknown/left id, or the owner itself) — a target not mutable in the channel                                            |
+| Code                     | Triggered by                                                                                                                                                                                      |
+|--------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `BAD_MESSAGE`            | Unparseable / unknown-type control frame                                                                                                                                                          |
+| `INVALID_CHANNEL`        | `join` with a channel name not matching the pattern                                                                                                                                               |
+| `INVALID_DISPLAY_NAME`   | `join` or `rename` with a display name not matching the pattern                                                                                                                                   |
+| `INVALID_MODE`           | `changeMode` to `GLOBAL_PTT` outside the `global` channel, or `setFloorQueue` in a full-duplex channel                                                                                            |
+| `RESERVED_CHANNEL`       | `join` (or in-place switch) naming the channel `global` with a non-`GLOBAL_PTT` mode                                                                                                              |
+| `ENCRYPTION_NOT_ALLOWED` | a `GLOBAL_PTT` `join` carrying a non-null `keyCheck` (the global room is always plaintext)                                                                                                        |
+| `NOT_IN_CHANNEL`         | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / `setLocked` / `setFloorQueue` / signal before `join`                       |
+| `NOT_OWNER`              | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember`, `muteAll`, `setLocked` or `setFloorQueue` by a non-owner                                                                     |
+| `PASSPHRASE_MISMATCH`    | `join` with a `keyCheck` differing from the channel's (E2EE §7). On an in-place switch (§3c) you KEEP your current channel — a switch is all-or-nothing                                           |
+| `CHANNEL_LOCKED`         | `join` (or in-place switch) to a locked channel on a server configured NOT to park newcomers (`walkie.max-join-requests: 0`, §3e). Otherwise a locked channel replies `joinPending` instead (§3f) |
+| `CHANNEL_FULL`           | `join` (or in-place switch) to a channel already at its member cap (one stream index per member, 0..254 → 255 members). You keep your current channel                                             |
+| `TOO_MANY_JOIN_REQUESTS` | `join` at a locked channel whose waiting list is already at `walkie.max-join-requests` (§3f). Transient — the list drains as the owner decides, so retrying later may work                        |
+| `JOIN_REQUEST_DENIED`    | The owner declined your request to join (§3f). Not a malformed request: the answer was simply no, so stop waiting and stay connected                                                              |
+| `UNKNOWN_TARGET`         | WebRTC signal, `transferOwnership`, or `muteMember` (unknown/left id, or the owner itself) — a target not mutable in the channel                                                                  |
 
 ---
 

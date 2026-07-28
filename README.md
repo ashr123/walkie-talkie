@@ -271,12 +271,20 @@ muted. (Caveat: on the **WebRTC** transport, media is peer-to-peer, so the serve
 audio itself; the muted client still stops sending as a courtesy, but the guarantee holds only on the relay
 transport.)
 
-**Lock the channel.** The owner can freeze the room to newcomers: a **Lock channel** / **Unlock channel** toggle
-in the **Members** panel header (owner-only, applied immediately) stops anyone else joining — even with the right
-passphrase. Everyone sees a **🔒 Locked** badge while it's on. Enforcement is on the **server** (the join is
-refused with `CHANNEL_LOCKED`), so it doesn't rely on the clients. Existing members are unaffected; a member who
-*leaves* a locked channel, though, can't come back until it's unlocked. (The ownerless `global` room can't be
-locked.)
+**Lock the channel, and approve who comes in.** The owner can close the room to newcomers: a **Lock channel** /
+**Unlock channel** toggle in the **Members** panel header (owner-only, applied immediately). Everyone sees a
+**🔒 Locked** badge while it's on, and existing members are unaffected.
+
+While it's locked, somebody trying to join isn't turned away — they're **parked for your approval**, WhatsApp
+style. You get a **Requests to join (N)** block above the roster with **Admit** / **Deny** on each row (plus
+**Admit all** / **Deny all**), and they see a "waiting for the owner to admit you" banner with a **Cancel**
+button. Unlocking lets everyone still waiting in. Someone waiting keeps whatever channel they were already in, so
+asking costs them nothing — and being declined leaves them connected, free to try elsewhere.
+
+Enforcement is on the **server**, so it doesn't rely on the clients: an approval is a one-shot permission for that
+one person, and re-asking is not a way in. Set `walkie.max-join-requests: 0` to go back to refusing newcomers
+outright (`CHANNEL_LOCKED`) if you'd rather not be asked at all; the default caps the list at 16. (The ownerless
+`global` room can't be locked, so it never has a waiting list.)
 
 Open the page in two tabs (or two machines) to talk between them.
 
@@ -327,8 +335,9 @@ re-enter it) · `o <#id>` hand ownership to another member (owner; `<#id>` is th
 · `mute <#id|all>` / `unmute <#id|all>` mute or unmute a member — or everyone but yourself — as the owner (the
 server enforces it: a muted member's audio is dropped and it's shown `[muted]` in `w`; being muted stops your
 mic and refuses `t` until you're unmuted) · `lock` / `unlock` lock or unlock the channel to new members as the
-owner (server-enforced; a blocked newcomer is refused with `CHANNEL_LOCKED`; existing members are unaffected) ·
-`n <name>` rename · `f` toggle hi-fi
+owner (server-enforced; existing members are unaffected — while locked, newcomers are parked for your approval) ·
+`requests` list the newcomers waiting to be admitted, `admit <#id|all>` / `deny <#id|all>` decide, as the owner ·
+`cancel` stop waiting to be admitted somewhere · `n <name>` rename · `f` toggle hi-fi
 (music/voice) live · `q` quit (closes the socket, ending the session) · `h` help.
 
 The client encodes Opus at 48 kHz with in-band FEC (Concentus) — stereo when the audio device supports it,

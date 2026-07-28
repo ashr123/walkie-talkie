@@ -131,14 +131,45 @@ join's lock read share the **same bin lock** as the key-check (both under `chann
 atomic w.r.t. every concurrent join — a joiner sees consistently the locked or the unlocked state. Only
 NEWCOMERS are blocked: an existing member's in-place re-join to its **current** channel short-circuits in
 `handleJoin` before `joinOrCreate` (idempotent re-snapshot, carrying `locked`), so it's never locked out; the
-lock also never removes existing members. `CHANNEL_LOCKED` behaves like `PASSPHRASE_MISMATCH` (both are
-detectable only inside the atomic join): an initial connect fails cleanly, and a switch INTO a locked channel is
-refused **without** dropping you (see the in-place switch note below). The `ChannelLocked` broadcast
+lock also never removes existing members. A locked channel **parks** a newcomer for the owner's approval rather than refusing it (see
+"Owner-approved join requests" below); `CHANNEL_LOCKED` is returned only when parking is disabled
+(`walkie.max-join-requests: 0`). Either way a switch INTO a locked channel is handled **without** dropping you
+(see the in-place switch note below). The `ChannelLocked` broadcast
 runs under the channel monitor reading the live `isLocked()` (convergence, like the passphrase/owner
 broadcasts). The lock persists across a departure-triggered ownership change (a new owner inherits it and can
 unlock); the sentinel-owned `global` room can't be locked (`NOT_OWNER`). Web: an owner-only Lock/Unlock toggle
 in the Members header + a 🔒 badge shown to everyone; Java: `lock`/`unlock` commands + a 🔒 marker in `w` and
 the join line.
+
+**Owner-approved join requests ("requests to join").** A LOCKED channel doesn't turn newcomers away — it **parks**
+them on a per-channel waiting list for the owner to admit or deny (`ConnectionService.handleResolveJoinRequest` /
+`handleResolveAllJoinRequests`, `ClientMessage.ResolveJoinRequest` / `ResolveAllJoinRequests` /
+`WithdrawJoinRequest`). There is deliberately **no second toggle**: the lock IS the switch, and
+`walkie.max-join-requests` (default 16) bounds the list — set it to `0` and a locked channel refuses outright with
+`CHANNEL_LOCKED`, the pre-feature behaviour and the "closed, don't even ask" setting. The list is
+`Channel.joinRequests`, a monitor-guarded FIFO `SequencedMap` keyed by session id, seeded from
+`Channel.Defaults(floorQueueEnabled, maxJoinRequests)` at creation like the floor-queue default. **Invariant: a
+request exists only while the channel is locked** — knocks happen only in the locked branch and unlocking drains
+the list in the same bin-locked step. Nothing is time-driven, so the 1 Hz floor sweep is not involved.
+**A parked newcomer is NOT a member**: no stream index, no roster entry, no broadcasts, `channelName` untouched —
+so every existing gate (`onAudio`, `requireChannel`) already refuses it with no new enforcement.
+**Admission is grant-then-claim**, because the server *cannot* add the newcomer itself: a waiting session may be a
+member of another channel, and leaving it would mean calling a `ChannelRegistry` mutate from inside another's
+`compute` remapping, which `ConcurrentHashMap` forbids. So `joinOrCreate`'s locked branch has three ways through —
+spend a one-shot grant (`Channel.consumeGrant`, which bypasses the LOCK only; capacity and the key-check still
+apply), else validate the key-check and `knock`, else refuse. The grant is the **security boundary**: it is what
+stops a parked newcomer admitting itself by simply re-sending `Join`. `JoinOutcome` therefore gains `Pending`, and
+`ClientSession.pendingChannel` (single-valued: one outstanding request per session) is what lets `onClose` scrub a
+waiting entry in O(1) — teardown reconciles by `channelName`, which a knocker doesn't have.
+The owner sees `ServerMessage.JoinRequests`, an authoritative to-one snapshot re-sent on every change (the
+`FloorStatus` doctrine); a granted-but-unclaimed entry stays listed so it can be revoked, and a newly elected owner
+inherits the list. `JoinApproved` is one trigger for three causes the client need not distinguish (admitted,
+unlocked, or the channel was dropped when its last member left — in which case the re-`Join` **recreates** it and
+that newcomer owns it). `ChannelRegistry.leave` returns a sealed `LeaveOutcome`
+(`Removed`/`OwnerElected`/`ChannelDropped`/`NotFound`) precisely so the dropped-channel case can't be overlooked.
+Web: a **Requests to join (N)** block above the roster with per-row Admit/Deny + Admit all/Deny all, and a waiting
+banner with Cancel; Java: `requests`, `admit <#id|all>`, `deny <#id|all>`, `cancel`, and a waiting count in `w`.
+See docs/CLIENT_PROTOCOL.md §3f.
 
 **In-place channel switch & rename.** A client changes channel/mode/passphrase **without a new socket**:
 re-sending `Join` on the live connection is handled as "join the new channel, then leave the old one" on the same

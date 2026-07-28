@@ -1168,7 +1168,7 @@ class ConnectionServiceTest {
 				"the control message past the per-session rate cap is dropped before dispatch");
 	}
 
-	// --- push-to-talk floor QUEUE ("raise hand", owner-toggleable) — see docs/FLOOR_QUEUE.md -------
+	// --- push-to-talk floor QUEUE ("raise hand", owner-toggleable) — see docs/CLIENT_PROTOCOL.md §3b -------
 
 	@Test
 	void enqueuingForABusyFloorPlacesTheMemberInTheFloorStatusQueue() {

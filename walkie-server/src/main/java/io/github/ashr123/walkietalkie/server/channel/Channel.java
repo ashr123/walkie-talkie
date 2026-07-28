@@ -93,7 +93,7 @@ public final class Channel {
 	private volatile Instant floorAcquiredAt = Instant.EPOCH;
 	private volatile Instant floorActivityAt = Instant.EPOCH;
 	// --- floor queue (push-to-talk "raise hand", owner-toggleable) --------------------------------
-	// See docs/FLOOR_QUEUE.md. When enabled, a member that presses talk while the floor is busy is ENQUEUED
+	// See docs/CLIENT_PROTOCOL.md §3b. When enabled, a member that presses talk while the floor is busy is ENQUEUED
 	// (FIFO) instead of denied; when the floor frees, it is RESERVED to the head for a bounded claim window
 	// (the head must claim by acquiring, else the reservation-expiry sweep drops it and offers the floor to the
 	// next head). Default off — behaviour then matches the pre-queue model (busy floor => acquire fails).

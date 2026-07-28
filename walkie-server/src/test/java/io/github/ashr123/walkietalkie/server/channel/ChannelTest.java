@@ -122,7 +122,7 @@ class ChannelTest {
 				"requireStreamIndex fails fast on a missing member (an invariant breach) instead of returning 0");
 	}
 
-	// --- floor queue primitives (the "raise hand" model — see docs/FLOOR_QUEUE.md) ------------------
+	// --- floor queue primitives (the "raise hand" model — see docs/CLIENT_PROTOCOL.md §3b) ------------------
 
 	private static Channel queueChannel() {
 		return new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, new Channel.Defaults(true, 0));
