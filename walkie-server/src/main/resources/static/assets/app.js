@@ -251,6 +251,13 @@ async function connect() {
 			log(`WebSocket open (${state.transport})`);
 			sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck});
 			setStatus(true, `Connected — ${state.transport}`);
+			// Rename is a SESSION property: the server accepts it with or without a channel ("no roster to keep
+			// consistent"), and someone waiting to be admitted to a locked channel has a real reason to use it —
+			// their name is what the owner is deciding about. It was previously revealed only on Joined, which left
+			// a waiting or declined user with no button even though pressing Enter in the field still renamed them.
+			byId('renameBtn').hidden = false;
+			byId('renameHint').hidden = false;
+			updateRenameButton();
 			// The Connect/Disconnect buttons were already flipped to "Disconnect only" when the connect flow began.
 			// The in-channel controls — Rename, the adaptive Apply/Switch button, the owner dropdown — appear only
 			// once the server confirms the join (the Joined snapshot), via onJoined. Revealing them here on a mere
@@ -435,13 +442,16 @@ function updateApplyControls() {
 		|| ownerSelectChanged;
 	// No disabled state: the button — and its explanatory hint — appear ONLY when there's something to do (a
 	// pending property change, or a member re-key to adopt) AND the channel name is valid, and are hidden
-	// otherwise. The label switches between "Switch channel" (the channel name changed → a fresh join) and
-	// "Apply changes" (in-place edit).
+	// otherwise. The label says which of the three things pressing it will do: JOIN one (we are in no channel —
+	// connected but channel-less, after a refused or declined join), SWITCH to a different one, or APPLY an
+	// in-place edit to the one we are in. "Switch channel" while in no channel described a move from nowhere.
 	const actionable = changed && channelValid || state.rekeyPending;
 	btn.hidden = !actionable;
 	byId('resetBtn').hidden = !actionable;   // Reset (cancel) appears and disappears together with Apply/Switch
 	hint.hidden = !actionable;
-	btn.textContent = channelChanged ? 'Switch channel' : 'Apply changes';
+	byId('applyHintChannelless').hidden = state.channel !== null;
+	byId('applyHintInChannel').hidden = state.channel === null;
+	btn.textContent = state.channel === null ? 'Join channel' : channelChanged ? 'Switch channel' : 'Apply changes';
 
 	// Post-connect, the channel's properties — transport, mode, passphrase — are editable only by the channel
 	// OWNER, or by anyone who has changed the channel NAME to switch to a different room (a fresh join, so you
@@ -683,9 +693,14 @@ function rename() {
 function updateRenameButton() {
 	const btn = byId('renameBtn');
 	if (btn.hidden) {
+		// Leave it DISABLED rather than untouched: the Enter-in-the-field shortcut is gated on this same flag, and a
+		// stale `false` let Enter rename while no button was even on screen.
+		btn.disabled = true;
 		return;
 	}
-	btn.disabled = byId('display').value.trim() === state.members.get(state.selfId);
+	// Channel-less there is no roster to compare against, so any valid name is a change — which is the point: it is
+	// how a waiting newcomer corrects the name its channel's owner is looking at.
+	btn.disabled = byId('display').value.trim() === (state.channel === null ? '' : state.members.get(state.selfId));
 }
 
 // --- incoming messages ----------------------------------------------------------------------------
@@ -854,10 +869,8 @@ function onJoined(msg) {
 	updateTalkButton();
 	updateModeControl();
 	updateGlobalModeLocks();
-	// Reveal the in-channel controls only now that the server has confirmed the join. Renaming makes sense only in
-	// a channel, and showing it here (not on socket-open) avoids flashing it for a join the server rejects.
-	byId('renameBtn').hidden = false;
-	byId('renameHint').hidden = false;
+	// Reveal the in-channel controls only now that the server has confirmed the join. (Rename is revealed on
+	// socket-open instead — see connect() — because a rename is a property of the SESSION, not of a channel.)
 	updateRenameButton();   // starts disabled — the field matches our just-joined name
 	updateApplyControls();
 	renderOwnerSelect();
@@ -1080,7 +1093,9 @@ function onJoinRefused(reason) {
 	state.ownerId = null;
 	state.channelKeyCheck = null;   // the announced key-check belonged to no channel; keep the typed passphrase for the next try
 	state.rekeyPending = false;
-	log(`${reason} Pick a channel and press Apply to try another.`);
+	// "Join channel" is what the adaptive button reads while channel-less (see updateApplyControls) — naming the
+	// button it does not have would send the reader looking for an "Apply" that isn't there.
+	log(`${reason} Pick a channel and press Join to try another.`);
 	// One re-render: renderMembers already fans out to every owner-only control (mute-all, lock, queue, the owner
 	// dropdown) and to Apply/Reset. They now all read ownsChannel() === false, so they hide rather than mistaking
 	// null === null for "I'm the owner".

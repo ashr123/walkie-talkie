@@ -423,10 +423,13 @@
 		<select hidden id="ownerSelect"></select>
 		<button hidden id="applyBtn" style="width:100%; margin-top:8px;">Apply changes</button>
 		<button class="secondary" hidden id="resetBtn" style="width:100%; margin-top:8px;">Reset</button>
-		<div class="hint" hidden id="applyHint">Change the transport, mode, channel, passphrase, or owner above, then
-			Apply — or Reset to discard the pending changes. A new channel name switches rooms (carrying the chosen
-			properties); otherwise the change applies to the current channel — mode, passphrase and ownership are
-			owner-only, and changing the transport reconnects. Clear the passphrase and Apply to turn encryption off.</div>
+		<div class="hint" hidden id="applyHint"><span hidden id="applyHintChannelless">You are connected but not in a
+			channel. Pick a channel name (and the properties you want) above, then Join — or Reset to discard the
+			pending changes.</span><span id="applyHintInChannel">Change the transport, mode, channel, passphrase, or
+			owner above, then Apply — or Reset to discard the pending changes. A new channel name switches rooms
+			(carrying the chosen properties); otherwise the change applies to the current channel — mode, passphrase
+			and ownership are owner-only, and changing the transport reconnects. Clear the passphrase and Apply to turn
+			encryption off.</span></div>
 		<label hidden id="shareRekeyRow" style="align-items:center; gap:8px; margin-top:8px;">
 			<input checked id="shareRekey" style="width:auto;" type="checkbox"> <span id="shareRekeyText">Share new passphrase with current members (uncheck to require everyone to re-enter it)</span>
 		</label>
