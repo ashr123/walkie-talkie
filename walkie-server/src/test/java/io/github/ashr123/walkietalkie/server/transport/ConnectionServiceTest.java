@@ -2153,6 +2153,237 @@ class ConnectionServiceTest {
 				"the full list is unchanged");
 	}
 
+	/// Admitting is grant-then-claim: the owner's approval does not add the member, it authorises the newcomer's own
+	/// re-sent `Join` to pass the lock. The server cannot add it directly — a newcomer may be in another channel, and
+	/// leaving that one from inside the atomic join is forbidden — so the round trip IS the design.
+	@Test
+	void anAdmittedNewcomerJoinsByReSendingItsJoin() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", true));
+
+		assertEquals("team", firstOf(bob, ServerMessage.JoinApproved.class).channel(), "the newcomer is told to claim");
+		assertNull(bob.channelName(), "an approval alone does not make it a member");
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertEquals("team", bob.channelName(), "its own re-Join completes the join");
+		assertEquals(2, channel("team").size());
+		assertNull(bob.pendingChannel(), "and it is no longer waiting");
+		assertTrue(lastOf(alice, ServerMessage.JoinRequests.class).requests().isEmpty(),
+				"the request left the owner's list when it was consumed");
+	}
+
+	@Test
+	void aGrantIsOneShotSoAReJoinCannotBeReplayed() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", true));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		// bob is in. It leaves, then tries to walk back in on the strength of the approval it already spent.
+		svc.onMessage(bob, new ClientMessage.Leave());
+		bob.sent.clear();
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertNull(bob.channelName(), "the spent grant does not let it back in");
+		assertEquals("team", firstOf(bob, ServerMessage.JoinPending.class).channel(), "it has to ask again");
+	}
+
+	@Test
+	void aDeniedNewcomerIsToldAndDroppedFromTheList() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", false));
+
+		assertEquals(ErrorCode.JOIN_REQUEST_DENIED, firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertNull(bob.pendingChannel());
+		assertTrue(lastOf(alice, ServerMessage.JoinRequests.class).requests().isEmpty());
+		assertEquals(1, channel("team").size());
+	}
+
+	@Test
+	void anUnclaimedApprovalCanStillBeRevoked() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", true));
+		// bob's client never comes back to claim it — which is why a granted request stays on the owner's list.
+		assertEquals(List.of("bob"),
+				lastOf(alice, ServerMessage.JoinRequests.class).requests().stream().map(JoinRequestInfo::id).toList());
+
+		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", false));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertNull(bob.channelName(), "the revoked approval no longer admits it");
+		// Its claim arrives to find no grant, so it counts as asking again — which is what bob is in fact doing.
+		assertEquals("team", bob.pendingChannel());
+		assertEquals(List.of("bob"),
+				lastOf(alice, ServerMessage.JoinRequests.class).requests().stream().map(JoinRequestInfo::id).toList(),
+				"a revoked-then-retried newcomer is back on the list as a fresh request");
+	}
+
+	@Test
+	void aWithdrawnRequestLeavesTheOwnersList() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(bob, new ClientMessage.WithdrawJoinRequest());
+
+		assertNull(bob.pendingChannel());
+		assertTrue(lastOf(alice, ServerMessage.JoinRequests.class).requests().isEmpty());
+	}
+
+	@Test
+	void unlockingAdmitsEveryoneWhoWasWaiting() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		FakeClientSession carol = session("carol");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+
+		svc.onMessage(alice, new ClientMessage.SetLocked(false));
+
+		// An unlocked channel admits anyone, so leaving people parked at an open door would be incoherent.
+		assertEquals("team", firstOf(bob, ServerMessage.JoinApproved.class).channel());
+		assertEquals("team", firstOf(carol, ServerMessage.JoinApproved.class).channel());
+		assertNull(bob.pendingChannel());
+		assertTrue(lastOf(alice, ServerMessage.JoinRequests.class).requests().isEmpty(),
+				"the list is drained, not left full of approvals no unlocked channel would ever consume");
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		assertEquals("team", bob.channelName(), "and they join normally, the lock being gone");
+	}
+
+	/// The case that makes the sealed LeaveOutcome necessary: the owner of a locked channel is its ONLY member, so
+	/// its departure drops the channel — taking the waiting list with it. Those newcomers would wait forever for an
+	/// owner who no longer exists, so they are released instead.
+	@Test
+	void theLastMemberLeavingALockedChannelReleasesEveryoneWaiting() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onClose(alice, "normal close");
+
+		assertFalse(channelExists("team"), "the channel emptied and was dropped");
+		assertEquals("team", firstOf(bob, ServerMessage.JoinApproved.class).channel(),
+				"the lock died with the channel, so the waiting newcomer is cleared to join");
+		assertNull(bob.pendingChannel());
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertEquals("team", bob.channelName(), "its re-Join RECREATES the channel");
+		assertEquals("bob", channel("team").ownerId(), "and whoever was waiting at an abandoned door now owns it");
+		assertFalse(channel("team").isLocked(), "a freshly created channel is never locked");
+	}
+
+	@Test
+	void aNewlyElectedOwnerInheritsTheWaitingList() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		FakeClientSession carol = session("carol");
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		carol.sent.clear();
+
+		svc.onClose(alice, "normal close");   // ownership auto-elects to carol
+
+		assertEquals("carol", channel("team").ownerId());
+		assertEquals(List.of("bob"),
+				lastOf(carol, ServerMessage.JoinRequests.class).requests().stream().map(JoinRequestInfo::id).toList(),
+				"the waiting list is owner-only knowledge, so the new owner must be handed it");
+		svc.onMessage(carol, new ClientMessage.ResolveJoinRequest("bob", true));
+		assertEquals("team", firstOf(bob, ServerMessage.JoinApproved.class).channel(), "and can act on it");
+	}
+
+	@Test
+	void onlyTheOwnerCanResolveAJoinRequest() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		FakeClientSession carol = session("carol");
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(carol, new ClientMessage.ResolveJoinRequest("bob", true));
+
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(carol, ServerMessage.ErrorMessage.class).code());
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.JoinApproved.class::isInstance),
+				"a non-owner's approval admits nobody");
+	}
+
+	@Test
+	void resolvingAnUnknownRequestIsReportedRatherThanIgnored() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+
+		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("ghost", true));
+
+		assertEquals(ErrorCode.UNKNOWN_TARGET, firstOf(alice, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void admitAllAdmitsEveryWaitingNewcomerAndDenyAllTurnsThemAway() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		FakeClientSession carol = session("carol");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+
+		svc.onMessage(alice, new ClientMessage.ResolveAllJoinRequests(true));
+
+		// Admit-all keeps the channel LOCKED, so each newcomer still needs its grant to pass the lock.
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+		assertEquals(3, channel("team").size());
+		assertTrue(channel("team").isLocked(), "admit-all is not an unlock");
+
+		FakeClientSession dave = session("dave");
+		svc.onMessage(dave, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "dave", null));
+		svc.onMessage(alice, new ClientMessage.ResolveAllJoinRequests(false));
+
+		assertEquals(ErrorCode.JOIN_REQUEST_DENIED, firstOf(dave, ServerMessage.ErrorMessage.class).code());
+		assertNull(dave.pendingChannel());
+	}
+
 	// --- session lifecycle: a closed session must not resurrect per-session state --------------------
 
 	/// A late control frame from a session whose socket has already gone is dropped BEFORE anything acts on it.

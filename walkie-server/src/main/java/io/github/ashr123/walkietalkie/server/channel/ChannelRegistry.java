@@ -176,24 +176,54 @@ public class ChannelRegistry {
 		return Option.of(channels.get(name));
 	}
 
-	/// Atomically removes a member, dropping the channel once empty. If the leaver owned the channel and
-	/// others remain, ownership is reassigned and the new owner id is returned (so the caller can
-	/// announce it); otherwise [io.github.ashr123.option.None].
-	public Option<String> leave(String name, String sessionId) {
-		AtomicReference<String> newOwner = new AtomicReference<>();
+	/// What a departure changed. Sealed and exhaustive because these outcomes are mutually exclusive — a channel that
+	/// emptied cannot also have elected an owner — and because the caller MUST NOT overlook [ChannelDropped]: a
+	/// dropped channel takes its waiting list with it, and those newcomers would otherwise wait forever for an owner
+	/// who no longer exists. An `Option<String>` return (all this used to be) could not express that at all.
+	public sealed interface LeaveOutcome {
+
+		/// The member was removed and others remain; the owner is unchanged.
+		record Removed() implements LeaveOutcome {
+		}
+
+		/// The member was removed, others remain, and it OWNED the channel — so ownership was auto-elected to
+		/// `newOwnerId`. The new owner inherits any waiting list and must be sent the current snapshot.
+		record OwnerElected(String newOwnerId) implements LeaveOutcome {
+		}
+
+		/// The LAST member left, so the channel was dropped from the registry. `clearedRequests` are the newcomers
+		/// who were waiting at its door: the lock died with the channel, so they are cleared to join, and whichever
+		/// of them re-sends `Join` first RECREATES the channel and owns it.
+		record ChannelDropped(List<ClientSession> clearedRequests) implements LeaveOutcome {
+		}
+
+		/// No such channel (already dropped), or the session was not a member of it — nothing changed.
+		record NotFound() implements LeaveOutcome {
+		}
+	}
+
+	/// Atomically removes a member, dropping the channel once empty and auto-electing a new owner when the leaver
+	/// owned it. See [LeaveOutcome] for what the caller must then announce.
+	public LeaveOutcome leave(String name, String sessionId) {
+		AtomicReference<LeaveOutcome> outcome = new AtomicReference<>(new LeaveOutcome.NotFound());
 		channels.computeIfPresent(name, (_, channel) -> {
 			boolean wasOwner = sessionId.equals(channel.ownerId());
 			channel.remove(sessionId);
 			if (channel.isEmpty()) {
+				// Nobody is left to admit anyone, so hand the waiting newcomers back for the caller to release
+				// rather than letting them vanish with the channel object.
+				outcome.set(new LeaveOutcome.ChannelDropped(channel.drainJoinRequests()));
 				return null;
 			}
 			if (wasOwner && channel.anyMember() instanceof Some(String elected)) {
 				channel.setOwner(elected);
-				newOwner.set(elected);
+				outcome.set(new LeaveOutcome.OwnerElected(elected));
+			} else {
+				outcome.set(new LeaveOutcome.Removed());
 			}
 			return channel;
 		});
-		return Option.of(newOwner.get());
+		return outcome.get();
 	}
 
 	/// The result of a [#changePassphrase] attempt. `Ok` carries the exact `Channel` whose key-check was rotated —
@@ -275,7 +305,10 @@ public class ChannelRegistry {
 	/// = the requester doesn't own the channel; `NotFound` = no such channel. Sealed, so the caller's `switch` is
 	/// exhaustive and the `Channel` is present only on success.
 	public sealed interface LockResult {
-		record Ok(Channel channel) implements LockResult {}
+		/// The flag was changed. `clearedRequests` are the newcomers UNLOCKING released — an unlocked channel admits
+		/// anyone, so leaving people parked at an open door would be incoherent, and it is what keeps the invariant
+		/// "a request exists only while the channel is locked" true. Empty when locking, or when nobody was waiting.
+		record Ok(Channel channel, List<ClientSession> clearedRequests) implements LockResult {}
 
 		record NotOwner() implements LockResult {}
 
@@ -293,7 +326,14 @@ public class ChannelRegistry {
 		channels.computeIfPresent(name, (_, channel) -> {
 			if (requesterId.equals(channel.ownerId())) {
 				channel.setLocked(locked);
-				result.set(new LockResult.Ok(channel));
+				// Unlocking releases everyone waiting, in the SAME bin-locked step as the flag: a concurrent join
+				// therefore either sees the channel still locked (and is parked) or sees it open (and walks in) —
+				// never "open but you are still on a list nobody will ever read".
+				//
+				// It DRAINS rather than grants. A grant exists only to bypass the lock, and there is no longer a lock
+				// to bypass: joinOrCreate's locked branch — the only place a grant is consumed — is skipped once the
+				// channel is open, so granting here would leave every entry in the list forever.
+				result.set(new LockResult.Ok(channel, locked ? List.of() : channel.drainJoinRequests()));
 			} else {
 				result.set(new LockResult.NotOwner());
 			}

@@ -282,6 +282,18 @@ public class ConnectionService {
 				parkJoinRequest(session, channel, alreadyWaiting);
 			}
 			case ChannelRegistry.JoinOutcome.Admitted admitted -> {
+				// We are a member somewhere now, so we are not waiting at any door — but HOW we stop waiting differs:
+				String wasWaitingFor = session.pendingChannel();
+				if (wasWaitingFor != null && wasWaitingFor.equals(admitted.channel().name())) {
+					// This join spent a grant, which removed the request INSIDE the atomic join. Nothing is left to
+					// withdraw, so the owner's view of the list has to be refreshed explicitly.
+					session.pendingCleared();
+					notifyOwnerOfJoinRequests(admitted.channel());
+				} else {
+					// It gave up on one door by successfully joining a DIFFERENT channel: withdraw the abandoned
+					// request, which refreshes THAT channel's owner.
+					withdrawPendingElsewhere(session, null);
+				}
 				// The target has us; only now let go of the channel we came from. Departing BEFORE announcing keeps
 				// the observable order a switch has always had (the old channel's MemberLeft, then the new channel's
 				// MemberJoined) and keeps the "left" line tagged with the channel actually left, since announceJoin
@@ -510,7 +522,21 @@ public class ConnectionService {
 		// the next head gets a fresh window). We must NOT hold the channel monitor across channelRegistry.leave (the
 		// registry takes its bin lock then this monitor, so the reverse order deadlocks — see the lock-order note on
 		// Channel), so the floor teardown runs AFTER the removal, on LIVE state.
-		boolean ownerChanged = channelRegistry.leave(channelName, session.id()) instanceof Some<String>;
+		ChannelRegistry.LeaveOutcome departure = channelRegistry.leave(channelName, session.id());
+		// The channel emptied and was dropped, so anyone still waiting at its door can never be admitted by an owner
+		// that no longer exists. Release them instead: the lock died with the channel, so they are cleared to join,
+		// and whichever of them re-sends Join first recreates it and owns it. Done BEFORE the survivor fan-out below
+		// because there are no survivors on this path (the channel is gone).
+		if (departure instanceof ChannelRegistry.LeaveOutcome.ChannelDropped(List<ClientSession> cleared)) {
+			for (ClientSession waiting : cleared) {
+				waiting.pendingCleared();
+				broadcaster.toOne(waiting, new ServerMessage.JoinApproved(channelName));
+			}
+			if (!cleared.isEmpty()) {
+				log.info("channel dropped; released {} waiting newcomer(s) to rejoin", cleared.size());
+			}
+		}
+		boolean ownerChanged = departure instanceof ChannelRegistry.LeaveOutcome.OwnerElected;
 		if (channelBeforeLeave instanceof Some(Channel channel)) {
 			// Announce to the survivors of the SAME channel object the leave acted on — NOT a fresh find()-by-name,
 			// which could resolve a dropped-and-recreated same-named channel and notify its members instead.
@@ -531,6 +557,12 @@ public class ConnectionService {
 					// never muted, so unmute it if needed — else it would be a muted owner nobody can unmute.
 					if (unmuteOwner(channel)) {
 						events.add(new ServerMessage.MemberMuted(newOwnerId, false));
+					}
+					// The waiting list is owner-only knowledge, and ownership just moved: hand the new owner the
+					// current list (to-one, so it doesn't ride the survivor fan-out) or it would inherit newcomers it
+					// cannot see. The outgoing owner is gone, so nothing needs clearing there.
+					if (channel.member(newOwnerId) instanceof Some(ClientSession newOwner)) {
+						broadcaster.toOne(newOwner, new ServerMessage.JoinRequests(channel.joinRequestInfos()));
 					}
 					log.info(
 							"ownership transferred to {} ({})",
@@ -1194,11 +1226,23 @@ public class ConnectionService {
 			case ChannelRegistry.LockResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.LockResult.NotOwner _ ->
 					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can lock the channel");
-			case ChannelRegistry.LockResult.Ok(Channel channel) -> {
+			case ChannelRegistry.LockResult.Ok(Channel channel, List<ClientSession> cleared) -> {
 				synchronized (channel) {
 					broadcaster.toAll(channel, new ServerMessage.ChannelLocked(channel.isLocked()));
 				}
-				log.info("channel {}", locked ? "locked" : "unlocked");
+				// Unlocking admitted everyone who was waiting: each completes the join with its own re-sent Join, the
+				// same way an individually approved newcomer does, so there is one admission path rather than two.
+				for (ClientSession waiting : cleared) {
+					waiting.pendingCleared();   // their request is gone from the list, so the marker must go too
+					broadcaster.toOne(waiting, new ServerMessage.JoinApproved(channel.name()));
+				}
+				if (!cleared.isEmpty()) {
+					// The list is now empty, so refresh the owner's view of it.
+					broadcaster.toOne(session, new ServerMessage.JoinRequests(channel.joinRequestInfos()));
+					log.info("channel unlocked; admitted {} waiting newcomer(s)", cleared.size());
+				} else {
+					log.info("channel {}", locked ? "locked" : "unlocked");
+				}
 			}
 		}
 	}
