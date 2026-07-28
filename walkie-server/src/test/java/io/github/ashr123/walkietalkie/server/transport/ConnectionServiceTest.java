@@ -2027,6 +2027,26 @@ class ConnectionServiceTest {
 		assertEquals(1, channel("team").size(), "the channel still has only its owner");
 	}
 
+	/// A fresh connection's Join is the only place its display name comes from, so parking must not roll it back —
+	/// the owner would be looking at an anonymous entry and could not tell who it is deciding about.
+	@Test
+	void aParkedNewcomerKeepsTheNameItsJoinCarried() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = new FakeClientSession("bob-id", Transport.AUDIO_RELAY, "");   // no name until it joins
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertEquals("bob", bob.displayName(), "the name its Join carried survives being parked");
+		assertEquals(
+				"bob",
+				lastOf(alice, ServerMessage.JoinRequests.class).requests().getFirst().displayName(),
+				"so the owner sees who is asking, not a blank entry"
+		);
+	}
+
 	@Test
 	void aParkedNewcomerCannotLetItselfIn() {
 		ConnectionService svc = serviceParking(16);

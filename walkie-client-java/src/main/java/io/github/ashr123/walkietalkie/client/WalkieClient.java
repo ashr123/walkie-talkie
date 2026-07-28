@@ -93,6 +93,7 @@ public final class WalkieClient implements AutoCloseable {
 			           c <channel> [mode] [key] = switch channel
 			           n <name> = rename
 			           f = hi-fi on/off
+			           cancel = stop waiting to be admitted to a locked channel
 			           q = quit
 			           h = help""";
 	/// The owner-only command block — shown in the help ONLY to the current channel owner, and announced verbatim
@@ -106,7 +107,9 @@ public final class WalkieClient implements AutoCloseable {
 			           o <#id> = give ownership to another member
 			           mute <#id|all> / unmute <#id|all> = mute or unmute members
 			           lock / unlock = lock or unlock the channel to new members
-			           queue on / queue off = turn the push-to-talk floor queue on or off""";
+			           queue on / queue off = turn the push-to-talk floor queue on or off
+			           requests = list the newcomers waiting to be admitted (a locked channel parks them)
+			           admit <#id|all> / deny <#id|all> = let a waiting newcomer in, or turn it away""";
 	/// The one passphrase command a NON-owner has: adopt a rotation the owner announced but didn't auto-share (an
 	/// owner instead changes the passphrase with `p`/`p!` — see [#OWNER_COMMANDS]). The 11 leading spaces align its
 	/// `p` under the command column of [#COMMON_COMMANDS] / [#OWNER_COMMANDS] after their text-block indent is
@@ -645,7 +648,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// id (membership precedes any floor/owner/mute reference, and delivery is ordered per recipient), so no
 	/// unknown-id fallback is needed — mirrors the browser client's memberLabel().
 	private String name(String id) {
-		return memberNames.get(id) + " (#" + id.substring(0, Math.min(ID_PREFIX_LENGTH, id.length())) + ")";
+		return memberNames.get(id) + " (#" + shortId(id) + ")";
 	}
 
 	private void announceJoin(MemberInfo member) {
@@ -745,9 +748,9 @@ public final class WalkieClient implements AutoCloseable {
 		joinRequests = List.copyOf(requests);
 		requests.stream()
 				.filter(request -> !known.contains(request.id()))
-				.forEach(request -> log("[knock] " + request.displayName() + " (#"
-						+ request.id().substring(0, Math.min(ID_PREFIX_LENGTH, request.id().length()))
-						+ ") is waiting to join (" + requests.size() + " waiting)"));
+				.forEach(request -> log("[knock] " + request.displayName() + " (#" + shortId(request.id())
+						+ ") wants to join — 'admit #" + shortId(request.id()) + "' or 'deny #" + shortId(request.id())
+						+ "' (" + requests.size() + " waiting)"));
 	}
 
 	/// Whether the mic should auto-open on a full-duplex join or mode change, for the current session — reads our
@@ -795,7 +798,11 @@ public final class WalkieClient implements AutoCloseable {
 				.collect(Collectors.joining(
 						System.lineSeparator() + "  - ",
 						"[members] " + memberNames.size() + " in this channel"
-								+ (channelLocked ? " 🔒 locked to new members" : "") + ":" + System.lineSeparator() + "  - ",
+								+ (channelLocked ? " 🔒 locked to new members" : "")
+								// A terminal has no badge to glance at, so the count rides the status line the user
+								// already types. Only the owner is sent the list, so it is silently 0 for anyone else.
+								+ (joinRequests.isEmpty() ? "" : " · " + joinRequests.size() + " waiting to join ('requests')")
+								+ ":" + System.lineSeparator() + "  - ",
 						""
 				)));
 	}
@@ -820,6 +827,10 @@ public final class WalkieClient implements AutoCloseable {
 					case "lock" -> setChannelLock(true);
 					case "unlock" -> setChannelLock(false);
 					case "queue" -> setFloorQueue(parts.length > 1 ? parts[1] : "");
+					case "requests" -> listJoinRequests();
+					case "admit" -> resolveJoinRequest(parts.length > 1 ? parts[1] : "", true);
+					case "deny" -> resolveJoinRequest(parts.length > 1 ? parts[1] : "", false);
+					case "cancel" -> cancelJoinRequest();
 					case "n", "name" -> rename(parts.length > 1 ? parts[1] : "");
 					case "f", "fidelity" -> toggleFidelity();
 					case "w", "who", "members" -> listMembers();
@@ -1169,6 +1180,80 @@ public final class WalkieClient implements AutoCloseable {
 	/// The other members (never ourself) whose session id starts with `needle` — the shared resolution for the
 	/// id-prefix targeting used by `o` (transfer ownership) and `mute`/`unmute`. Ourself is excluded because none
 	/// of those actions apply to it (you can't transfer to, or mute, yourself).
+	/// `requests` — the newcomers waiting to be admitted to this locked channel, in arrival order. The server sends
+	/// this list only to the owner, so for anyone else it is simply empty (rather than a permission error): being
+	/// unable to see who is knocking is not a failed command.
+	private void listJoinRequests() {
+		List<JoinRequestInfo> waiting = joinRequests;
+		if (waiting.isEmpty()) {
+			log(selfId.equals(ownerId)
+					? "[requests] nobody is waiting to join."
+					: "[requests] only the channel owner sees who is waiting to join.");
+			return;
+		}
+		log(waiting.stream()
+				.map(request -> request.displayName() + " (#" + shortId(request.id()) + ")")
+				.collect(Collectors.joining(
+						System.lineSeparator() + "  - ",
+						"[requests] " + waiting.size() + " waiting to join — 'admit <#id>' or 'deny <#id>':"
+								+ System.lineSeparator() + "  - ",
+						"")));
+	}
+
+	/// `admit <#id|all>` / `deny <#id|all>` — the owner's decision on a waiting newcomer, resolved from the `#id`
+	/// prefix shown by `requests` exactly the way `mute` resolves a member's.
+	///
+	/// Admitting does not add the member here: the server records a one-shot approval and the newcomer's own client
+	/// completes the join, so nothing happens on this side until that lands as a MemberJoined.
+	private void resolveJoinRequest(String arg, boolean admit) {
+		String verb = admit ? "admit" : "deny";
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can " + verb + " newcomers");
+			return;
+		}
+		String prefix = arg.strip();
+		if (prefix.equalsIgnoreCase("all")) {
+			enqueue(new ClientMessage.ResolveAllJoinRequests(admit));
+			log("[" + verb + "] " + verb + "-ing everyone waiting...");
+			return;
+		}
+		if (prefix.startsWith("#")) {
+			prefix = prefix.substring(1);
+		}
+		if (prefix.isBlank()) {
+			System.out.println("Usage: " + verb + " <#id|all>  (the #id shown by 'requests', or 'all')");
+			return;
+		}
+		String needle = prefix;
+		List<JoinRequestInfo> matches = joinRequests.stream()
+				.filter(request -> request.id().startsWith(needle))
+				.toList();
+		switch (matches.size()) {
+			case 0 -> log("[" + verb + "] nobody waiting has an id starting with \"" + needle
+					+ "\" — use 'requests' to list them.");
+			case 1 -> {
+				JoinRequestInfo target = matches.getFirst();
+				enqueue(new ClientMessage.ResolveJoinRequest(target.id(), admit));
+				log("[" + verb + "] " + verb + "-ing " + target.displayName() + " (#" + shortId(target.id()) + ")...");
+			}
+			default -> log("[" + verb + "] \"" + needle + "\" matches " + matches.size()
+					+ " waiting newcomers — use more of the id.");
+		}
+	}
+
+	/// `cancel` — stop waiting to be admitted somewhere. Harmless when we are not waiting: the server treats it as a
+	/// no-op, and saying so locally is friendlier than a silent nothing.
+	private void cancelJoinRequest() {
+		enqueue(new ClientMessage.WithdrawJoinRequest());
+		log("[cancel] withdrawing any request to join a locked channel.");
+	}
+
+	/// The short `#id` prefix both clients show beside a name, so two people sharing a display name stay tellable
+	/// apart. Shared by the roster and the waiting list.
+	private static String shortId(String id) {
+		return id.substring(0, Math.min(ID_PREFIX_LENGTH, id.length()));
+	}
+
 	private List<String> otherMembersMatching(String needle) {
 		return memberNames.keySet().stream()
 				.filter(id -> !id.equals(selfId) && id.startsWith(needle))

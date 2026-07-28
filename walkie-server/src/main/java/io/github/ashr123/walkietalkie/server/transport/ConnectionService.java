@@ -307,10 +307,14 @@ public class ConnectionService {
 	}
 
 	/// Puts the display name back after a join that did not happen. `Join` carries the name alongside the channel, so
-	/// without this a refused or parked switcher would keep the new name while the channel it is still in — and which
-	/// received no `MemberRenamed` — goes on showing the old one. A no-op when the name didn't change.
+	/// without this a refused or parked SWITCHER would keep the new name while the channel it is still in — and which
+	/// received no `MemberRenamed` — goes on showing the old one.
+	///
+	/// Only a session still in a channel is rolled back. For one that is in none, there is no roster to contradict and
+	/// the name is the only label it has: rolling it back would blank a fresh connection's name (its previous one is
+	/// ""), leaving the owner of a locked channel looking at an anonymous entry in its waiting list.
 	private void undoRename(ClientSession session, String previousDisplayName) {
-		if (!previousDisplayName.equals(session.displayName())) {
+		if (session.channelName() != null && !previousDisplayName.equals(session.displayName())) {
 			session.setDisplayName(previousDisplayName);
 			RequestContext.updateDisplayName(previousDisplayName);
 		}
