@@ -401,6 +401,7 @@ disconnects, or the channel is dropped. Nothing about it is time-driven — ther
 | Last member leaves (channel dropped) | `joinApproved` — the lock died with the channel, and whoever re-sends `join` first **recreates it and owns it**                                                |
 | Waiting list already full            | `error` `TOO_MANY_JOIN_REQUESTS` (transient)                                                                                                                   |
 | Wrong passphrase                     | `error` `PASSPHRASE_MISMATCH` — the key-check is validated **before** parking, so an owner is never asked to approve somebody who could not have got in anyway |
+| Waiting newcomer renames             | nothing to the newcomer, but the owner is re-sent `joinRequests` — the list renders that name and its membership did not change, so nothing else would refresh it. Both routes count: `rename`, or re-sending `join` with a new `displayName`. A re-`join` with the SAME name is not a change and is deliberately not re-notified, so a retry loop cannot flood the owner. A parked **switcher**'s rename is rolled back with the rest of its refused switch, so the list keeps the name its own channel knows it by |
 
 The `global` room has a sentinel owner and so can never be locked, which means it never has a waiting list.
 

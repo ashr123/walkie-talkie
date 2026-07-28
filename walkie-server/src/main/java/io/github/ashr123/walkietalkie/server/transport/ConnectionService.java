@@ -279,7 +279,10 @@ public class ConnectionService {
 			}
 			case ChannelRegistry.JoinOutcome.Pending(Channel channel, boolean alreadyWaiting) -> {
 				undoRename(session, previousDisplayName);
-				parkJoinRequest(session, channel, alreadyWaiting);
+				// Compare AFTER undoRename: for a switcher it puts the name back, so the name did not really change
+				// and the owner needs no refresh. A re-knock that DID rename must refresh, since the waiting list
+				// renders that name and its membership is otherwise unchanged.
+				parkJoinRequest(session, channel, alreadyWaiting, !previousDisplayName.equals(session.displayName()));
 			}
 			case ChannelRegistry.JoinOutcome.Admitted admitted -> {
 				// We are a member somewhere now, so we are not waiting at any door — but HOW we stop waiting differs:
@@ -328,20 +331,22 @@ public class ConnectionService {
 	///
 	/// The waiting marker is set HERE rather than inside the registry because it is session state, not channel state —
 	/// and it is what lets the disconnect path scrub the request in O(1).
-	private void parkJoinRequest(ClientSession session, Channel channel, boolean alreadyWaiting) {
+	private void parkJoinRequest(ClientSession session, Channel channel, boolean alreadyWaiting, boolean renamed) {
 		// At most one outstanding request per session: knocking at a second door drops the first, so a session can
 		// never be waiting in two places (which the single-valued marker could not represent, and the disconnect
 		// scrub could not clean up).
 		withdrawPendingElsewhere(session, channel.name());
 		session.pendingIn(channel.name());
 		broadcaster.toOne(session, new ServerMessage.JoinPending(channel.name()));
-		if (alreadyWaiting) {
-			// An idempotent re-knock (a client retrying): the owner's list is unchanged, so re-sending the snapshot
-			// would be pure churn — and a client looping on Join could otherwise flood the owner's mailbox.
-			return;
+		// Refresh the owner unless this changed nothing they can see. An idempotent re-knock carrying the SAME name
+		// is pure churn, and re-sending the snapshot for it would let a client looping on Join flood the owner's
+		// mailbox — but a re-knock that renamed did change what their list renders.
+		if (!alreadyWaiting || renamed) {
+			notifyOwnerOfJoinRequests(channel);
 		}
-		notifyOwnerOfJoinRequests(channel);
-		log.info("waiting for approval to join {} (locked)", channel.name());
+		if (!alreadyWaiting) {
+			log.info("waiting for approval to join {} (locked)", channel.name());
+		}
 	}
 
 	/// Drops any request this session left waiting at a DIFFERENT channel, notifying that channel's owner so their
@@ -1320,6 +1325,21 @@ public class ConnectionService {
 			session.setDisplayName(displayName);
 			RequestContext.updateDisplayName(displayName);
 			log.info("renamed to {}", displayName);
+		}
+		// A rename does not change any channel's MEMBERSHIP, so nothing above refreshes a locked channel's waiting
+		// list — yet that list renders this name. Deliberately outside the monitor span above: this takes ANOTHER
+		// channel's monitor, and taking two in sequence rather than nested keeps the lock order flat.
+		notifyOwnerWhereWaiting(session);
+	}
+
+	/// Re-sends the waiting-list snapshot to the owner of the channel this session is waiting to be admitted to, if
+	/// any. Needed because that list shows the waiting session's display name, and the list itself did not change —
+	/// so without this the owner would go on deciding about a name the newcomer no longer uses. A no-op for a session
+	/// that is not waiting anywhere, which is the overwhelmingly common case.
+	private void notifyOwnerWhereWaiting(ClientSession session) {
+		String pending = session.pendingChannel();
+		if (pending != null && channelRegistry.find(pending) instanceof Some(Channel waitingAt)) {
+			notifyOwnerOfJoinRequests(waitingAt);
 		}
 	}
 }

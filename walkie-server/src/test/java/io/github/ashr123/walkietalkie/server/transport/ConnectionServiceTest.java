@@ -2047,6 +2047,94 @@ class ConnectionServiceTest {
 		);
 	}
 
+	/// The waiting list renders the newcomer's display name, but a rename changes no channel's MEMBERSHIP — so
+	/// nothing else would ever refresh it, and the owner would go on deciding about a name that newcomer no longer
+	/// uses.
+	@Test
+	void renamingWhileWaitingRefreshesTheOwnersList() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(bob, new ClientMessage.Rename("bob-renamed"));
+
+		assertEquals("bob-renamed", bob.displayName());
+		assertEquals(
+				"bob-renamed",
+				lastOf(alice, ServerMessage.JoinRequests.class).requests().getFirst().displayName(),
+				"the owner is shown the name the newcomer now uses"
+		);
+	}
+
+	/// The same, but reached by re-sending Join with a different name — which is what the browser's Apply does when
+	/// the user edits the display-name field while waiting.
+	@Test
+	void reJoiningWithANewNameWhileWaitingRefreshesTheOwnersList() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob2", null));
+
+		assertEquals("bob2", bob.displayName(), "a parked newcomer keeps the name its latest Join carried");
+		assertEquals(
+				List.of("bob2"),
+				lastOf(alice, ServerMessage.JoinRequests.class).requests().stream()
+						.map(JoinRequestInfo::displayName).toList()
+		);
+		assertEquals(1, channel("team").joinRequestInfos().size(), "and it is still ONE request, not two");
+	}
+
+	/// The anti-spam guard has to survive the fix above: a plain retry loop must not hand the owner a snapshot per
+	/// attempt, or a client could fill their control mailbox and get them disconnected for backlog.
+	@Test
+	void reJoiningWithTheSameNameDoesNotReNotifyTheOwner() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		long afterFirstKnock = alice.sent.stream().filter(ServerMessage.JoinRequests.class::isInstance).count();
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		svc.onMessage(bob, new ClientMessage.Rename("bob"));   // a no-op rename is also not a change
+
+		assertEquals(
+				afterFirstKnock,
+				alice.sent.stream().filter(ServerMessage.JoinRequests.class::isInstance).count(),
+				"nothing the owner can see changed, so they are sent nothing"
+		);
+	}
+
+	/// A SWITCHER that gets parked has its Join-carried name rolled back (its old channel was never told of a
+	/// rename), so the waiting list must keep showing the name that channel still knows it by.
+	@Test
+	void aParkedSwitcherKeepsTheNameItsOwnChannelKnowsItBy() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob-renamed", null));
+
+		assertEquals("bob", bob.displayName(), "the rename is rolled back with the rest of the refused switch");
+		assertEquals(
+				"bob",
+				lastOf(alice, ServerMessage.JoinRequests.class).requests().getFirst().displayName(),
+				"so the waiting list agrees with the roster of the channel it is still in"
+		);
+	}
+
 	@Test
 	void aParkedNewcomerCannotLetItselfIn() {
 		ConnectionService svc = serviceParking(16);
