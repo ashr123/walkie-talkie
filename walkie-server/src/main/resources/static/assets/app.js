@@ -81,6 +81,8 @@ const state = {
 	channelKeyCheck: null,  // the channel's currently-announced key-check (null = unencrypted); a member re-keys to match it
 	rekeyPending: false,    // owner changed the passphrase but our current passphrase doesn't match it yet
 	switchRollback: null,   // key material an in-place switch overwrote, restored if the server refuses it (onJoinRefused)
+	joinRequests: [],       // newcomers waiting to be admitted here; the server sends this ONLY to the owner
+	pendingChannel: null,   // the locked channel WE are waiting to be admitted to (null = not waiting)
 	txChain: null,          // serializes async frame encryption (send side) so it can't reorder our Opus stream
 	warnedDecrypt: false,
 	warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
@@ -717,6 +719,16 @@ function onWsMessage(ev) {
 		case 'channelLocked':
 			onChannelLocked(msg.locked);
 			break;
+		case 'joinPending':
+			onJoinPending(msg.channel);
+			break;
+		case 'joinApproved':
+			onJoinApproved(msg.channel);
+			break;
+		case 'joinRequests':
+			state.joinRequests = msg.requests;
+			renderJoinRequests();
+			break;
 		case 'floorGranted':
 			log('Floor granted — you are live');
 			clearTurnAlert();                   // we claimed — stop the "your turn" beep countdown / tab-title flash
@@ -761,6 +773,10 @@ function onWsMessage(ev) {
 				onJoinRefused('This channel is locked by its owner.');
 			} else if (msg.code === 'CHANNEL_FULL') {
 				onJoinRefused('This channel is full — it has reached its member limit.');
+			} else if (msg.code === 'JOIN_REQUEST_DENIED') {
+				onJoinRefused('The owner declined your request to join.');
+			} else if (msg.code === 'TOO_MANY_JOIN_REQUESTS') {
+				onJoinRefused('Too many people are already waiting to join this channel — try again shortly.');
 			} else if (msg.code === 'CHANNEL_ROUTING_MISMATCH') {
 				// Channel affinity (multi-instance): the channel we tried to switch to lives on another instance, so
 				// an in-place switch can't reach it. Reconnect as a NEW session — reusing the transport-change path
@@ -938,6 +954,96 @@ function onChannelLocked(locked) {
 }
 
 /**
+ * We asked to join a LOCKED channel that parks newcomers, so we are on its waiting list and its owner decides.
+ * We are not a member of it — and, because the server gives up our current channel only once a join succeeds, we
+ * are still in whatever channel we were already in. So nothing is reset here: we just show that we are waiting.
+ */
+function onJoinPending(channel) {
+	state.pendingChannel = channel;
+	log(`Waiting for the owner of "${channel}" to admit you…`);
+	renderPendingBanner();
+	if (state.channel === null) {
+		// A fresh connection that went straight to the waiting list is connected but in no channel, so the talk
+		// control would otherwise still read its pre-connect "Connect first". (A switcher keeps its channel — and
+		// its working talk control — so leave that alone.)
+		enableTalkButton(false);
+		byId('talkBtn').textContent = 'Waiting to be admitted…';
+	}
+}
+
+/**
+ * We are cleared to join — re-send the Join to complete it. The server deliberately does not add us itself (it
+ * cannot move a session between channels from inside its atomic join), so this last step is ours. The three causes
+ * are indistinguishable on purpose because the action is identical: the owner admitted us, the owner unlocked the
+ * channel, or its last member left and the channel is gone (in which case our Join recreates it and we own it).
+ */
+function onJoinApproved(channel) {
+	state.pendingChannel = null;
+	renderPendingBanner();
+	log(`Admitted to "${channel}" — joining…`);
+	// Re-run the ordinary Apply/switch path rather than hand-rolling a Join: it re-reads the form (the user may have
+	// edited it while waiting), re-derives the key for the target, and is the same code every other join goes through.
+	void applyOrSwitch();
+}
+
+/**
+ * Shows OUR waiting state (we asked to enter a locked channel and the owner hasn't decided). Hidden otherwise.
+ */
+function renderPendingBanner() {
+	const banner = byId('pendingBanner');
+	banner.hidden = state.pendingChannel === null;
+	if (!banner.hidden) {
+		byId('pendingText').textContent = `Waiting for the owner of "${state.pendingChannel}" to admit you…`;
+	}
+}
+
+/**
+ * The owner's list of newcomers waiting to be admitted, above the roster. Owner-only by construction: the server
+ * sends the list only to the owner, so for anyone else it is empty and the whole block stays hidden.
+ *
+ * Each row carries its own Admit/Deny; Admit all / Deny all appear only when a single decision wouldn't do. Rows
+ * are rebuilt from the authoritative snapshot on every change rather than patched, matching how the roster and the
+ * floor are rendered — there is no incremental add/remove to drift.
+ */
+function renderJoinRequests() {
+	const panel = byId('requestsPanel');
+	const list = byId('joinRequests');
+	const waiting = ownsChannel() ? state.joinRequests : [];
+	panel.hidden = waiting.length === 0;
+	list.replaceChildren();
+	if (panel.hidden) {
+		return;
+	}
+	byId('requestsTitle').textContent = `Requests to join (${waiting.length})`;
+	waiting.forEach(request => {
+		const li = document.createElement('li');
+		const label = document.createElement('span');
+		// Same "name (#id-prefix)" form the roster uses, so two people sharing a display name stay tellable apart.
+		label.textContent = `${request.displayName} (#${request.id.slice(0, ID_PREFIX_LENGTH)})`;
+		li.appendChild(label);
+		li.appendChild(requestButton('Admit', 'request-admit', () => resolveJoinRequest(request.id, true)));
+		li.appendChild(requestButton('Deny', 'request-deny', () => resolveJoinRequest(request.id, false)));
+		list.appendChild(li);
+	});
+	byId('requestsAllRow').hidden = waiting.length < 2;
+}
+
+/** One Admit/Deny button for a waiting-list row. */
+function requestButton(text, extraClass, onClick) {
+	const button = document.createElement('button');
+	button.type = 'button';
+	button.className = `secondary request-action ${extraClass}`;
+	button.textContent = text;
+	button.addEventListener('click', onClick);
+	return button;
+}
+
+/** Owner action: admit or deny one waiting newcomer. */
+function resolveJoinRequest(sessionId, admit) {
+	sendCtrl({type: 'resolveJoinRequest', sessionId, admit});
+}
+
+/**
  * The server REFUSED a join (wrong passphrase, or the channel is locked/full). Either way we are now connected but
  * in NO channel: on an initial connect nothing was joined, and on a switch the server evaluates the target by
  * leaving the current channel BEFORE the atomic join, so a refused switch has already removed us there.
@@ -950,6 +1056,10 @@ function onChannelLocked(locked) {
 function onJoinRefused(reason) {
 	const rollback = state.switchRollback;
 	state.switchRollback = null;
+	// Whatever the reason, we are no longer waiting for anyone's decision — so the banner must not go on claiming
+	// otherwise. (A denial is delivered as an error, which is how this is reached for a declined request.)
+	state.pendingChannel = null;
+	renderPendingBanner();
 	if (state.channel !== null) {
 		// A refused SWITCH. The server departs our current channel only once a join succeeds, so we are still in it
 		// with our roster, floor and stream lanes intact — keep all of it and only undo what the switch applied
@@ -2080,6 +2190,7 @@ function renderMembers() {
 	updateLockControls();  // show the 🔒 indicator to everyone + the owner's Lock/Unlock toggle (ownership may have changed)
 	updateQueueControl();  // show/relabel the owner's floor-queue toggle (ownership may have changed)
 	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
+	renderJoinRequests();  // ownership may have just moved to (or away from) us, and only the owner sees the list
 	updateApplyControls(); // re-settle Apply/Reset: a rebuild may have dropped a now-departed pending owner pick
 }
 
@@ -2317,6 +2428,16 @@ window.addEventListener('DOMContentLoaded', () => {
 	// Owner-only floor-queue toggle: flip the current queue state (recomputed at click time). The echoed
 	// floorQueueChanged is what actually flips everyone's state; the server enforces NOT_OWNER. Immediate.
 	byId('queueBtn').addEventListener('click', () => sendCtrl({type: 'setFloorQueue', enabled: !state.floorQueueEnabled}));
+	byId('admitAllBtn').addEventListener('click', () => sendCtrl({type: 'resolveAllJoinRequests', admit: true}));
+	byId('denyAllBtn').addEventListener('click', () => sendCtrl({type: 'resolveAllJoinRequests', admit: false}));
+	byId('cancelRequestBtn').addEventListener('click', () => {
+		// Tell the server, then clear locally: the server sends nothing back for a withdrawal (there is nothing to
+		// report to a client that just asked to stop waiting), so the banner has to come down here.
+		sendCtrl({type: 'withdrawJoinRequest'});
+		state.pendingChannel = null;
+		renderPendingBanner();
+		log('Stopped waiting to be admitted.');
+	});
 	byId('ownerSelect').addEventListener('change', updateApplyControls);   // a pending transfer; applied via the button
 	// Re-evaluate the adaptive Switch/Apply button as the form fields change (mode is handled in its own listener).
 	byId('channel').addEventListener('input', updateApplyControls);

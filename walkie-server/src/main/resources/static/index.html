@@ -286,6 +286,70 @@
             color: var(--bad);
             white-space: nowrap;
         }
+        /* Owner-only: newcomers waiting to be admitted to a locked channel. Sits ABOVE the roster because it is
+           the only part of this panel that needs a decision, and is accented so it reads as pending, not present. */
+        #requestsPanel {
+            margin: 8px 0 0;
+            padding: 8px;
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+        }
+        #requestsPanel h3 {
+            margin: 0 0 6px;
+            font-size: 13px;
+            color: var(--accent);
+        }
+        ul#joinRequests {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        ul#joinRequests li {
+            padding: 6px 8px;
+            border-radius: 6px;
+            background: #0e151c;
+            margin-bottom: 6px;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        /* Admit/deny sit at the right edge of each row, like the per-member mute toggle. */
+        ul#joinRequests li .request-action {
+            width: auto;
+            padding: 3px 9px;
+            font-size: 12px;
+        }
+        ul#joinRequests li .request-admit {
+            margin-left: auto;
+        }
+        #requestsAllRow {
+            display: flex;
+            gap: 6px;
+            justify-content: flex-end;
+        }
+        #requestsAllRow button {
+            width: auto;
+            padding: 3px 9px;
+            font-size: 12px;
+        }
+        /* The knocker's own state: shown while WE are waiting to be admitted somewhere. */
+        #pendingBanner {
+            margin: 8px 0 0;
+            padding: 8px;
+            border: 1px solid var(--accent-2);
+            border-radius: 6px;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        #pendingBanner button {
+            width: auto;
+            padding: 3px 9px;
+            font-size: 12px;
+            margin-left: auto;
+        }
 
         #log {
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -386,6 +450,19 @@
 						<button class="secondary" hidden id="queueBtn" type="button" title="Turn the push-to-talk floor queue on or off">Enable queue</button>
 						<button class="secondary" hidden id="lockBtn" type="button">Lock channel</button>
 						<button class="secondary" hidden id="muteAllBtn" type="button">Mute all</button>
+					</div>
+				</div>
+				<div hidden id="pendingBanner">
+					<span id="pendingText"></span>
+					<button class="secondary" id="cancelRequestBtn" type="button"
+					        title="Stop waiting to be admitted">Cancel</button>
+				</div>
+				<div hidden id="requestsPanel">
+					<h3 id="requestsTitle">Requests to join</h3>
+					<ul id="joinRequests"></ul>
+					<div hidden id="requestsAllRow">
+						<button class="secondary" id="admitAllBtn" type="button">Admit all</button>
+						<button class="secondary" id="denyAllBtn" type="button">Deny all</button>
 					</div>
 				</div>
 				<ul id="members"></ul>
