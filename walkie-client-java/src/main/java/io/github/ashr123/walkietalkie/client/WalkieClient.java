@@ -531,13 +531,13 @@ public final class WalkieClient implements AutoCloseable {
 						rekeyInFlight = false;
 						pendingPassphrase = null;
 					}
-					// A passphrase mismatch is fatal: the channel requires a different --key, so there's nothing to do
-					// but disconnect — gracefully, so the server sees a clean close instead of an abrupt EOF.
-					case PASSPHRASE_MISMATCH -> exitGracefully("Disconnecting — this channel needs a different --key.");
-					// A locked/full channel refused our join. Like a passphrase mismatch, the join failed (an initial
-					// connect joined nothing; a refused switch dropped us), so there's nothing to do but exit gracefully.
-					case CHANNEL_LOCKED -> exitGracefully("This channel is locked by its owner — cannot join.");
-					case CHANNEL_FULL -> exitGracefully("This channel is full — it has reached its member limit.");
+					// The three join REFUSALS. All three leave us connected but in NO channel (see joinRefused), so
+					// they are no longer fatal: we keep the socket and the audio loops, and 'c <channel>' can try
+					// another. They used to exit the process, which threw away a healthy connection and left the user
+					// nothing to do but restart.
+					case PASSPHRASE_MISMATCH -> joinRefused("this channel needs a different --key.");
+					case CHANNEL_LOCKED -> joinRefused("this channel is locked by its owner.");
+					case CHANNEL_FULL -> joinRefused("this channel is full — it has reached its member limit.");
 					// The target channel lives on another instance (channel affinity): an in-place switch can't reach
 					// it, so reconnect — a fresh handshake carrying ?channel=<target> is routed to the owning instance,
 					// and switchTo already applied the target's mode/key + advanced connectTarget so the
@@ -668,6 +668,32 @@ public final class WalkieClient implements AutoCloseable {
 				: "[unlocked] the owner unlocked this channel — new members can join again.");
 	}
 
+	/// A join was REFUSED by the server — a passphrase mismatch, or a locked/full channel. Either way we end up
+	/// connected but in NO channel: an initial connect joined nothing, and on a switch the server validates the
+	/// target by leaving the current channel BEFORE the atomic join, so a refused switch has already removed us
+	/// there. Reconcile to that truth (drop every piece of per-channel state) and KEEP RUNNING: the socket, the
+	/// capture/playback loops and the console stay alive, so `c <channel> [mode]` can pick another channel. This
+	/// used to exit the process, which discarded a healthy session and left restarting as the only option.
+	///
+	/// The typed `--key` (`crypto`) is deliberately KEPT — it is the passphrase the user supplied, reusable for the
+	/// next attempt — while `currentChannelKeyCheck` (the *channel's* announced value) is cleared, since the channel
+	/// it described is one we are no longer in.
+	private void joinRefused(String reason) {
+		String wasIn = currentChannel;
+		currentChannel = null;
+		ownerId = null;
+		channelLocked = false;
+		currentChannelKeyCheck = null;
+		memberNames.clear();
+		mutedMembers.clear();
+		floorSnapshot = FloorSnapshot.IDLE;
+		awaitingClaim = false;
+		audio.setTransmitting(false);   // we hold no floor anywhere now, so the mic must not stay live
+		log(wasIn == null
+				? "[refused] " + reason + " Use 'c <channel> [mode]' to try another."
+				: "[refused] " + reason + " You are no longer in \"" + wasIn + "\" — use 'c <channel> [mode]' to join another.");
+	}
+
 	/// Whether the mic should auto-open on a full-duplex join or mode change, for the current session — reads our
 	/// `--muted` option and our own owner-mute state, then defers to the pure [#shouldAutoOpenMic(ChannelMode, boolean, boolean)].
 	private boolean shouldAutoOpenMic(ChannelMode mode) {
@@ -761,6 +787,12 @@ public final class WalkieClient implements AutoCloseable {
 	/// queued, claim when it's our turn, grab-or-enqueue otherwise. The owner-mute guard and the full-duplex behaviour
 	/// are unchanged.
 	private void toggleTalk() {
+		if (currentChannel == null) {
+			// Connected but in no channel — a refused join leaves us here (see joinRefused). Refuse locally rather
+			// than open the mic and emit frames/floor requests the server would only drop as NOT_IN_CHANNEL.
+			log("[no channel] you are not in a channel — use 'c <channel> [mode]' to join one.");
+			return;
+		}
 		if (mutedMembers.contains(selfId)) {
 			// Owner-muted: refuse. We already stopped the mic on MemberMuted, so we're not transmitting here; this
 			// just tells a user who tries to talk why they can't (the server would drop us and refuse us the floor).

@@ -127,6 +127,24 @@ function isOpen() {
 	return state.ws && state.ws.readyState === WebSocket.OPEN;
 }
 
+/**
+ * Connected AND in a channel. The roster, the floor and owner-ness are meaningful only while joined, and a
+ * REFUSED join now leaves us connected but channel-less (see onJoinRefused) rather than tearing the socket down —
+ * a state in which `state.selfId === state.ownerId` is `null === null`, i.e. wrongly true.
+ */
+function isJoined() {
+	return isOpen() && state.channel !== null;
+}
+
+/**
+ * Whether WE own the current channel — the single gate for every owner-only control (mode, passphrase, transfer,
+ * mute, lock, floor queue). The server-managed "global" room carries a sentinel owner that no participant's
+ * session id can match, so nobody owns it.
+ */
+function ownsChannel() {
+	return isJoined() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+}
+
 // --- connection -----------------------------------------------------------------------------------
 
 /**
@@ -230,7 +248,7 @@ async function connect() {
 			// The in-channel controls — Rename, the adaptive Apply/Switch button, the owner dropdown — appear only
 			// once the server confirms the join (the Joined snapshot), via onJoined. Revealing them here on a mere
 			// socket-open would flash them for a join the server then rejects (e.g. a wrong passphrase →
-			// PASSPHRASE_MISMATCH closes the socket right after it opened).
+			// PASSPHRASE_MISMATCH, which now leaves us connected but channel-less — see onJoinRefused).
 		};
 		ws.onmessage = onWsMessage;
 		ws.onclose = ev => {
@@ -314,7 +332,7 @@ async function applyOrSwitch() {
 	// Same channel & transport: apply this channel's property changes. Mode/passphrase are owner-only (the Mode
 	// selector is disabled for non-owners, so a mode change here means we own the channel); a member uses the
 	// passphrase path to adopt the owner's announced rotation.
-	const iAmOwner = state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const iAmOwner = ownsChannel();
 	let acted = false;
 	if (mode !== state.mode) {
 		sendCtrl({type: 'changeMode', mode});
@@ -398,7 +416,7 @@ function updateApplyControls() {
 	const channelValid = mode === 'GLOBAL_PTT' || CHANNEL_NAME.test(channelField);
 	const passphraseValue = byId('passphrase').value;
 	const passphraseChanged = passphraseValue !== (state.passphrase || '');
-	const iAmOwner = state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const iAmOwner = ownsChannel();
 	// A pending OWNERSHIP transfer: the owner picked a different member in the dropdown. It's an in-place action
 	// (you can't hand off a channel you're switching away from), so it counts only when the channel is unchanged;
 	// it is applied — not sent live on selection — by the adaptive button, alongside any mode/passphrase change.
@@ -475,7 +493,7 @@ function updateApplyControls() {
  */
 function renderOwnerSelect() {
 	const select = byId('ownerSelect');
-	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const iAmOwner = ownsChannel();
 	select.hidden = !iAmOwner;
 	byId('ownerLabel').hidden = !iAmOwner;
 	if (!iAmOwner) {
@@ -733,18 +751,11 @@ function onWsMessage(ev) {
 			// Codes are the shared ErrorCode enum serialized as its constant names; an unrecognized code (a newer
 			// server) simply falls through — the log line above already showed it.
 			if (msg.code === 'PASSPHRASE_MISMATCH') {
-				log('Disconnecting — this channel needs a different passphrase.');
-				disconnect();
+				onJoinRefused('This channel needs a different passphrase.');
 			} else if (msg.code === 'CHANNEL_LOCKED') {
-				// The join was refused because the channel is locked to new members. Like PASSPHRASE_MISMATCH, the
-				// join failed — on an initial connect nothing joined, and a locked switch drops us — so disconnect
-				// cleanly rather than sit half-joined.
-				log('This channel is locked by its owner — you can\'t join it right now.');
-				disconnect();
+				onJoinRefused('This channel is locked by its owner.');
 			} else if (msg.code === 'CHANNEL_FULL') {
-				// The channel is at its member limit — the join failed the same way as a locked/mismatched one.
-				log('This channel is full — it has reached its member limit.');
-				disconnect();
+				onJoinRefused('This channel is full — it has reached its member limit.');
 			} else if (msg.code === 'CHANNEL_ROUTING_MISMATCH') {
 				// Channel affinity (multi-instance): the channel we tried to switch to lives on another instance, so
 				// an in-place switch can't reach it. Reconnect as a NEW session — reusing the transport-change path
@@ -793,7 +804,7 @@ function onJoined(msg) {
 	log(`Joined "${msg.channel}" (${msg.mode}) with ${msg.members.length} member(s)`);
 	log(state.ownerId === SERVER_OWNER
 		? 'Server-managed global room — everyone can talk (push-to-talk), no owner, no encryption.'
-		: state.selfId === state.ownerId
+		: ownsChannel()
 			? 'You own this channel — change mode/passphrase and click Apply, or pick a new owner.'
 			: `Owner: ${memberLabel(state.ownerId)}`);
 	// Report the channel's E2EE status on every confirmed room entry — initial join AND in-place switch, whether
@@ -916,6 +927,38 @@ function onChannelLocked(locked) {
 		? 'Channel locked by the owner — new members can\'t join (current members are unaffected).'
 		: 'Channel unlocked by the owner — new members can join again.');
 	updateLockControls();
+}
+
+/**
+ * The server REFUSED a join (wrong passphrase, or the channel is locked/full). Either way we are now connected but
+ * in NO channel: on an initial connect nothing was joined, and on a switch the server evaluates the target by
+ * leaving the current channel BEFORE the atomic join, so a refused switch has already removed us there.
+ *
+ * Reconcile to that truth and KEEP THE SOCKET. This used to call disconnect(), which hid the discrepancy — the
+ * client was still showing the old channel the server had removed it from — by throwing the whole session away.
+ * Staying connected is both more honest and cheaper: the mic, AudioContext and token survive, so picking another
+ * channel is one Apply away instead of a full reconnect.
+ */
+function onJoinRefused(reason) {
+	const wasIn = state.channel;
+	resetChannelState();      // roster, floor, decode lanes, peers, lock badge — all belonged to a channel we are not in
+	state.channel = null;
+	state.selfId = null;
+	state.ownerId = null;
+	state.channelKeyCheck = null;   // the announced key-check belonged to that channel; keep the typed passphrase for the next try
+	state.rekeyPending = false;
+	log(wasIn === null
+		? `${reason} Pick a channel and press Apply to try another.`
+		: `${reason} You are no longer in "${wasIn}" — pick a channel and press Apply to join one.`);
+	// One re-render: renderMembers already fans out to every owner-only control (mute-all, lock, queue, the owner
+	// dropdown) and to Apply/Reset. They now all read ownsChannel() === false, so they hide rather than mistaking
+	// null === null for "I'm the owner".
+	renderMembers();
+	updateModeControl();
+	enableTalkButton(false);
+	const talkBtn = byId('talkBtn');
+	talkBtn.textContent = 'Not in a channel';
+	talkBtn.classList.remove('live', 'myturn');
 }
 
 /**
@@ -1957,7 +2000,7 @@ function renderMembers() {
 	state.memberLis.clear();
 	// Only the channel owner sees the moderation controls (per-member Mute/Unmute + "Mute all"); the server
 	// enforces the same rule, so this is UI convenience, not the security boundary. Never for the ownerless global room.
-	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const iAmOwner = ownsChannel();
 	// Always append a short session-id prefix after the display name (the session id is the real identity —
 	// names aren't unique); the full id is on hover. Lexicographic (case-insensitive) by name, then by id.
 	[...state.members.entries()]
@@ -2026,7 +2069,7 @@ function renderMembers() {
  */
 function updateMuteAllButton() {
 	const btn = byId('muteAllBtn');
-	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const iAmOwner = ownsChannel();
 	btn.hidden = !iAmOwner;
 	if (!iAmOwner) {
 		return;
@@ -2046,7 +2089,7 @@ function updateLockControls() {
 	const badge = byId('lockedBadge');
 	const btn = byId('lockBtn');
 	badge.hidden = !state.locked;
-	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const iAmOwner = ownsChannel();
 	btn.hidden = !iAmOwner;
 	if (iAmOwner) {
 		btn.textContent = state.locked ? 'Unlock channel' : 'Lock channel';
@@ -2061,7 +2104,7 @@ function updateLockControls() {
  */
 function updateQueueControl() {
 	const btn = byId('queueBtn');
-	const iAmOwner = isOpen() && state.selfId === state.ownerId && state.ownerId !== SERVER_OWNER;
+	const iAmOwner = ownsChannel();
 	const show = iAmOwner && state.mode !== 'FULL_DUPLEX';
 	btn.hidden = !show;
 	if (show) {
