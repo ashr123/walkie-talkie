@@ -24,6 +24,11 @@ public final class FakeClientSession implements ClientSession {
 	private String displayName;
 	private String channelName;
 	private String handshakeChannel;   // the routing channel a test pins via setHandshakeChannel (null by default)
+	/// Lifecycle state, so a test can exercise the paths that only run for a session whose socket has gone away —
+	/// the real [io.github.ashr123.walkietalkie.server.session.WebSocketClientSession] flips this at teardown, and
+	/// [ClientSession#isOpen] is what stops a late inbound frame resurrecting per-session server state. Without it
+	/// this double is permanently open and those guards cannot be tested at all.
+	private boolean closed;
 
 	public FakeClientSession(String id, Transport transport, String displayName) {
 		this.id = id;
@@ -83,7 +88,22 @@ public final class FakeClientSession implements ClientSession {
 	}
 
 	@Override
+	public boolean isOpen() {
+		return !closed;
+	}
+
+	/// Mirrors the real session's teardown: flips this double to closed so [#isOpen] reports false. Idempotent, and
+	/// deliberately does NOT clear `sent`/`audio` — a test still asserts on what was delivered before the close.
+	@Override
+	public void close() {
+		closed = true;
+	}
+
+	@Override
 	public void sendEncoded(String encoded) {
+		if (closed) {
+			return;   // the real session refuses frames once closed; mirror that so a fan-out past a close records nothing
+		}
 		// All control now arrives pre-serialized (via MessageBroadcaster's toOne/toAll/toOthers); decode it back to
 		// a typed message so tests assert on received ServerMessages. This test double, not production, is the only
 		// place a sent message is reconstructed.
@@ -92,6 +112,9 @@ public final class FakeClientSession implements ClientSession {
 
 	@Override
 	public void sendAudio(byte[] audioFrame) {
+		if (closed) {
+			return;
+		}
 		audio.add(audioFrame);
 	}
 }

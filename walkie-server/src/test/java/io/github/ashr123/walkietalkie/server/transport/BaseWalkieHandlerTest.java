@@ -3,6 +3,7 @@ package io.github.ashr123.walkietalkie.server.transport;
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
@@ -83,6 +84,26 @@ class BaseWalkieHandlerTest {
 		when(session.getAttributes()).thenReturn(new HashMap<>());   // no bound session -> nothing to close
 
 		assertDoesNotThrow(() -> handler.handleTransportError(session, new RuntimeException("boom")));
+	}
+
+	/// The session is closed BEFORE [ConnectionService#onClose] runs, not after. That ordering is what makes the
+	/// `isOpen()` guard on the inbound paths authoritative: `onClose` forgets the per-session rate-limiter buckets,
+	/// so if `closed` were only flipped afterwards (the old `try { onClose } finally { close }` shape) a straggler
+	/// inbound frame could slip in during the forget and re-create a bucket nothing ever forgets again. Safe to do
+	/// first because `onClose` only broadcasts to the OTHER members, never to the session that is leaving.
+	@Test
+	void aCloseFlipsTheSessionClosedBeforeTheServiceTearsItDown() {
+		ClientSession bound = mock(ClientSession.class);
+		WebSocketSession session = mock(WebSocketSession.class);
+		Map<String, Object> attributes = new HashMap<>();
+		attributes.put(BaseWalkieHandler.SESSION_KEY, bound);
+		when(session.getAttributes()).thenReturn(attributes);
+
+		handler.afterConnectionClosed(session, CloseStatus.NORMAL);
+
+		InOrder ordered = inOrder(bound, connectionService);
+		ordered.verify(bound).close();
+		ordered.verify(connectionService).onClose(eq(bound), anyString());
 	}
 
 	@Test

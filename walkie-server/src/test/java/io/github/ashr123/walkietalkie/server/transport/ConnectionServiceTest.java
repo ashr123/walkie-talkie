@@ -1960,6 +1960,41 @@ class ConnectionServiceTest {
 		assertEquals(ErrorCode.NOT_IN_CHANNEL, firstOf(stray, ServerMessage.ErrorMessage.class).code());
 	}
 
+	// --- session lifecycle: a closed session must not resurrect per-session state --------------------
+
+	/// A late control frame from a session whose socket has already gone is dropped BEFORE anything acts on it.
+	/// The motivating case is the per-session rate-limiter bucket: `onClose` forgets it, and a straggler frame
+	/// reaching `tryAcquire` would re-create it — a permanent one-entry leak, because nothing forgets it a second
+	/// time. `afterConnectionClosed` closes the session before `onClose` runs, so the guard sees `isOpen() == false`
+	/// for the whole teardown. Only expressible now that [FakeClientSession] can actually be closed.
+	@Test
+	void aControlMessageFromAClosedSessionIsDropped() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+
+		alice.close();   // its socket went away
+		service.onMessage(alice, new ClientMessage.Rename("alice-renamed"));
+
+		assertEquals("alice", alice.displayName(), "a closed session's control message is never dispatched");
+		assertTrue(
+				bob.sent.stream().noneMatch(ServerMessage.MemberRenamed.class::isInstance),
+				"and nothing is broadcast to the channel on its behalf"
+		);
+	}
+
+	/// The same frame from a session that is still open IS dispatched — so the guard above is doing the work, and
+	/// the assertion isn't passing for some unrelated reason (e.g. a rejected display name).
+	@Test
+	void theSameControlMessageFromAnOpenSessionIsDispatched() {
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+
+		service.onMessage(alice, new ClientMessage.Rename("alice-renamed"));
+
+		assertEquals("alice-renamed", alice.displayName());
+		assertEquals("alice-renamed", firstOf(bob, ServerMessage.MemberRenamed.class).displayName());
+	}
+
 	/// A [ClientSession] whose audio send always fails, used to verify [ConnectionService#onAudio] isolates a
 	/// single failing recipient and still delivers to the others.
 	private static final class ThrowingSession implements ClientSession {
