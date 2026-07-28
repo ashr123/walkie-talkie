@@ -47,7 +47,9 @@ module applies it via `plugins { id("walkietalkie.java-conventions") }`. Do **no
   client from `src/main/resources/static/`.
 - `walkie-client-java` — console client (`javax.sound.sampled` + JDK WebSocket + Concentus Opus).
 
-`check` (so `build`) also runs **`checkJavadocReferences`** — a `JavadocReferenceCheck` task from `buildSrc` that
+`check` (so `build`) also runs **`checkJavadocReferences`** — a `JavadocReferenceCheck` task written in **Java**
+(`buildSrc/src/main/java/`, alongside the Kotlin precompiled script plugin — `kotlin-dsl` brings the `java` plugin,
+and `buildSrc/build.gradle.kts` already pins both compilers to Java 25) that
 fails on a `///` Javadoc reference naming a type or member that doesn't exist (`[SomeType]`, `[Type#member]`,
 `[#member]`). The compiler treats those links as plain text, so a rename — or documenting something before writing
 it — otherwise leaves a silently broken reference. Each module scans its own sources while the type index spans the
