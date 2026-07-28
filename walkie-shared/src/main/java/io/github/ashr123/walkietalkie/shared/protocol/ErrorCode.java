@@ -31,8 +31,16 @@ public enum ErrorCode {
 	NOT_OWNER,
 	/// `join` with a key-check differing from the channel's — wrong (or missing) end-to-end-encryption passphrase.
 	PASSPHRASE_MISMATCH,
-	/// `join` refused because the owner has locked the channel to new members.
+	/// `join` refused because the owner has locked the channel to new members AND it does not park them for
+	/// approval (`walkie.max-join-requests` is 0). When it does park them the join is neither admitted nor refused:
+	/// the joiner receives [ServerMessage.JoinPending] instead and waits for the owner's decision.
 	CHANNEL_LOCKED,
+	/// `join` at a locked channel refused because its waiting list is already at `walkie.max-join-requests`. Unlike
+	/// [#CHANNEL_LOCKED] this is transient — the list drains as the owner decides — so trying again later may work.
+	TOO_MANY_JOIN_REQUESTS,
+	/// The channel owner denied this session's request to join (see [ServerMessage.JoinPending]). Not an error in
+	/// the request itself: the answer was simply no, so the client stops waiting and stays connected.
+	JOIN_REQUEST_DENIED,
 	/// `join` refused because the channel is at its member cap (one stream index per member).
 	CHANNEL_FULL,
 	/// A request naming another member (signal, transfer, mute) whose target isn't addressable — not a member,

@@ -7,6 +7,7 @@ import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.transport.ConnectionService;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
+import io.github.ashr123.walkietalkie.shared.protocol.JoinRequestInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 
 import java.time.Instant;
@@ -108,15 +109,48 @@ public final class Channel {
 	// EPOCH when nobody is reserved. Stamped under the monitor by the reserve/acquire paths, read (under the
 	// monitor) by the sweep; volatile for cross-thread visibility of the last write.
 	private volatile Instant floorReservedAt = Instant.EPOCH;
+	// --- owner-approved join requests (a LOCKED channel PARKS newcomers instead of refusing them) --------
+	// A newcomer that hits a locked channel is parked here for the owner to admit or deny, rather than refused
+	// outright (see ChannelRegistry#joinOrCreate). The owner's decision is a one-shot GRANT which the knocker's
+	// OWN re-`Join` consumes ([#consumeGrant]) — the server never moves a session into the channel itself,
+	// because admitting a knocker that is currently in another channel would mean calling a ChannelRegistry
+	// mutate (leave) from inside another one's remapping function, which `ConcurrentHashMap` forbids.
+	//
+	// Serialization: `joinRequests` is guarded by THIS monitor — every read/mutation runs under
+	// `synchronized (channel)`, exactly like `floorQueue`.
+	//
+	// INVARIANT: a request exists only while the channel is LOCKED. Knocks happen only in the locked branch, and
+	// unlocking grants every parked request inside the same bin-locked step, so an unlocked channel is always
+	// request-free. Nothing here is time-driven, so the floor sweep is not involved at all: a request lives until
+	// the owner decides, the owner unlocks, the knocker withdraws or disconnects, or the channel is dropped.
+	private final SequencedMap<String, JoinRequest> joinRequests = new LinkedHashMap<>();
+	/// How many newcomers may be parked at once (`walkie.max-join-requests`), captured at creation exactly like
+	/// [#floorQueueEnabled]. A DoS bound rather than a tuning knob: every change re-sends the owner a full
+	/// snapshot, so an unbounded list would turn knock/withdraw churn into unbounded owner traffic. `0` disables
+	/// parking, so a locked channel refuses newcomers outright — the behaviour before this feature existed.
+	private final int maxJoinRequests;
 
-	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck, boolean floorQueueEnabled) {
+	/// The server-wide settings a **newly created** channel adopts; an existing channel keeps its own state (like
+	/// its mode and owner). Grouped into one value so [ChannelRegistry#joinOrCreate] carries a single "how to seed
+	/// a fresh channel" argument rather than a growing tail of unrelated-looking flags.
+	public record Defaults(boolean floorQueueEnabled, int maxJoinRequests) {
+
+		/// Both features off: no push-to-talk floor queue, and a locked channel refuses newcomers outright instead
+		/// of parking them for approval — i.e. the behaviour before either feature existed.
+		public static final Defaults NONE = new Defaults(false, 0);
+	}
+
+	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck, Defaults defaults) {
 		this.name = name;
 		this.mode = mode;
 		this.ownerId = ownerId;
 		this.keyCheck = keyCheck;
 		// Seed the queue on/off state from the server-wide default a new channel adopts (walkie.floor-queue-default);
 		// the owner can toggle it per channel afterwards. Set only at creation — an existing channel keeps its own.
-		this.floorQueueEnabled = floorQueueEnabled;
+		this.floorQueueEnabled = defaults.floorQueueEnabled();
+		// Server-wide and fixed for the process (walkie.* properties are not refresh-scoped), so capturing it at
+		// creation can't leave a channel enforcing a stale cap.
+		this.maxJoinRequests = defaults.maxJoinRequests();
 	}
 
 	public String name() {
@@ -562,6 +596,113 @@ public final class Channel {
 	/// head the instant the floor frees). Under the monitor.
 	public synchronized Option<String> reservedHolder() {
 		return Option.of(hasHeadOfferedFloor() ? headOfQueue() : null);
+	}
+
+	// --- owner-approved join requests -------------------------------------------------------------------
+
+	/// One newcomer parked at a locked channel's door. `granted` is the owner's one-shot admission, consumed by the
+	/// knocker's own re-`Join` ([#consumeGrant]) — and it is the security boundary of the whole feature: without
+	/// it, any parked session could let itself into a locked channel simply by re-sending `Join`.
+	///
+	/// The session's display name is deliberately NOT copied here but read live in [#joinRequestInfos], so a rename
+	/// while waiting can't leave the owner looking at a stale label. Its key-check isn't stored either: the re-`Join`
+	/// carries a fresh one that the ordinary join path validates, so a passphrase rotation while someone waits needs
+	/// no invalidation logic — it simply becomes a normal mismatch.
+	private record JoinRequest(ClientSession session, boolean granted) {
+	}
+
+	/// The outcome of a [#knock]: newly parked, already waiting (an idempotent re-knock), or the list is at its cap.
+	public enum KnockOutcome {
+		REGISTERED,
+		ALREADY_WAITING,
+		LIST_FULL
+	}
+
+	/// Whether this channel parks newcomers at all (`walkie.max-join-requests > 0`). When false, a locked channel
+	/// refuses them outright — the behaviour before this feature existed, kept as an operator escape hatch for
+	/// "closed, don't even ask". Lock-free: the cap is final.
+	public boolean acceptsJoinRequests() {
+		return maxJoinRequests > 0;
+	}
+
+	/// Parks `session` for the owner's approval, at the tail of the arrival order.
+	///
+	/// Idempotent by design: a re-knock while already waiting reports [KnockOutcome#ALREADY_WAITING] and changes
+	/// nothing — so a client that retries cannot spam the owner with snapshots, and cannot clear a grant it has
+	/// already been given. Under the monitor.
+	public synchronized KnockOutcome knock(ClientSession session) {
+		if (joinRequests.containsKey(session.id())) {
+			return KnockOutcome.ALREADY_WAITING;
+		}
+		if (joinRequests.size() >= maxJoinRequests) {
+			return KnockOutcome.LIST_FULL;
+		}
+		joinRequests.put(session.id(), new JoinRequest(session, false));
+		return KnockOutcome.REGISTERED;
+	}
+
+	/// Consumes the one-shot admission grant for `sessionId`: `true` — and the request is REMOVED — iff the owner
+	/// had granted it. An ungranted request is left untouched and returns `false`, which is what stops a parked
+	/// newcomer admitting itself by re-sending `Join`. Under the monitor.
+	public synchronized boolean consumeGrant(String sessionId) {
+		JoinRequest request = joinRequests.get(sessionId);
+		if (request == null || !request.granted()) {
+			return false;
+		}
+		joinRequests.remove(sessionId);
+		return true;
+	}
+
+	/// Grants `sessionId`'s parked request — the owner admitting one newcomer. Returns that knocker's session so the
+	/// caller can tell it to claim (re-send `Join`), or [io.github.ashr123.option.None] if it is not waiting here.
+	/// Idempotent: granting an already-granted request just returns it again, and its position is kept (a
+	/// `LinkedHashMap` re-`put` on an existing key does not reorder). Under the monitor.
+	public synchronized Option<ClientSession> grant(String sessionId) {
+		JoinRequest request = joinRequests.get(sessionId);
+		if (request != null) {
+			joinRequests.put(sessionId, new JoinRequest(request.session(), true));
+		}
+		return Option.of(request).map(JoinRequest::session);
+	}
+
+	/// Grants EVERY parked request, in arrival order, returning their sessions. Serves both "admit all" and the
+	/// UNLOCK path: an unlocked channel admits anyone, so leaving people parked at an open door would be incoherent
+	/// — which is what keeps the "requests exist only while locked" invariant true. Under the monitor.
+	public synchronized List<ClientSession> grantAll() {
+		List<ClientSession> sessions = new ArrayList<>(joinRequests.size());
+		for (Map.Entry<String, JoinRequest> entry : joinRequests.entrySet()) {
+			ClientSession session = entry.getValue().session();
+			sessions.add(session);
+			entry.setValue(new JoinRequest(session, true));   // in-place value update: no reordering, no re-put
+		}
+		return sessions;
+	}
+
+	/// Removes `sessionId`'s parked request — a deny, the knocker's own cancel, or the disconnect scrub — and
+	/// returns the removed knocker's session so the caller can notify it (or `None` if it wasn't waiting). Works on
+	/// a GRANTED request too, so the owner can still revoke an approval whose client never came back to claim it.
+	/// Under the monitor.
+	public synchronized Option<ClientSession> withdraw(String sessionId) {
+        return Option.of(joinRequests.remove(sessionId)).map(JoinRequest::session);
+	}
+
+	/// Removes and returns every parked request — used when this channel is about to be DROPPED from the registry
+	/// because its last member left. Those knockers are then cleared to join rather than left waiting forever: the
+	/// lock dies with the channel, so their re-`Join` recreates it (and the first to arrive owns it). Under the
+	/// monitor.
+	public synchronized List<ClientSession> drainJoinRequests() {
+		List<ClientSession> sessions = joinRequests.values().stream().map(JoinRequest::session).toList();
+		joinRequests.clear();
+		return sessions;
+	}
+
+	/// The owner's view of who is waiting, in arrival order — the payload of the owner-only `JoinRequests` snapshot.
+	/// GRANTED-but-unclaimed requests are included on purpose: they are the ones whose client never came back, and
+	/// the owner needs to see them to revoke them ([#withdraw]). Under the monitor.
+	public synchronized List<JoinRequestInfo> joinRequestInfos() {
+		return joinRequests.values().stream()
+				.map(request -> new JoinRequestInfo(request.session().id(), request.session().displayName()))
+				.toList();
 	}
 
 	/// When the current head's reservation started (basis for the claim-window expiry); EPOCH if nobody reserved.

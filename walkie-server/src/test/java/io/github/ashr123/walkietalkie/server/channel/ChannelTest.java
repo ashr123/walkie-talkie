@@ -3,13 +3,17 @@ package io.github.ashr123.walkietalkie.server.channel;
 import io.github.ashr123.option.None;
 import io.github.ashr123.option.NoneInt;
 import io.github.ashr123.option.Option;
+import io.github.ashr123.option.Some;
 import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.FakeClientSession;
+import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
+import io.github.ashr123.walkietalkie.shared.protocol.JoinRequestInfo;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -25,7 +29,7 @@ class ChannelTest {
 
 	@Test
 	void grantsTheFloorToTheFirstAcquirerAndDeniesTheSecond() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, false);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
 		channel.add(session("alice"));
 		channel.add(session("bob"));
 
@@ -38,7 +42,7 @@ class ChannelTest {
 
 	@Test
 	void releaseLetsTheNextAcquirerIn() {
-		Channel channel = new Channel("c", ChannelMode.GLOBAL_PTT, "alice", null, false);
+		Channel channel = new Channel("c", ChannelMode.GLOBAL_PTT, "alice", null, Channel.Defaults.NONE);
 
 		assertTrue(channel.tryAcquireFloor("alice", Instant.EPOCH));
 		assertTrue(channel.releaseFloor("alice"), "the holder releases");
@@ -48,7 +52,7 @@ class ChannelTest {
 
 	@Test
 	void releaseByANonHolderIsRejected() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, false);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
 
 		channel.tryAcquireFloor("alice", Instant.EPOCH);
 		assertFalse(channel.releaseFloor("bob"), "a non-holder cannot release the floor");
@@ -57,7 +61,7 @@ class ChannelTest {
 
 	@Test
 	void fullDuplexAlwaysGrantsTheFloorAndTracksNoHolder() {
-		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "owner", null, false);
+		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "owner", null, Channel.Defaults.NONE);
 
 		assertTrue(channel.tryAcquireFloor("alice", Instant.EPOCH));
 		assertTrue(channel.tryAcquireFloor("bob", Instant.EPOCH), "full-duplex never contends for the floor");
@@ -67,7 +71,7 @@ class ChannelTest {
 
 	@Test
 	void setMutedReportsWhetherItChangedAndIsMutedReflectsIt() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, false);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
 		channel.add(session("bob"));
 
 		assertFalse(channel.isMuted("bob"), "a member starts unmuted");
@@ -81,7 +85,7 @@ class ChannelTest {
 
 	@Test
 	void setMutedForAllExceptSkipsTheOwnerAndReturnsOnlyTheChangedIds() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, false);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
 		channel.add(session("alice"));
 		channel.add(session("bob"));
 		channel.add(session("carol"));
@@ -96,7 +100,7 @@ class ChannelTest {
 
 	@Test
 	void removeClearsAMembersMuteState() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, false);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
 		channel.add(session("bob"));
 		channel.setMuted("bob", true);
 
@@ -106,7 +110,7 @@ class ChannelTest {
 
 	@Test
 	void streamIndexOfIsNoneForAnUnknownSessionAndRequireFailsFast() {
-		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "alice", null, false);
+		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "alice", null, Channel.Defaults.NONE);
 		channel.add(session("alice"));
 
 		assertInstanceOf(SomeInt.class, channel.streamIndexOf("alice"), "a current member has an index");
@@ -121,7 +125,7 @@ class ChannelTest {
 	// --- floor queue primitives (the "raise hand" model — see docs/FLOOR_QUEUE.md) ------------------
 
 	private static Channel queueChannel() {
-		return new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, true);
+		return new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, new Channel.Defaults(true, 0));
 	}
 
 	@Test
@@ -300,5 +304,146 @@ class ChannelTest {
 		channel.clearFloor();
 		assertEquals(Instant.EPOCH, channel.floorReservedAt(), "clearFloor resets the reservation clock");
 		assertTrue(channel.floorQueue().isEmpty());
+	}
+
+	// --- owner-approved join requests (a locked channel parks newcomers) ----------------------------
+
+	/// A channel that parks up to two newcomers, so the cap is reachable in a test without twelve sessions.
+	private static Channel knockChannel() {
+		return new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, new Channel.Defaults(false, 2));
+	}
+
+	@Test
+	void parkingIsDisabledWhenTheCapIsZero() {
+		assertFalse(new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE)
+						.acceptsJoinRequests(),
+				"cap 0 means a locked channel refuses newcomers outright instead of parking them");
+		assertTrue(knockChannel().acceptsJoinRequests());
+	}
+
+	@Test
+	void knockParksInArrivalOrderAndIsIdempotent() {
+		Channel channel = knockChannel();
+
+		assertEquals(Channel.KnockOutcome.REGISTERED, channel.knock(session("bob")));
+		assertEquals(Channel.KnockOutcome.ALREADY_WAITING, channel.knock(session("bob")),
+				"a re-knock changes nothing, so a retrying client can't spam the owner");
+		assertEquals(Channel.KnockOutcome.REGISTERED, channel.knock(session("carol")));
+
+		assertEquals(List.of("bob", "carol"), ids(channel), "the waiting list preserves arrival order");
+	}
+
+	@Test
+	void knockRefusesOnceTheListIsFull() {
+		Channel channel = knockChannel();   // cap 2
+		channel.knock(session("bob"));
+		channel.knock(session("carol"));
+
+		assertEquals(Channel.KnockOutcome.LIST_FULL, channel.knock(session("dave")));
+		assertEquals(List.of("bob", "carol"), ids(channel), "the refused newcomer was not parked");
+	}
+
+	@Test
+	void onlyAGrantedRequestCanBeConsumed() {
+		Channel channel = knockChannel();
+		channel.knock(session("bob"));
+
+		assertFalse(channel.consumeGrant("bob"),
+				"an UNGRANTED request must not admit itself — this is what stops a knocker walking into a locked channel");
+		assertEquals(List.of("bob"), ids(channel), "a rejected consume leaves the request parked");
+		assertFalse(channel.consumeGrant("nobody"), "an unknown session has nothing to consume");
+
+		assertInstanceOf(Some.class, channel.grant("bob"));
+		assertTrue(channel.consumeGrant("bob"), "once granted, the knocker's own re-Join consumes it");
+		assertTrue(ids(channel).isEmpty(), "consuming REMOVES the request — it is one-shot");
+		assertFalse(channel.consumeGrant("bob"), "and it cannot be consumed twice");
+	}
+
+	@Test
+	void grantIsIdempotentAndKeepsItsPlaceInLine() {
+		Channel channel = knockChannel();
+		channel.knock(session("bob"));
+		channel.knock(session("carol"));
+
+		assertEquals("bob", waiting(channel.grant("bob")).id());
+		assertEquals("bob", waiting(channel.grant("bob")).id(),
+				"granting twice just returns the knocker again");
+		assertEquals(List.of("bob", "carol"), ids(channel), "a grant does not reorder the waiting list");
+		assertInstanceOf(None.class, channel.grant("nobody"), "granting an absent request yields None");
+	}
+
+	@Test
+	void grantAllClearsTheWayForEveryoneInOrder() {
+		Channel channel = knockChannel();
+		channel.knock(session("bob"));
+		channel.knock(session("carol"));
+
+		assertEquals(List.of("bob", "carol"),
+				channel.grantAll().stream().map(ClientSession::id).toList(),
+				"grantAll returns every knocker in arrival order (the unlock path)");
+		assertTrue(channel.consumeGrant("bob"), "all of them are now granted");
+		assertTrue(channel.consumeGrant("carol"));
+	}
+
+	@Test
+	void withdrawRemovesEitherStateSoAnUnclaimedApprovalCanBeRevoked() {
+		Channel channel = knockChannel();
+		channel.knock(session("bob"));
+		channel.knock(session("carol"));
+		channel.grant("carol");
+
+		assertEquals("bob", waiting(channel.withdraw("bob")).id(), "an undecided request can be denied");
+		assertEquals("carol", waiting(channel.withdraw("carol")).id(),
+				"and so can a GRANTED one whose client never came back to claim it");
+		assertTrue(ids(channel).isEmpty());
+		assertInstanceOf(None.class, channel.withdraw("bob"), "withdrawing twice yields None");
+		assertFalse(channel.consumeGrant("carol"), "a revoked grant is no longer consumable");
+	}
+
+	@Test
+	void drainHandsBackEveryoneSoNobodyIsStrandedWhenTheChannelIsDropped() {
+		Channel channel = knockChannel();
+		channel.knock(session("bob"));
+		channel.knock(session("carol"));
+		channel.grant("carol");
+
+		assertEquals(List.of("bob", "carol"),
+				channel.drainJoinRequests().stream().map(ClientSession::id).toList(),
+				"draining hands back every knocker, granted or not, in arrival order");
+		assertTrue(ids(channel).isEmpty(), "and empties the list");
+	}
+
+	@Test
+	void theOwnersViewReadsDisplayNamesLiveSoARenameCannotGoStale() {
+		Channel channel = knockChannel();
+		FakeClientSession bob = session("bob");
+		channel.knock(bob);
+		assertEquals("bob", channel.joinRequestInfos().getFirst().displayName());
+
+		bob.setDisplayName("bob-renamed");
+
+		assertEquals("bob-renamed", channel.joinRequestInfos().getFirst().displayName(),
+				"the snapshot reads the session's live name rather than a copy taken at knock time");
+	}
+
+	@Test
+	void theOwnersViewIncludesGrantedRequestsSoTheyCanStillBeRevoked() {
+		Channel channel = knockChannel();
+		channel.knock(session("bob"));
+		channel.grant("bob");
+
+		assertEquals(List.of("bob"), ids(channel),
+				"a granted-but-unclaimed request stays visible: it is exactly the one the owner may want to revoke");
+	}
+
+	/// The session a grant/withdraw outcome carries, failing the test with a readable message if it was None — so
+	/// callers can dereference it without narrowing at every site (mirrors ConnectionServiceTest's `channel`).
+	private static ClientSession waiting(Option<ClientSession> outcome) {
+		return outcome instanceof Some(ClientSession session) ? session : fail("expected a waiting session");
+	}
+
+	/// The waiting session ids, in arrival order — the owner's view reduced to what most assertions care about.
+	private static List<String> ids(Channel channel) {
+		return channel.joinRequestInfos().stream().map(JoinRequestInfo::id).toList();
 	}
 }

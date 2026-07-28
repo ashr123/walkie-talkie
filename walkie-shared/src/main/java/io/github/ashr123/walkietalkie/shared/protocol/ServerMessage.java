@@ -54,6 +54,40 @@ public sealed interface ServerMessage {
 	record ChannelLocked(boolean locked) implements ServerMessage {
 	}
 
+	/// Your `Join` reached a LOCKED channel that parks newcomers, so you are on its waiting list and its owner
+	/// decides. You are **not** a member of that channel: you receive none of its roster, floor state or audio. If
+	/// this `Join` was a SWITCH you are still in the channel you were already in — the server gives that up only once
+	/// a join actually succeeds — so waiting costs you nothing, and neither does a refusal.
+	///
+	/// Show a waiting state and stay connected. What follows is exactly one of: [JoinApproved] (send `Join` again
+	/// to complete it), an [ErrorMessage] with `JOIN_REQUEST_DENIED` (the owner said no), or nothing at all if you
+	/// withdraw ([ClientMessage.WithdrawJoinRequest]) or disconnect.
+	@JsonTypeName("joinPending")
+	record JoinPending(String channel) implements ServerMessage {
+	}
+
+	/// You are cleared to join `channel` — **re-send [ClientMessage.Join]** to complete it. An imperative trigger,
+	/// sent only to the newcomer it concerns, for any of three causes it deliberately does not distinguish (the
+	/// action is the same): the owner admitted you, the owner unlocked the channel, or the channel was dropped
+	/// because its last member left (in which case your `Join` recreates it and you own it).
+	///
+	/// The server does NOT add you itself: doing so would mean moving a session between channels from inside the
+	/// registry's atomic join, which is not permitted, so the final step is always the newcomer's own `Join`.
+	@JsonTypeName("joinApproved")
+	record JoinApproved(String channel) implements ServerMessage {
+	}
+
+	/// The channel's current waiting list, in arrival order — the authoritative snapshot, re-sent on every change
+	/// rather than as incremental add/remove events (the [FloorStatus] doctrine: one message that cannot drift).
+	///
+	/// Sent **only to the owner**, who is the only member that can act on it — broadcasting it would leak who is
+	/// knocking to everyone and multiply the traffic. A newly elected owner is sent the current list, and an owner
+	/// that loses ownership is sent an empty one. Entries the owner has already approved but whose client has not
+	/// yet come back stay listed, so an approval can still be revoked.
+	@JsonTypeName("joinRequests")
+	record JoinRequests(List<JoinRequestInfo> requests) implements ServerMessage {
+	}
+
 	/// The floor was granted to you; open your mic and transmit. An imperative "go live now" trigger sent only to
 	/// the new holder — the accompanying [FloorStatus] (broadcast to everyone) is what renders who holds the floor.
 	@JsonTypeName("floorGranted")

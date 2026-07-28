@@ -29,8 +29,10 @@ public class ChannelRegistry {
 	/// *any* of three different refusals, which forced the caller to re-read the channel afterwards and GUESS
 	/// which one applied — an approximation that could name a reason that only became true after the fact.
 	///
-	/// The `Channel` appears ONLY on the success variant, mirroring [RekeyResult]/[TransferResult]/[LockResult]:
-	/// a refusal added nobody, so there is no joined channel to hand back and nothing for a caller to null-check.
+	/// The `Channel` appears only on the two outcomes that leave the joiner attached to one — [Admitted] (it is a
+	/// member) and [Pending] (it is parked at the door, and the caller needs the channel to notify its owner).
+	/// [Refused] carries none, mirroring [RekeyResult]/[TransferResult]/[LockResult]: nothing was joined, so there
+	/// is nothing for a caller to null-check.
 	public sealed interface JoinOutcome {
 
 		/// The joiner was added: `created` says whether this join brought the channel into being, and the
@@ -41,17 +43,27 @@ public class ChannelRegistry {
 				implements JoinOutcome {
 		}
 
+		/// The channel is LOCKED and parks newcomers, so the joiner was placed on its waiting list instead of being
+		/// admitted or refused — the owner now decides (see [Channel#knock]). The joiner is NOT a member: it holds
+		/// no stream index, receives no broadcasts, and its `channelName` is untouched, so it keeps whatever channel
+		/// it was already in while it waits. `alreadyWaiting` marks an idempotent re-knock, which the caller uses to
+		/// avoid re-notifying the owner about a request already on their list.
+		record Pending(Channel channel, boolean alreadyWaiting) implements JoinOutcome {
+		}
+
 		/// The joiner was NOT added, for exactly this `reason`. The channel is left unchanged and still registered.
 		record Refused(Reason reason) implements JoinOutcome {
 		}
 
-		/// Why a join was refused, in the order [ChannelRegistry#joinOrCreate] evaluates them: the owner locked
-		/// the channel to new members; it is at its member cap (one stream index per member); or the joiner's
-		/// key-check differs from the channel's (wrong or missing end-to-end-encryption passphrase).
+		/// Why a join was refused, in the order [ChannelRegistry#joinOrCreate] evaluates them: the channel is locked
+		/// and does NOT park newcomers (`walkie.max-join-requests` is 0); it is at its member cap (one stream index
+		/// per member); the joiner's key-check differs from the channel's (wrong or missing end-to-end-encryption
+		/// passphrase); or the channel parks newcomers but its waiting list is already at the cap.
 		enum Reason {
 			LOCKED,
 			FULL,
-			PASSPHRASE_MISMATCH
+			PASSPHRASE_MISMATCH,
+			WAITING_LIST_FULL
 		}
 	}
 
@@ -62,24 +74,24 @@ public class ChannelRegistry {
 	/// channel's. The whole check-add-and-snapshot happens inside the atomic map update, so it cannot race with a
 	/// concurrent create or [#leave].
 	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session) {
-		return joinOrCreate(name, mode, keyCheck, session, session.id(), false, NO_OP);
+		return joinOrCreate(name, mode, keyCheck, session, session.id(), Channel.Defaults.NONE, NO_OP);
 	}
 
 	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], but stamps a newly-created channel with
 	/// an explicit `ownerId` instead of the joiner's session id — used to give the server-managed "global"
 	/// channel a sentinel owner that no participant can match. An existing channel keeps its own owner.
 	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId) {
-		return joinOrCreate(name, mode, keyCheck, session, ownerId, false, NO_OP);
+		return joinOrCreate(name, mode, keyCheck, session, ownerId, Channel.Defaults.NONE, NO_OP);
 	}
 
-	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], plus the queue default a newly-created
+	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], plus the [Channel.Defaults] a newly-created
 	/// channel adopts and a hook run on a successful add. See the full form for what `onJoinUnderLock` guarantees.
-	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, boolean floorQueueEnabled, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
-		return joinOrCreate(name, mode, keyCheck, session, session.id(), floorQueueEnabled, onJoinUnderLock);
+	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, Channel.Defaults defaults, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
+		return joinOrCreate(name, mode, keyCheck, session, session.id(), defaults, onJoinUnderLock);
 	}
 
-	/// Full form. `floorQueueEnabled` is the owner-toggleable push-to-talk floor-queue default a **newly created**
-	/// channel adopts (an existing channel keeps its own state, like its mode/owner). On a successful add,
+	/// Full form. `defaults` seeds a **newly created** channel (an existing channel keeps its own state, like its
+	/// mode/owner) — see [Channel.Defaults]. On a successful add,
 	/// `onJoinUnderLock` is invoked exactly once with the captured [JoinOutcome.Admitted] **while the channel
 	/// monitor is still held** (and before any concurrent floor transition can run) — the caller uses it to emit the
 	/// joiner's initial state (its `Joined` snapshot and floor snapshot) so that emission is serialized with floor
@@ -87,21 +99,46 @@ public class ChannelRegistry {
 	/// leave the hint naming a stale holder. The hook MUST be short and non-blocking — it runs under the registry
 	/// bin lock and the channel monitor, and must NOT call back into the registry (that would invert the
 	/// bin→monitor order). It is skipped entirely on a refusal.
-	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, boolean floorQueueEnabled, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
+	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, Channel.Defaults defaults, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
 		AtomicReference<JoinOutcome> outcome = new AtomicReference<>();
 		channels.compute(name, (key, existing) -> {
-			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck, floorQueueEnabled) : existing;
+			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck, defaults) : existing;
 			// Each refusal below records its OWN reason while still under the bin lock, so the caller never has to
 			// re-read the channel to work out which rule rejected the joiner.
 			//
-			// A channel its owner LOCKED admits no new members — refuse before the key-check (a locked door doesn't
-			// care about the key). Only reachable for a NEWCOMER: a re-join to the member's CURRENT channel
-			// short-circuits in ConnectionService.handleJoin and never gets here. This read is under the bin lock,
-			// so it is atomic with a concurrent setLocked/leave/join (a freshly created channel is never locked, so
-			// this only affects joins).
+			// A channel its owner LOCKED does not admit newcomers off the street. Only reachable for a NEWCOMER: a
+			// re-join to the member's CURRENT channel short-circuits in ConnectionService.handleJoin and never gets
+			// here. This read is under the bin lock, so it is atomic with a concurrent setLocked/leave/join (a
+			// freshly created channel is never locked, so this only affects joins).
+			//
+			// Three ways through a locked door, in this order:
+			//   1. the owner already ADMITTED this session — spend its one-shot grant and fall through to the
+			//      ordinary add below. The grant bypasses the LOCK only; capacity and the key-check still apply.
+			//   2. the channel parks newcomers — validate the key-check FIRST, so the owner is never asked to
+			//      approve someone who could not have got in anyway — then knock.
+			//   3. it doesn't park them (`walkie.max-join-requests` = 0) — refuse outright, as before this feature.
 			if (existing != null && channel.isLocked()) {
-				outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.LOCKED));
-				return channel;   // keep the channel; do not add the joiner
+				// One atomic step: the ticket is TORN HERE, before the capacity and key-check gates below. If one of
+				// those then refuses this join, the grant is spent and the newcomer must knock again — deliberate,
+				// because peeking first and spending later would open a window for a concurrent deny (which takes
+				// only the channel monitor, not this bin lock) to withdraw the request in between.
+				boolean admittedByOwner = channel.consumeGrant(session.id());
+				if (!admittedByOwner) {
+					if (!channel.acceptsJoinRequests()) {
+						outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.LOCKED));
+						return channel;   // keep the channel; do not add the joiner
+					}
+					if (!Objects.equals(channel.keyCheck(), keyCheck)) {
+						outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.PASSPHRASE_MISMATCH));
+						return channel;
+					}
+					outcome.set(switch (channel.knock(session)) {
+						case REGISTERED -> new JoinOutcome.Pending(channel, false);
+						case ALREADY_WAITING -> new JoinOutcome.Pending(channel, true);
+						case LIST_FULL -> new JoinOutcome.Refused(JoinOutcome.Reason.WAITING_LIST_FULL);
+					});
+					return channel;
+				}
 			}
 			// Refuse a newcomer once the channel is at capacity (one stream index per member, range 0..254) rather
 			// than assign a colliding index. Under the bin lock, so the capacity check + the add are atomic w.r.t.

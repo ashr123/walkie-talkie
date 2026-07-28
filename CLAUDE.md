@@ -132,8 +132,8 @@ atomic w.r.t. every concurrent join — a joiner sees consistently the locked or
 NEWCOMERS are blocked: an existing member's in-place re-join to its **current** channel short-circuits in
 `handleJoin` before `joinOrCreate` (idempotent re-snapshot, carrying `locked`), so it's never locked out; the
 lock also never removes existing members. `CHANNEL_LOCKED` behaves like `PASSPHRASE_MISMATCH` (both are
-detectable only inside the atomic join): an initial connect fails cleanly, and a switch INTO a locked channel
-drops you — the clients handle it the same way (browser disconnects; Java exits). The `ChannelLocked` broadcast
+detectable only inside the atomic join): an initial connect fails cleanly, and a switch INTO a locked channel is
+refused **without** dropping you (see the in-place switch note below). The `ChannelLocked` broadcast
 runs under the channel monitor reading the live `isLocked()` (convergence, like the passphrase/owner
 broadcasts). The lock persists across a departure-triggered ownership change (a new owner inherits it and can
 unlock); the sentinel-owned `global` room can't be locked (`NOT_OWNER`). Web: an owner-only Lock/Unlock toggle
@@ -141,14 +141,18 @@ in the Members header + a 🔒 badge shown to everyone; Java: `lock`/`unlock` co
 the join line.
 
 **In-place channel switch & rename.** A client changes channel/mode/passphrase **without a new socket**:
-re-sending `Join` on the live connection is handled as "leave the old channel, join the new one" on the same
+re-sending `Join` on the live connection is handled as "join the new channel, then leave the old one" on the same
 `WebSocketSession`, so the **session id (identity) and the audio loops survive** — only per-channel state
-(roster, floor, stream indices, E2EE key) turns over. `handleJoin` validates the target **before** leaving: a
-duplicate `Join` for the *current* channel short-circuits to an idempotent re-snapshot (no membership churn),
-and a bad target (`INVALID_CHANNEL` / `INVALID_DISPLAY_NAME` / `RESERVED_CHANNEL` / `ENCRYPTION_NOT_ALLOWED`)
-is refused **without** dropping you — the **only** failure that can still drop a switcher is
-`PASSPHRASE_MISMATCH`, detectable solely inside the atomic `joinOrCreate` (which necessarily runs after the
-leave). Transport can't switch in place (different endpoint + audio pipeline), so both clients reconnect for
+(roster, floor, stream indices, E2EE key) turns over. **A switch is all-or-nothing: NO failure drops a switcher.**
+`handleJoin` validates what it can up front (a duplicate `Join` for the *current* channel short-circuits to an
+idempotent re-snapshot with no membership churn; `INVALID_CHANNEL` / `INVALID_DISPLAY_NAME` / `RESERVED_CHANNEL`
+/ `ENCRYPTION_NOT_ALLOWED` / `CHANNEL_ROUTING_MISMATCH` are refused cheaply), and the verdicts that are knowable
+only inside the atomic `joinOrCreate` — `PASSPHRASE_MISMATCH`, `CHANNEL_FULL`, `CHANNEL_LOCKED`,
+`TOO_MANY_JOIN_REQUESTS`, and being parked for owner approval — are handled by departing the old channel
+**only after** the join succeeds (`departChannel`, split out of `handleLeave` so it removes membership without
+clearing the session's current-channel pointer). The display name `Join` carries is rolled back on a failed
+switch too (`undoRename`), so a refused switcher can't be left in its old channel under a name that channel was
+never told about. (Earlier versions left first, so a wrong passphrase dropped the switcher from both channels.) Transport can't switch in place (different endpoint + audio pipeline), so both clients reconnect for
 it. **Rename** is a separate `Rename` → `setDisplayName` + broadcast `MemberRenamed` (no membership/floor
 churn). Re-key safety: the Java client holds the key in a `volatile FrameCrypto` reassigned on the console
 thread and read **once** into a local by the capture/receive threads (no TOCTOU NPE across a swap); the browser

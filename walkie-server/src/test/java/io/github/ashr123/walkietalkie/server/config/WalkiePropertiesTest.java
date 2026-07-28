@@ -19,7 +19,7 @@ class WalkiePropertiesTest {
 				-1,
 				-1,
 				10,
-				false,
+				false, 0,
 				null,
 				false
 		);
@@ -46,7 +46,7 @@ class WalkiePropertiesTest {
 						1,
 						1,
 						1,
-						false,
+						false, 0,
 						null,
 						false
 				)
@@ -65,7 +65,7 @@ class WalkiePropertiesTest {
 				7,
 				42,
 				15,
-				true,
+				true, 0,
 				"secret",
 				false
 		);
@@ -92,7 +92,7 @@ class WalkiePropertiesTest {
 				0,
 				0,
 				10,
-				false,
+				false, 0,
 				null,
 				false
 		);
@@ -106,16 +106,16 @@ class WalkiePropertiesTest {
 		// 0 or negative reservation is coerced to the 10 s default rather than disabling anything. The queue
 		// on/off default is a plain flag with no coercion, so it passes through verbatim.
 		assertEquals(10, new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 0, false, null, false).floorReservationSeconds(),
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 0, false, 0, null, false).floorReservationSeconds(),
 				"a zero reservation window falls back to the 10 s default");
 		assertEquals(10, new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, -1, false, null, false).floorReservationSeconds(),
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, -1, false, 0, null, false).floorReservationSeconds(),
 				"a negative reservation window falls back to the 10 s default");
 		assertTrue(new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, true, null, false).floorQueueDefault(),
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, true, 0, null, false).floorQueueDefault(),
 				"floorQueueDefault=true passes through");
 		assertFalse(new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, null, false).floorQueueDefault(),
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false).floorQueueDefault(),
 				"floorQueueDefault=false passes through");
 	}
 
@@ -132,7 +132,7 @@ class WalkiePropertiesTest {
 				5,
 				300,
 				10,
-				false,
+				false, 0,
 				null,
 				false
 		);

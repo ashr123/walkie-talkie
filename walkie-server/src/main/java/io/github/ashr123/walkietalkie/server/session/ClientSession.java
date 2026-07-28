@@ -25,6 +25,22 @@ public interface ClientSession {
 
 	void leftChannel();
 
+	/// The name of the LOCKED channel this session is waiting to be admitted to, or `null` if it is not waiting
+	/// anywhere. Distinct from [#channelName]: a session waiting at one channel's door may still be a full member
+	/// of another, and waiting alone makes it a member of nothing.
+	///
+	/// Single-valued on purpose. It enforces "at most one outstanding request per session" (knocking elsewhere
+	/// withdraws the first), and — the reason it exists at all — it lets the disconnect path find and scrub the
+	/// request in O(1). Without it a waiting session's departure would leak its entry: teardown reconciles by
+	/// [#channelName], which is exactly what a waiting session does NOT have.
+	String pendingChannel();
+
+	/// Records that this session is waiting to be admitted to `channel`.
+	void pendingIn(String channel);
+
+	/// Clears the waiting marker — the request was admitted, denied, withdrawn, or its channel disappeared.
+	void pendingCleared();
+
 	boolean supportsAudioRelay();
 
 	/// Whether this session is still live (its socket open / not torn down). Unlike [#channelName] (which is also

@@ -119,6 +119,35 @@ public sealed interface ClientMessage {
 	record SetLocked(boolean locked) implements ClientMessage {
 	}
 
+	/// Owner-only: admit or deny ONE newcomer waiting at this locked channel's door. `sessionId` is the id from the
+	/// owner-only [ServerMessage.JoinRequests] snapshot; `admit` is true to let them in, false to turn them away.
+	/// A non-owner gets `NOT_OWNER`, sending it before joining gets `NOT_IN_CHANNEL`, and an id that isn't waiting
+	/// here gets `UNKNOWN_TARGET`.
+	///
+	/// Admitting does not itself add the member: the server records a one-shot approval and sends that newcomer
+	/// [ServerMessage.JoinApproved], whose client completes the join by re-sending [Join]. So an approval a client
+	/// never acts on leaves the entry on the list, where the owner can still revoke it with `admit = false`.
+	@JsonTypeName("resolveJoinRequest")
+	record ResolveJoinRequest(String sessionId, boolean admit) implements ClientMessage {
+	}
+
+	/// Owner-only: admit or deny EVERY newcomer currently waiting, in arrival order. Same rules and the same
+	/// per-newcomer effects as [ResolveJoinRequest] (mirroring how [MuteAll] relates to [MuteMember]); a no-op when
+	/// nobody is waiting.
+	@JsonTypeName("resolveAllJoinRequests")
+	record ResolveAllJoinRequests(boolean admit) implements ClientMessage {
+	}
+
+	/// Withdraw your own pending request to join a locked channel — "never mind, I'll stop waiting". Sent by the
+	/// waiting client itself, so it needs no arguments: a session may be waiting at only one door. A no-op when the
+	/// sender is not waiting anywhere. The channel's owner is sent a refreshed [ServerMessage.JoinRequests].
+	///
+	/// Deliberately NOT folded into [Leave]: the server calls its leave path internally while switching channels,
+	/// so giving `Leave` a second meaning would change what that internal call does.
+	@JsonTypeName("withdrawJoinRequest")
+	record WithdrawJoinRequest() implements ClientMessage {
+	}
+
 	/// WebRTC: an SDP offer aimed at another member, relayed by the server.
 	@JsonTypeName("offer")
 	record Offer(String target, String sdp) implements ClientMessage {

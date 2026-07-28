@@ -48,6 +48,11 @@ walkie:
   # false preserves the plain busy-floor-refused behaviour.
   floor-reservation-seconds: 10
   floor-queue-default: false
+  # Owner-approved join requests. A LOCKED channel does not refuse a newcomer outright — it PARKS it here for the
+  # owner to admit or deny (the owner sees the waiting list; unlocking admits everyone still waiting). This caps
+  # that list: it is a DoS bound, not a tuning knob, because every change re-sends the owner a full snapshot.
+  # Set to 0 to go back to refusing newcomers outright (CHANNEL_LOCKED) — the "closed, don't even ask" setting.
+  max-join-requests: 16
 
 management:
   endpoints:

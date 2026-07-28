@@ -63,6 +63,10 @@ public final class WebSocketClientSession implements ClientSession {
 	// Set when the client joins a channel (from the validated Join.displayName); "" until then.
 	private volatile String displayName = "";
 	private volatile String channelName;
+	/// The locked channel this session is waiting to be admitted to (see [ClientSession#pendingChannel]); null when
+	/// it is not waiting. Volatile for the same reason as `channelName`: written on the inbound thread that handles
+	/// the join/withdraw, read on the teardown thread that scrubs the request.
+	private volatile String pendingChannel;
 
 	public WebSocketClientSession(WebSocketSession session,
 	                              Transport transport,
@@ -156,6 +160,21 @@ public final class WebSocketClientSession implements ClientSession {
 	@Override
 	public void leftChannel() {
 		this.channelName = null;
+	}
+
+	@Override
+	public String pendingChannel() {
+		return pendingChannel;
+	}
+
+	@Override
+	public void pendingIn(String channel) {
+		this.pendingChannel = channel;
+	}
+
+	@Override
+	public void pendingCleared() {
+		this.pendingChannel = null;
 	}
 
 	@Override

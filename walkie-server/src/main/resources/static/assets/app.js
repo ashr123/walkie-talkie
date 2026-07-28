@@ -80,6 +80,7 @@ const state = {
 	passphrase: '',         // raw passphrase backing the current channel key (for the adaptive button's change-detection)
 	channelKeyCheck: null,  // the channel's currently-announced key-check (null = unencrypted); a member re-keys to match it
 	rekeyPending: false,    // owner changed the passphrase but our current passphrase doesn't match it yet
+	switchRollback: null,   // key material an in-place switch overwrote, restored if the server refuses it (onJoinRefused)
 	txChain: null,          // serializes async frame encryption (send side) so it can't reorder our Opus stream
 	warnedDecrypt: false,
 	warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
@@ -162,6 +163,10 @@ async function deriveJoinKey(transport, passphrase, mode, channel) {
 	const derived = transport === 'relay' && passphrase && mode !== 'GLOBAL_PTT'
 		? await deriveKey(passphrase, channel)
 		: null;
+	// Remember what this (optimistic) key change overwrites. The server keeps us in our current channel unless the
+	// join succeeds, so a refusal must put it back — otherwise we would sit in that channel holding the target's
+	// key, which the transmit gate mutes because the channel's announced key-check no longer matches ours.
+	state.switchRollback = {cryptoKey: state.cryptoKey, keyCheck: state.keyCheck, passphrase: state.passphrase};
 	state.cryptoKey = derived ? derived.key : null;
 	state.keyCheck = derived ? derived.keyCheck : null;
 	state.passphrase = derived ? passphrase : '';   // remember what backs the current key, for the adaptive button
@@ -790,6 +795,9 @@ function onJoined(msg) {
 	state.mode = msg.mode;
 	state.channel = msg.channel;
 	state.locked = msg.locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join too)
+	// The join landed, so what the switch overwrote is now the truth; a stale rollback here would let a LATER
+	// refusal restore this channel's superseded key.
+	state.switchRollback = null;
 	state.floorQueueEnabled = msg.floorQueueEnabled;   // adopt the channel's queue setting (authoritative on every Joined; a fresh floorStatus follows)
 	if (channelChanged) {
 		// Baseline the announced key-check to what we joined with, and clear any pending rotation — ONLY on an
@@ -940,16 +948,29 @@ function onChannelLocked(locked) {
  * channel is one Apply away instead of a full reconnect.
  */
 function onJoinRefused(reason) {
-	const wasIn = state.channel;
-	resetChannelState();      // roster, floor, decode lanes, peers, lock badge — all belonged to a channel we are not in
-	state.channel = null;
+	const rollback = state.switchRollback;
+	state.switchRollback = null;
+	if (state.channel !== null) {
+		// A refused SWITCH. The server departs our current channel only once a join succeeds, so we are still in it
+		// with our roster, floor and stream lanes intact — keep all of it and only undo what the switch applied
+		// ahead of the answer (the derived key; see deriveJoinKey).
+		if (rollback) {
+			state.cryptoKey = rollback.cryptoKey;
+			state.keyCheck = rollback.keyCheck;
+			state.passphrase = rollback.passphrase;
+		}
+		log(`${reason} You are still in "${state.channel}".`);
+		updateApplyControls();   // re-settle Apply/Reset: the pending switch is over
+		return;
+	}
+	// Nothing was joined in the first place (an initial connect), so there is nothing to keep: settle into the
+	// connected-but-channel-less state and let the user pick another channel.
+	resetChannelState();
 	state.selfId = null;
 	state.ownerId = null;
-	state.channelKeyCheck = null;   // the announced key-check belonged to that channel; keep the typed passphrase for the next try
+	state.channelKeyCheck = null;   // the announced key-check belonged to no channel; keep the typed passphrase for the next try
 	state.rekeyPending = false;
-	log(wasIn === null
-		? `${reason} Pick a channel and press Apply to try another.`
-		: `${reason} You are no longer in "${wasIn}" — pick a channel and press Apply to join one.`);
+	log(`${reason} Pick a channel and press Apply to try another.`);
 	// One re-render: renderMembers already fans out to every owner-only control (mute-all, lock, queue, the owner
 	// dropdown) and to Apply/Reset. They now all read ownsChannel() === false, so they hide rather than mistaking
 	// null === null for "I'm the owner".

@@ -23,6 +23,7 @@ public final class FakeClientSession implements ClientSession {
 	private final Transport transport;
 	private String displayName;
 	private String channelName;
+	private String pendingChannel;
 	private String handshakeChannel;   // the routing channel a test pins via setHandshakeChannel (null by default)
 	/// Lifecycle state, so a test can exercise the paths that only run for a session whose socket has gone away —
 	/// the real [io.github.ashr123.walkietalkie.server.session.WebSocketClientSession] flips this at teardown, and
@@ -80,6 +81,21 @@ public final class FakeClientSession implements ClientSession {
 	@Override
 	public void leftChannel() {
 		this.channelName = null;
+	}
+
+	@Override
+	public String pendingChannel() {
+		return pendingChannel;
+	}
+
+	@Override
+	public void pendingIn(String channel) {
+		this.pendingChannel = channel;
+	}
+
+	@Override
+	public void pendingCleared() {
+		this.pendingChannel = null;
 	}
 
 	@Override

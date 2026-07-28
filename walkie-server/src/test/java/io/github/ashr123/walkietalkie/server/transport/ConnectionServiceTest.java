@@ -12,6 +12,7 @@ import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
+import io.github.ashr123.walkietalkie.shared.protocol.JoinRequestInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
@@ -47,7 +48,7 @@ class ConnectionServiceTest {
 					5,
 					300,
 					10,
-					false,
+					false, 0,
 					null, false
 			),
 			BROADCASTER
@@ -69,7 +70,7 @@ class ConnectionServiceTest {
 						idleSeconds,
 						maxHoldSeconds,
 						10,
-						false,
+						false, 0,
 						null, false
 				),
 				BROADCASTER,
@@ -118,7 +119,7 @@ class ConnectionServiceTest {
 	private ConnectionService affinityService() {
 		return new ConnectionService(
 				channelRegistry,
-				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, null, true), BROADCASTER);
+				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, 0, null, true), BROADCASTER);
 	}
 
 	/// Whether a channel with `name` currently exists — the absence counterpart to [#channel], for asserting a
@@ -577,7 +578,7 @@ class ConnectionServiceTest {
 	}
 
 	@Test
-	void aSwitchToAChannelWithAWrongPassphraseDropsTheClientFromBoth() {
+	void aSwitchToAChannelWithAWrongPassphraseLeavesTheSwitcherWhereItWas() {
 		// alice owns encrypted "team"; "other" already exists with a DIFFERENT key-check.
 		FakeClientSession alice = session("alice");
 		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
@@ -585,14 +586,46 @@ class ConnectionServiceTest {
 		service.onMessage(bootstrap, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bootstrap", "kcv-OTHER"));
 		alice.sent.clear();
 
-		// In-place switch to "other" with the WRONG key-check: handleJoin leaves "team" BEFORE joinOrCreate
-		// validates the target's key-check, so this is the one switch failure that genuinely drops you.
+		// In-place switch to "other" with the WRONG key-check. The mismatch is only knowable inside the atomic join,
+		// so this used to drop the switcher from BOTH channels; the join now departs the old channel only on success.
 		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-WRONG"));
 
 		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(alice, ServerMessage.ErrorMessage.class).code());
-		assertNull(alice.channelName(), "a wrong-passphrase switch drops the client from BOTH channels");
-		assertFalse(channelExists("team"), "the old channel was left (and dropped once empty)");
+		assertEquals("team", alice.channelName(), "a failed switch no longer costs the switcher its channel");
+		assertEquals(1, channel("team").size(), "it is still a member there, with its floor and roster entry intact");
 		assertEquals(1, channel("other").size(), "the mismatched switcher was not added to the target");
+	}
+
+	@Test
+	void aFailedSwitchAlsoUndoesTheDisplayNameItCarried() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession bootstrap = session("bootstrap");
+		service.onMessage(bootstrap, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bootstrap", "kcv-OTHER"));
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		bob.sent.clear();
+
+		// Join carries a display name as well as a channel, so a rejected switch must not apply half of it: staying in
+		// "team" under a new name nobody there was told about would leave that roster wrong forever.
+		service.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bob-renamed", "kcv-WRONG"));
+
+		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals("bob", bob.displayName(), "the name the failed Join carried is rolled back");
+		assertEquals("team", bob.channelName());
+		assertTrue(alice.sent.stream().noneMatch(ServerMessage.MemberRenamed.class::isInstance),
+				"and the channel it stayed in was never told about a rename that did not happen");
+	}
+
+	@Test
+	void aSuccessfulSwitchDoesApplyTheDisplayNameItCarried() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+
+		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice-renamed", null));
+
+		assertEquals("alice-renamed", alice.displayName(), "on success the Join's name takes effect");
+		assertEquals("other", alice.channelName());
 	}
 
 	@Test
@@ -1049,7 +1082,7 @@ class ConnectionServiceTest {
 						0,
 						0,
 						10,
-						false,
+						false, 0,
 						null, false
 				),
 				BROADCASTER
@@ -1081,7 +1114,7 @@ class ConnectionServiceTest {
 						0,
 						0,
 						10,
-						false,
+						false, 0,
 						null, false
 				),
 				BROADCASTER
@@ -1119,7 +1152,7 @@ class ConnectionServiceTest {
 						0,
 						0,
 						10,
-						false,
+						false, 0,
 						null, false
 				),
 				BROADCASTER,
@@ -1960,6 +1993,166 @@ class ConnectionServiceTest {
 		assertEquals(ErrorCode.NOT_IN_CHANNEL, firstOf(stray, ServerMessage.ErrorMessage.class).code());
 	}
 
+	// --- owner-approved join requests (a locked channel parks newcomers) ----------------------------
+
+	/// A service whose channels park up to `cap` newcomers (`walkie.max-join-requests`), over the shared registry.
+	private ConnectionService serviceParking(int cap) {
+		return new ConnectionService(
+				channelRegistry,
+				new WalkieProperties(
+						new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, cap, null, false
+				),
+				BROADCASTER
+		);
+	}
+
+	@Test
+	void aNewcomerAtALockedChannelIsParkedAndTheOwnerIsTold() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertEquals("team", firstOf(bob, ServerMessage.JoinPending.class).channel(),
+				"the newcomer is told it is waiting, NOT refused");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.Joined.class::isInstance), "and it did not join");
+		assertNull(bob.channelName(), "a parked newcomer is not a member of anything");
+		assertEquals("team", bob.pendingChannel(), "it is marked as waiting, so a disconnect can scrub it");
+		assertEquals(List.of("bob"),
+				lastOf(alice, ServerMessage.JoinRequests.class).requests().stream().map(JoinRequestInfo::id).toList(),
+				"the owner is sent the waiting list");
+		assertEquals(1, channel("team").size(), "the channel still has only its owner");
+	}
+
+	@Test
+	void aParkedNewcomerCannotLetItselfIn() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		// Re-sending Join is exactly what an APPROVED newcomer does to claim its place, so an unapproved one
+		// re-sending it must NOT get in — otherwise the lock means nothing.
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.Joined.class::isInstance),
+				"a re-Join without an approval does not admit the newcomer");
+		assertEquals(1, channel("team").size());
+		assertEquals(1, alice.sent.stream().filter(ServerMessage.JoinRequests.class::isInstance).count(),
+				"and the idempotent re-knock does not re-notify the owner (a looping client can't flood them)");
+	}
+
+	/// Being parked costs the switcher nothing: the join departs the old channel only once the target has taken it,
+	/// so waiting for an owner's approval leaves the existing membership, floor and roster entry untouched.
+	@Test
+	void aMemberSwitchingIntoALockedChannelIsParkedAndKeepsItsOldChannel() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertEquals("other", bob.channelName(), "waiting does not cost the switcher the channel it already had");
+		assertEquals("team", bob.pendingChannel(), "and it is now waiting at the locked channel's door");
+		assertEquals("team", firstOf(bob, ServerMessage.JoinPending.class).channel());
+		assertEquals(1, channel("other").size(), "it is still a member of its own channel");
+	}
+
+	@Test
+	void aWaitingNewcomerThatDisconnectsIsScrubbedFromTheOwnersList() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onClose(bob, "normal close");
+
+		assertTrue(lastOf(alice, ServerMessage.JoinRequests.class).requests().isEmpty(),
+				"the request dies with the socket — otherwise it would hold a slot on the owner's list forever");
+		assertNull(bob.pendingChannel());
+	}
+
+	@Test
+	void knockingAtASecondDoorWithdrawsTheFirstRequest() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession dave = session("dave");
+		svc.onMessage(dave, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "dave", null));
+		svc.onMessage(dave, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertEquals("other", bob.pendingChannel(), "a session waits at exactly one door");
+		assertTrue(lastOf(alice, ServerMessage.JoinRequests.class).requests().isEmpty(),
+				"the abandoned request is withdrawn and its owner's list refreshed");
+		assertEquals(List.of("bob"),
+				lastOf(dave, ServerMessage.JoinRequests.class).requests().stream().map(JoinRequestInfo::id).toList());
+	}
+
+	@Test
+	void withTheCapAtZeroALockedChannelStillRefusesOutright() {
+		ConnectionService svc = serviceParking(0);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+
+		assertEquals(ErrorCode.CHANNEL_LOCKED, firstOf(bob, ServerMessage.ErrorMessage.class).code(),
+				"cap 0 keeps the pre-feature behaviour, so CHANNEL_LOCKED stays reachable");
+		assertNull(bob.pendingChannel(), "and nothing is parked");
+	}
+
+	@Test
+	void aWrongPassphraseIsRefusedRatherThanParked() {
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-B"));
+
+		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(bob, ServerMessage.ErrorMessage.class).code(),
+				"the key-check is validated BEFORE parking, so the owner is never asked to approve someone who "
+						+ "could not have got in anyway");
+		assertNull(bob.pendingChannel());
+	}
+
+	@Test
+	void theWaitingListIsRefusedOnceFull() {
+		ConnectionService svc = serviceParking(1);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", null));
+		FakeClientSession carol = session("carol");
+
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", null));
+
+		assertEquals(ErrorCode.TOO_MANY_JOIN_REQUESTS, firstOf(carol, ServerMessage.ErrorMessage.class).code());
+		assertNull(carol.pendingChannel());
+		assertEquals(List.of("bob"),
+				lastOf(alice, ServerMessage.JoinRequests.class).requests().stream().map(JoinRequestInfo::id).toList(),
+				"the full list is unchanged");
+	}
+
 	// --- session lifecycle: a closed session must not resurrect per-session state --------------------
 
 	/// A late control frame from a session whose socket has already gone is dropped BEFORE anything acts on it.
@@ -2046,6 +2239,19 @@ class ConnectionServiceTest {
 		@Override
 		public void leftChannel() {
 			this.channelName = null;
+		}
+
+		@Override
+		public String pendingChannel() {
+			return null;   // this fake never waits at a door; it exists only to fail an audio send
+		}
+
+		@Override
+		public void pendingIn(String channel) {
+		}
+
+		@Override
+		public void pendingCleared() {
 		}
 
 		@Override

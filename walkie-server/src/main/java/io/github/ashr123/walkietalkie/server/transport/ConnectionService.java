@@ -57,6 +57,10 @@ public class ConnectionService {
 	/// reservation-expiry sweep drops it and offers the floor to the next in line. Carried to the reserved head in
 	/// [ServerMessage.FloorReserved] so its client can run the countdown (see docs/FLOOR_QUEUE.md).
 	private final Duration floorReservation;
+	/// The server-wide settings a newly created channel adopts — the floor-queue default and the join-request cap.
+	/// Built once here (rather than per join) because they are fixed for the process; the sentinel-owned `global`
+	/// room deliberately bypasses them and uses [Channel.Defaults#NONE].
+	private final Channel.Defaults channelDefaults;
 
 	@Autowired
 	public ConnectionService(ChannelRegistry channelRegistry,
@@ -82,6 +86,7 @@ public class ConnectionService {
 		this.floorIdleRelease = Duration.ofSeconds(properties.floorIdleReleaseSeconds());
 		this.floorMaxHold = Duration.ofSeconds(properties.floorMaxHoldSeconds());
 		this.floorReservation = Duration.ofSeconds(properties.floorReservationSeconds());
+		this.channelDefaults = new Channel.Defaults(properties.floorQueueDefault(), properties.maxJoinRequests());
 	}
 
 	public static void onConnect(ClientSession session) {
@@ -129,6 +134,10 @@ public class ConnectionService {
 			case ClientMessage.MuteMember(String memberId, boolean muted) -> handleMuteMember(session, memberId, muted);
 			case ClientMessage.MuteAll(boolean muted) -> handleMuteAll(session, muted);
 			case ClientMessage.SetLocked(boolean locked) -> handleSetLocked(session, locked);
+			case ClientMessage.ResolveJoinRequest(String sessionId, boolean admit) ->
+					handleResolveJoinRequest(session, sessionId, admit);
+			case ClientMessage.ResolveAllJoinRequests(boolean admit) -> handleResolveAllJoinRequests(session, admit);
+			case ClientMessage.WithdrawJoinRequest _ -> handleWithdrawJoinRequest(session);
 			case ClientMessage.SetFloorQueue(boolean enabled) -> handleSetFloorQueue(session, enabled);
 			case ClientMessage.Offer(String target, String sdp) ->
 					relaySignal(session, target, new ServerMessage.SignalOffer(session.id(), sdp));
@@ -171,10 +180,10 @@ public class ConnectionService {
 			return;
 		}
 
-		// Validate the switch TARGET before leaving the current channel, so a bad request (typo'd channel name,
-		// invalid display name, or reserved/encryption misuse) is refused WITHOUT dropping the client from the
-		// channel it is already in. Only a passphrase mismatch can still drop a switcher — it is detectable only
-		// by the atomic joinOrCreate below, which necessarily runs after the leave.
+		// Validate the switch TARGET first, so a bad request (typo'd channel name, invalid display name, or
+		// reserved/encryption misuse) is refused cheaply. These are the checks that CAN be made up front; the rest
+		// (passphrase, capacity, lock) are only knowable inside the atomic join — which is why the departure from
+		// the current channel now happens AFTER it succeeds, leaving no failure that can drop a switcher.
 		if (requested == null || !CHANNEL_NAME.matcher(requested).matches()) {
 			sendError(session, ErrorCode.INVALID_CHANNEL,
 					"Channel name must match " + CHANNEL_NAME.pattern());
@@ -211,14 +220,20 @@ public class ConnectionService {
 			return;
 		}
 
-		// Switching channels: leave the current one only after the target passed the validations above.
-		if (session.channelName() != null) {
-			handleLeave(session);
-		}
+		// A SWITCH does not give up its current channel until the target has actually taken it. Every way a join can
+		// fail — a wrong passphrase, a full channel, a locked one, a full waiting list, or being parked for approval
+		// — is only knowable INSIDE the atomic join below, so leaving first (as this used to) meant any of them left
+		// the client in no channel at all. Departing afterwards instead makes the whole `Join` all-or-nothing: on
+		// failure the session keeps its channel, its floor and its roster entry, exactly as if it had never asked.
+		String previousChannel = session.channelName();
+
+		// The display name rides on Join too, and it must be in place BEFORE the join: the roster snapshot the
+		// registry captures under its lock reads it. So apply it now and undo it if the join doesn't happen — else a
+		// refused switcher would sit in its old channel under a name that channel was never told about.
+		String previousDisplayName = session.displayName();
 		session.setDisplayName(join.displayName());
-		// The name is only known now (after validation), but onMessage snapshotted the MDC name at scope entry
-		// when it was still blank — advance it so this handler's lines (the "joined" line below) carry name=...
-		// instead of name=-. The scope's restore-on-exit still cleans it up.
+		// onMessage snapshotted the MDC name at scope entry, when it was still blank — advance it so this handler's
+		// lines carry name=... instead of name=-. The scope's restore-on-exit still cleans it up.
 		RequestContext.updateDisplayName(join.displayName());
 
 		// Emit the joiner's initial state — its Joined snapshot then an authoritative FloorStatus snapshot — from
@@ -252,16 +267,168 @@ public class ConnectionService {
 		// and can never be toggled on (its floor-queue toggle is NOT_OWNER), since it is unbounded and a large queue
 		// would mean heavy position-broadcast churn.
 		ChannelRegistry.JoinOutcome outcome = join.mode() == ChannelMode.GLOBAL_PTT
-				? channelRegistry.joinOrCreate(requested, join.mode(), null, session, GLOBAL_CHANNEL_OWNER, false, emitInitialState)
-				: channelRegistry.joinOrCreate(requested, join.mode(), join.keyCheck(), session, properties.floorQueueDefault(), emitInitialState);
+				? channelRegistry.joinOrCreate(requested, join.mode(), null, session, GLOBAL_CHANNEL_OWNER, Channel.Defaults.NONE, emitInitialState)
+				: channelRegistry.joinOrCreate(requested, join.mode(), join.keyCheck(), session, channelDefaults, emitInitialState);
 		// The atomic join carries its own verdict, decided under the registry bin lock, so a refusal names its EXACT
 		// reason — no re-reading the channel afterwards to guess which of the three rules rejected us (a re-read
 		// could report a reason that only became true in the instant after the failed join).
 		switch (outcome) {
-			case ChannelRegistry.JoinOutcome.Refused(ChannelRegistry.JoinOutcome.Reason reason) ->
-					refuseJoin(session, reason);
-			case ChannelRegistry.JoinOutcome.Admitted admitted -> announceJoin(session, admitted);
+			case ChannelRegistry.JoinOutcome.Refused(ChannelRegistry.JoinOutcome.Reason reason) -> {
+				undoRename(session, previousDisplayName);
+				refuseJoin(session, reason);
+			}
+			case ChannelRegistry.JoinOutcome.Pending(Channel channel, boolean alreadyWaiting) -> {
+				undoRename(session, previousDisplayName);
+				parkJoinRequest(session, channel, alreadyWaiting);
+			}
+			case ChannelRegistry.JoinOutcome.Admitted admitted -> {
+				// The target has us; only now let go of the channel we came from. Departing BEFORE announcing keeps
+				// the observable order a switch has always had (the old channel's MemberLeft, then the new channel's
+				// MemberJoined) and keeps the "left" line tagged with the channel actually left, since announceJoin
+				// is what advances the logging context to the new one.
+				if (previousChannel != null && !previousChannel.equals(admitted.channel().name())) {
+					departChannel(session, previousChannel);
+				}
+				announceJoin(session, admitted);
+			}
 		}
+	}
+
+	/// Puts the display name back after a join that did not happen. `Join` carries the name alongside the channel, so
+	/// without this a refused or parked switcher would keep the new name while the channel it is still in — and which
+	/// received no `MemberRenamed` — goes on showing the old one. A no-op when the name didn't change.
+	private void undoRename(ClientSession session, String previousDisplayName) {
+		if (!previousDisplayName.equals(session.displayName())) {
+			session.setDisplayName(previousDisplayName);
+			RequestContext.updateDisplayName(previousDisplayName);
+		}
+	}
+
+	/// The target is locked and parks newcomers, so this session is now on its waiting list rather than in it.
+	///
+	/// Waiting costs the session nothing: `handleJoin` departs the old channel only once the target has actually taken
+	/// it, so a switcher that ends up parked keeps its current channel, floor and roster entry while it waits — and a
+	/// fresh connection simply stays channel-less.
+	///
+	/// The waiting marker is set HERE rather than inside the registry because it is session state, not channel state —
+	/// and it is what lets the disconnect path scrub the request in O(1).
+	private void parkJoinRequest(ClientSession session, Channel channel, boolean alreadyWaiting) {
+		// At most one outstanding request per session: knocking at a second door drops the first, so a session can
+		// never be waiting in two places (which the single-valued marker could not represent, and the disconnect
+		// scrub could not clean up).
+		withdrawPendingElsewhere(session, channel.name());
+		session.pendingIn(channel.name());
+		broadcaster.toOne(session, new ServerMessage.JoinPending(channel.name()));
+		if (alreadyWaiting) {
+			// An idempotent re-knock (a client retrying): the owner's list is unchanged, so re-sending the snapshot
+			// would be pure churn — and a client looping on Join could otherwise flood the owner's mailbox.
+			return;
+		}
+		notifyOwnerOfJoinRequests(channel);
+		log.info("waiting for approval to join {} (locked)", channel.name());
+	}
+
+	/// Drops any request this session left waiting at a DIFFERENT channel, notifying that channel's owner so their
+	/// list stays truthful. A no-op when the session is not waiting anywhere, or is already waiting at `keepChannel`.
+	private void withdrawPendingElsewhere(ClientSession session, String keepChannel) {
+		String pending = session.pendingChannel();
+		if (pending == null || pending.equals(keepChannel)) {
+			return;
+		}
+		session.pendingCleared();
+		if (channelRegistry.find(pending) instanceof Some(Channel previous)) {
+			synchronized (previous) {
+				if (previous.withdraw(session.id()) instanceof Some<ClientSession>) {
+					notifyOwnerOfJoinRequests(previous);
+				}
+			}
+		}
+	}
+
+	/// Sends the channel's owner the authoritative waiting-list snapshot. Owner-only: nobody else can act on it, and
+	/// broadcasting it would tell every member who is knocking. Read and sent under the channel monitor so two
+	/// concurrent changes converge on the channel's LIVE list rather than each fanning out its own captured view —
+	/// the same discipline as the owner/passphrase/lock broadcasts. The sentinel-owned `global` room can't be locked,
+	/// so it never has requests and never reaches the send.
+	private void notifyOwnerOfJoinRequests(Channel channel) {
+		synchronized (channel) {
+			if (channel.member(channel.ownerId()) instanceof Some(ClientSession owner)) {
+				broadcaster.toOne(owner, new ServerMessage.JoinRequests(channel.joinRequestInfos()));
+			}
+		}
+	}
+
+	/// Owner-only: admit or deny ONE waiting newcomer.
+	///
+	/// Admitting does NOT add the member here. The server cannot move a session into the channel itself — a newcomer
+	/// may still be in another channel, and leaving that one would mean calling a registry mutate from inside
+	/// another's remapping, which `ConcurrentHashMap` forbids — so it records a one-shot approval and tells the
+	/// newcomer to complete the join with its own `Join`. That also means the newcomer's client, not the server,
+	/// decides the moment its audio context switches channels.
+	private void handleResolveJoinRequest(ClientSession session, String sessionId, boolean admit) {
+		if (!(requireOwnedChannel(session) instanceof Some(Channel channel))) {
+			return;
+		}
+		// The decision + its notification run under the channel monitor, so two concurrent decisions can't both
+		// resolve the same request, and the owner's refreshed snapshot always reflects the live list.
+		synchronized (channel) {
+			Option<ClientSession> resolved = admit ? channel.grant(sessionId) : channel.withdraw(sessionId);
+			if (!(resolved instanceof Some(ClientSession newcomer))) {
+				sendError(session, ErrorCode.UNKNOWN_TARGET, "Nobody with id '" + sessionId + "' is waiting to join.");
+				return;
+			}
+			if (admit) {
+				broadcaster.toOne(newcomer, new ServerMessage.JoinApproved(channel.name()));
+			} else {
+				newcomer.pendingCleared();
+				sendError(newcomer, ErrorCode.JOIN_REQUEST_DENIED, "The channel owner declined your request to join.");
+			}
+			broadcaster.toOne(session, new ServerMessage.JoinRequests(channel.joinRequestInfos()));
+			log.info("{} {} ({})", admit ? "admitted" : "denied", sessionId, newcomer.displayName());
+		}
+	}
+
+	/// Owner-only: admit or deny EVERY waiting newcomer, in arrival order — the same per-newcomer effects as
+	/// [#handleResolveJoinRequest], in one step.
+	private void handleResolveAllJoinRequests(ClientSession session, boolean admit) {
+		if (!(requireOwnedChannel(session) instanceof Some(Channel channel))) {
+			return;
+		}
+		synchronized (channel) {
+			List<ClientSession> resolved = admit ? channel.grantAll() : channel.drainJoinRequests();
+			for (ClientSession newcomer : resolved) {
+				if (admit) {
+					broadcaster.toOne(newcomer, new ServerMessage.JoinApproved(channel.name()));
+				} else {
+					newcomer.pendingCleared();
+					sendError(newcomer, ErrorCode.JOIN_REQUEST_DENIED, "The channel owner declined your request to join.");
+				}
+			}
+			broadcaster.toOne(session, new ServerMessage.JoinRequests(channel.joinRequestInfos()));
+			if (!resolved.isEmpty()) {
+				log.info("{} all {} waiting newcomer(s)", admit ? "admitted" : "denied", resolved.size());
+			}
+		}
+	}
+
+	/// The waiting client itself gives up. Reuses the same scrub as a disconnect, so the owner's list is refreshed
+	/// by exactly one code path; a no-op when the sender is not waiting anywhere.
+	private void handleWithdrawJoinRequest(ClientSession session) {
+		withdrawPendingElsewhere(session, null);
+	}
+
+	/// The channel this session owns, or [io.github.ashr123.option.None] after replying with the reason it isn't
+	/// eligible — `NOT_IN_CHANNEL` before joining, `NOT_OWNER` otherwise. The sentinel-owned `global` room can never
+	/// be locked, so it never has waiting newcomers; its owner check refuses there anyway.
+	private Option<Channel> requireOwnedChannel(ClientSession session) {
+		if (!(requireChannel(session) instanceof Some(Channel channel))) {
+			return Option.of((Channel) null);
+		}
+		if (!session.id().equals(channel.ownerId())) {
+			sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can resolve join requests");
+			return Option.of((Channel) null);
+		}
+		return Option.of(channel);
 	}
 
 	/// Reports a refused join to the would-be joiner. The reason is the one the atomic join itself decided, so each
@@ -282,6 +449,11 @@ public class ConnectionService {
 					session,
 					ErrorCode.PASSPHRASE_MISMATCH,
 					"This channel is using a different encryption passphrase (or none) — you can't join it."
+			);
+			case WAITING_LIST_FULL -> sendError(
+					session,
+					ErrorCode.TOO_MANY_JOIN_REQUESTS,
+					"Too many people are already waiting to join this channel — try again shortly."
 			);
 		}
 	}
@@ -311,14 +483,24 @@ public class ConnectionService {
 		log.info("{} mode={}", joined.created() ? "created" : "joined", joined.channel().mode());
 	}
 
+	/// Leaves the channel this session is currently in, if any, and clears its current-channel pointer.
 	private void handleLeave(ClientSession session) {
-		// Snapshot channelName ONCE: it feeds the null-guard, find(), and leave() below, and a concurrent
-		// onClose/switch nulling it between those reads would turn find(null)/leave(null) into a ConcurrentHashMap
-		// null-key NPE (the same hazard fixed in onAudio / handleTransferOwnership's local-first form).
+		// Snapshot channelName ONCE: it feeds the null-guard and the departure below, and a concurrent onClose/switch
+		// nulling it in between would turn find(null)/leave(null) into a ConcurrentHashMap null-key NPE (the same
+		// hazard fixed in onAudio / handleTransferOwnership's local-first form).
 		String channelName = session.channelName();
 		if (channelName == null) {
 			return;
 		}
+		departChannel(session, channelName);
+		session.leftChannel();
+	}
+
+	/// Removes `session` from the NAMED channel and announces the departure, WITHOUT touching the session's
+	/// current-channel pointer. That separation is what lets a switch join its target first and only then let go of
+	/// the channel it came from: by that point the pointer already names the NEW channel, so this must not clear it.
+	/// [#handleLeave] is the ordinary entry point, which departs the current channel and then clears the pointer.
+	private void departChannel(ClientSession session, String channelName) {
 		Option<Channel> channelBeforeLeave = channelRegistry.find(channelName);
 		// Remove the member + re-elect an owner atomically in the registry, THEN announce — broadcasting MemberLeft
 		// only AFTER the removal closes the ghost-member window: a member joining between an earlier broadcast and
@@ -371,7 +553,6 @@ public class ConnectionService {
 		}
 		log.info("left");   // the channel left is in the MDC prefix; clear it for any later line in this scope
 		RequestContext.updateChannel(null);
-		session.leftChannel();
 	}
 
 	private void handleRequestFloor(ClientSession session) {
@@ -715,6 +896,10 @@ public class ConnectionService {
 		// the MDC (this is why a disconnect previously logged no name — onClose wasn't bound to the identity).
 		try (RequestContext.Scope _ = RequestContext.scope(session)) {
 			handleLeave(session);
+			// A session waiting to be admitted somewhere is NOT a member there, so handleLeave (which reconciles by
+			// channelName) cannot see it — scrub it explicitly, or its entry would outlive the socket and hold a slot
+			// on the owner's list forever. Passing null as the channel to keep means "keep none".
+			withdrawPendingElsewhere(session, null);
 			audioRateLimiter.forget(session.id());
 			controlRateLimiter.forget(session.id());
 			log.info("disconnected ({})", closeReason);

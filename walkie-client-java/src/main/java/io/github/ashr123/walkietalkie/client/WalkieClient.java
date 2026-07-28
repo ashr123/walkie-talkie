@@ -170,6 +170,15 @@ public final class WalkieClient implements AutoCloseable {
 	// FloorStatus drops us (then we log "[your turn passed]"). Listener-thread-only today, volatile for the same
 	// warn-once-survives-a-refactor rationale as warnedDecrypt.
 	private volatile boolean awaitingClaim;
+	/// What an in-place switch optimistically overwrote, kept so a REFUSED switch can put it back. The server departs
+	/// our current channel only once a join succeeds, so a refusal leaves us still in it — and without this we would
+	/// sit there holding the target's key, which the transmit gate would (correctly) mute us for. Null when no switch
+	/// is in flight. Written on the console thread, read on the listener thread.
+	private volatile SwitchRollback switchRollback;
+	/// The channel's waiting list of newcomers asking to be admitted — sent by the server ONLY while we own the
+	/// channel, so it is empty for everyone else. Published by the listener thread as an immutable copy (the
+	/// [FloorSnapshot] discipline: a reader never sees a half-built list) and read by the console thread.
+	private volatile List<JoinRequestInfo> joinRequests = List.of();
 
 	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
 		this.options = options;
@@ -319,6 +328,11 @@ public final class WalkieClient implements AutoCloseable {
 	record ConnectTarget(String channel, ChannelMode mode) {
 	}
 
+	/// The key material and connect target belonging to the channel we are CURRENTLY in, captured before an in-place
+	/// switch optimistically replaces them with the target's (see [#switchRollback]).
+	record SwitchRollback(FrameCrypto crypto, String passphrase, ConnectTarget target) {
+	}
+
 	private static ChannelMode parseMode(String arg, ChannelMode fallback) {
 		return switch (arg.toLowerCase(Locale.ROOT)) {
 			case "ptt", "multi" -> ChannelMode.MULTI_CHANNEL_PTT;
@@ -412,6 +426,10 @@ public final class WalkieClient implements AutoCloseable {
 				this.currentMode = mode;
 				this.currentChannel = channel;
 				this.channelLocked = locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join)
+				// The switch (or initial join) landed, so what it overwrote is now the truth — there is nothing to
+				// roll back. Leaving a stale rollback here would let a LATER refusal restore this channel's
+				// superseded key.
+				this.switchRollback = null;
 				this.floorQueueEnabled = floorQueueEnabled;   // adopt the channel's queue setting (authoritative on every Joined)
 				if (channelChanged) {
 					// Baseline the channel's announced key-check from the key we joined with — only on an ACTUAL
@@ -469,6 +487,17 @@ public final class WalkieClient implements AutoCloseable {
 					announceRename(memberId, displayName);
 			case ServerMessage.MemberMuted(String memberId, boolean muted) -> handleMuteChange(memberId, muted);
 			case ServerMessage.ChannelLocked(boolean locked) -> handleChannelLocked(locked);
+			case ServerMessage.JoinPending(String channel) ->
+				// Parked at a locked channel's door. We are NOT in it (and still in whatever channel we were in), so
+				// there is nothing to reset — just say so and wait for the owner's decision.
+					log("[waiting] \"" + channel + "\" is locked — waiting for its owner to admit you.");
+			case ServerMessage.JoinApproved(String channel) -> {
+				// Cleared to join: the server never adds us itself, so the final step is ours. Claim it immediately —
+				// switchTo already advanced connectTarget when we asked, so sendJoin carries the right target.
+				log("[admitted] \"" + channel + "\" — joining…");
+				sendJoin();
+			}
+			case ServerMessage.JoinRequests(List<JoinRequestInfo> requests) -> handleJoinRequests(requests);
 			case ServerMessage.FloorGranted _ when mutedMembers.contains(selfId) ->
 				// Owner-muted: never open the mic, even on a (stray) grant — the server refuses the floor to a
 				// muted member, so this shouldn't arrive, but guard it like the browser's beginTransmit does.
@@ -679,8 +708,23 @@ public final class WalkieClient implements AutoCloseable {
 	/// next attempt — while `currentChannelKeyCheck` (the *channel's* announced value) is cleared, since the channel
 	/// it described is one we are no longer in.
 	private void joinRefused(String reason) {
-		String wasIn = currentChannel;
-		currentChannel = null;
+		SwitchRollback rollback = switchRollback;
+		switchRollback = null;
+		if (currentChannel != null) {
+			// A refused SWITCH. The server departs our current channel only once a join succeeds, so we are still in
+			// it with our floor and roster intact — keep all of that, and just undo what switchTo applied ahead of
+			// the answer. Restoring the key matters: holding the target's key while in this channel makes the
+			// transmit gate mute us (its announced key-check no longer matches the one we hold).
+			if (rollback != null) {
+				crypto = rollback.crypto();
+				currentPassphrase = rollback.passphrase();
+				connectTarget = rollback.target();
+			}
+			log("[refused] " + reason + " You are still in \"" + currentChannel + "\".");
+			return;
+		}
+		// Nothing was joined in the first place (an initial connect), so there is nothing to keep: settle into the
+		// connected-but-channel-less state and let the user pick another channel.
 		ownerId = null;
 		channelLocked = false;
 		currentChannelKeyCheck = null;
@@ -688,10 +732,22 @@ public final class WalkieClient implements AutoCloseable {
 		mutedMembers.clear();
 		floorSnapshot = FloorSnapshot.IDLE;
 		awaitingClaim = false;
-		audio.setTransmitting(false);   // we hold no floor anywhere now, so the mic must not stay live
-		log(wasIn == null
-				? "[refused] " + reason + " Use 'c <channel> [mode]' to try another."
-				: "[refused] " + reason + " You are no longer in \"" + wasIn + "\" — use 'c <channel> [mode]' to join another.");
+		audio.setTransmitting(false);
+		log("[refused] " + reason + " Use 'c <channel> [mode]' to try another.");
+	}
+
+	/// Handles [ServerMessage.JoinRequests]: the authoritative list of newcomers waiting at this locked channel's
+	/// door, sent only while we own it. A terminal has no badge to glance at, so an ARRIVAL is announced as a log
+	/// line — the line is the notification. Departures (a withdrawal, a decision) are not announced: they are
+	/// consequences of something already reported, and re-announcing them would be noise.
+	private void handleJoinRequests(List<JoinRequestInfo> requests) {
+		List<String> known = joinRequests.stream().map(JoinRequestInfo::id).toList();
+		joinRequests = List.copyOf(requests);
+		requests.stream()
+				.filter(request -> !known.contains(request.id()))
+				.forEach(request -> log("[knock] " + request.displayName() + " (#"
+						+ request.id().substring(0, Math.min(ID_PREFIX_LENGTH, request.id().length()))
+						+ ") is waiting to join (" + requests.size() + " waiting)"));
 	}
 
 	/// Whether the mic should auto-open on a full-duplex join or mode change, for the current session — reads our
@@ -1043,6 +1099,9 @@ public final class WalkieClient implements AutoCloseable {
 		}
 		try {
 			FrameCrypto next = deriveCrypto(passphrase, mode, channel);
+			// Remember what this switch is about to overwrite: the server keeps us in our current channel unless the
+			// join succeeds, so a refusal has to restore it (see joinRefused).
+			switchRollback = new SwitchRollback(crypto, currentPassphrase, connectTarget);
 			crypto = next;                 // volatile — the capture/playback loops pick up the new key
 			currentPassphrase = passphrase;
 			// Advance the (re)connect target too, optimistically like crypto above: if the server refuses this

@@ -34,6 +34,13 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 /// @param floorQueueDefault      the floor-queue on/off state a NEWLY created channel adopts (its owner can then
 ///                               toggle it per channel via `setFloorQueue`); default false, preserving the plain
 ///                               busy-floor-refused behaviour
+/// @param maxJoinRequests       how many newcomers a LOCKED channel may park for the owner to admit or deny.
+///                               A locked channel turns a would-be join into a *request* the owner resolves, and
+///                               this bounds that list — every change re-sends the owner a full snapshot, so an
+///                               unbounded list would let knock/withdraw churn flood them. **0 means a locked
+///                               channel refuses newcomers outright** (`CHANNEL_LOCKED`, the behaviour before
+///                               join requests existed), so it doubles as the "closed, don't even ask" setting.
+///                               A newly created channel captures it; negative/absent → default (16)
 /// @param authSigningKey         HMAC-SHA512 key used to sign/verify bearer tokens, bound from
 ///                               `walkie.auth-signing-key` (env `WALKIE_AUTH_SIGNING_KEY`). Blank/absent means
 ///                               a random key is generated per process (dev only — tokens then don't survive a
@@ -55,6 +62,7 @@ public record WalkieProperties(
 		long floorMaxHoldSeconds,
 		long floorReservationSeconds,
 		boolean floorQueueDefault,
+		int maxJoinRequests,
 		String authSigningKey,
 		boolean channelAffinity) {
 
@@ -99,6 +107,12 @@ public record WalkieProperties(
 		if (floorReservationSeconds <= 0) {
 			// Grant-to-claim needs a positive window, so 0/blank means "use the default" (never "disabled").
 			floorReservationSeconds = 10;
+		}
+		if (maxJoinRequests < 0) {
+			// Like the floor timers, an explicit 0 is meaningful ("refuse newcomers outright"), so only a
+			// nonsensical negative falls back. 16 is far above any plausible number of people asking to enter one
+			// room at once, and negligible beside the 255-member cap.
+			maxJoinRequests = 16;
 		}
 	}
 }

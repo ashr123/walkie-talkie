@@ -57,7 +57,7 @@ class ConcurrencyStressTest {
 						0,
 						0,
 						10,
-						false,
+						false, 0,
 						null,
 						false
 				),
@@ -151,7 +151,7 @@ class ConcurrencyStressTest {
 						0,
 						0,
 						10,
-						false,
+						false, 0,
 						null,
 						false
 				),
@@ -252,7 +252,7 @@ class ConcurrencyStressTest {
 						5,
 						10,
 						10,
-						true,
+						true, 0,
 						null,
 						false
 				),
