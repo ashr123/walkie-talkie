@@ -52,6 +52,25 @@ tasks.withType<Test>().configureEach {
 	finalizedBy(tasks.named("jacocoTestReport"))
 }
 
+// Verify this module's `///` Javadoc references actually resolve, and fail `check` when one doesn't. Registered
+// here (rather than on the root, which is a bare aggregator with no `check`) so each module checks the files it
+// owns; the TYPE INDEX still spans the whole build, because a reference routinely names another module's type.
+// Only `rootDir` — a plain File — is read from outside this project, so no other project's model is touched.
+val checkJavadocReferences = tasks.register<JavadocReferenceCheck>("checkJavadocReferences") {
+	group = "verification"
+	description = "Fails on a /// Javadoc reference to a type or member that does not exist."
+	// Both inputs are hand-written sources only, matched by path rather than taken from the source sets: the
+	// server's source sets also contain Spring's GENERATED AOT sources (hundreds of files with no Javadoc), which
+	// would make this check slower, noisier, and dependent on a code-generation task it has no business needing.
+	indexSources.from(fileTree(rootDir) { include("*/src/*/java/**/*.java") })
+	scanSources.from(fileTree(projectDir) { include("src/*/java/**/*.java") })
+	report.set(layout.buildDirectory.file("reports/javadoc-references.txt"))
+}
+
+tasks.named("check") {
+	dependsOn(checkJavadocReferences)
+}
+
 tasks.named<JacocoReport>("jacocoTestReport") {
 	dependsOn(tasks.named("test"))
 	reports {

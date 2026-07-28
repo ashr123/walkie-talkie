@@ -47,6 +47,15 @@ module applies it via `plugins { id("walkietalkie.java-conventions") }`. Do **no
   client from `src/main/resources/static/`.
 - `walkie-client-java` — console client (`javax.sound.sampled` + JDK WebSocket + Concentus Opus).
 
+`check` (so `build`) also runs **`checkJavadocReferences`** — a `JavadocReferenceCheck` task from `buildSrc` that
+fails on a `///` Javadoc reference naming a type or member that doesn't exist (`[SomeType]`, `[Type#member]`,
+`[#member]`). The compiler treats those links as plain text, so a rename — or documenting something before writing
+it — otherwise leaves a silently broken reference. Each module scans its own sources while the type index spans the
+whole build (references cross modules routinely). It is deliberately conservative: Markdown links, bracketed prose
+(`[tag][payload]`), `java.lang`, imported and fully-qualified third-party types are all skipped, as is a bare
+simple name in a file with a wildcard import — but NOT an `Outer.Nested` whose outer half is one of ours, since a
+wildcard import can't explain that away. Report: `<module>/build/reports/javadoc-references.txt`.
+
 Project rule: **no `var` keyword** anywhere. A linter may reformat saved files (tabs, `///` Javadoc,
 `_` for unused catch/pattern vars) — match the existing style rather than fighting it.
 
