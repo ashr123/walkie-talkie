@@ -860,6 +860,15 @@ function onJoined(msg) {
 	if (state.transport === 'relay' && state.ownerId !== SERVER_OWNER) {
 		log(state.cryptoKey ? 'End-to-end encryption: ON (AES-256-GCM)' : 'End-to-end encryption: off');
 	}
+	// Report the queue setting on JOIN, not only when the owner toggles it (onFloorQueueChanged). Whoever was already
+	// in the channel heard that toggle; whoever joins afterwards heard nothing — and since the queue defaults OFF,
+	// that is most people, arriving with no explanation for why a busy floor offers them nothing to do. Skipped in
+	// full-duplex, which has no floor to queue for.
+	if (state.mode !== 'FULL_DUPLEX') {
+		log(state.floorQueueEnabled
+			? 'Floor queue is on — if the floor is busy, tap Talk to join the line.'
+			: 'Floor queue is off — a busy floor refuses new requests until it frees.');
+	}
 
 	if (state.transport === 'webrtc') {
 		msg.members
@@ -1129,6 +1138,20 @@ function updateModeControl() {
  * encrypted global join), so both fields are misleading if editable. Each field's typed value is stashed and
  * restored when switching back. Driven by the mode SELECTOR (the pending pick), not the live mode.
  */
+/**
+ * What each channel mode will feel like once you are in it — shown under the mode selector while you are choosing.
+ *
+ * This is deliberately NOT the Talk button's hint (talk.js MODE_HINTS). That one describes the gesture the LIVE
+ * control accepts and is empty when there is no gesture; this one is advice about a form choice you have not made
+ * yet. Conflating them is what the old static prose did: a single sentence describing all three modes, parked under
+ * a disabled button, telling you to hold a control that does nothing.
+ */
+const MODE_INTROS = {
+	MULTI_CHANNEL_PTT: 'One speaker at a time — hold the Talk button, or hold Space, to take the floor.',
+	GLOBAL_PTT: 'The server\'s shared room, one speaker at a time — hold Talk, or hold Space, to take the floor.',
+	FULL_DUPLEX: 'Everyone\'s mic is open at once — click Talk to mute or unmute yourself.'
+};
+
 function updateGlobalModeLocks() {
 	// Key the locks off the mode SELECTOR (what you're about to connect or switch with), not the live state.mode.
 	// This (a) disables the channel field the moment GLOBAL_PTT is picked — pre-connect AND while connected — and
@@ -1138,6 +1161,7 @@ function updateGlobalModeLocks() {
 	// syncs the selector to state.mode, so this stays correct there; only a deliberate pending pick diverges.
 	const mode = byId('mode').value;
 	const global = mode === 'GLOBAL_PTT';
+	byId('modeHint').textContent = MODE_INTROS[mode];   // advice for the mode you are picking — see MODE_INTROS
 	lockInGlobalMode(byId('channel'), byId('channelHint'), 'global', global);
 	// The global room is always unencrypted, so the passphrase doesn't apply there: HIDE its label + input (not
 	// just disable them) and DELETE any typed secret, leaving the hint to explain the absence. A non-global mode
