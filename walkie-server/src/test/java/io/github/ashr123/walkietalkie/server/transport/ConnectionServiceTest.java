@@ -1187,6 +1187,91 @@ class ConnectionServiceTest {
 		assertEquals(List.of("bob"), status.waiting(), "bob sees itself in the waiting queue");
 	}
 
+	/// The reserved head must receive the SNAPSHOT that makes it `waiting[0]` of a free floor BEFORE the imperative
+	/// FloorReserved trigger. Clients derive reservedness from the snapshot — there is no `reserved` field on the wire
+	/// (docs/CLIENT_PROTOCOL.md §3b) — so a trigger that overtakes it lands while the member still looks merely queued
+	/// behind the ex-holder, and the client contradicts the alert it has just raised: the browser rendered "In line #1
+	/// of N — tap to leave", and the Java client's `t` sent ReleaseFloor and DECLINED the turn.
+	///
+	/// Asserted by INDEX, not by membership: every other FloorReserved assertion in this class is an `anyMatch` over
+	/// the recipient's messages, which passes either way round. The mailbox is strictly FIFO per recipient, so the
+	/// recorded order is the delivery order.
+	@Test
+	void theReservedHeadSeesTheFreedFloorSnapshotBeforeItIsToldItsTurn() {
+		FakeClientSession alice = join("alice", "order", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "order", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues behind her, becoming the head
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.ReleaseFloor());   // the floor frees and is reserved for bob
+
+		List<ServerMessage> delivered = List.copyOf(bob.sent);
+		int snapshot = indexOf(delivered, ServerMessage.FloorStatus.class);
+		int trigger = indexOf(delivered, ServerMessage.FloorReserved.class);
+		assertTrue(snapshot >= 0, () -> "bob was never sent the freed-floor snapshot: " + delivered);
+		assertTrue(trigger >= 0, () -> "bob was never told its turn: " + delivered);
+		assertTrue(snapshot < trigger,
+				() -> "the FloorStatus making bob the head of a free floor must precede the FloorReserved trigger, got " + delivered);
+		// And the snapshot bob sees first is genuinely the one its own derivation reads as "my turn".
+		ServerMessage.FloorStatus reserved = (ServerMessage.FloorStatus) delivered.get(snapshot);
+		assertNull(reserved.holderId(), "the floor is free while reserved");
+		assertEquals(List.of("bob"), reserved.waiting(), "bob is the head being offered the floor");
+	}
+
+	/// The same ordering, on the paths where the snapshot RIDES a batched fan-out (a departure, a mute) instead of
+	/// being broadcast on its own. Those are the easy ones to get wrong: there the FloorStatus is only APPENDED to an
+	/// events list and sent later, so moving the reserve call above the append changes nothing on the wire — the
+	/// to-one trigger still has to be held back until after the fan-out itself.
+	@Test
+	void aFloorFreedByADepartureOrAMuteAlsoSnapshotsBeforeItTellsTheNewHead() {
+		FakeClientSession alice = join("alice", "batched", ChannelMode.MULTI_CHANNEL_PTT);   // owner
+		FakeClientSession bob = join("bob", "batched", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession carol = join("carol", "batched", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+
+		// A MUTE frees the floor: bob holds, carol is the queue head, the owner mutes bob.
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob holds
+		service.onMessage(carol, new ClientMessage.RequestFloor());   // carol queues, becoming the head
+		carol.sent.clear();
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
+		assertSnapshotPrecedesTrigger(carol, "a floor freed by muting its holder");
+
+		// A DEPARTURE frees it: carol now holds, bob (unmuted) is the head, carol's socket closes.
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", false));
+		service.onMessage(carol, new ClientMessage.RequestFloor());   // carol claims its reserved turn -> holds
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues behind carol, becoming the head
+		bob.sent.clear();
+		service.onClose(carol, "the holder leaves");
+		assertSnapshotPrecedesTrigger(bob, "a floor freed by its holder leaving");
+	}
+
+	/// Asserts a newly reserved head received the freed-floor FloorStatus BEFORE the FloorReserved trigger, and that
+	/// the snapshot is the one its own derivation reads as "my turn" (free floor, itself at the head).
+	private static void assertSnapshotPrecedesTrigger(FakeClientSession head, String path) {
+		List<ServerMessage> delivered = List.copyOf(head.sent);
+		int snapshot = indexOf(delivered, ServerMessage.FloorStatus.class);
+		int trigger = indexOf(delivered, ServerMessage.FloorReserved.class);
+		assertTrue(snapshot >= 0, () -> path + ": no freed-floor snapshot reached the new head: " + delivered);
+		assertTrue(trigger >= 0, () -> path + ": the new head was never told its turn: " + delivered);
+		assertTrue(snapshot < trigger,
+				() -> path + ": the FloorStatus must precede the FloorReserved trigger, got " + delivered);
+		ServerMessage.FloorStatus reserved = (ServerMessage.FloorStatus) delivered.get(snapshot);
+		assertNull(reserved.holderId(), () -> path + ": the floor is free while reserved");
+		assertEquals(List.of(head.id()), reserved.waiting(), () -> path + ": the recipient is the head being offered the floor");
+	}
+
+	/// The position of the first message of `type` in a recipient's delivered order, or -1 if it never arrived.
+	private static int indexOf(List<ServerMessage> delivered, Class<? extends ServerMessage> type) {
+		for (int i = 0; i < delivered.size(); i++) {
+			if (type.isInstance(delivered.get(i))) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
 	@Test
 	void theReservedHeadClaimsItsTurnWhileANonHeadCannotGrabTheFreedFloor() {
 		FakeClientSession alice = join("alice", "q2", ChannelMode.MULTI_CHANNEL_PTT);   // owner

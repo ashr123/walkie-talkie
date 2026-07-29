@@ -582,14 +582,21 @@ public class ConnectionService {
 					);
 				}
 				// Floor teardown on LIVE state, run UNCONDITIONALLY. This is safe despite the monitor gap around
-				// channelRegistry.leave precisely because reserveHead is IDEMPOTENT: it (re-)reserves + notifies the
-				// head only when the floor is free with NO running window, so it never re-stamps (never moves
-				// backward) a reservation a concurrent sweep may already have started for the current head, and the
-				// sweep's EPOCH guard stops it dropping a head this leave is about to reserve. The snapshot rides the
-				// same fan-out and always re-syncs the survivors (an unchanged floor just re-sends it — harmless).
-				reserveAndNotify(channel, clock.instant());
+				// channelRegistry.leave precisely because reserveHead is IDEMPOTENT: it (re-)reserves the head only
+				// when the floor is free with NO running window, so it never re-stamps (never moves backward) a
+				// reservation a concurrent sweep may already have started for the current head, and the sweep's EPOCH
+				// guard stops it dropping a head this leave is about to reserve. The snapshot rides the same fan-out
+				// and always re-syncs the survivors (an unchanged floor just re-sends it — harmless).
+				//
+				// Spelled out rather than folded into reserveAndBroadcast because the snapshot RIDES that fan-out: the
+				// FloorReserved trigger has to wait for `toOthers` below, since the reserved head is one of the others
+				// and must see itself as the head of a free floor BEFORE being told it is its turn (notifyReserved).
+				// Reordering these two lines alone would change nothing on the wire — floorStatusOf only builds the
+				// message; the send is `toOthers`.
+				ClientSession reserved = reserveFloorHead(channel, clock.instant());
 				events.add(floorStatusOf(channel));
 				broadcaster.toOthers(channel, session.id(), events.toArray(ServerMessage[]::new));
+				notifyReserved(reserved);
 			}
 		}
 		log.info("left");   // the channel left is in the MDC prefix; clear it for any later line in this scope
@@ -637,7 +644,7 @@ public class ConnectionService {
 			if (channel.isFloorQueueEnabled()) {
 				// Raise-hand: join the FIFO queue and re-broadcast positions. An enqueue never creates a reservation
 				// (the floor is still held/reserved by someone else); the head is offered the floor only when the
-				// floor next frees — the release/leave paths and the idle-release sweep do that via reserveAndNotify.
+				// floor next frees — the release/leave paths and the idle-release sweep do that via reserveFloorHead.
 				channel.enqueueFloor(session.id());
 				broadcastFloorStatus(channel);
 				log.debug("queued for the floor");
@@ -680,6 +687,12 @@ public class ConnectionService {
 	/// trigger, then broadcasts the authoritative [ServerMessage.FloorStatus] to the whole channel (the
 	/// acquire/activity marks were stamped atomically with the swap in [Channel]). The snapshot doubles as the
 	/// notice to a just-preempted ex-holder that the floor is no longer theirs (its id is no longer the holder).
+	///
+	/// Trigger BEFORE snapshot here, which is the opposite of the FREE -> RESERVED transition ([#notifyReserved]) —
+	/// deliberately, and not an inconsistency to tidy up. FloorGranted is what actually opens the microphone, so a
+	/// snapshot arriving first would name us the holder while the mic is still closed: one message of "LIVE — release
+	/// to stop" over a dead mic. FloorReserved carries no such state (only the countdown length), so there the
+	/// snapshot must lead or the client contradicts the alert.
 	private void grantFloor(Channel channel, ClientSession session) {
 		broadcaster.toOne(session, new ServerMessage.FloorGranted());
 		broadcastFloorStatus(channel);
@@ -696,22 +709,50 @@ public class ConnectionService {
 	}
 
 	/// Broadcasts the current [#floorStatusOf] snapshot to the whole channel. Call under `synchronized(channel)` so
-	/// the snapshot is consistent and its fan-out is ordered with the floor transition that triggered it.
+	/// the snapshot is consistent and its fan-out is ordered with the floor transition that triggered it. For a
+	/// FREE -> RESERVED transition this MUST go out BEFORE the to-one [ServerMessage.FloorReserved] — see
+	/// [#notifyReserved].
 	private void broadcastFloorStatus(Channel channel) {
 		broadcaster.toAll(channel, floorStatusOf(channel));
 	}
 
-	/// The FREE -> RESERVED transition: offer the freed floor to the queue head and, if that head is still a
-	/// member, send it the imperative [ServerMessage.FloorReserved] "your turn — start the claim countdown"
-	/// trigger. A no-op when the floor is held or the queue is empty. The caller invokes this EXACTLY ONCE per
-	/// floor-free transition (release/decline/leave/idle/max-hold/expiry) so it never re-stamps a running
-	/// reservation — see [Channel#reserveHead]. MUST be called under `synchronized(channel)`; the caller
-	/// re-broadcasts [#broadcastFloorStatus] so everyone else sees the new reserved head as the queue head.
-	private void reserveAndNotify(Channel channel, Instant now) {
+	/// The FREE -> RESERVED transition, step 1 of 2: offers the freed floor to the queue head and resolves that head
+	/// to its session. Returns `null` when nothing was reserved — the floor is held, the queue is empty, a
+	/// reservation is already running, or the head has since left. Callers invoke it EXACTLY ONCE per floor-free
+	/// transition (release/decline/leave/idle/max-hold/expiry) so it never re-stamps a running reservation — see
+	/// [Channel#reserveHead]. MUST be called under `synchronized(channel)`.
+	///
+	/// The session is resolved HERE rather than in [#notifyReserved] so the recipient is captured atomically with the
+	/// reservation that named it, not after the snapshot fan-out that follows.
+	private static ClientSession reserveFloorHead(Channel channel, Instant now) {
 		String head = channel.reserveHead(now);
-		if (head != null && channel.member(head) instanceof Some(ClientSession reserved)) {
+		return head != null && channel.member(head) instanceof Some(ClientSession reserved) ? reserved : null;
+	}
+
+	/// Step 2 of 2: sends the reserved head the imperative [ServerMessage.FloorReserved] "your turn — start the claim
+	/// countdown" trigger. A no-op when nothing was reserved.
+	///
+	/// MUST be called AFTER the [ServerMessage.FloorStatus] that shows this member as `waiting[0]` of a FREE floor has
+	/// been fanned out, because clients DERIVE reservedness from that snapshot — there is deliberately no `reserved`
+	/// field on the wire (docs/CLIENT_PROTOCOL.md §3b). A trigger that overtakes its snapshot lands while the member
+	/// still looks merely queued behind the ex-holder, and both clients then contradict the alert they just raised: the
+	/// browser rendered "In line #1 of N — tap to leave" for that message, and the Java client's `t` resolved to
+	/// IN_LINE and sent [ClientMessage.ReleaseFloor], DECLINING the turn the terminal bell had just announced.
+	/// Contrast [#grantFloor], which is deliberately the other way round.
+	private void notifyReserved(ClientSession reserved) {
+		if (reserved != null) {
 			broadcaster.toOne(reserved, new ServerMessage.FloorReserved(floorReservation.toSeconds()));
 		}
+	}
+
+	/// The whole FREE -> RESERVED transition for the callers whose snapshot is a broadcast of its own: reserve the
+	/// head, fan out [#broadcastFloorStatus], then trigger that head. Holding the three together is what keeps the
+	/// order from drifting back; the callers whose snapshot instead RIDES a larger fan-out (leave, mute) have to spell
+	/// the same sequence out, and must not collapse it back into this. Under `synchronized(channel)`.
+	private void reserveAndBroadcast(Channel channel, Instant now) {
+		ClientSession reserved = reserveFloorHead(channel, now);
+		broadcastFloorStatus(channel);
+		notifyReserved(reserved);
 	}
 
 	private void handleReleaseFloor(ClientSession session) {
@@ -721,20 +762,18 @@ public class ConnectionService {
 		Instant now = clock.instant();
 		synchronized (channel) {
 			if (channel.releaseFloor(session.id())) {
-				// The live holder gave up the floor: offer it to the queue head (if any) and re-broadcast.
-				reserveAndNotify(channel, now);
-				broadcastFloorStatus(channel);
+				// The live holder gave up the floor: re-broadcast, then offer it to the queue head (if any).
+				reserveAndBroadcast(channel, now);
 				log.debug("released the floor");
 				return;
 			}
 			// Not the holder — a waiter leaving the line, or the reserved head declining its turn. dequeueFloor
 			// resets the reservation clock IFF this caller was the reserved head (so the next head gets a fresh
-			// window; a mid-queue leave keeps the running head's window). reserveAndNotify is then unconditional but
-			// IDEMPOTENT: it re-reserves + notifies only when the floor is free with an unstamped head — i.e. only
+			// window; a mid-queue leave keeps the running head's window). The reserve is then unconditional but
+			// IDEMPOTENT: it re-reserves + triggers only when the floor is free with an unstamped head — i.e. only
 			// when the head genuinely changed — so a mid-queue leave is a reserve no-op that never re-stamps.
 			if (channel.dequeueFloor(session.id())) {
-				reserveAndNotify(channel, now);
-				broadcastFloorStatus(channel);
+				reserveAndBroadcast(channel, now);
 				log.debug("left the floor queue");
 			}
 		}
@@ -800,20 +839,20 @@ public class ConnectionService {
 									released, holder.displayName());
 						}
 					}
-					// 3. Whatever freed the floor above, offer it to the queue head and re-broadcast the snapshot.
+					// 3. Whatever freed the floor above, re-broadcast the snapshot and offer the floor to the queue head.
 					if (freed) {
-						reserveAndNotify(channel, now);
-						broadcastFloorStatus(channel);
+						reserveAndBroadcast(channel, now);
 					}
 					// 4. Reservation-expiry: a reserved head that missed its claim window is dropped, and the floor is
 					// offered to the next in line — if anyone was behind it. Runs last so a reservation freshly
-					// stamped at `now` by steps 1–3 is not itself treated as expired.
+					// stamped at `now` by steps 1–3 is not itself treated as expired. dequeueFloor comes FIRST because
+					// it is the one call here that changes the snapshot (it drops the lapsed head), so the broadcast
+					// inside reserveAndBroadcast must follow it.
 					String missed = channel.expiredReservationHead(now.minus(floorReservation));
 					if (missed != null) {
                         channel.dequeueFloor(missed);
-						reserveAndNotify(channel, now);
-						broadcastFloorStatus(channel);
-						// reserveAndNotify stamps a fresh reservation on the next head IFF one was behind the dropped
+						reserveAndBroadcast(channel, now);
+						// The reserve stamps a fresh reservation on the next head IFF one was behind the dropped
 						// member: a present reservedHolder() means the floor was handed on; an absent one means the
 						// queue emptied and the floor is simply free. The {} tail reflects which.
 						log.info(
@@ -872,11 +911,10 @@ public class ConnectionService {
 				if (!floorMaxHold.isZero()
 						&& Duration.between(channel.floorAcquiredAt(), now).compareTo(floorMaxHold) >= 0
 						&& channel.releaseFloor(session.id())) {
-					// Talk-time limit reached: free the floor, offer it to the queue head (if any), and re-broadcast
-					// the snapshot to the whole channel (incl. the (ex-)speaker so its client stops transmitting and
-					// resets); the speaker must re-request to continue.
-					reserveAndNotify(channel, now);
-					broadcastFloorStatus(channel);
+					// Talk-time limit reached: free the floor, re-broadcast the snapshot to the whole channel (incl. the
+					// (ex-)speaker so its client stops transmitting and resets), and offer the floor to the queue head
+					// (if any); the speaker must re-request to continue.
+					reserveAndBroadcast(channel, now);
 					// onAudio is intentionally not session-scoped (no per-frame MDC churn), so the holder's id + name
 					// are logged inline; the channel is mirrored into the MDC (channelScope) so this line carries
 					// channel=… like the handler lines rather than repeating it in the message.
@@ -1141,14 +1179,18 @@ public class ConnectionService {
 				return;   // already in that state: nothing to free, nothing to broadcast
 			}
 			// Fan out the mute state change, plus the fresh floor snapshot when muting took the member off the floor
-			// (holder released, or a waiter / reserved head dequeued) — in ONE pass.
+			// (holder released, or a waiter / reserved head dequeued) — in ONE pass. The FloorReserved trigger for a
+			// head that inherited the freed floor follows that pass rather than riding it: it is a to-one send, and it
+			// must reach the new head only after the snapshot it derives its turn from (see notifyReserved).
 			List<ServerMessage> events = new ArrayList<>();
 			events.add(new ServerMessage.MemberMuted(memberId, muted));
+			ClientSession reserved = null;
 			if (detachFromFloorIfMuted(channel, memberId, muted)) {
-				reserveAndNotify(channel, clock.instant());
+				reserved = reserveFloorHead(channel, clock.instant());
 				events.add(floorStatusOf(channel));
 			}
 			broadcaster.toAll(channel, events.toArray(ServerMessage[]::new));
+			notifyReserved(reserved);
 		}
 		log.info(
 				"{} member {} ({})",
@@ -1177,14 +1219,17 @@ public class ConnectionService {
 				events.add(new ServerMessage.MemberMuted(memberId, muted));
 			}
 			// If any muted member was on the floor (holder or waiting), advance/free it and append the fresh snapshot
-			// so it rides the SAME fan-out.
+			// so it rides the SAME fan-out. The to-one FloorReserved for a head that inherited the floor waits until
+			// after that pass — it must not overtake the snapshot its turn is derived from (see notifyReserved).
+			ClientSession reserved = null;
 			if (floorChanged) {
-				reserveAndNotify(channel, clock.instant());
+				reserved = reserveFloorHead(channel, clock.instant());
 				events.add(floorStatusOf(channel));
 			}
 			if (!events.isEmpty()) {   // nothing actually changed (idempotent) -> no fan-out at all
 				broadcaster.toAll(channel, events.toArray(ServerMessage[]::new));
 			}
+			notifyReserved(reserved);
 		}
 		log.info("{} all members", muted ? "muted" : "unmuted");
 	}

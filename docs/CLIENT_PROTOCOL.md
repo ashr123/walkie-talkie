@@ -179,12 +179,20 @@ whenever `holderId == null`, because the server reserves the head the instant th
 "free, queue non-empty, nobody reserved" state). So `reserved = (holderId == null && waiting.length > 0) ?
 waiting[0] : null` — derived identically by every client.
 
-**Two to-one imperative triggers** accompany the snapshot for the moments you must *act*:
+**Two to-one imperative triggers** accompany the snapshot for the moments you must *act*. Neither carries floor
+state you cannot already derive, so **treat them as prompts, never as a source of truth** — render from the
+snapshot:
 
 - **`floorGranted`** — you just acquired the floor: open your mic and transmit. (The broadcast `floorStatus`
-  renders who holds it for everyone else.)
+  renders who holds it for everyone else.) This one is sent **before** its `floorStatus`, because it is what
+  actually opens your mic: were the snapshot first you would briefly show yourself live over a closed mic.
 - **`floorReserved { claimSeconds }`** — sent to the reserved head: it's your turn. Alert the user and start a
-  `claimSeconds` countdown. **Grant-to-claim, never a hot mic:** you must take the normal talk action
+  `claimSeconds` countdown. **Guaranteed to arrive AFTER** the `floorStatus` that shows you as `waiting[0]` of a
+  free floor, so by the time it lands your own derivation above already says *it's your turn*, and this message
+  adds only the alert and the window length. You therefore never need to buffer or latch it — and a client that
+  renders from the snapshot alone is never briefly told the opposite (before this guarantee, both reference
+  clients spent one message showing "in line — tap to leave" for a turn that was already theirs, and acting on
+  that would have *declined* it). **Grant-to-claim, never a hot mic:** you must take the normal talk action
   (`requestFloor`) within the window to go live. Miss it and the server drops you from the queue and offers the
   floor to the next in line (you will see a `floorStatus` in which you are no longer the head).
 
@@ -205,7 +213,8 @@ server revokes the floor by **idle auto-release** (a relay holder silent for `wa
 default 5, when another member wants the floor — relay-only, measured from frame *timing* so it works on
 encrypted channels) and **max-hold** (any holder past `walkie.floor-max-hold-seconds`, default 300 — a pure time
 cap that also bounds a WebRTC peer, §3a). Both `0`-disable. When the queue is on, a freed floor is offered to the
-queue head (a fresh `floorReserved` to it + a `floorStatus` to all) instead of going idle. A normal active relay
+queue head (a `floorStatus` to all, then a fresh `floorReserved` to that head — in that order, see above) instead
+of going idle. A normal active relay
 talker is **never** idle-released: it sends a frame every 20 ms (even through speech pauses), refreshing the
 activity mark, so idle auto-release only catches a holder that genuinely went silent on the wire without
 releasing.

@@ -246,13 +246,17 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			assertEquals(List.of(ids[1]), queued.waiting(), "Bob is shown waiting in line");
 			awaitType(a.messages, ServerMessage.FloorStatus.class);   // drain Alice's copy of the queue update
 
-			// Alice releases -> Bob is reserved (his turn) and told so, with the claim window.
+			// Alice releases -> Bob is reserved (his turn) and told so, with the claim window. Order is part of the
+			// contract: the SNAPSHOT that makes Bob the head of a free floor is sent BEFORE the imperative trigger, so
+			// his own derivation already says "my turn" when the trigger lands (clients derive reservedness from the
+			// snapshot — there is no `reserved` field on the wire). These two awaits ARE that assertion: awaitType
+			// discards whatever it skips, so awaiting them the other way round consumes the snapshot and then times out.
 			send(sa, new ClientMessage.ReleaseFloor());
-			assertEquals(10, awaitType(b.messages, ServerMessage.FloorReserved.class).claimSeconds(),
-					"the reserved head is told its turn with the default 10 s claim window");
 			ServerMessage.FloorStatus reserved = awaitType(b.messages, ServerMessage.FloorStatus.class);
 			assertNull(reserved.holderId(), "the floor is free while reserved");
 			assertEquals(List.of(ids[1]), reserved.waiting(), "Bob is the head being offered the floor");
+			assertEquals(10, awaitType(b.messages, ServerMessage.FloorReserved.class).claimSeconds(),
+					"the reserved head is then told its turn, with the default 10 s claim window");
 
 			// Bob claims his turn -> granted, becomes the holder, leaves the queue.
 			send(sb, new ClientMessage.RequestFloor());

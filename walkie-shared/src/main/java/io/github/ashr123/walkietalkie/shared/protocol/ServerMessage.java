@@ -111,7 +111,14 @@ public sealed interface ServerMessage {
 	/// It is your turn: the floor is reserved for you for `claimSeconds`. An imperative "your turn — alert the
 	/// user and start the claim countdown" trigger sent only to the newly reserved head; you must claim it (send
 	/// [ClientMessage.RequestFloor]) within the window or the server drops you from the queue and offers the floor
-	/// to the next member. The accompanying [FloorStatus] shows you as `waiting.get(0)` with `holderId == null`.
+	/// to the next member.
+	///
+	/// The [FloorStatus] showing you as `waiting.get(0)` with `holderId == null` is broadcast BEFORE this trigger, so
+	/// a client's derived state already reads "it is your turn" when this lands and this message adds only the alert
+	/// and the window length. That ordering is part of the contract, not an accident: reservedness is DERIVED from the
+	/// snapshot (there is no `reserved` field), so a trigger arriving first would prompt the user against a snapshot
+	/// still showing them merely queued behind the ex-holder. Contrast [FloorGranted], which deliberately precedes
+	/// its snapshot because it is what opens the microphone.
 	@JsonTypeName("floorReserved")
 	record FloorReserved(long claimSeconds) implements ServerMessage {
 	}

@@ -82,7 +82,13 @@ volatile reads, re-validated under the monitor before audio fan-out); full-duple
 conveyed to clients by ONE authoritative snapshot `FloorStatus(holderId, waiting)` — broadcast on **every** floor
 change and sent to-one right after `Joined` — plus two to-one imperative triggers, `FloorGranted` ("go live") and
 `FloorReserved(claimSeconds)` ("your turn — claim it"; queue only). `FloorTaken`/`FloorIdle`/`FloorDenied` are
-**retired** (all subsumed by `FloorStatus`). **Floor anti-hogging** (PTT modes, in `ConnectionService`): a holder gone silent past
+**retired** (all subsumed by `FloorStatus`). **Trigger ordering is part of the contract, and differs per trigger:**
+`FloorReserved` is sent **after** the `FloorStatus` that makes you `waiting[0]` of a free floor, because
+reservedness is *derived* from that snapshot (`ConnectionService.reserveFloorHead` reserves, the snapshot fans out,
+then `notifyReserved` triggers — one `reserveAndBroadcast` helper for the plain broadcasts, spelled out at the
+leave/mute sites whose snapshot rides a batched fan-out). `FloorGranted` is deliberately sent **before** its
+snapshot, because it is what opens the mic — snapshot-first there would render "LIVE" over a closed mic. Pinned by
+`ConnectionServiceTest`'s two index-based ordering tests plus `FloorLifecycleIntegrationTest`. **Floor anti-hogging** (PTT modes, in `ConnectionService`): a holder gone silent past
 `walkie.floor-idle-release-seconds` (default 5) is preempted when another member requests the floor (idle
 auto-release — `Channel.preemptFloorIfIdle`, relay holders only, keyed off frame *timing* not content), and any
 holder is force-released after `walkie.floor-max-hold-seconds` (default 300) of continuous holding (max-hold —
@@ -111,8 +117,8 @@ instant the floor frees. `RequestFloor`/`ReleaseFloor` are interpreted by the se
 claim / enqueue vs. stop / leave-queue / decline), so the queue needs no new client command. A muted member is
 dropped from the queue; the ownerless `global` room is always off; full-duplex has no floor and no queue. The 1 s
 `releaseExpiredFloors` sweep now runs three per-channel steps under the monitor — max-hold, idle-release (queue
-advance, relay-only), then reservation-expiry — each handing the freed floor to the queue head (`reserveHead` +
-a to-one `FloorReserved`) and re-broadcasting `FloorStatus`.
+advance, relay-only), then reservation-expiry — each handing the freed floor to the queue head (`reserveHead`,
+re-broadcasting `FloorStatus`, and only THEN a to-one `FloorReserved` to that head — see the ordering rule above).
 
 **Owner-enforced mute.** The owner can mute members (`MuteMember` for one, `MuteAll` for everyone but the owner
 → broadcast `MemberMuted`, `ConnectionService.handleMuteMember` / `handleMuteAll`); the muted set is per-`Channel`

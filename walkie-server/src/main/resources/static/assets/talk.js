@@ -159,8 +159,11 @@ function decideTalk(view) {
 		case FLOOR_LIVE:
 			return {mode: 'hold', label: 'LIVE — release to stop', myTurn: false, action};
 		case FLOOR_MY_TURN:
-			// Reserved for us (hold to claim). The countdown is display-only — the server owns the real window — and
-			// is absent both before FloorReserved carries it and again once it has ticked down to 0.
+			// Reserved for us (hold to claim). The countdown is display-only — the server owns the real window — and is
+			// absent in two REACHABLE states, so neither arm is dead code: the snapshot that makes us the head always
+			// arrives BEFORE the FloorReserved carrying the window (a protocol guarantee, see ServerMessage.
+			// FloorReserved), so this renders suffix-less for that one message; and it drops the suffix again once the
+			// ticker reaches 0, until the authoritative snapshot flips us away.
 			return {
 				mode: 'hold',
 				label: view.claimSecondsLeft > 0
