@@ -298,11 +298,13 @@
             margin: 0;
         }
 
-        /* Right-aligned owner moderation controls (lock toggle + mute-all) and the everyone-visible lock badge. */
+        /* The everyone-visible channel-state badge row, right-aligned beside the Members heading. */
         .members-controls {
             display: flex;
             align-items: center;
-            gap: 8px;
+            flex-wrap: wrap;   /* never clip a badge label — drop it to another line instead */
+            justify-content: flex-end;
+            gap: 4px 8px;
         }
 
         #muteAllBtn {
@@ -312,17 +314,19 @@
             margin-top: 10px;
         }
 
-        /* Channel-state badges, shown to EVERY member (toggled at runtime by app.js). */
+        /* Channel-state badges, shown to EVERY member. This row and the owner's checkbox rows are both BUILT at
+           runtime from the flag table in assets/channel-flags.js, so neither appears in this markup. */
         #channelBadges > span {
             font-size: 12px;
             color: var(--muted);
             white-space: nowrap;
         }
 
-        /* Locked is the one that blocks people, so it reads as a warning rather than as information. */
+        /* The flag that blocks people reads as a warning rather than as information. A class, not an id, since the
+           badges are generated; id + element + class outranks the rule above without needing !important. */
         /*noinspection CssUnusedSymbol*/
-        #lockedBadge {
-            color: var(--bad) !important;
+        #channelBadges > span.warn {
+            color: var(--bad);
         }
 
         /* Owner-only channel settings: three state checkboxes plus the one-shot mute action. */
@@ -525,11 +529,7 @@
 					<!-- Channel STATE, shown to everyone (each badge hidden when off). The owner's toggles for the same
 					     three flags live in #ownerSettings below; this row is what a non-owner gets, and it is why the
 					     floor-queue state is no longer log-only. Written by updateChannelSettings in app.js. -->
-					<div class="members-controls" id="channelBadges">
-						<span hidden id="lockedBadge" title="The owner locked this channel — a newcomer has to be admitted">🔒 Locked</span>
-						<span hidden id="queueBadge" title="A busy floor forms a line — tap Talk to join it">✋ Queue on</span>
-						<span hidden id="muteOnEntryBadge" title="The owner mutes every member that joins">🔇 Joiners muted</span>
-					</div>
+					<div class="members-controls" id="channelBadges"></div>
 				</div>
 				<!-- Owner-only channel settings. Checkboxes, not flip-label buttons, because these are persistent
 				     STATE: "Disable queue" makes you infer the state from the verb, a tick states it. "Mute everyone
@@ -538,9 +538,7 @@
 				     quieting a room usually wants both. -->
 				<div hidden id="ownerSettings">
 					<h3>Channel settings</h3>
-					<label><input id="lockToggle" type="checkbox"> Locked — a newcomer has to be admitted</label>
-					<label id="queueToggleRow"><input id="queueToggle" type="checkbox"> Raise-hand queue for a busy floor</label>
-					<label><input id="muteOnEntryToggle" type="checkbox"> Mute members as they join</label>
+					<div id="channelFlagToggles"></div>
 					<button class="secondary" id="muteAllBtn" type="button"
 					        title="Mute or unmute everyone already in the channel — a one-shot, unlike the setting above">Mute everyone now</button>
 				</div>

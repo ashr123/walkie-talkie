@@ -436,6 +436,14 @@ module** that `app.js` imports — the pattern to follow for any new pure browse
 - `static/assets/e2ee.js` — E2EE + the outbound transmit-gate decision, testable because Node exposes the same
   Web Crypto API. `e2ee.test.js` pins the SAME known-answer vectors as Java's `FrameCryptoTest` (keeping the two
   clients byte-identical) plus the `frameDisposition` no-plaintext gate. Java mirror: `WalkieClient.outboundFrame`.
+- `static/assets/channel-flags.js` — the channel's standing owner flags (`locked` / `floorQueueEnabled` /
+  `muteNewMembers`) as ONE table each, plus `flagDisplay(flag, view)`. `app.js` BUILDS both the everyone-visible
+  badge row and the owner's checkboxes from it, so a fourth flag is a table entry rather than markup in two places
+  plus three render sites. `flagDisplay` is a pure function of the snapshot the SERVER wrote — the click handler only
+  sends `flag.command(...)` — which is what makes a refused toggle snap back instead of leaving the UI claiming
+  something untrue; `channel-flags.test.js` states that property directly, and pins the per-message wire field
+  (`setLocked` carries `locked`, the others `enabled`) and that `field` matches the `Joined` component it is filled
+  from.
 - `static/assets/talk.js` — the floor rules (`floorStateFor`/`floorActionFor`/`floorIsFree`), the full-duplex
   mic auto-open policy (`shouldAutoOpenMic`, whose three terms are mode / "Connect muted" / owner-mute), and
   `talkDecision`,

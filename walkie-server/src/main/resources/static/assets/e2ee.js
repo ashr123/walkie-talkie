@@ -1,7 +1,8 @@
 // Relay-path end-to-end encryption for the browser client, plus the outbound transmit-gate decision. Pulled out
-// of app.js into a DOM-free module — talk.js is the other one — so it can be unit-tested under Node's built-in
-// test runner (`node --test`), which exposes the same Web Crypto API (`globalThis.crypto`) the browser does. MUST
-// stay byte-identical to the Java client's FrameCrypto and to FrameCryptoTest's known-answer vectors.
+// of app.js into a DOM-free module — talk.js and channel-flags.js are the others — so it can be unit-tested under
+// Node's built-in test runner (`node --test`), which exposes the same Web Crypto API (`globalThis.crypto`) the
+// browser does. MUST stay byte-identical to the Java client's FrameCrypto and to FrameCryptoTest's known-answer
+// vectors.
 
 export const E2EE_SCHEME = 0xe2;        // wire marker for an encrypted frame: [scheme][IV(12)][ciphertext+tag]; kept outside the codec-tag set {1,2} so a plaintext receiver drops it cleanly
 export const E2EE_AAD = Uint8Array.of(E2EE_SCHEME);   // the scheme byte, authenticated (GCM additionalData) but not encrypted, so the envelope is covered by the tag

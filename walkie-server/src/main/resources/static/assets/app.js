@@ -18,6 +18,7 @@ import {
 	unwrapPassphrase,
 	wrapPassphrase
 } from './e2ee.js';
+import {CHANNEL_FLAGS, flagDisplay} from './channel-flags.js';
 import {
 	FLOOR_IN_LINE,
 	FLOOR_LIVE,
@@ -2308,26 +2309,60 @@ function renderMembers() {
  * now" stays a button because it is a one-shot over the members present — and sits under the standing rule for
  * arrivals, since an owner quieting a room usually wants both.
  */
+/**
+ * Creates the badge row and the owner's checkbox rows from CHANNEL_FLAGS, once, remembering each flag's nodes on the
+ * flag itself so updateChannelSettings renders without looking anything up by id. Built rather than written into
+ * index.html so a flag is described in exactly ONE place; built once and never rebuilt, because these are focusable
+ * inputs an owner may be tabbing through — a re-render would steal that focus, unlike the roster, which is rebuilt
+ * from its snapshot freely.
+ */
+function buildChannelFlagControls() {
+	const badges = byId('channelBadges');
+	const rows = byId('channelFlagToggles');
+	CHANNEL_FLAGS.forEach(flag => {
+		const badge = document.createElement('span');
+		badge.hidden = true;
+		badge.textContent = flag.badge;
+		badge.title = flag.badgeTitle;
+		if (flag.warn) {
+			badge.classList.add('warn');
+		}
+		badges.append(badge);
+
+		const input = document.createElement('input');
+		input.type = 'checkbox';
+		// Send the intent, then re-assert from state: the click is not the truth, the server's broadcast is.
+		input.addEventListener('change', () => {
+			sendCtrl(flag.command(input.checked));
+			updateChannelSettings();
+		});
+		const row = document.createElement('label');
+		row.append(input, ` ${flag.label}`);
+		rows.append(row);
+
+		flag.badgeNode = badge;
+		flag.rowNode = row;
+		flag.inputNode = input;
+	});
+}
+
 function updateChannelSettings() {
 	const iAmOwner = ownsChannel();
-	// Badges: channel state, for everyone. The queue badge is meaningless in full-duplex, which has no floor.
-	byId('lockedBadge').hidden = !state.locked;
-	byId('queueBadge').hidden = !(state.floorQueueEnabled && state.mode !== 'FULL_DUPLEX');
-	byId('muteOnEntryBadge').hidden = !state.muteNewMembers;
+	// Every flag renders from the SAME derivation (channel-flags.js) — the badge everyone sees and the owner's tick
+	// alike, so the two cannot disagree. It reads only fields the server wrote, never the click that may have just
+	// flipped a box, which is what snaps a refused toggle back instead of leaving the UI claiming something untrue
+	// (ownership moved mid-click, the wrong mode, a dropped socket).
+	CHANNEL_FLAGS.forEach(flag => {
+		const display = flagDisplay(flag, state);
+		flag.badgeNode.hidden = !display.badgeShown;
+		flag.rowNode.hidden = !display.applies;
+		flag.inputNode.checked = display.checked;
+	});
 
 	byId('ownerSettings').hidden = !iAmOwner;
 	if (!iAmOwner) {
 		return;
 	}
-	// Re-assert every tick from state, not from the click that may have just flipped it: a checkbox toggles itself
-	// optimistically, while the server is authoritative and may refuse (ownership moved mid-click, wrong mode, a
-	// dropped socket). Re-asserting here snaps it back until the broadcast lands.
-	byId('lockToggle').checked = state.locked;
-	byId('queueToggle').checked = state.floorQueueEnabled;
-	byId('muteOnEntryToggle').checked = state.muteNewMembers;
-	// The floor queue applies only to push-to-talk; the server refuses the toggle in full-duplex with INVALID_MODE.
-	byId('queueToggleRow').hidden = state.mode === 'FULL_DUPLEX';
-
 	const btn = byId('muteAllBtn');
 	const others = [...state.members.keys()].filter(id => id !== state.ownerId);
 	const allMuted = others.length > 0 && others.every(id => state.mutedMembers.has(id));
@@ -2483,24 +2518,8 @@ window.addEventListener('DOMContentLoaded', () => {
 		const allMuted = others.length > 0 && others.every(id => state.mutedMembers.has(id));
 		sendCtrl({type: 'muteAll', muted: !allMuted});
 	});
-	// Owner-only "Lock/Unlock channel" toggle: flip the current lock state (recomputed at click time). Immediate.
-	// Each toggle SENDS its intent and then re-asserts every tick from state: the server is authoritative, so a
-	// refused change (ownership moved mid-click, or the wrong mode) must snap the box back rather than leave the UI
-	// claiming something untrue. The matching broadcast is what actually flips it.
-	byId('lockToggle').addEventListener('change', e => {
-		sendCtrl({type: 'setLocked', locked: e.target.checked});
-		updateChannelSettings();
-	});
-	byId('muteOnEntryToggle').addEventListener('change', e => {
-		sendCtrl({type: 'setMuteNewMembers', enabled: e.target.checked});
-		updateChannelSettings();
-	});
-	// Owner-only floor-queue toggle: flip the current queue state (recomputed at click time). The echoed
-	// floorQueueChanged is what actually flips everyone's state; the server enforces NOT_OWNER. Immediate.
-	byId('queueToggle').addEventListener('change', e => {
-		sendCtrl({type: 'setFloorQueue', enabled: e.target.checked});
-		updateChannelSettings();
-	});
+	// The owner's channel-flag checkboxes and everyone's badge row, both generated from one table.
+	buildChannelFlagControls();
 	byId('admitAllBtn').addEventListener('click', () => sendCtrl({type: 'resolveAllJoinRequests', admit: true}));
 	byId('denyAllBtn').addEventListener('click', () => sendCtrl({type: 'resolveAllJoinRequests', admit: false}));
 	byId('cancelRequestBtn').addEventListener('click', () => {
