@@ -1233,7 +1233,17 @@ function floorIsFree() {
  *   'tap'      — a click toggles queue membership; press/release do NOT drive the mic (IN_LINE, IDLE + busy + queue on).
  */
 function talkMode() {
-	if (state.mutedMembers.has(state.selfId)) {
+	// Connected but in NO channel — waiting to be admitted to a locked one, or declined. There is no floor to
+	// act on, so every talk gesture is a no-op.
+	//
+	// This guard has to live here rather than in the event handlers: a DISABLED button still dispatches
+	// mouseleave (browsers suppress activation events like click/mousedown on it, but not enter/leave), so
+	// merely moving the cursor off the greyed-out control fired the hold-release path and earned a
+	// NOT_IN_CHANNEL from the server — once per pass, without the user pressing anything. Fixing it in
+	// talkMode covers the mouse, touch and Space paths at once, since they all route through
+	// pressTalk/releaseTalk, which no-op on 'disabled'.
+	if (state.channel === null
+		|| state.mutedMembers.has(state.selfId)) {
 		return 'disabled';
 	}
 	if (state.mode === 'FULL_DUPLEX') {
