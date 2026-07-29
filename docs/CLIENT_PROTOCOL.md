@@ -706,4 +706,5 @@ A minimal full-duplex-capable client should pass:
       drops oldest at its bound; lanes age out after `SILENCE_TTL_MS` and close immediately on `memberLeft`.
 
 > Sample frame hexdumps and the canonical KAT inputs live in `walkie-client-java`'s `FrameCryptoTest` and the
-> reference clients (`app.js`, `AudioEngine.java`); use them as the authoritative reference implementation.
+> reference clients (the browser's `assets/e2ee.js` — with `assets/app.js` for the surrounding pipeline — and
+> `AudioEngine.java`); use them as the authoritative reference implementation.

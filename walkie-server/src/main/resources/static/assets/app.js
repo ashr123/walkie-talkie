@@ -18,6 +18,13 @@ import {
 	unwrapPassphrase,
 	wrapPassphrase
 } from './e2ee.js';
+import {
+	FLOOR_IN_LINE,
+	FLOOR_LIVE,
+	FLOOR_MY_TURN,
+	floorStateFor,
+	talkDecision
+} from './talk.js';
 
 /**
  * Tiny alias for the regular DOM accessor — NOT jQuery (there is no jQuery in this project).
@@ -101,8 +108,8 @@ const state = {
 	speakTimers: new Map(),  // id -> timeout that clears a relay speaker after a short silence
 	floorSpeaker: null,      // PTT/global floor holder — drives the highlight when there are no relay frames (WebRTC)
 	// Push-to-talk floor snapshot, from the authoritative ServerMessage.FloorStatus (holderId + waiting). ALL floor
-	// UI is derived from these — mirroring the Java client's floorStateFor — so the Talk button, queue position and
-	// "your turn" state stay consistent across both clients.
+	// UI is derived from these — via talk.js's floorStateFor, mirroring the Java client's — so the Talk button,
+	// queue position and "your turn" state stay consistent across both clients.
 	floorHolder: null,       // id currently holding the floor (both transports), null when free/reserved/full-duplex
 	floorWaiting: [],        // the FIFO floor queue in order (empty when the queue is off or nobody is waiting)
 	floorQueueEnabled: false, // whether the owner-toggleable floor queue is on (from joined.floorQueueEnabled + floorQueueChanged)
@@ -865,7 +872,6 @@ function onJoined(msg) {
 		state.transmitting = false;
 		enableLocalTracks(false);
 	}
-	enableTalkButton(true);
 	updateTalkButton();
 	updateModeControl();
 	updateGlobalModeLocks();
@@ -975,13 +981,10 @@ function onJoinPending(channel) {
 	state.pendingChannel = channel;
 	log(`Waiting for the owner of "${channel}" to admit you…`);
 	renderPendingBanner();
-	if (state.channel === null) {
-		// A fresh connection that went straight to the waiting list is connected but in no channel, so the talk
-		// control would otherwise still read its pre-connect "Connect first". (A switcher keeps its channel — and
-		// its working talk control — so leave that alone.)
-		enableTalkButton(false);
-		byId('talkBtn').textContent = 'Waiting to be admitted…';
-	}
+	// The talk control reads state.pendingChannel itself now: a fresh connection that went straight to the waiting
+	// list is connected but in no channel, so it reads "Waiting to be admitted…" and does nothing. A SWITCHER keeps
+	// its channel — and its working talk control — because the decision ranks channel membership above the knock.
+	updateTalkButton();
 }
 
 /**
@@ -1101,10 +1104,7 @@ function onJoinRefused(reason) {
 	// null === null for "I'm the owner".
 	renderMembers();
 	updateModeControl();
-	enableTalkButton(false);
-	const talkBtn = byId('talkBtn');
-	talkBtn.textContent = 'Not in a channel';
-	talkBtn.classList.remove('live', 'myturn');
+	updateTalkButton();   // "Not in a channel", disabled, with the live / your-turn highlights cleared
 }
 
 /**
@@ -1180,84 +1180,34 @@ function lockInGlobalMode(input, hint, lockedValue, global) {
 }
 
 // --- push-to-talk floor: queue + "your turn" attention --------------------------------------------
-// ALL floor UI is derived from ONE authoritative snapshot (ServerMessage.FloorStatus: holderId + waiting),
-// mirroring the Java client. floorStateFor is the SAME pure rule both clients apply; floorActionFor is the
-// state-driven decision behind the unified Talk control (there is no separate queue button).
-
-const FLOOR_LIVE = 'LIVE';       // we hold the floor and are transmitting
-const FLOOR_MY_TURN = 'MY_TURN'; // reserved for us: the floor is free and we are the queue head — claim it
-const FLOOR_IN_LINE = 'IN_LINE'; // waiting further back in the queue
-const FLOOR_IDLE = 'IDLE';       // none of the above: floor free, held by another, or reserved for another
+// ALL floor UI is derived from ONE authoritative snapshot (ServerMessage.FloorStatus: holderId + waiting).
+// The rules themselves live in the DOM-free assets/talk.js (floorStateFor is the SAME pure rule the Java client
+// applies; talkDecision is the state-driven decision behind the unified Talk control — there is no separate queue
+// button); what stays here is everything that touches the socket, the DOM or a timer.
 
 /**
- * Derives our floor state from the authoritative snapshot (holderId + waiting) and our own id — the same rule the
- * Java client's floorStateFor applies, so both stay in lock-step. There is deliberately no "reserved" field: the
- * member offered a free floor is exactly waiting[0] (the server reserves the head the instant the floor frees).
+ * The Talk control's decision for the state RIGHT NOW — talkDecision in talk.js owns the rule; this is the only
+ * place client state is projected into its inputs, so the renderer (updateTalkButton) and the pointer/touch/Space
+ * handlers all act on one answer instead of re-deriving it.
+ *
+ * Always call this at event time. A decision cached from the last render can be stale, and consulting the button's
+ * own `disabled` attribute instead — as the Space handlers used to — re-derives the rule from the pixels.
  */
-function floorStateFor(self, holderId, waiting) {
-	return self === holderId
-		? FLOOR_LIVE
-		: holderId == null && waiting.length > 0 && waiting[0] === self
-			? FLOOR_MY_TURN
-			: waiting.includes(self)
-				? FLOOR_IN_LINE
-				: FLOOR_IDLE;
-}
-
-/**
- * The message the state-driven Talk control sends for a floor state — mirrors the Java client's floorActionFor:
- * LIVE → releaseFloor (stop), IN_LINE → releaseFloor (leave the queue), MY_TURN → requestFloor (claim), IDLE →
- * requestFloor (grab if free, else enqueue when the queue is on; the server ignores it when busy + queue off).
- */
-function floorActionFor(floorState) {
-	return floorState === FLOOR_LIVE || floorState === FLOOR_IN_LINE
-		? {type: 'releaseFloor'}
-		: {type: 'requestFloor'};
-}
-
-/**
- * Whether nobody holds OR is reserved for the floor — the only IDLE sub-case that stays a plain hold-to-talk. A
- * busy floor instead becomes tap-to-raise-hand when the queue is on, or a disabled "held by X" when it's off.
- */
-function floorIsFree() {
-	return !state.floorHolder && state.floorWaiting.length === 0;
-}
-
-/**
- * The Talk button's INTERACTION mode for the current state — the subtle hold-vs-tap flip from the design's
- * unified-control table. Read by BOTH the pointer/keyboard handlers and updateTalkButton so the gesture and the
- * label can't drift:
- *   'duplex'   — full-duplex mic on/off toggle (no floor);
- *   'disabled' — owner-muted, or a busy floor with the queue OFF (today's committed behaviour) — no action;
- *   'hold'     — press-and-hold drives the floor/mic (LIVE, MY_TURN, IDLE + free);
- *   'tap'      — a click toggles queue membership; press/release do NOT drive the mic (IN_LINE, IDLE + busy + queue on).
- */
-function talkMode() {
-	// Connected but in NO channel — waiting to be admitted to a locked one, or declined. There is no floor to
-	// act on, so every talk gesture is a no-op.
-	//
-	// This guard has to live here rather than in the event handlers: a DISABLED button still dispatches
-	// mouseleave (browsers suppress activation events like click/mousedown on it, but not enter/leave), so
-	// merely moving the cursor off the greyed-out control fired the hold-release path and earned a
-	// NOT_IN_CHANNEL from the server — once per pass, without the user pressing anything. Fixing it in
-	// talkMode covers the mouse, touch and Space paths at once, since they all route through
-	// pressTalk/releaseTalk, which no-op on 'disabled'.
-	if (state.channel === null
-		|| state.mutedMembers.has(state.selfId)) {
-		return 'disabled';
-	}
-	if (state.mode === 'FULL_DUPLEX') {
-		return 'duplex';
-	}
-	switch (floorStateFor(state.selfId, state.floorHolder, state.floorWaiting)) {
-		case FLOOR_LIVE:
-		case FLOOR_MY_TURN:
-			return 'hold';
-		case FLOOR_IN_LINE:
-			return 'tap';
-		default: // IDLE
-			return floorIsFree() ? 'hold' : state.floorQueueEnabled ? 'tap' : 'disabled';
-	}
+function talkNow() {
+	return talkDecision({
+		connected: isOpen(),
+		channel: state.channel,
+		pendingChannel: state.pendingChannel,
+		selfId: state.selfId,
+		muted: state.mutedMembers.has(state.selfId),
+		mode: state.mode,
+		transmitting: state.transmitting,
+		floorHolder: state.floorHolder,
+		floorWaiting: state.floorWaiting,
+		floorQueueEnabled: state.floorQueueEnabled,
+		claimSecondsLeft: state.claimSecondsLeft,
+		labelFor: memberLabel
+	});
 }
 
 /**
@@ -1295,7 +1245,8 @@ function startTurnAlert(claimSeconds) {
 	state.claimTimer = setInterval(() => {
 		state.claimSecondsLeft = Math.max(0, state.claimSecondsLeft - 1);
 		if (state.claimSecondsLeft === 0) {
-			// Stop ticking at 0; leave the button reading "0s" until the authoritative floorStatus flips us away.
+			// Stop ticking at 0. The button then reads a bare "YOUR TURN — hold to talk" (talk.js shows the suffix
+			// only above 0) until the authoritative floorStatus flips us away.
 			clearInterval(state.claimTimer);
 			state.claimTimer = null;
 		}
@@ -1424,9 +1375,10 @@ function onFloorQueueChanged(enabled) {
 // --- talk control ---------------------------------------------------------------------------------
 
 function pressTalk() {
-	// talkMode() folds in the owner-mute guard (returns 'disabled') and the full-duplex case, so this one check
-	// replaces the old explicit mute + floor-held guards (it also guards the hold-Space path).
-	const mode = talkMode();
+	// One decision drives the gesture and the label alike (see talkNow): 'disabled' already folds in not-connected,
+	// in-no-channel, owner-muted and a busy floor with the queue off, so this single check replaces the old explicit
+	// mute + floor-held guards (it also guards the hold-Space path).
+	const {mode, action} = talkNow();
 	if (mode === 'disabled') {
 		return;
 	}
@@ -1441,27 +1393,28 @@ function pressTalk() {
 	if (mode === 'tap') {
 		return;   // tap states toggle queue membership on RELEASE (a full tap), not on the down edge — see releaseTalk
 	}
-	// hold state (LIVE / MY_TURN / IDLE + free): the down edge begins the grab/claim. floorActionFor for a
-	// not-yet-live hold state (MY_TURN or IDLE) is requestFloor; the !transmitting guard makes re-pressing while
-	// already LIVE (button still physically held right after the grant) a no-op. We go live on floorGranted.
+	// hold state (LIVE / MY_TURN / IDLE + free): the down edge begins the grab/claim. The action for a not-yet-live
+	// hold state (MY_TURN or IDLE) is requestFloor; the !transmitting guard makes re-pressing while already LIVE
+	// (button still physically held right after the grant) a no-op. We go live on floorGranted.
 	if (!state.transmitting) {
-		sendCtrl(floorActionFor(floorStateFor(state.selfId, state.floorHolder, state.floorWaiting)));
+		sendCtrl(action);
 	}
 }
 
 function releaseTalk() {
-	const mode = talkMode();
+	const {mode, action} = talkNow();
 	if (mode === 'duplex' || mode === 'disabled') {
 		return;   // full-duplex toggles on press; a disabled control has no release action
 	}
 	if (mode === 'tap') {
-		// A full tap on a tap-state button toggles queue membership: floorActionFor gives releaseFloor to LEAVE the
-		// line (IN_LINE) or requestFloor to JOIN it (IDLE + busy + queue on). The mic is never driven here.
-		sendCtrl(floorActionFor(floorStateFor(state.selfId, state.floorHolder, state.floorWaiting)));
+		// A full tap on a tap-state button toggles queue membership: the action is releaseFloor to LEAVE the line
+		// (IN_LINE) or requestFloor to JOIN it (IDLE + busy + queue on). The mic is never driven here.
+		sendCtrl(action);
 		return;
 	}
 	// hold: give up the floor and stop the mic. LIVE → releaseFloor; a press we never got granted also releases
-	// (harmless if we never held it).
+	// (harmless if we never held it). Deliberately releaseFloor and NOT this state's own `action`, which for a
+	// MY_TURN or IDLE hold would be requestFloor — releasing a hold never asks for the floor.
 	if (state.transmitting) {
 		endTransmit();
 	}
@@ -2269,70 +2222,23 @@ function updateQueueControl() {
 	}
 }
 
-function enableTalkButton(enabled) {
-	byId('talkBtn').disabled = !enabled;
-}
-
+/**
+ * Renders the Talk control from the one decision (talkNow) — a pure projection, no rules of its own. Every branch
+ * of that decision settles all four writes, so no earlier state can be left stranded on the button: the pulsing
+ * "your turn" highlight used to survive a disconnect because the teardown path cleared only 'live'.
+ *
+ * It owns the DISABLED presentation too, including the states that used to be poked in imperatively ("Connect
+ * first", "Not in a channel", "Waiting to be admitted…"). That is the whole point of the split: while the label
+ * came from here and the gesture came from a second tree, the two could disagree about whether the control was
+ * live — and they did, in exactly the state where there was no channel to talk in.
+ */
 function updateTalkButton() {
 	const btn = byId('talkBtn');
+	const {mode, label, myTurn} = talkNow();
+	btn.disabled = mode === 'disabled';
+	btn.textContent = label;
+	btn.classList.toggle('myturn', myTurn);
 	btn.classList.toggle('live', state.transmitting);
-	// Owner-muted first: the control is disabled and says why. The server drops our audio (and refuses us the floor)
-	// regardless, but disabling here stops us talking into a closed door and makes the reason plain. This runs only
-	// while connected (every caller is post-join), so it owns the connected disabled state alongside the mute.
-	if (state.mutedMembers.has(state.selfId)) {
-		btn.classList.remove('myturn');
-		btn.disabled = true;
-		btn.textContent = 'Muted by owner';
-		return;
-	}
-	// Full-duplex: no floor — a plain mic on/off toggle (unchanged).
-	if (state.mode === 'FULL_DUPLEX') {
-		btn.classList.remove('myturn');
-		btn.disabled = false;
-		btn.textContent = state.transmitting ? 'Mic ON (click to mute)' : 'Mic OFF (click to talk)';
-		return;
-	}
-	// Push-to-talk: the label AND the interaction mode are state-driven (see the design's unified-control table and
-	// talkMode()). The 'myturn' class drives the pulsing highlight for the reserved "your turn" state.
-	const floorState = floorStateFor(state.selfId, state.floorHolder, state.floorWaiting);
-	btn.classList.toggle('myturn', floorState === FLOOR_MY_TURN);
-	switch (floorState) {
-		case FLOOR_LIVE:
-			btn.disabled = false;
-			btn.textContent = 'LIVE — release to stop';
-			return;
-		case FLOOR_MY_TURN:
-			// Reserved for us (hold to claim). The countdown is display-only (startTurnAlert ticks it); fall back to
-			// no suffix if a floorStatus makes us the head a beat before floorReserved carries the window.
-			btn.disabled = false;
-			btn.textContent = state.claimSecondsLeft > 0
-				? `YOUR TURN — hold to talk · ${state.claimSecondsLeft}s`
-				: 'YOUR TURN — hold to talk';
-			return;
-		case FLOOR_IN_LINE:
-			// Waiting in line (tap to leave). Position is 1-based; self is in the queue by definition of IN_LINE.
-			btn.disabled = false;
-			btn.textContent = `In line #${state.floorWaiting.indexOf(state.selfId) + 1} of ${state.floorWaiting.length} — tap to leave`;
-			return;
-		default: { // IDLE
-			if (floorIsFree()) {
-				btn.disabled = false;
-				btn.textContent = 'Hold to talk';
-				return;
-			}
-			// Floor busy: with the queue ON, offer to raise a hand (tap to join the line); with it OFF, disable the
-			// button and name the holder — exactly today's committed queue-off behaviour.
-			if (state.floorQueueEnabled) {
-				btn.disabled = false;
-				btn.textContent = 'Raise hand ✋';
-				return;
-			}
-			btn.disabled = true;
-			const busyId = state.floorHolder || state.floorWaiting[0];
-			btn.textContent = `Floor held by ${memberLabel(busyId)}`;
-			return;
-		}
-	}
 }
 
 /**
@@ -2396,10 +2302,12 @@ function cleanup() {
 	state.ws = null;
 	state.token = null;
 	state.ownerId = null;
-	enableTalkButton(false);
-	const talkBtn = byId('talkBtn');
-	talkBtn.textContent = 'Connect first';
-	talkBtn.classList.remove('live');
+	// A dropped connection ends any outstanding request to join: nobody is going to admit a socket that is gone.
+	// Clearing it here is what keeps the waiting banner — and the talk control, which reads the same field — from
+	// outliving the connection that was waiting.
+	state.pendingChannel = null;
+	renderPendingBanner();
+	updateTalkButton();   // "Connect first", disabled, with the live / your-turn highlights cleared
 	byId('connectBtn').hidden = false;
 	byId('disconnectBtn').hidden = true;
 	byId('renameBtn').hidden = true;
@@ -2461,6 +2369,7 @@ window.addEventListener('DOMContentLoaded', () => {
 		sendCtrl({type: 'withdrawJoinRequest'});
 		state.pendingChannel = null;
 		renderPendingBanner();
+		updateTalkButton();   // no longer waiting: the control drops "Waiting to be admitted…" for "Not in a channel"
 		log('Stopped waiting to be admitted.');
 	});
 	byId('ownerSelect').addEventListener('change', updateApplyControls);   // a pending transfer; applied via the button
@@ -2518,8 +2427,8 @@ window.addEventListener('DOMContentLoaded', () => {
 	const talk = byId('talkBtn');
 	// Track whether the Talk button is physically held (down edges set it, every up/leave edge clears it) so a
 	// floorReserved landing mid-hold auto-claims — the design's "already holding when the turn lands = immediate
-	// claim". The down/up edges call the SAME pressTalk/releaseTalk; those branch on talkMode() to decide whether the
-	// gesture is a hold (drives the mic) or a tap (toggles queue membership) — see talkMode().
+	// claim". The down/up edges call the SAME pressTalk/releaseTalk; those branch on talkNow().mode to decide whether
+	// the gesture is a hold (drives the mic) or a tap (toggles queue membership) — see talkDecision in talk.js.
 	talk.addEventListener('mousedown', () => {
 		state.talkHeld = true;
 		pressTalk();
@@ -2532,7 +2441,10 @@ window.addEventListener('DOMContentLoaded', () => {
 		state.talkHeld = false;
 		// Only a HOLD gesture releases the floor when the pointer drifts off; a tap-state button must NOT toggle
 		// queue membership just because the pointer left after a click (releaseTalk handles the tap on mouseup).
-		if (talkMode() === 'hold') {
+		// A disabled control answers neither, which is what stops a cursor merely crossing it from acting: this
+		// listener fires even on a disabled button, since browsers suppress activation events there but not
+		// enter/leave.
+		if (talkNow().mode === 'hold') {
 			releaseTalk();
 		}
 	});
@@ -2547,17 +2459,25 @@ window.addEventListener('DOMContentLoaded', () => {
 		releaseTalk();
 	}, {passive: false});
 
-	// Space is a push-to-talk key (PTT only; full-duplex is excluded, as before). In tap states pressTalk no-ops on
-	// key-down and releaseTalk toggles the queue on key-up, so Space "raises a hand" / leaves the line too.
+	// Space is a push-to-talk key: it drives the floor gestures and deliberately leaves full-duplex alone, whose mic
+	// toggle stays a click. Both gates ask talkNow() rather than the button's own `disabled` attribute, so the
+	// keyboard rides the same decision as the pointer instead of a rendered value that can lag the state behind it —
+	// and the 'duplex' exclusion is expressed once, in talk.js, rather than re-derived from state.mode here. In tap
+	// states pressTalk no-ops on key-down and releaseTalk toggles the queue on key-up, so Space "raises a hand" /
+	// leaves the line too.
+	const spaceDrivesTalk = () => {
+		const {mode} = talkNow();
+		return (mode === 'hold' || mode === 'tap') && document.activeElement.tagName !== 'INPUT';
+	};
 	window.addEventListener('keydown', e => {
-		if (e.code === 'Space' && !e.repeat && !talk.disabled && state.mode !== 'FULL_DUPLEX' && document.activeElement.tagName !== 'INPUT') {
+		if (e.code === 'Space' && !e.repeat && spaceDrivesTalk()) {
 			e.preventDefault();
 			state.talkHeld = true;
 			pressTalk();
 		}
 	});
 	window.addEventListener('keyup', e => {
-		if (e.code === 'Space' && !talk.disabled && state.mode !== 'FULL_DUPLEX' && document.activeElement.tagName !== 'INPUT') {
+		if (e.code === 'Space' && spaceDrivesTalk()) {
 			e.preventDefault();
 			state.talkHeld = false;
 			releaseTalk();

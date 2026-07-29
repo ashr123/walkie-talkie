@@ -129,9 +129,10 @@ JAVA_OPTS= ./gradlew build      # compiles all modules and runs the test suite
 The suite includes the **browser client's** tests: plain ES-module tests under
 [`walkie-server/src/test/js/`](walkie-server/src/test/js) that run on **Node's built-in test runner** (no npm
 dependencies). They pin the relay end-to-end-encryption to the same known-answer vectors as the Java
-`FrameCryptoTest`, so both clients stay byte-for-byte interoperable, and assert the no-plaintext transmit gate.
+`FrameCryptoTest`, so both clients stay byte-for-byte interoperable, and assert the no-plaintext transmit gate;
+they also pin the push-to-talk floor rules the two clients share, and every state of the browser's Talk control.
 `./gradlew build` runs them via the `:walkie-server:jsTest` task when `node` is on `PATH` (it logs a skip if
-not). To run them directly: `node --test walkie-server/src/test/js/e2ee.test.js`.
+not). To run them directly: `node --test 'walkie-server/src/test/js/**/*.test.js'`.
 
 ### Run the server
 

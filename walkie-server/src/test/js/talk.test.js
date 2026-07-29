@@ -1,0 +1,442 @@
+// Browser-client tests for the Talk control's decision and the push-to-talk floor rules, run under Node's built-in
+// test runner (`node --test`), no npm dependencies. Wired into the Gradle build via the `jsTest` task (guarded so
+// it skips when Node isn't on PATH).
+//
+// talk.js is DOM-free by construction, so everything the Talk button says and does is pinned here as data: a
+// snapshot of client state in, {mode, label, myTurn, action} out. The button's `disabled` is derived by app.js as
+// `mode === 'disabled'`, so asserting the mode asserts the greyed-out state too.
+//
+// floorStateFor / floorActionFor are the SAME pure rules the Java client applies, and the cases below mirror
+// WalkieClientTest's, so a drift between the two clients fails on both sides.
+
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+	FLOOR_IDLE,
+	FLOOR_IN_LINE,
+	FLOOR_LIVE,
+	FLOOR_MY_TURN,
+	floorActionFor,
+	floorIsFree,
+	floorStateFor,
+	talkDecision
+} from '../../main/resources/static/assets/talk.js';
+
+const SELF = 'self-session-id';
+const OTHER = 'other-session-id';
+const HOLDER = 'holder-session-id';
+
+const REQUEST = {type: 'requestFloor'};
+const RELEASE = {type: 'releaseFloor'};
+
+/**
+ * A connected member of an ordinary PTT channel with a free floor — the state every case below varies ONE field of,
+ * so each test names only what it is actually about.
+ *
+ * labelFor throws by default: the roster is consulted for exactly one label ("Floor held by X"), and a test that
+ * doesn't opt in is asserting that it stays that way.
+ */
+function view(overrides) {
+	return {
+		connected: true,
+		channel: 'team1',
+		pendingChannel: null,
+		selfId: SELF,
+		muted: false,
+		mode: 'MULTI_CHANNEL_PTT',
+		transmitting: false,
+		floorHolder: null,
+		floorWaiting: [],
+		floorQueueEnabled: false,
+		claimSecondsLeft: 0,
+		labelFor: id => assert.fail(`labelFor should not be consulted in this state (asked for ${id})`),
+		...overrides
+	};
+}
+
+// --- connected but in no channel: the regression this module was extracted for ---------------------
+
+test('in no channel the control is disabled, not an inviting "Hold to talk"', () => {
+	// THE motivating bug. A disabled button still dispatches mouseleave — browsers suppress activation events like
+	// click/mousedown on it, but not enter/leave — so the mouseleave handler, whose only gate is `mode === 'hold'`,
+	// ran on a cursor merely crossing the greyed-out control and released a floor in a channel we were not in. The
+	// server answered NOT_IN_CHANNEL, once per pass, with nothing pressed.
+	assert.deepEqual(talkDecision(view({channel: null})), {
+		mode: 'disabled',
+		label: 'Not in a channel',
+		myTurn: false,
+		action: null
+	});
+});
+
+test('in no channel EVERY floor snapshot is still disabled, and never a hold', () => {
+	// The guard has to dominate the whole floor tree, not just the free-floor leaf: narrowed to (say) an empty queue,
+	// or sunk below the switch, it would survive a single-snapshot test while leaving the mouseleave path armed for
+	// any state the server had last told us about.
+	for (const floorHolder of [SELF, OTHER, null]) {
+		for (const floorWaiting of [[], [SELF], [OTHER, SELF]]) {
+			for (const floorQueueEnabled of [true, false]) {
+				const decision = talkDecision(view({channel: null, floorHolder, floorWaiting, floorQueueEnabled}));
+				// 'disabled' in particular is not 'hold', which is the mouseleave handler's only trigger.
+				assert.equal(decision.mode, 'disabled', `holder=${floorHolder} waiting=[${floorWaiting}] queue=${floorQueueEnabled}`);
+			}
+		}
+	}
+});
+
+test('in no channel a leftover FULL_DUPLEX mode does not hand back a working mic toggle', () => {
+	// Reachable: neither the channel reset nor the disconnect teardown clears state.mode, so a client that was in a
+	// full-duplex channel still holds 'FULL_DUPLEX' after a refused join. That is why membership is tested ABOVE the
+	// full-duplex branch — the order the Java client also uses.
+	assert.deepEqual(talkDecision(view({channel: null, mode: 'FULL_DUPLEX'})), {
+		mode: 'disabled',
+		label: 'Not in a channel',
+		myTurn: false,
+		action: null
+	});
+});
+
+test('not connected reads the pre-connect label', () => {
+	// Pins the initial markup (`<button disabled id="talkBtn">Connect first</button>`) and the disconnect teardown,
+	// which used to poke this string in by hand. Without `connected` as an input the renderer could not tell "never
+	// connected" from "connected, no channel".
+	assert.deepEqual(talkDecision(view({connected: false, channel: null})), {
+		mode: 'disabled',
+		label: 'Connect first',
+		myTurn: false,
+		action: null
+	});
+});
+
+test('waiting to be admitted beats the generic no-channel label', () => {
+	// A fresh connection that knocked on a locked channel is parked, not refused. Swap the two guards and a knocker
+	// is told it is simply "not in a channel" while the owner is still deciding.
+	assert.equal(talkDecision(view({channel: null, pendingChannel: 'locked-room'})).label, 'Waiting to be admitted…');
+});
+
+test('a parked SWITCHER keeps a working control for the channel it is still in', () => {
+	// The server gives up your current channel only once a join succeeds, so knocking on a locked channel from inside
+	// another one must not disarm the control you are still using. Channel membership therefore outranks the knock.
+	assert.deepEqual(talkDecision(view({pendingChannel: 'locked-room'})), {
+		mode: 'hold',
+		label: 'Hold to talk',
+		myTurn: false,
+		action: REQUEST
+	});
+});
+
+test('a parked switcher that is LIVE can still stop talking', () => {
+	// The strongest form of the case above: a member holding the floor must be able to release it while a knock is
+	// outstanding. A pending-beats-everything ordering would leave a hot mic with no way to close it.
+	assert.deepEqual(talkDecision(view({pendingChannel: 'locked-room', floorHolder: SELF, transmitting: true})), {
+		mode: 'hold',
+		label: 'LIVE — release to stop',
+		myTurn: false,
+		action: RELEASE
+	});
+});
+
+// --- owner-enforced mute ---------------------------------------------------------------------------
+
+test('owner-muted beats a free floor', () => {
+	// The server drops a muted sender's audio and refuses it the floor anyway; disabling here stops the user talking
+	// into a closed door and states the reason.
+	assert.deepEqual(talkDecision(view({muted: true})), {
+		mode: 'disabled',
+		label: 'Muted by owner',
+		myTurn: false,
+		action: null
+	});
+});
+
+test('owner-muted beats FULL_DUPLEX', () => {
+	// Otherwise a muted full-duplex member gets an enabled "Mic ON" toggle for audio the server is discarding.
+	assert.equal(talkDecision(view({muted: true, mode: 'FULL_DUPLEX', transmitting: true})).label, 'Muted by owner');
+});
+
+test('owner-muted beats LIVE', () => {
+	// Muting force-releases the floor server-side, but MemberMuted can render before the FloorStatus that clears the
+	// holder lands. In that window the mute must win, or the button invites a release that is already done.
+	assert.equal(talkDecision(view({muted: true, floorHolder: SELF, transmitting: true})).mode, 'disabled');
+});
+
+test('owner-muted clears the "your turn" highlight', () => {
+	// Without this a muted member keeps the pulsing highlight for a claim it can never make.
+	assert.equal(talkDecision(view({muted: true, floorWaiting: [SELF], claimSecondsLeft: 8})).myTurn, false);
+});
+
+// --- full duplex: no floor, no queue ---------------------------------------------------------------
+
+test('FULL_DUPLEX ignores the floor entirely', () => {
+	// Full-duplex has no floor arbitration, so a snapshot left over from a pre-switch PTT channel must not disable
+	// the mic toggle.
+	assert.deepEqual(talkDecision(view({mode: 'FULL_DUPLEX', floorHolder: OTHER, floorWaiting: [HOLDER]})), {
+		mode: 'duplex',
+		label: 'Mic OFF (click to talk)',
+		myTurn: false,
+		action: null
+	});
+});
+
+test('the FULL_DUPLEX label follows the mic, both ways', () => {
+	// Asserting both arms is what kills a swapped ternary — and a swapped label here is a live footgun, since the
+	// user would click to mute and open the mic instead.
+	assert.equal(talkDecision(view({mode: 'FULL_DUPLEX', transmitting: true})).label, 'Mic ON (click to mute)');
+	assert.equal(talkDecision(view({mode: 'FULL_DUPLEX', transmitting: false})).label, 'Mic OFF (click to talk)');
+});
+
+// --- the push-to-talk floor states ----------------------------------------------------------------
+
+test('LIVE is a hold that releases', () => {
+	// 'hold' is load-bearing twice over: it is what makes dragging the pointer off the button drop the floor rather
+	// than leave a hot mic, and what makes a release stop the mic instead of leaving a queue.
+	assert.deepEqual(talkDecision(view({floorHolder: SELF, transmitting: true})), {
+		mode: 'hold',
+		label: 'LIVE — release to stop',
+		myTurn: false,
+		action: RELEASE
+	});
+});
+
+test('MY_TURN shows the claim countdown while it is running', () => {
+	assert.deepEqual(talkDecision(view({floorWaiting: [SELF, OTHER], claimSecondsLeft: 7})), {
+		mode: 'hold',
+		label: 'YOUR TURN — hold to talk · 7s',
+		myTurn: true,
+		action: REQUEST
+	});
+});
+
+test('MY_TURN drops the countdown cleanly rather than reading "0s"', () => {
+	// The window is display-only — the server owns the real one — and is absent both before FloorReserved carries it
+	// and again once the ticker clamps to 0. Dropping the `> 0` test would show "· 0s" for a turn still claimable.
+	assert.equal(talkDecision(view({floorWaiting: [SELF], claimSecondsLeft: 0})).label, 'YOUR TURN — hold to talk');
+});
+
+test('MY_TURN is head-only: a mid-queue member is IN_LINE, not offered a claim', () => {
+	// The reservation is DERIVED from being waiting[0]. Weaken it to "somewhere in the queue" and every queued member
+	// gets the pulsing highlight, a hold gesture, and sends a requestFloor claiming a turn that isn't theirs.
+	const decision = talkDecision(view({floorWaiting: [OTHER, SELF], floorQueueEnabled: true}));
+	assert.equal(decision.myTurn, false);
+	assert.deepEqual(decision, {
+		mode: 'tap',
+		label: 'In line #2 of 2 — tap to leave',
+		myTurn: false,
+		action: RELEASE
+	});
+});
+
+test('IN_LINE reports a 1-based position and leaves on a tap', () => {
+	// Drop the `+ 1` and the second in line is told "#1 of 3" — indistinguishable from being next, so they stop
+	// watching for their turn.
+	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, floorWaiting: [OTHER, SELF, 'third'], floorQueueEnabled: true})), {
+		mode: 'tap',
+		label: 'In line #2 of 3 — tap to leave',
+		myTurn: false,
+		action: RELEASE
+	});
+});
+
+test('IN_LINE at the head of a busy floor is a tap to leave, not an offered claim', () => {
+	// The commonest queue state, and the one the two-name cases above can't reach: I raised the FIRST hand while
+	// someone else is still talking. It is IN_LINE rather than MY_TURN because the floor is not free — so no pulsing
+	// highlight, and no hold. Getting it wrong the other way is worse than cosmetic: 'hold' is the mouseleave
+	// handler's only trigger, so a cursor crossing the button would drop the first hand-raiser out of the line.
+	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, floorWaiting: [SELF], floorQueueEnabled: true})), {
+		mode: 'tap',
+		label: 'In line #1 of 1 — tap to leave',
+		myTurn: false,
+		action: RELEASE
+	});
+});
+
+test('IN_LINE stays tappable, and still LEAVES the line, when the queue flag is already off', () => {
+	// Reachable: FloorQueueChanged(false) can render before the FloorStatus that drains the line. A member still
+	// listed must be able to get out, so the queue flag is consulted only in the IDLE-and-busy leaf — and the tap
+	// has to send releaseFloor, or tapping re-requests the floor and the member cannot leave at all.
+	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, floorWaiting: [OTHER, SELF], floorQueueEnabled: false})), {
+		mode: 'tap',
+		label: 'In line #2 of 2 — tap to leave',
+		myTurn: false,
+		action: RELEASE
+	});
+});
+
+test('a free floor is hold-to-talk whether the queue is on or off', () => {
+	// The queue flag is consulted ONLY when the floor is busy: with the queue on and nobody talking there is nothing
+	// to queue behind, which is the resting state of every raise-hand channel. Treating it as a tap would stop
+	// press-and-hold driving the mic there at all, and enqueue the user behind an empty line instead of just talking.
+	const free = {mode: 'hold', label: 'Hold to talk', myTurn: false, action: REQUEST};
+	assert.deepEqual(talkDecision(view({floorQueueEnabled: false})), free);
+	assert.deepEqual(talkDecision(view({floorQueueEnabled: true})), free);
+});
+
+test('IDLE + busy + queue ON offers a raised hand', () => {
+	// A tap, not a hold: holding here would drive the mic against a floor we do not own.
+	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, floorQueueEnabled: true})), {
+		mode: 'tap',
+		label: 'Raise hand ✋',
+		myTurn: false,
+		action: REQUEST
+	});
+});
+
+test('IDLE + busy + queue OFF is disabled and names the holder', () => {
+	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, labelFor: id => `Bob (#${id})`})), {
+		mode: 'disabled',
+		label: `Floor held by Bob (#${HOLDER})`,
+		myTurn: false,
+		action: null
+	});
+});
+
+test('the busy-floor label names the live holder, not someone queued behind them', () => {
+	// The only case where BOTH halves of "the holder, or else the member it is reserved for" are present: a member
+	// talking with a hand already raised behind them, queue off. Prefer the wrong one and the button names a silent
+	// waiter while somebody else is the one actually transmitting.
+	const decision = talkDecision(view({
+		floorHolder: HOLDER,
+		floorWaiting: [OTHER],
+		labelFor: id => (id === HOLDER ? 'Bob' : 'Ann')
+	}));
+	assert.equal(decision.label, 'Floor held by Bob');
+});
+
+test('a floor merely RESERVED for another is busy, not free', () => {
+	// The sharpest mutation-killer for floorIsFree: weaken it from "no holder AND an empty queue" to "no holder" and
+	// this reads as a free floor, letting us grab one the server has reserved for the queue head. The queue-off arm
+	// also pins the `holder || waiting[0]` fallback — drop that half and the labeller is handed nothing.
+	assert.deepEqual(talkDecision(view({floorWaiting: [OTHER], labelFor: id => `Ann (#${id})`})), {
+		mode: 'disabled',
+		label: `Floor held by Ann (#${OTHER})`,
+		myTurn: false,
+		action: null
+	});
+	assert.equal(talkDecision(view({floorWaiting: [OTHER], floorQueueEnabled: true})).mode, 'tap');
+});
+
+// --- the whole decision as one table --------------------------------------------------------------
+
+/**
+ * Every branch of the decision, with its COMPLETE expected output written out rather than derived from the
+ * decision itself — an expectation read back off the returned object proves nothing. The focused tests above say
+ * why each rule is what it is; this table is the flat oracle that no state escapes.
+ */
+const EVERY_STATE = [
+	{name: 'not connected', view: {connected: false, channel: null}, expect: {mode: 'disabled', label: 'Connect first', myTurn: false, action: null}},
+	{name: 'not connected but still holding a channel', view: {connected: false}, expect: {mode: 'disabled', label: 'Connect first', myTurn: false, action: null}},
+	{name: 'no channel', view: {channel: null}, expect: {mode: 'disabled', label: 'Not in a channel', myTurn: false, action: null}},
+	{name: 'waiting to be admitted', view: {channel: null, pendingChannel: 'locked-room'}, expect: {mode: 'disabled', label: 'Waiting to be admitted…', myTurn: false, action: null}},
+	{name: 'muted, free floor', view: {muted: true}, expect: {mode: 'disabled', label: 'Muted by owner', myTurn: false, action: null}},
+	{name: 'muted, full duplex', view: {muted: true, mode: 'FULL_DUPLEX'}, expect: {mode: 'disabled', label: 'Muted by owner', myTurn: false, action: null}},
+	{name: 'muted while live', view: {muted: true, floorHolder: SELF, transmitting: true}, expect: {mode: 'disabled', label: 'Muted by owner', myTurn: false, action: null}},
+	{name: 'muted while reserved', view: {muted: true, floorWaiting: [SELF], claimSecondsLeft: 5}, expect: {mode: 'disabled', label: 'Muted by owner', myTurn: false, action: null}},
+	{name: 'duplex, mic on', view: {mode: 'FULL_DUPLEX', transmitting: true}, expect: {mode: 'duplex', label: 'Mic ON (click to mute)', myTurn: false, action: null}},
+	{name: 'duplex, mic off', view: {mode: 'FULL_DUPLEX'}, expect: {mode: 'duplex', label: 'Mic OFF (click to talk)', myTurn: false, action: null}},
+	{name: 'live', view: {floorHolder: SELF, transmitting: true}, expect: {mode: 'hold', label: 'LIVE — release to stop', myTurn: false, action: RELEASE}},
+	{name: 'my turn, counting down', view: {floorWaiting: [SELF], claimSecondsLeft: 4}, expect: {mode: 'hold', label: 'YOUR TURN — hold to talk · 4s', myTurn: true, action: REQUEST}},
+	{name: 'my turn, window lapsed', view: {floorWaiting: [SELF]}, expect: {mode: 'hold', label: 'YOUR TURN — hold to talk', myTurn: true, action: REQUEST}},
+	{name: 'in line at the head, queue on', view: {floorHolder: HOLDER, floorWaiting: [SELF], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'In line #1 of 1 — tap to leave', myTurn: false, action: RELEASE}},
+	{name: 'in line further back, queue on', view: {floorHolder: HOLDER, floorWaiting: [OTHER, SELF], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'In line #2 of 2 — tap to leave', myTurn: false, action: RELEASE}},
+	{name: 'in line, queue off', view: {floorHolder: HOLDER, floorWaiting: [OTHER, SELF]}, expect: {mode: 'tap', label: 'In line #2 of 2 — tap to leave', myTurn: false, action: RELEASE}},
+	{name: 'idle, floor free, queue off', view: {}, expect: {mode: 'hold', label: 'Hold to talk', myTurn: false, action: REQUEST}},
+	{name: 'idle, floor free, queue on', view: {floorQueueEnabled: true}, expect: {mode: 'hold', label: 'Hold to talk', myTurn: false, action: REQUEST}},
+	{name: 'idle, floor free, global push-to-talk', view: {mode: 'GLOBAL_PTT', channel: 'global'}, expect: {mode: 'hold', label: 'Hold to talk', myTurn: false, action: REQUEST}},
+	{name: 'idle, busy, queue on', view: {floorHolder: HOLDER, floorQueueEnabled: true}, expect: {mode: 'tap', label: 'Raise hand ✋', myTurn: false, action: REQUEST}},
+	{name: 'idle, reserved for another, queue on', view: {floorWaiting: [OTHER], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'Raise hand ✋', myTurn: false, action: REQUEST}},
+	{name: 'idle, busy, queue off', view: {floorHolder: HOLDER, labelFor: () => 'Bob'}, expect: {mode: 'disabled', label: 'Floor held by Bob', myTurn: false, action: null}},
+	{name: 'idle, busy with one queued behind, queue off', view: {floorHolder: HOLDER, floorWaiting: [OTHER], labelFor: () => 'Bob'}, expect: {mode: 'disabled', label: 'Floor held by Bob', myTurn: false, action: null}},
+	{name: 'idle, reserved for another, queue off', view: {floorWaiting: [OTHER], labelFor: () => 'Ann'}, expect: {mode: 'disabled', label: 'Floor held by Ann', myTurn: false, action: null}}
+];
+
+test('the decision table: every state maps to exactly one mode, label, highlight and message', () => {
+	for (const {name, view: overrides, expect} of EVERY_STATE) {
+		assert.deepEqual(talkDecision(view(overrides)), expect, name);
+	}
+});
+
+test('no state falls outside the four interaction modes', () => {
+	// app.js derives `btn.disabled = mode === 'disabled'` and the Space gate admits exactly 'hold' and 'tap', so a
+	// fifth value would silently read as "not disabled, not actionable" — enabled-looking and inert, which is the
+	// shape of the bug this module was extracted to prevent.
+	for (const {name, view: overrides} of EVERY_STATE) {
+		const {mode} = talkDecision(view(overrides));
+		assert.ok(['duplex', 'disabled', 'hold', 'tap'].includes(mode), `${name}: unknown mode ${mode}`);
+	}
+});
+
+test('the roster is consulted for one label only', () => {
+	// A structural guard: the default labelFor throws, so this passes only while "Floor held by X" is the single
+	// place member names enter the decision. It stops a future edit smuggling the roster into another branch — and
+	// with it the staleness of a name that is resolved once and cached in a string.
+	for (const {name, view: overrides} of EVERY_STATE) {
+		if (!('labelFor' in overrides)) {   // the rows that supply one are exactly the three that name a holder
+			talkDecision(view(overrides));   // throws via assert.fail if labelFor is touched
+		}
+	}
+});
+
+// --- the pure floor rules, in lock-step with the Java client's ------------------------------------
+// These mirror WalkieClientTest's floorStateFor / floorActionFor cases one-for-one.
+
+test('floorStateFor: holding the floor wins over also being queued', () => {
+	// self === holder is tested first. A redundant or racing snapshot must not demote a live talker to IN_LINE, which
+	// would flip the control to a tap and turn a release into "leave the queue".
+	assert.equal(floorStateFor('me', 'me', []), FLOOR_LIVE);
+	assert.equal(floorStateFor('me', 'me', ['me']), FLOOR_LIVE);
+});
+
+test('floorStateFor: the head of the queue on a free floor is MY_TURN', () => {
+	// The reserved member is derived, not stored — the server reserves the head the instant the floor frees, so there
+	// is deliberately no "reserved" field on the wire.
+	assert.equal(floorStateFor('me', null, ['me', 'b']), FLOOR_MY_TURN);
+});
+
+test('floorStateFor: MY_TURN requires a free floor', () => {
+	// Drop the null-holder conjunct and the head of the queue is offered a claim while another member is still
+	// talking.
+	assert.equal(floorStateFor('me', 'other', ['me']), FLOOR_IN_LINE);
+});
+
+test('floorStateFor: further back in the queue is IN_LINE', () => {
+	assert.equal(floorStateFor('me', null, ['a', 'me']), FLOOR_IN_LINE);
+	assert.equal(floorStateFor('me', 'holder', ['a', 'me']), FLOOR_IN_LINE);
+});
+
+test('floorStateFor: everything else is IDLE', () => {
+	assert.equal(floorStateFor('me', null, []), FLOOR_IDLE);          // floor free
+	assert.equal(floorStateFor('me', 'holder', []), FLOOR_IDLE);      // busy, we're not queued
+	assert.equal(floorStateFor('me', null, ['a', 'b']), FLOOR_IDLE);  // reserved for someone else
+});
+
+test('floorStateFor: a snapshot that omits the holder reads as a free floor', () => {
+	// The holder test is deliberately loose (`== null`), so a FloorStatus with the field absent is a free floor
+	// rather than one held by `undefined`. Tightening it to `===` would break that.
+	assert.equal(floorStateFor('me', undefined, ['me']), FLOOR_MY_TURN);
+});
+
+test('floorActionFor: the full four-way table', () => {
+	// Read by both the hold down-edge and the tap up-edge, so one wrong cell means either leaving the queue when you
+	// meant to join it or asking for the floor when you meant to stop talking.
+	assert.deepEqual(floorActionFor(FLOOR_LIVE), RELEASE);
+	assert.deepEqual(floorActionFor(FLOOR_IN_LINE), RELEASE);
+	assert.deepEqual(floorActionFor(FLOOR_MY_TURN), REQUEST);
+	assert.deepEqual(floorActionFor(FLOOR_IDLE), REQUEST);
+});
+
+test('floorIsFree: free means no holder AND nobody reserved', () => {
+	assert.equal(floorIsFree(null, []), true);
+	assert.equal(floorIsFree('x', []), false);
+	assert.equal(floorIsFree(null, ['a']), false);   // reserved for the queue head — not ours to grab
+	assert.equal(floorIsFree('x', ['a']), false);
+});
+
+test('the FLOOR_* values are the Java client\'s FloorState enum names', () => {
+	// Same reason the E2EE suite pins the Java known-answer vectors: these strings are the shared vocabulary of a
+	// rule both clients are documented to apply identically.
+	assert.equal(FLOOR_LIVE, 'LIVE');
+	assert.equal(FLOOR_MY_TURN, 'MY_TURN');
+	assert.equal(FLOOR_IN_LINE, 'IN_LINE');
+	assert.equal(FLOOR_IDLE, 'IDLE');
+});
