@@ -2480,9 +2480,15 @@ window.addEventListener('DOMContentLoaded', () => {
 		}
 	});
 	window.addEventListener('keyup', e => {
-		if (e.code === 'Space' && spaceDrivesTalk()) {
+		if (e.code !== 'Space') {
+			return;
+		}
+		// EVERY Space up-edge ends the hold, including one the gate below then ignores (the control was disabled
+		// mid-hold by an owner mute, or focus moved into a field). Otherwise talkHeld stays true with nothing held,
+		// and a later floorReserved reads it as "already holding when the turn landed" and claims the floor unprompted.
+		state.talkHeld = false;
+		if (spaceDrivesTalk()) {
 			e.preventDefault();
-			state.talkHeld = false;
 			releaseTalk();
 		}
 	});
