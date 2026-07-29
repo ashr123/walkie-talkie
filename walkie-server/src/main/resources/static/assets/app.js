@@ -1145,10 +1145,13 @@ function updateModeControl() {
  * control accepts and is empty when there is no gesture; this one is advice about a form choice you have not made
  * yet. Conflating them is what the old static prose did: a single sentence describing all three modes, parked under
  * a disabled button, telling you to hold a control that does nothing.
+ *
+ * That split is also why the Space shortcut is named only in the Talk hint and not here: it is a way of operating
+ * the live control, so mentioning it in both left the two hints saying the same thing side by side once connected.
  */
 const MODE_INTROS = {
-	MULTI_CHANNEL_PTT: 'One speaker at a time — hold the Talk button, or hold Space, to take the floor.',
-	GLOBAL_PTT: 'The server\'s shared room, one speaker at a time — hold Talk, or hold Space, to take the floor.',
+	MULTI_CHANNEL_PTT: 'One speaker at a time — hold the Talk button to take the floor.',
+	GLOBAL_PTT: 'The server\'s shared room, one speaker at a time — hold Talk to take the floor.',
 	FULL_DUPLEX: 'Everyone\'s mic is open at once — click Talk to mute or unmute yourself.'
 };
 
