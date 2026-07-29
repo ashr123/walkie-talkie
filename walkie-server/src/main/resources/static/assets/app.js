@@ -70,6 +70,12 @@ const state = {
 	hifi: false,
 	startMuted: false,
 	selfId: null,
+	// The display name the SERVER currently has for us — what Rename compares the field against. Not derivable from
+	// the roster: a session waiting to be admitted has no roster at all, yet can still rename (that is how it fixes
+	// the name the owner is deciding on), and the server sends it no confirmation because there is no channel to
+	// broadcast to. So it is set from the name we join with, corrected by any authoritative Joined/MemberRenamed,
+	// and advanced optimistically for the one case that gets no reply.
+	displayName: '',
 	ownerId: null,
 	audioContext: null,
 	captureNode: null,
@@ -195,6 +201,7 @@ async function connect() {
 	state.hifi = byId('hifi').checked;
 	state.startMuted = byId('startMuted').checked;   // full-duplex only: join with the mic muted
 	const display = byId('display').value.trim();
+	state.displayName = display;   // what the Join below carries; a Joined/MemberRenamed later corrects it
 	const channel = byId('channel').value.trim();
 	const passphrase = byId('passphrase').value;   // read once; used only on the relay path (E2EE)
 
@@ -350,6 +357,15 @@ async function applyOrSwitch() {
 		}
 		await deriveJoinKey(transport, passphrase, mode, channel);
 		sendCtrl({type: 'join', channel, mode, displayName: display, keyCheck: state.keyCheck});
+		if (state.channel === null) {
+			// A CHANNEL-LESS join commits the name outright: the server keeps whatever the Join carried, even if the
+			// join only lands us on a waiting list, and nothing comes back to confirm it. Record it, or Rename stays
+			// lit over the very name the owner is already reading. A SWITCH is the opposite case and must NOT do this:
+			// the server rolls the name back if it refuses one (undoRename), so leaving this alone is what keeps
+			// Rename offered for a retry.
+			state.displayName = display;
+			updateRenameButton();
+		}
 		log(`Switching to "${effectiveChannel}" (${mode})…`);   // E2EE status follows in onJoined once confirmed
 		updateApplyControls();
 		return;
@@ -691,10 +707,17 @@ function rename() {
 		log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
 		return;
 	}
-	if (display === state.members.get(state.selfId)) {
-		return;   // no-op: same as the current name (the button is disabled for this, and the server rejects it)
+	if (display === state.displayName) {
+		return;   // no-op: same as the name the server has (the button is disabled for this, and the server ignores it)
 	}
 	sendCtrl({type: 'rename', displayName: display});
+	if (state.channel === null) {
+		// Nothing is coming back: with no channel there is no roster to broadcast a MemberRenamed to, so the server
+		// applies the name silently (it does refresh the waiting list the owner is reading). Record it here or Rename
+		// would stay enabled over a name that is already committed.
+		state.displayName = display;
+		updateRenameButton();
+	}
 }
 
 /**
@@ -710,9 +733,10 @@ function updateRenameButton() {
 		btn.disabled = true;
 		return;
 	}
-	// Channel-less there is no roster to compare against, so any valid name is a change — which is the point: it is
-	// how a waiting newcomer corrects the name its channel's owner is looking at.
-	btn.disabled = byId('display').value.trim() === (state.channel === null ? '' : state.members.get(state.selfId));
+	// One comparison for both states — in a channel or waiting at its door — because state.displayName tracks what
+	// the server has either way. Comparing against the roster instead would enable Rename for every waiting newcomer
+	// whose name was already correct, since a waiting session has no roster entry.
+	btn.disabled = byId('display').value.trim() === state.displayName;
 }
 
 // --- incoming messages ----------------------------------------------------------------------------
@@ -897,6 +921,8 @@ function onJoined(msg) {
 	updateGlobalModeLocks();
 	// Reveal the in-channel controls only now that the server has confirmed the join. (Rename is revealed on
 	// socket-open instead — see connect() — because a rename is a property of the SESSION, not of a channel.)
+	// Our own roster entry is the authoritative name — notably after a SWITCH, whose Join carried a new one.
+	state.displayName = state.members.get(state.selfId) ?? state.displayName;
 	updateRenameButton();   // starts disabled — the field matches our just-joined name
 	updateApplyControls();
 	renderOwnerSelect();
@@ -2103,6 +2129,9 @@ function renameMember(id, name) {
 		return;   // not a member we're tracking (shouldn't happen for a channel rename)
 	}
 	state.members.set(id, name);
+	if (id === state.selfId) {
+		state.displayName = name;   // confirmed by the server, so Rename settles
+	}
 	renderMembers();
 	updateRenameButton();   // if this was our own rename, the field now matches the new name → Rename re-disables
 	// A rename is the one member change that arrives with no FloorStatus behind it, so the talk control has to be
