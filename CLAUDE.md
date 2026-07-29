@@ -439,7 +439,10 @@ module** that `app.js` imports — the pattern to follow for any new pure browse
 - `static/assets/channel-flags.js` — the channel's standing owner flags (`locked` / `floorQueueEnabled` /
   `muteNewMembers`) as ONE table each, plus `flagDisplay(flag, view)`. `app.js` BUILDS both the everyone-visible
   badge row and the owner's checkboxes from it, so a fourth flag is a table entry rather than markup in two places
-  plus three render sites. `flagDisplay` is a pure function of the snapshot the SERVER wrote — the click handler only
+  plus three render sites. (Layout note, since it has already been got wrong once: the Members/Log row must NOT use
+  `flex-wrap` — wrapping makes each line's cross size content-driven, so the Log panel sizes to its own text and
+  `#log`'s `overflow-y: auto` never engages, growing the page instead of scrolling. Let the panels shrink
+  (`min-width: 0`) and stack via the media queries, which keep the height bounded.) `flagDisplay` is a pure function of the snapshot the SERVER wrote — the click handler only
   sends `flag.command(...)` — which is what makes a refused toggle snap back instead of leaving the UI claiming
   something untrue; `channel-flags.test.js` states that property directly, and pins the per-message wire field
   (`setLocked` carries `locked`, the others `enabled`) and that `field` matches the `Joined` component it is filled

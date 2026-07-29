@@ -116,16 +116,33 @@
             flex: 1;
         }
 
-        /* The Members/Log row specifically. Without wrap + a min-width the Members panel's min-content (its
-           settings and badges) sets the row's floor, which squeezed the log panel to a few dozen pixels and pushed
-           the page into horizontal overflow well before the viewport got narrow. Wrapping lets them stack instead. */
-        .row.panels {
-            flex-wrap: wrap;
-            align-content: stretch;
+        /* The Members/Log row. Both panels must be allowed to SHRINK below their content width: a flex item defaults
+           to `min-width: auto` (its min-content), so the Members panel's settings block and badges were setting the
+           row's floor — squeezing the log to a few dozen pixels and overflowing the page horizontally well before the
+           viewport got narrow.
+           Deliberately NOT `flex-wrap`: wrapping makes each line's cross size CONTENT-driven, so the Log panel would
+           size to its own text and #log's `overflow-y: auto` would never engage — the log would grow without end
+           instead of scrolling. Stacking is done by the media queries below, which keep a bound on its height. */
+        .row.panels > div {
+            min-width: 0;
         }
 
-        .row.panels > div {
-            min-width: 280px;
+        /* Too narrow for the two panels side by side: stack them. They then no longer share one bounded height, so
+           the page scrolls — and #log is capped against the viewport so it still scrolls INTERNALLY (its
+           scroll-to-bottom in app.js depends on that) rather than growing forever. */
+        @media (max-width: 900px) {
+            main {
+                grid-template-rows: auto;
+                min-height: auto;
+            }
+
+            .row.panels {
+                flex-direction: column;
+            }
+
+            #log {
+                max-height: 50vh;
+            }
         }
 
         /* One column on a phone: the 340px sidebar plus a panel cannot both fit, and the page was being scaled down
@@ -133,7 +150,6 @@
         @media (max-width: 640px) {
             main {
                 grid-template-columns: 1fr;
-                grid-template-rows: auto minmax(0, 1fr);
                 padding: 12px;
                 gap: 12px;
             }
@@ -141,10 +157,6 @@
             #setup {
                 max-height: none;
                 overflow-y: visible;
-            }
-
-            #log {
-                min-height: 160px;
             }
         }
 
