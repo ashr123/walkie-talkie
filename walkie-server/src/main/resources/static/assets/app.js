@@ -23,6 +23,7 @@ import {
 	FLOOR_LIVE,
 	FLOOR_MY_TURN,
 	floorStateFor,
+	shouldAutoOpenMic,
 	talkDecision
 } from './talk.js';
 
@@ -866,8 +867,10 @@ function onJoined(msg) {
 			.forEach(m => offerTo(m.id).catch(err => log(`Offer error: ${err.message}`)));
 	}
 
-	if (state.mode === 'FULL_DUPLEX' && !state.startMuted) {
-		beginTransmit(); // full-duplex: mic is live as soon as you join (unless "Connect muted")
+	// Runs AFTER the roster is seeded above, so micAutoOpens sees our own owner-mute: a muted member re-joining its
+	// current channel keeps its mic closed.
+	if (micAutoOpens()) {
+		beginTransmit(); // full-duplex: mic is live as soon as you join
 	} else {
 		state.transmitting = false;
 		enableLocalTracks(false);
@@ -886,8 +889,8 @@ function onModeChanged(mode) {
 	state.mode = mode;
 	state.transmitting = false;
 	enableLocalTracks(false);
-	if (mode === 'FULL_DUPLEX' && !state.startMuted) {
-		beginTransmit(); // full-duplex: the mic goes live immediately (unless "Connect muted")
+	if (micAutoOpens()) {
+		beginTransmit(); // full-duplex: the mic goes live immediately
 	}
 	updateTalkButton();
 	updateModeControl();
@@ -1193,6 +1196,15 @@ function lockInGlobalMode(input, hint, lockedValue, global) {
  * Always call this at event time. A decision cached from the last render can be stale, and consulting the button's
  * own `disabled` attribute instead — as the Space handlers used to — re-derives the rule from the pixels.
  */
+/**
+ * shouldAutoOpenMic (talk.js) for the CURRENT state — the projection half, mirroring the Java client's private
+ * overload of the same name. Both auto-open sites go through this so the three terms can't drift apart between
+ * them: "Connect muted" is read once at connect, and the owner-mute is read live from the roster.
+ */
+function micAutoOpens() {
+	return shouldAutoOpenMic(state.mode, state.startMuted, state.mutedMembers.has(state.selfId));
+}
+
 function talkNow() {
 	return talkDecision({
 		connected: isOpen(),

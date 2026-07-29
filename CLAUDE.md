@@ -395,14 +395,16 @@ module** that `app.js` imports — the pattern to follow for any new pure browse
 - `static/assets/e2ee.js` — E2EE + the outbound transmit-gate decision, testable because Node exposes the same
   Web Crypto API. `e2ee.test.js` pins the SAME known-answer vectors as Java's `FrameCryptoTest` (keeping the two
   clients byte-identical) plus the `frameDisposition` no-plaintext gate. Java mirror: `WalkieClient.outboundFrame`.
-- `static/assets/talk.js` — the floor rules (`floorStateFor`/`floorActionFor`/`floorIsFree`) and `talkDecision`,
+- `static/assets/talk.js` — the floor rules (`floorStateFor`/`floorActionFor`/`floorIsFree`), the full-duplex
+  mic auto-open policy (`shouldAutoOpenMic`, whose three terms are mode / "Connect muted" / owner-mute), and
+  `talkDecision`,
   the Talk control's ONE decision: state in, `{mode, label, myTurn, action}` out, with `btn.disabled` derived as
   `mode === 'disabled'`. `app.js` holds only the projection of state into it (`talkNow`), a four-write renderer
   (`updateTalkButton`) and the gesture handlers. `talk.test.js` pins every reachable button state, incl. that a
   channel-less client is `'disabled'` — a **disabled button still dispatches `mouseleave`**, so a `'hold'` there
   made a cursor crossing the control release a floor it never held. Java mirrors: `WalkieClient.floorStateFor` /
-  `floorActionFor` (pinned by `WalkieClientTest`), which the FLOOR_* names and cases deliberately match; the
-  hold-vs-tap axis is browser-only.
+  `floorActionFor` / `shouldAutoOpenMic` (pinned by `WalkieClientTest`), which the FLOOR_* names, positional
+  signatures and cases deliberately match; the hold-vs-tap axis is browser-only.
 
 The `:walkie-server:jsTest` Gradle task (an `Exec` guarded by an `onlyIf` Node-on-PATH check, hooked into `check`)
 runs them as part of `build`, and picks up a new `*.test.js` with no build change. `walkie-server/package.json`

@@ -3,10 +3,12 @@
 // npm dependencies) from src/test/js/talk.test.js. Nothing here touches the DOM or any browser global: it maps a
 // plain snapshot of client state to what the Talk button should SAY and DO, and app.js renders that.
 //
-// floorStateFor and floorActionFor are the SAME pure rules the Java client applies — WalkieClient.floorStateFor
-// and WalkieClient.floorActionFor, pinned by WalkieClientTest — and the FLOOR_* values are that client's
-// FloorState enum names, so the two must stay in lock-step. The hold-vs-tap axis in talkDecision is genuinely
-// browser-only: the Java console client's `t` is a single keystroke with no press/release edge to distinguish.
+// floorStateFor, floorActionFor and shouldAutoOpenMic are the SAME pure rules the Java client applies —
+// WalkieClient.floorStateFor / floorActionFor / shouldAutoOpenMic, pinned by WalkieClientTest — and the FLOOR_*
+// values are that client's FloorState enum names, so the two must stay in lock-step. They take the same positional
+// arguments as their Java counterparts for that reason; talkDecision takes a snapshot object instead only because
+// it reads a dozen fields. The hold-vs-tap axis in talkDecision is genuinely browser-only: the Java console
+// client's `t` is a single keystroke with no press/release edge to distinguish.
 
 export const FLOOR_LIVE = 'LIVE';       // we hold the floor and are transmitting
 export const FLOOR_MY_TURN = 'MY_TURN'; // reserved for us: the floor is free and we are the queue head — claim it
@@ -48,6 +50,20 @@ export function floorActionFor(floorState) {
  */
 export function floorIsFree(holderId, waiting) {
 	return !holderId && waiting.length === 0;
+}
+
+/**
+ * Whether joining a channel — or switching it to full-duplex — should open the microphone by itself: full-duplex
+ * only, and only when the user didn't ask to start muted and the owner hasn't muted us. Mirrors the Java client's
+ * shouldAutoOpenMic argument for argument. Push-to-talk never auto-opens; there the mic follows the floor.
+ *
+ * The owner-mute term earns its place on two real paths: a member re-joining its CURRENT channel re-snapshots
+ * itself as muted, and a switch to full-duplex must not open a muted member's mic. It is not the enforcement
+ * boundary — the server drops a muted sender's frames regardless — but without it the client would report a live
+ * mic while every frame was being discarded.
+ */
+export function shouldAutoOpenMic(mode, startMuted, selfMuted) {
+	return mode === 'FULL_DUPLEX' && !startMuted && !selfMuted;
 }
 
 /** A decision with no floor message behind it: the disabled states and the full-duplex mic toggle. */

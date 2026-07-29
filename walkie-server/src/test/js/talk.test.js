@@ -20,6 +20,7 @@ import {
 	floorActionFor,
 	floorIsFree,
 	floorStateFor,
+	shouldAutoOpenMic,
 	talkDecision
 } from '../../main/resources/static/assets/talk.js';
 
@@ -430,6 +431,34 @@ test('floorIsFree: free means no holder AND nobody reserved', () => {
 	assert.equal(floorIsFree('x', []), false);
 	assert.equal(floorIsFree(null, ['a']), false);   // reserved for the queue head — not ours to grab
 	assert.equal(floorIsFree('x', ['a']), false);
+});
+
+// --- the full-duplex mic auto-open policy ---------------------------------------------------------
+// One-for-one with WalkieClientTest's four shouldAutoOpenMic cases, so the two clients can't drift on when a
+// microphone opens by itself.
+
+test('shouldAutoOpenMic: full-duplex opens the mic by default', () => {
+	// Full-duplex, no "Connect muted", not owner-muted: the mic goes live as soon as you join or switch into it.
+	assert.equal(shouldAutoOpenMic('FULL_DUPLEX', false, false), true);
+});
+
+test('shouldAutoOpenMic: push-to-talk modes never auto-open the mic', () => {
+	// PTT and global require an explicit talk gesture to take the floor — the mic never opens on its own there,
+	// muted or not. Both PTT modes, so a mutation that only excludes one is caught.
+	assert.equal(shouldAutoOpenMic('MULTI_CHANNEL_PTT', false, false), false);
+	assert.equal(shouldAutoOpenMic('GLOBAL_PTT', false, false), false);
+});
+
+test('shouldAutoOpenMic: "Connect muted" keeps the mic closed in full-duplex', () => {
+	// A connect-time choice: join full-duplex with the mic off until the user clicks the control.
+	assert.equal(shouldAutoOpenMic('FULL_DUPLEX', true, false), false);
+});
+
+test('shouldAutoOpenMic: an owner-muted member\'s mic never auto-opens', () => {
+	// The term that is easiest to drop, and the one with a user-visible cost: without it the control would report a
+	// live mic ("Mic ON (click to mute)") while the server discarded every frame. It guards two real paths — a muted
+	// member re-joining its CURRENT channel re-snapshots itself as muted, and a switch to full-duplex while muted.
+	assert.equal(shouldAutoOpenMic('FULL_DUPLEX', false, true), false);
 });
 
 test('the FLOOR_* values are the Java client\'s FloorState enum names', () => {
