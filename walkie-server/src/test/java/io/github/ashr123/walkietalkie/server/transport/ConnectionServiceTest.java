@@ -1972,6 +1972,40 @@ class ConnectionServiceTest {
 		return last.sent.size();
 	}
 
+	/// An in-place switch adds the session to its TARGET and departs the old channel only afterwards — deliberately,
+	/// so a refused switch cannot drop it from both — and no lock on the old channel is held across that gap. So a
+	/// concurrent change there can fan out to a member that has already moved on, and NO channel-scoped message
+	/// carries a channel name for the client to filter on.
+	///
+	/// It would not be a passing glitch either: most of these are CHANGE events with no periodic re-sync, so a stray
+	/// one stays wrong. Staged here by putting a session in a channel's roster while its own channel pointer names
+	/// another — exactly the state that gap produces.
+	@Test
+	void aChannelBroadcastSkipsAMemberThatHasAlreadyMovedToAnotherChannel() {
+		FakeClientSession alice = join("alice", "old", ChannelMode.MULTI_CHANNEL_PTT);   // owner of the old channel
+		FakeClientSession switcher = join("switcher", "old", ChannelMode.MULTI_CHANNEL_PTT);
+
+		// Mid-switch: the target already has it (its pointer says so), the old channel has not let go yet.
+		switcher.joinedChannel("target");
+		switcher.sent.clear();
+		alice.sent.clear();
+
+		// Every kind of channel-scoped change, so the guard is shown to cover the class and not one message.
+		service.onMessage(alice, new ClientMessage.SetLocked(true));
+		service.onMessage(alice, new ClientMessage.SetMuteNewMembers(true));
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.MuteAll(true));
+		service.onMessage(alice, new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
+
+		assertTrue(switcher.sent.isEmpty(),
+				() -> "a member that has moved on must receive none of its old channel's broadcasts, got " + switcher.sent);
+		// The channel it really is in still works — the guard skips a stray recipient, not the fan-out.
+		assertFalse(alice.sent.isEmpty(), "the members actually in the channel still receive everything");
+		assertTrue(alice.sent.stream().anyMatch(ServerMessage.ChannelLocked.class::isInstance));
+		assertTrue(alice.sent.stream().anyMatch(ServerMessage.MuteNewMembersChanged.class::isInstance));
+		assertTrue(alice.sent.stream().anyMatch(ServerMessage.ModeChanged.class::isInstance));
+	}
+
 	// --- the owner's standing "mute new members on entry" rule -------------------------------------
 
 	@Test

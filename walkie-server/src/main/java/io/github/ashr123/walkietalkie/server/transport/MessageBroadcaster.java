@@ -49,7 +49,7 @@ public class MessageBroadcaster {
 	/// Serialize each message once, then deliver them all — in argument order — to EVERY member of `channel`.
 	public void toAll(Channel channel, ServerMessage... messages) {
 		String[] encoded = encodeAll(messages);
-		channel.forEach(member -> deliver(member, encoded));
+		channel.forEach(member -> deliverIfStillIn(channel, member, encoded));
 	}
 
 	/// Serialize each message once, then deliver them all — in argument order — to every member of `channel`
@@ -57,7 +57,32 @@ public class MessageBroadcaster {
 	/// triggered the broadcast).
 	public void toOthers(Channel channel, String excludeSessionId, ServerMessage... messages) {
 		String[] encoded = encodeAll(messages);
-		channel.forEachOther(excludeSessionId, member -> deliver(member, encoded));
+		channel.forEachOther(excludeSessionId, member -> deliverIfStillIn(channel, member, encoded));
+	}
+
+	/// Delivers a channel fan-out only to a member whose CURRENT channel really is this one.
+	///
+	/// A member can sit in a channel's roster while already belonging to another, for a few microseconds: an
+	/// in-place switch adds the session to its TARGET and departs the old channel only afterwards, deliberately, so
+	/// that a refused switch cannot drop it from both. No lock on the old channel is held across that gap, so a
+	/// concurrent handler there can fan out and reach a session that has already moved on.
+	///
+	/// The session's own channel pointer is what settles it: the join hook sets it to the target BEFORE announcing
+	/// anything (`session.joinedChannel(...)` in ConnectionService's initial-state hook), so during the gap it names
+	/// the target while the old channel still lists the member.
+	///
+	/// Filtering here rather than on the wire is what makes it cheap: no channel-scoped message carries a channel
+	/// name, so a client cannot tell a stray apart from a real one — and it would not be a passing glitch if it
+	/// could not, because most of these are CHANGE events with no periodic re-sync. A stray `MemberLeft` drops a real
+	/// member from a roster with nothing to restore it; a stray `ModeChanged` flips a client's mode; a stray
+	/// `MuteStatus` can convince a member muted in its new channel that it is not. Only `FloorStatus` self-heals.
+	/// Doing it in one place covers every such message at once, and costs a string compare per recipient on the
+	/// control plane only — [ConnectionService]'s audio fan-out is untouched, since a stray audio frame is
+	/// self-healing noise and that loop is deliberately allocation-free.
+	private static void deliverIfStillIn(Channel channel, ClientSession member, String... encoded) {
+		if (channel.name().equals(member.channelName())) {
+			deliver(member, encoded);
+		}
 	}
 
 	/// Serialize `message` and send it to a SINGLE recipient — the non-fan-out control sends (a Joined snapshot, a

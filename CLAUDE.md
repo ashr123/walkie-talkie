@@ -372,7 +372,15 @@ fan-out caller `Channel.forEachOther` or other recipients), and the single consu
 in submission order (required by the stateful Opus decode). Audio and control are split: audio is bounded and
 **dropped** on overflow (lossy, real-time), while control (floor/mode/owner/membership) is delivered reliably and
 drained ahead of audio — a client too far behind even for control is disconnected to force a clean
-reconnect/re-sync. **All outbound control goes through `MessageBroadcaster`** (which owns the `MessageCodec`):
+reconnect/re-sync. **A channel fan-out reaches only members whose CURRENT channel is that channel.** An in-place switch adds the
+session to its target and departs the old channel afterwards (so a refusal can't drop it from both), holding no lock
+on the old one across the gap — so a concurrent change there could otherwise fan out to a session that has already
+moved. `MessageBroadcaster.deliverIfStillIn` compares `channel.name()` against `ClientSession.channelName()`, which
+the join hook sets to the target before announcing anything. It is filtered server-side because no channel-scoped
+message carries a channel name, and a stray one does NOT heal: most are change events with no periodic re-sync (a
+stray `MemberLeft` drops a real member from a roster, a stray `ModeChanged` flips a client's mode; only
+`FloorStatus` self-corrects). Control plane only — the audio fan-out is untouched, a stray frame being self-healing
+noise. **All outbound control goes through `MessageBroadcaster`** (which owns the `MessageCodec`):
 `toOne` for a single recipient (a `Joined` snapshot, a floor grant, an error), `toAll`/`toOthers` for a channel
 fan-out. It serializes each message **once** and hands the same JSON to every recipient's mailbox via
 `ClientSession.sendEncoded`, so a fan-out to N members costs one encode, not N — and it keeps `ConnectionService`
