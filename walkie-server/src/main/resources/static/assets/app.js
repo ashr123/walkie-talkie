@@ -2249,11 +2249,16 @@ function updateQueueControl() {
  */
 function updateTalkButton() {
 	const btn = byId('talkBtn');
-	const {mode, label, myTurn} = talkNow();
+	const {mode, label, myTurn, hint} = talkNow();
 	btn.disabled = mode === 'disabled';
 	btn.textContent = label;
 	btn.classList.toggle('myturn', myTurn);
 	btn.classList.toggle('live', state.transmitting);
+	// The hint describes the GESTURE, so a control with no gesture has none. Hide the element rather than blank it:
+	// .hint carries a top margin, which would otherwise leave a gap under the button.
+	const hintEl = byId('talkHint');
+	hintEl.textContent = hint;
+	hintEl.hidden = hint === '';
 }
 
 /**

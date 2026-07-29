@@ -3,7 +3,7 @@
 // it skips when Node isn't on PATH).
 //
 // talk.js is DOM-free by construction, so everything the Talk button says and does is pinned here as data: a
-// snapshot of client state in, {mode, label, myTurn, action} out. The button's `disabled` is derived by app.js as
+// snapshot of client state in, {mode, label, hint, myTurn, action} out. The button's `disabled` is derived by app.js as
 // `mode === 'disabled'`, so asserting the mode asserts the greyed-out state too.
 //
 // floorStateFor / floorActionFor are the SAME pure rules the Java client applies, and the cases below mirror
@@ -30,6 +30,14 @@ const HOLDER = 'holder-session-id';
 
 const REQUEST = {type: 'requestFloor'};
 const RELEASE = {type: 'releaseFloor'};
+
+// The gesture instruction under the button, spelled out here rather than imported: the point is that the module
+// says exactly this, and a hint read back from the module would pin nothing. NO_HINT is the disabled states, whose
+// label already gives the reason — app.js hides the element for it.
+const HOLD_HINT = 'Hold the button — or hold Space — while you talk.';
+const TAP_HINT = 'Tap to join or leave the line; holding does nothing here.';
+const DUPLEX_HINT = 'Full-duplex: your mic stays open. Click to mute yourself.';
+const NO_HINT = '';
 
 /**
  * A connected member of an ordinary PTT channel with a free floor — the state every case below varies ONE field of,
@@ -66,6 +74,7 @@ test('in no channel the control is disabled, not an inviting "Hold to talk"', ()
 	assert.deepEqual(talkDecision(view({channel: null})), {
 		mode: 'disabled',
 		label: 'Not in a channel',
+		hint: NO_HINT,
 		myTurn: false,
 		action: null
 	});
@@ -93,6 +102,7 @@ test('in no channel a leftover FULL_DUPLEX mode does not hand back a working mic
 	assert.deepEqual(talkDecision(view({channel: null, mode: 'FULL_DUPLEX'})), {
 		mode: 'disabled',
 		label: 'Not in a channel',
+		hint: NO_HINT,
 		myTurn: false,
 		action: null
 	});
@@ -105,6 +115,7 @@ test('not connected reads the pre-connect label', () => {
 	assert.deepEqual(talkDecision(view({connected: false, channel: null})), {
 		mode: 'disabled',
 		label: 'Connect first',
+		hint: NO_HINT,
 		myTurn: false,
 		action: null
 	});
@@ -122,6 +133,7 @@ test('a parked SWITCHER keeps a working control for the channel it is still in',
 	assert.deepEqual(talkDecision(view({pendingChannel: 'locked-room'})), {
 		mode: 'hold',
 		label: 'Hold to talk',
+		hint: HOLD_HINT,
 		myTurn: false,
 		action: REQUEST
 	});
@@ -133,6 +145,7 @@ test('a parked switcher that is LIVE can still stop talking', () => {
 	assert.deepEqual(talkDecision(view({pendingChannel: 'locked-room', floorHolder: SELF, transmitting: true})), {
 		mode: 'hold',
 		label: 'LIVE — release to stop',
+		hint: HOLD_HINT,
 		myTurn: false,
 		action: RELEASE
 	});
@@ -146,6 +159,7 @@ test('owner-muted beats a free floor', () => {
 	assert.deepEqual(talkDecision(view({muted: true})), {
 		mode: 'disabled',
 		label: 'Muted by owner',
+		hint: NO_HINT,
 		myTurn: false,
 		action: null
 	});
@@ -175,6 +189,7 @@ test('FULL_DUPLEX ignores the floor entirely', () => {
 	assert.deepEqual(talkDecision(view({mode: 'FULL_DUPLEX', floorHolder: OTHER, floorWaiting: [HOLDER]})), {
 		mode: 'duplex',
 		label: 'Mic OFF (click to talk)',
+		hint: DUPLEX_HINT,
 		myTurn: false,
 		action: null
 	});
@@ -195,6 +210,7 @@ test('LIVE is a hold that releases', () => {
 	assert.deepEqual(talkDecision(view({floorHolder: SELF, transmitting: true})), {
 		mode: 'hold',
 		label: 'LIVE — release to stop',
+		hint: HOLD_HINT,
 		myTurn: false,
 		action: RELEASE
 	});
@@ -204,6 +220,7 @@ test('MY_TURN shows the claim countdown while it is running', () => {
 	assert.deepEqual(talkDecision(view({floorWaiting: [SELF, OTHER], claimSecondsLeft: 7})), {
 		mode: 'hold',
 		label: 'YOUR TURN — hold to talk · 7s',
+		hint: HOLD_HINT,
 		myTurn: true,
 		action: REQUEST
 	});
@@ -223,6 +240,7 @@ test('MY_TURN is head-only: a mid-queue member is IN_LINE, not offered a claim',
 	assert.deepEqual(decision, {
 		mode: 'tap',
 		label: 'In line #2 of 2 — tap to leave',
+		hint: TAP_HINT,
 		myTurn: false,
 		action: RELEASE
 	});
@@ -234,6 +252,7 @@ test('IN_LINE reports a 1-based position and leaves on a tap', () => {
 	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, floorWaiting: [OTHER, SELF, 'third'], floorQueueEnabled: true})), {
 		mode: 'tap',
 		label: 'In line #2 of 3 — tap to leave',
+		hint: TAP_HINT,
 		myTurn: false,
 		action: RELEASE
 	});
@@ -247,6 +266,7 @@ test('IN_LINE at the head of a busy floor is a tap to leave, not an offered clai
 	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, floorWaiting: [SELF], floorQueueEnabled: true})), {
 		mode: 'tap',
 		label: 'In line #1 of 1 — tap to leave',
+		hint: TAP_HINT,
 		myTurn: false,
 		action: RELEASE
 	});
@@ -259,6 +279,7 @@ test('IN_LINE stays tappable, and still LEAVES the line, when the queue flag is 
 	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, floorWaiting: [OTHER, SELF], floorQueueEnabled: false})), {
 		mode: 'tap',
 		label: 'In line #2 of 2 — tap to leave',
+		hint: TAP_HINT,
 		myTurn: false,
 		action: RELEASE
 	});
@@ -268,7 +289,7 @@ test('a free floor is hold-to-talk whether the queue is on or off', () => {
 	// The queue flag is consulted ONLY when the floor is busy: with the queue on and nobody talking there is nothing
 	// to queue behind, which is the resting state of every raise-hand channel. Treating it as a tap would stop
 	// press-and-hold driving the mic there at all, and enqueue the user behind an empty line instead of just talking.
-	const free = {mode: 'hold', label: 'Hold to talk', myTurn: false, action: REQUEST};
+	const free = {mode: 'hold', label: 'Hold to talk', hint: HOLD_HINT, myTurn: false, action: REQUEST};
 	assert.deepEqual(talkDecision(view({floorQueueEnabled: false})), free);
 	assert.deepEqual(talkDecision(view({floorQueueEnabled: true})), free);
 });
@@ -278,6 +299,7 @@ test('IDLE + busy + queue ON offers a raised hand', () => {
 	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, floorQueueEnabled: true})), {
 		mode: 'tap',
 		label: 'Raise hand ✋',
+		hint: TAP_HINT,
 		myTurn: false,
 		action: REQUEST
 	});
@@ -287,6 +309,7 @@ test('IDLE + busy + queue OFF is disabled and names the holder', () => {
 	assert.deepEqual(talkDecision(view({floorHolder: HOLDER, labelFor: id => `Bob (#${id})`})), {
 		mode: 'disabled',
 		label: `Floor held by Bob (#${HOLDER})`,
+		hint: NO_HINT,
 		myTurn: false,
 		action: null
 	});
@@ -311,6 +334,7 @@ test('a floor merely RESERVED for another is busy, not free', () => {
 	assert.deepEqual(talkDecision(view({floorWaiting: [OTHER], labelFor: id => `Ann (#${id})`})), {
 		mode: 'disabled',
 		label: `Floor held by Ann (#${OTHER})`,
+		hint: NO_HINT,
 		myTurn: false,
 		action: null
 	});
@@ -325,36 +349,63 @@ test('a floor merely RESERVED for another is busy, not free', () => {
  * why each rule is what it is; this table is the flat oracle that no state escapes.
  */
 const EVERY_STATE = [
-	{name: 'not connected', view: {connected: false, channel: null}, expect: {mode: 'disabled', label: 'Connect first', myTurn: false, action: null}},
-	{name: 'not connected but still holding a channel', view: {connected: false}, expect: {mode: 'disabled', label: 'Connect first', myTurn: false, action: null}},
-	{name: 'no channel', view: {channel: null}, expect: {mode: 'disabled', label: 'Not in a channel', myTurn: false, action: null}},
-	{name: 'waiting to be admitted', view: {channel: null, pendingChannel: 'locked-room'}, expect: {mode: 'disabled', label: 'Waiting to be admitted…', myTurn: false, action: null}},
-	{name: 'muted, free floor', view: {muted: true}, expect: {mode: 'disabled', label: 'Muted by owner', myTurn: false, action: null}},
-	{name: 'muted, full duplex', view: {muted: true, mode: 'FULL_DUPLEX'}, expect: {mode: 'disabled', label: 'Muted by owner', myTurn: false, action: null}},
-	{name: 'muted while live', view: {muted: true, floorHolder: SELF, transmitting: true}, expect: {mode: 'disabled', label: 'Muted by owner', myTurn: false, action: null}},
-	{name: 'muted while reserved', view: {muted: true, floorWaiting: [SELF], claimSecondsLeft: 5}, expect: {mode: 'disabled', label: 'Muted by owner', myTurn: false, action: null}},
-	{name: 'duplex, mic on', view: {mode: 'FULL_DUPLEX', transmitting: true}, expect: {mode: 'duplex', label: 'Mic ON (click to mute)', myTurn: false, action: null}},
-	{name: 'duplex, mic off', view: {mode: 'FULL_DUPLEX'}, expect: {mode: 'duplex', label: 'Mic OFF (click to talk)', myTurn: false, action: null}},
-	{name: 'live', view: {floorHolder: SELF, transmitting: true}, expect: {mode: 'hold', label: 'LIVE — release to stop', myTurn: false, action: RELEASE}},
-	{name: 'my turn, counting down', view: {floorWaiting: [SELF], claimSecondsLeft: 4}, expect: {mode: 'hold', label: 'YOUR TURN — hold to talk · 4s', myTurn: true, action: REQUEST}},
-	{name: 'my turn, window lapsed', view: {floorWaiting: [SELF]}, expect: {mode: 'hold', label: 'YOUR TURN — hold to talk', myTurn: true, action: REQUEST}},
-	{name: 'in line at the head, queue on', view: {floorHolder: HOLDER, floorWaiting: [SELF], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'In line #1 of 1 — tap to leave', myTurn: false, action: RELEASE}},
-	{name: 'in line further back, queue on', view: {floorHolder: HOLDER, floorWaiting: [OTHER, SELF], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'In line #2 of 2 — tap to leave', myTurn: false, action: RELEASE}},
-	{name: 'in line, queue off', view: {floorHolder: HOLDER, floorWaiting: [OTHER, SELF]}, expect: {mode: 'tap', label: 'In line #2 of 2 — tap to leave', myTurn: false, action: RELEASE}},
-	{name: 'idle, floor free, queue off', view: {}, expect: {mode: 'hold', label: 'Hold to talk', myTurn: false, action: REQUEST}},
-	{name: 'idle, floor free, queue on', view: {floorQueueEnabled: true}, expect: {mode: 'hold', label: 'Hold to talk', myTurn: false, action: REQUEST}},
-	{name: 'idle, floor free, global push-to-talk', view: {mode: 'GLOBAL_PTT', channel: 'global'}, expect: {mode: 'hold', label: 'Hold to talk', myTurn: false, action: REQUEST}},
-	{name: 'idle, busy, queue on', view: {floorHolder: HOLDER, floorQueueEnabled: true}, expect: {mode: 'tap', label: 'Raise hand ✋', myTurn: false, action: REQUEST}},
-	{name: 'idle, reserved for another, queue on', view: {floorWaiting: [OTHER], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'Raise hand ✋', myTurn: false, action: REQUEST}},
-	{name: 'idle, busy, queue off', view: {floorHolder: HOLDER, labelFor: () => 'Bob'}, expect: {mode: 'disabled', label: 'Floor held by Bob', myTurn: false, action: null}},
-	{name: 'idle, busy with one queued behind, queue off', view: {floorHolder: HOLDER, floorWaiting: [OTHER], labelFor: () => 'Bob'}, expect: {mode: 'disabled', label: 'Floor held by Bob', myTurn: false, action: null}},
-	{name: 'idle, reserved for another, queue off', view: {floorWaiting: [OTHER], labelFor: () => 'Ann'}, expect: {mode: 'disabled', label: 'Floor held by Ann', myTurn: false, action: null}}
+	{name: 'not connected', view: {connected: false, channel: null}, expect: {mode: 'disabled', label: 'Connect first', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'not connected but still holding a channel', view: {connected: false}, expect: {mode: 'disabled', label: 'Connect first', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'no channel', view: {channel: null}, expect: {mode: 'disabled', label: 'Not in a channel', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'waiting to be admitted', view: {channel: null, pendingChannel: 'locked-room'}, expect: {mode: 'disabled', label: 'Waiting to be admitted…', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'muted, free floor', view: {muted: true}, expect: {mode: 'disabled', label: 'Muted by owner', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'muted, full duplex', view: {muted: true, mode: 'FULL_DUPLEX'}, expect: {mode: 'disabled', label: 'Muted by owner', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'muted while live', view: {muted: true, floorHolder: SELF, transmitting: true}, expect: {mode: 'disabled', label: 'Muted by owner', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'muted while reserved', view: {muted: true, floorWaiting: [SELF], claimSecondsLeft: 5}, expect: {mode: 'disabled', label: 'Muted by owner', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'duplex, mic on', view: {mode: 'FULL_DUPLEX', transmitting: true}, expect: {mode: 'duplex', label: 'Mic ON (click to mute)', hint: DUPLEX_HINT, myTurn: false, action: null}},
+	{name: 'duplex, mic off', view: {mode: 'FULL_DUPLEX'}, expect: {mode: 'duplex', label: 'Mic OFF (click to talk)', hint: DUPLEX_HINT, myTurn: false, action: null}},
+	{name: 'live', view: {floorHolder: SELF, transmitting: true}, expect: {mode: 'hold', label: 'LIVE — release to stop', hint: HOLD_HINT, myTurn: false, action: RELEASE}},
+	{name: 'my turn, counting down', view: {floorWaiting: [SELF], claimSecondsLeft: 4}, expect: {mode: 'hold', label: 'YOUR TURN — hold to talk · 4s', hint: HOLD_HINT, myTurn: true, action: REQUEST}},
+	{name: 'my turn, window lapsed', view: {floorWaiting: [SELF]}, expect: {mode: 'hold', label: 'YOUR TURN — hold to talk', hint: HOLD_HINT, myTurn: true, action: REQUEST}},
+	{name: 'in line at the head, queue on', view: {floorHolder: HOLDER, floorWaiting: [SELF], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'In line #1 of 1 — tap to leave', hint: TAP_HINT, myTurn: false, action: RELEASE}},
+	{name: 'in line further back, queue on', view: {floorHolder: HOLDER, floorWaiting: [OTHER, SELF], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'In line #2 of 2 — tap to leave', hint: TAP_HINT, myTurn: false, action: RELEASE}},
+	{name: 'in line, queue off', view: {floorHolder: HOLDER, floorWaiting: [OTHER, SELF]}, expect: {mode: 'tap', label: 'In line #2 of 2 — tap to leave', hint: TAP_HINT, myTurn: false, action: RELEASE}},
+	{name: 'idle, floor free, queue off', view: {}, expect: {mode: 'hold', label: 'Hold to talk', hint: HOLD_HINT, myTurn: false, action: REQUEST}},
+	{name: 'idle, floor free, queue on', view: {floorQueueEnabled: true}, expect: {mode: 'hold', label: 'Hold to talk', hint: HOLD_HINT, myTurn: false, action: REQUEST}},
+	{name: 'idle, floor free, global push-to-talk', view: {mode: 'GLOBAL_PTT', channel: 'global'}, expect: {mode: 'hold', label: 'Hold to talk', hint: HOLD_HINT, myTurn: false, action: REQUEST}},
+	{name: 'idle, busy, queue on', view: {floorHolder: HOLDER, floorQueueEnabled: true}, expect: {mode: 'tap', label: 'Raise hand ✋', hint: TAP_HINT, myTurn: false, action: REQUEST}},
+	{name: 'idle, reserved for another, queue on', view: {floorWaiting: [OTHER], floorQueueEnabled: true}, expect: {mode: 'tap', label: 'Raise hand ✋', hint: TAP_HINT, myTurn: false, action: REQUEST}},
+	{name: 'idle, busy, queue off', view: {floorHolder: HOLDER, labelFor: () => 'Bob'}, expect: {mode: 'disabled', label: 'Floor held by Bob', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'idle, busy with one queued behind, queue off', view: {floorHolder: HOLDER, floorWaiting: [OTHER], labelFor: () => 'Bob'}, expect: {mode: 'disabled', label: 'Floor held by Bob', hint: NO_HINT, myTurn: false, action: null}},
+	{name: 'idle, reserved for another, queue off', view: {floorWaiting: [OTHER], labelFor: () => 'Ann'}, expect: {mode: 'disabled', label: 'Floor held by Ann', hint: NO_HINT, myTurn: false, action: null}}
 ];
 
 test('the decision table: every state maps to exactly one mode, label, highlight and message', () => {
 	for (const {name, view: overrides, expect} of EVERY_STATE) {
 		assert.deepEqual(talkDecision(view(overrides)), expect, name);
 	}
+});
+
+test('the hint follows the interaction mode, and only the mode', () => {
+	// It answers "how do I work this control", which is the same answer for every state sharing a mode — so a state
+	// must never carry a hint belonging to a different gesture. That is exactly what the static prose this replaced
+	// got wrong: it told the two tap states to hold the button.
+	const byMode = new Map();
+	for (const {name, view: overrides} of EVERY_STATE) {
+		const {mode, hint} = talkDecision(view(overrides));
+		if (byMode.has(mode)) {
+			assert.equal(hint, byMode.get(mode), `${name}: hint disagrees with another '${mode}' state`);
+		}
+		byMode.set(mode, hint);
+	}
+	assert.deepEqual([...byMode.entries()].sort(), [
+		['disabled', NO_HINT],
+		['duplex', DUPLEX_HINT],
+		['hold', HOLD_HINT],
+		['tap', TAP_HINT]
+	]);
+	// The three operable hints must be distinct and non-empty, or the field would be telling the user nothing.
+	const operable = [HOLD_HINT, TAP_HINT, DUPLEX_HINT];
+	assert.equal(new Set(operable).size, 3);
+	operable.forEach(h => assert.ok(h.length > 0));
+	// A disabled control has NO hint — index.html starts #talkHint empty and hidden to match, and app.js hides it
+	// again whenever it is empty rather than leaving the element's top margin as a gap.
+	assert.equal(NO_HINT, '');
 });
 
 test('no state falls outside the four interaction modes', () => {

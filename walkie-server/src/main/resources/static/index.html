@@ -440,9 +440,10 @@
 		<div class="panel">
 			<h2>Talk</h2>
 			<button disabled id="talkBtn">Connect first</button>
-			<div class="hint" id="talkHint">Push-to-talk: hold the button (or hold Space). Full-duplex: click to toggle
-				your mic.
-			</div>
+			<!-- Written by app.js from the Talk decision's `hint` (assets/talk.js MODE_HINTS), so the instruction always
+			     matches the gesture the button actually accepts. Starts empty and hidden to match the pre-connect
+			     decision, whose control is disabled and has no gesture to describe. -->
+			<div class="hint" hidden id="talkHint"></div>
 		</div>
 		<div class="row" style="gap:20px; flex:1; min-height:0;">
 			<div class="panel" style="flex:1;">

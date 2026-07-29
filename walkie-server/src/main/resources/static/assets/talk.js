@@ -72,6 +72,23 @@ function floorless(mode, label) {
 }
 
 /**
+ * The gesture instruction for each interaction mode: what to DO with the control, where the label says what it
+ * currently IS. It depends on the mode alone — every state sharing a mode is operated the same way — which is why
+ * talkDecision attaches it in one place rather than repeating it per branch.
+ *
+ * A disabled control gets none. There is no gesture to describe, and its label already gives the reason ("Muted by
+ * owner", "Floor held by X", "Waiting to be admitted…"); app.js hides the element for an empty hint so the space
+ * collapses. This replaces a line of static prose that told EVERY state to hold the button — including the two tap
+ * states, where holding does nothing and a tap joins or leaves the queue.
+ */
+const MODE_HINTS = {
+	hold: 'Hold the button — or hold Space — while you talk.',
+	tap: 'Tap to join or leave the line; holding does nothing here.',
+	duplex: 'Full-duplex: your mic stays open. Click to mute yourself.',
+	disabled: ''
+};
+
+/**
  * The Talk control's ONE decision for a snapshot of client state — what the button says, whether a gesture does
  * anything, and which floor message that gesture sends.
  *
@@ -83,6 +100,7 @@ function floorless(mode, label) {
  *              'tap'      a click toggles queue membership; press/release do NOT drive the mic (IN_LINE, IDLE +
  *                         busy + queue on).
  *   label  — the button's text.
+ *   hint   — the gesture instruction shown under it (see MODE_HINTS), empty where there is no gesture.
  *   myTurn — drives the pulsing "your turn" highlight.
  *   action — the control message a gesture sends (floorActionFor of our floor state), or null where there is no
  *            floor to act on. Note a hold's RELEASE is always releaseFloor, not this; see app.js releaseTalk.
@@ -100,6 +118,11 @@ function floorless(mode, label) {
  * `floorWaiting` is expected to be an array (app.js normalises the snapshot on arrival).
  */
 export function talkDecision(view) {
+	const decision = decideTalk(view);
+	return {...decision, hint: MODE_HINTS[decision.mode]};
+}
+
+function decideTalk(view) {
 	// Order matters, and it is the Java client's order (toggleTalk tests "no channel" before the owner-mute).
 	// Nothing resets the channel MODE on a disconnect or a refused join, so a channel-less client can still be
 	// holding 'FULL_DUPLEX': testing membership below that branch would hand it a working mic toggle for a channel
