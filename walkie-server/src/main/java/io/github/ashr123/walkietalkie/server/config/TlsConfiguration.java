@@ -165,7 +165,7 @@ public class TlsConfiguration implements WebServerFactoryCustomizer<Configurable
 		boolean hasIpv4Loopback = false;
 		boolean hasIpv6Loopback = false;
 		for (List<?> subjectAlternativeName : subjectAlternativeNames) {
-			if (subjectAlternativeName.size() < 2 || !(subjectAlternativeName.get(0) instanceof Integer type)) {
+			if (subjectAlternativeName.size() < 2 || !(subjectAlternativeName.getFirst() instanceof Integer type)) {
 				continue;
 			}
 			if (type == DNS_SUBJECT_ALT_NAME && "localhost".equalsIgnoreCase(String.valueOf(subjectAlternativeName.get(1)))) {
