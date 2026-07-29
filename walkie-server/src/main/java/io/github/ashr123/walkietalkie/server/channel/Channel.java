@@ -104,6 +104,12 @@ public final class Channel {
 	// is free (`floorHolder == null`): the server reserves the head the instant the floor frees, so there is no
 	// "free, queue non-empty, nobody reserved" state — hence no stored reserved-id.
 	private volatile boolean floorQueueEnabled;
+	/// Whether every member that JOINS from now on is muted as it is added ([#add]) — the owner's standing
+	/// counterpart to a one-shot [#setMutedForAllExcept]. Written under this channel's monitor by the toggle
+	/// handler and read under it at the add; `volatile` so the two lock-free [ServerMessage.Joined] builders see the
+	/// latest value. Toggling it NEVER changes an existing member's mute, in either direction: arming the rule must
+	/// not cut off whoever is mid-sentence, and disarming it must not undo the owner's deliberate mutes.
+	private volatile boolean muteNewMembers;
 	private final SequencedSet<String> floorQueue = new LinkedHashSet<>();
 	// When the current head's reservation (claim window) started — the basis for the reservation-expiry sweep;
 	// EPOCH when nobody is reserved. Stamped under the monitor by the reserve/acquire paths, read (under the
@@ -204,7 +210,22 @@ public final class Channel {
 		// factory runs ONLY on the absent path, so an idempotent re-add keeps the existing Member — and its stream
 		// index — and never allocates a fresh index. allocateStreamIndex mutates the index pool under the caller's
 		// channel monitor (ChannelRegistry.joinOrCreate holds it), so it is safe inside the compute lambda.
-		members.computeIfAbsent(session.id(), _ -> new Member(session, allocateStreamIndex()));
+		boolean[] fresh = {false};
+		members.computeIfAbsent(session.id(), _ -> {
+			fresh[0] = true;
+			return new Member(session, allocateStreamIndex());
+		});
+		// The owner's standing "mute new members" rule, applied HERE so it is inseparable from the add — exactly as
+		// the stream index is. That placement is what lets the joiner learn of its own mute with no extra message:
+		// [#memberInfos] derives each entry's `muted` bit, and the caller reads the roster for the joiner's `Joined`
+		// later in this same monitor span.
+		//
+		// Only on the FRESH path, and never the owner. Re-muting an existing member would undo a deliberate unmute
+		// on every idempotent re-add, and muting the owner would lock the channel's only moderator out for good —
+		// an owner cannot unmute itself ([#setMuted] rejects the owner as a target) and nothing else would.
+		if (fresh[0] && muteNewMembers && !session.id().equals(ownerId)) {
+			mutedMembers.add(session.id());
+		}
 	}
 
 	public void remove(String sessionId) {
@@ -500,6 +521,17 @@ public final class Channel {
 
 	public boolean isFloorQueueEnabled() {
 		return floorQueueEnabled;
+	}
+
+	public boolean mutesNewMembers() {
+		return muteNewMembers;
+	}
+
+	/// Arms or disarms the standing "mute every arrival" rule. Deliberately has NO side effect on the current
+	/// members — unlike [#setFloorQueueEnabled], which clears the queue when disabled — because this rule is about
+	/// arrivals only: see the field's note. Under the monitor, so it serializes with the [#add] that reads it.
+	public synchronized void setMuteNewMembers(boolean enabled) {
+		muteNewMembers = enabled;
 	}
 
 	/// Turns the owner-controlled floor queue on or off. Disabling also **clears** the queue and any reservation

@@ -139,6 +139,7 @@ public class ConnectionService {
 			case ClientMessage.ResolveAllJoinRequests(boolean admit) -> handleResolveAllJoinRequests(session, admit);
 			case ClientMessage.WithdrawJoinRequest _ -> handleWithdrawJoinRequest(session);
 			case ClientMessage.SetFloorQueue(boolean enabled) -> handleSetFloorQueue(session, enabled);
+			case ClientMessage.SetMuteNewMembers(boolean enabled) -> handleSetMuteNewMembers(session, enabled);
 			case ClientMessage.Offer(String target, String sdp) ->
 					relaySignal(session, target, new ServerMessage.SignalOffer(session.id(), sdp));
 			case ClientMessage.Answer(String target, String sdp) ->
@@ -179,6 +180,7 @@ public class ConnectionService {
 								current.ownerId(),
 								current.isLocked(),
 								current.isFloorQueueEnabled(),
+								current.mutesNewMembers(),
 								current.memberInfos()
 						)
 				);
@@ -261,6 +263,7 @@ public class ConnectionService {
 							joinedChannel.ownerId(),
 							joinedChannel.isLocked(),
 							joinedChannel.isFloorQueueEnabled(),
+							joinedChannel.mutesNewMembers(),
 							joined.roster()
 					)
 			);
@@ -501,7 +504,13 @@ public class ConnectionService {
 						session.id(),
 						session.displayName(),
 						joined.channel().requireStreamIndex(session.id()),
-						false
+						// The joiner IS muted from the outset when the owner has armed "mute new members"
+						// ([Channel#add] applies it), and this is the only message that tells the others — the rule
+						// deliberately emits no [ServerMessage.MuteStatus], which is for CHANGES and would name an id
+						// they have not been introduced to yet. A lock-free read is sound here even though the add ran
+						// under the monitor: that add happened earlier on THIS thread, so its write to the concurrent
+						// mute set is already visible to us.
+						joined.channel().isMuted(session.id())
 				))
 		);
 
@@ -1352,6 +1361,26 @@ public class ConnectionService {
 			broadcaster.toAll(channel, new ServerMessage.FloorQueueChanged(enabled), floorStatusOf(channel));
 		}
 		log.info("floor queue {}", enabled ? "enabled" : "disabled");
+	}
+
+	/// Arms or disarms the owner's standing "mute every arrival" rule — the counterpart to [#handleMuteAll], which
+	/// is a one-shot over the members present. Server-enforced at the add ([Channel#add]), never trusted to the
+	/// client. A non-owner gets `NOT_OWNER` (via [#requireOwnedChannel], which also covers the sentinel-owned
+	/// `global` room), and sending it before joining gets `NOT_IN_CHANNEL`.
+	///
+	/// Unlike [#handleSetFloorQueue] this touches NO current state and so needs no accompanying snapshot: it changes
+	/// nobody's mute (see [Channel#setMuteNewMembers]), frees no floor, and applies to nothing that has already
+	/// happened. It also has no mode restriction — a full-duplex channel has no floor but mute matters there most,
+	/// since every mic is open.
+	private void handleSetMuteNewMembers(ClientSession session, boolean enabled) {
+		if (!(requireOwnedChannel(session, "change who is muted on entry") instanceof Some(Channel channel))) {
+			return;
+		}
+		synchronized (channel) {
+			channel.setMuteNewMembers(enabled);
+			broadcaster.toAll(channel, new ServerMessage.MuteNewMembersChanged(enabled));
+		}
+		log.info("mute-new-members {}", enabled ? "enabled" : "disabled");
 	}
 
 	/// Changes the requester's display name — the human label only. The session id, which keys the floor,

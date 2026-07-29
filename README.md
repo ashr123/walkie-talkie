@@ -261,8 +261,11 @@ them the owner, and everyone's owner-only controls update. The connected-only **
 your display name in place (everyone's roster updates); it leaves the channel untouched.
 
 **Mute participants.** The channel owner can silence a member: each member row in the **Members** list gets a
-**Mute**/**Unmute** button (shown only to the owner), and a **Mute all** toggle in the panel header mutes (or
-un-mutes) everyone else at once. These apply **immediately** — there's no Apply step. A muted member is shown
+**Mute**/**Unmute** button (shown only to the owner), and a **Mute everyone now** button in the owner's **Channel
+settings** block mutes (or un-mutes) everyone else at once. That one is a **one-shot** over whoever is present, so
+next to it is the standing rule — **Mute members as they join** — which mutes every later arrival for as long as it
+is ticked. Quieting a room and keeping it quiet is both; arming the rule on its own never cuts off whoever is
+mid-sentence. These apply **immediately** — there's no Apply step. A muted member is shown
 dimmed with a 🔇 marker for everyone. Enforcement is on the **server**, which does not trust the clients: it
 **drops a muted member's relayed audio** and refuses it the talk floor, so a member can't talk around a mute by
 tampering with its client. If the owner mutes someone who is *currently* talking, their floor is freed at once
@@ -272,9 +275,13 @@ muted. (Caveat: on the **WebRTC** transport, media is peer-to-peer, so the serve
 audio itself; the muted client still stops sending as a courtesy, but the guarantee holds only on the relay
 transport.)
 
-**Lock the channel, and approve who comes in.** The owner can close the room to newcomers: a **Lock channel** /
-**Unlock channel** toggle in the **Members** panel header (owner-only, applied immediately). Everyone sees a
-**🔒 Locked** badge while it's on, and existing members are unaffected.
+**Lock the channel, and approve who comes in.** The owner can close the room to newcomers with the **Locked**
+checkbox in the owner-only **Channel settings** block (applied immediately). Everyone sees a **🔒 Locked** badge
+while it's on, and existing members are unaffected.
+
+> The three standing channel flags — **Locked**, the **raise-hand queue** and **mute on entry** — are checkboxes in
+> that block, because they are states rather than actions; every member (owner or not) sees whichever are on as
+> compact badges beside the **Members** heading.
 
 While it's locked, somebody trying to join isn't turned away — they're **parked for your approval**, WhatsApp
 style. You get a **Requests to join (N)** block above the roster with **Admit** / **Deny** on each row (plus
@@ -337,6 +344,8 @@ re-enter it) · `o <#id>` hand ownership to another member (owner; `<#id>` is th
 server enforces it: a muted member's audio is dropped and it's shown `[muted]` in `w`; being muted stops your
 mic and refuses `t` until you're unmuted) · `lock` / `unlock` lock or unlock the channel to new members as the
 owner (server-enforced; existing members are unaffected — while locked, newcomers are parked for your approval) ·
+`entry on` / `entry off` mute every member that JOINS from now on, as the owner (the standing counterpart to
+`mute all`, which covers those already here; shown as 🔇 in `w`) ·
 `requests` list the newcomers waiting to be admitted, `admit <#id|all>` / `deny <#id|all>` decide, as the owner ·
 `cancel` stop waiting to be admitted somewhere · `n <name>` rename · `f` toggle hi-fi
 (music/voice) live · `q` quit (closes the socket, ending the session) · `h` help.

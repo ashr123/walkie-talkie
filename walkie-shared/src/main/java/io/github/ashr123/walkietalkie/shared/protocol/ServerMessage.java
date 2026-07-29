@@ -15,6 +15,9 @@ public sealed interface ServerMessage {
 	/// whether the owner has locked the channel to new members — carried here so a re-snapshot (an in-place
 	/// re-join) renders the state without waiting for a [ChannelLocked]. `floorQueueEnabled` is whether the
 	/// owner-toggleable push-to-talk floor queue is on (see [FloorStatus]); carried here for the same reason.
+	/// `muteNewMembers` is whether the owner has armed the standing "mute every arrival" rule
+	/// ([ClientMessage.SetMuteNewMembers]); ditto. Your OWN mute — including one that rule applied as you were
+	/// added — is in your entry of `members` ([MemberInfo#muted]), not a separate field.
 	@JsonTypeName("joined")
 	record Joined(String selfId,
 	              String channel,
@@ -22,6 +25,7 @@ public sealed interface ServerMessage {
 	              String ownerId,
 	              boolean locked,
 	              boolean floorQueueEnabled,
+	              boolean muteNewMembers,
 	              List<MemberInfo> members) implements ServerMessage {
 	}
 
@@ -144,6 +148,18 @@ public sealed interface ServerMessage {
 	/// [FloorStatus]). `enabled` is the new state.
 	@JsonTypeName("floorQueueChanged")
 	record FloorQueueChanged(boolean enabled) implements ServerMessage {
+	}
+
+	/// The channel owner turned "mute new members" on or off. Broadcast to the whole channel so everyone renders the
+	/// state. `enabled` is the new state.
+	///
+	/// It changes NOBODY's mute by itself — it is a rule about future arrivals, complementing
+	/// [ClientMessage.MuteAll]'s one-shot over the present — so no [MuteStatus] accompanies it. A member that joins
+	/// while it is on carries `muted = true` in the [MemberJoined] everyone else receives, and in its own [Joined]
+	/// roster; again with no [MuteStatus], which is documented as sent only for a CHANGE and would in any case name
+	/// an id the recipients have not been told about yet.
+	@JsonTypeName("muteNewMembersChanged")
+	record MuteNewMembersChanged(boolean enabled) implements ServerMessage {
 	}
 
 	/// The channel's owner changed its mode; clients adopt it, reset their talk state and re-render

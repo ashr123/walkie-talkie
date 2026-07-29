@@ -1972,6 +1972,132 @@ class ConnectionServiceTest {
 		return last.sent.size();
 	}
 
+	// --- the owner's standing "mute new members on entry" rule -------------------------------------
+
+	@Test
+	void withMuteOnEntryArmedAJoinerArrivesMutedAndEveryoneIsToldWithoutAMuteSnapshot() {
+		FakeClientSession alice = join("alice", "entry", ChannelMode.FULL_DUPLEX);   // owner
+		service.onMessage(alice, new ClientMessage.SetMuteNewMembers(true));
+		assertTrue(lastOf(alice, ServerMessage.MuteNewMembersChanged.class).enabled(), "the channel is told the rule is armed");
+
+		alice.sent.clear();
+		FakeClientSession bob = join("bob", "entry", ChannelMode.FULL_DUPLEX);
+
+		assertTrue(channel("entry").isMuted("bob"), "the server muted the joiner as it was added");
+		// The joiner learns of its OWN mute from its own roster, which is the bit each client's full-duplex mic
+		// auto-open reads inside its Joined handler — so it must be true there, not one message later.
+		assertTrue(firstOf(bob, ServerMessage.Joined.class).members().stream()
+						.anyMatch(member -> member.id().equals("bob") && member.muted()),
+				"the joiner's own Joined roster shows it muted");
+		assertTrue(firstOf(bob, ServerMessage.Joined.class).muteNewMembers(), "and carries the rule itself");
+		// The others learn from MemberJoined alone. A MuteStatus here would be wrong twice over: it is documented as
+		// sent only for a CHANGE, and it would name an id its recipients have not been introduced to yet.
+		assertTrue(firstOf(alice, ServerMessage.MemberJoined.class).member().muted(),
+				"the other members are told the joiner is muted, on the message that introduces it");
+		assertTrue(alice.sent.stream().noneMatch(ServerMessage.MuteStatus.class::isInstance),
+				"a join emits no mute snapshot — the rule changes nobody already present");
+		// Enforcement, not just bookkeeping.
+		alice.audio.clear();
+		service.onAudio(bob, new byte[]{1, 2, 3});
+		assertEquals(0, alice.audio.size(), "an entry-muted member's audio is dropped server-side");
+	}
+
+	@Test
+	void armingMuteOnEntryLeavesTheMembersAlreadyPresentAlone() {
+		// The whole point of a separate flag: "Mute everyone now" is the one-shot over the present, this is the
+		// standing rule for arrivals. Arming it must not cut off whoever is mid-sentence.
+		FakeClientSession alice = join("alice", "entry-now", ChannelMode.FULL_DUPLEX);   // owner
+		FakeClientSession bob = join("bob", "entry-now", ChannelMode.FULL_DUPLEX);
+
+		bob.sent.clear();
+		service.onMessage(alice, new ClientMessage.SetMuteNewMembers(true));
+
+		assertFalse(channel("entry-now").isMuted("bob"), "a member already present is untouched");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MuteStatus.class::isInstance),
+				"and no mute snapshot is sent, because no mute changed");
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.MuteNewMembersChanged.class::isInstance),
+				"only the rule itself is broadcast");
+	}
+
+	@Test
+	void anEntryMutedMemberTheOwnerUnmutesStaysUnmutedAcrossAReJoin() {
+		// THE regression this guards: the browser's Apply flow re-sends Join for the CURRENT channel routinely. If the
+		// entry-mute were applied per Join rather than per add, every Apply would silently undo the owner's unmute.
+		FakeClientSession alice = join("alice", "entry-rejoin", ChannelMode.FULL_DUPLEX);   // owner
+		service.onMessage(alice, new ClientMessage.SetMuteNewMembers(true));
+		FakeClientSession bob = join("bob", "entry-rejoin", ChannelMode.FULL_DUPLEX);
+		assertTrue(channel("entry-rejoin").isMuted("bob"), "bob arrived muted");
+
+		service.onMessage(alice, new ClientMessage.MuteMember("bob", false));   // the owner lets bob speak
+		assertFalse(channel("entry-rejoin").isMuted("bob"));
+
+		bob.sent.clear();
+		service.onMessage(bob, new ClientMessage.Join("entry-rejoin", ChannelMode.FULL_DUPLEX, "bob", null));
+
+		assertFalse(channel("entry-rejoin").isMuted("bob"), "an idempotent re-join must not re-apply the entry mute");
+		assertFalse(firstOf(bob, ServerMessage.Joined.class).members().stream()
+						.anyMatch(member -> member.id().equals("bob") && member.muted()),
+				"and the re-snapshot reports it unmuted");
+	}
+
+	@Test
+	void aNewcomerAdmittedFromTheWaitingListAlsoArrivesMuted() {
+		// An approved knocker completes its join by re-sending Join, so it goes through the same add — no separate
+		// handling, which is exactly why the rule belongs at the add.
+		// The shared `service` has parking disabled (max-join-requests 0), so a locked channel would refuse outright.
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, "alice", null));
+		svc.onMessage(alice, new ClientMessage.SetMuteNewMembers(true));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+
+		FakeClientSession bob = session("bob");
+		svc.onMessage(bob, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, "bob", null));
+		assertTrue(bob.sent.stream().anyMatch(ServerMessage.JoinPending.class::isInstance), "bob is parked");
+		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", true));
+		svc.onMessage(bob, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, "bob", null));
+
+		assertEquals("entry-knock", bob.channelName(), "its own re-Join completed the join");
+		assertTrue(channel("entry-knock").isMuted("bob"), "an admitted newcomer is a newcomer");
+	}
+
+	@Test
+	void promotingAnEntryMutedMemberToOwnerUnmutesIt() {
+		// The rule can only ever mute a NON-owner, but ownership moves: an entry-muted member that inherits the
+		// channel would otherwise be a muted owner, and an owner cannot unmute itself.
+		FakeClientSession alice = join("alice", "entry-owner", ChannelMode.FULL_DUPLEX);   // owner
+		service.onMessage(alice, new ClientMessage.SetMuteNewMembers(true));
+		FakeClientSession bob = join("bob", "entry-owner", ChannelMode.FULL_DUPLEX);
+		assertTrue(channel("entry-owner").isMuted("bob"));
+
+		bob.sent.clear();
+		service.onClose(alice, "the owner leaves");   // auto-election promotes bob
+
+		assertEquals("bob", channel("entry-owner").ownerId());
+		assertFalse(channel("entry-owner").isMuted("bob"), "the new owner is never muted — it could not unmute itself");
+		assertTrue(bob.sent.stream().anyMatch(m ->
+						m instanceof ServerMessage.MuteStatus(Set<String> muted) && !muted.contains("bob")),
+				"and the channel is told, via the snapshot");
+	}
+
+	@Test
+	void onlyTheOwnerCanArmMuteOnEntryAndTheGlobalRoomNever() {
+		FakeClientSession alice = join("alice", "entry-owner-only", ChannelMode.FULL_DUPLEX);   // owner
+		FakeClientSession bob = join("bob", "entry-owner-only", ChannelMode.FULL_DUPLEX);
+
+		service.onMessage(bob, new ClientMessage.SetMuteNewMembers(true));
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertFalse(channel("entry-owner-only").mutesNewMembers(), "a non-owner cannot arm it");
+		assertTrue(alice.sent.stream().noneMatch(ServerMessage.MuteNewMembersChanged.class::isInstance),
+				"and nothing is broadcast");
+
+		// The global room's sentinel owner is nobody's session id, so even its first member is not its owner.
+		FakeClientSession global = join("g", null, ChannelMode.GLOBAL_PTT);
+		service.onMessage(global, new ClientMessage.SetMuteNewMembers(true));
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(global, ServerMessage.ErrorMessage.class).code());
+		assertFalse(channel("global").mutesNewMembers());
+	}
+
 	@Test
 	void theGlobalRoomCannotBeMuted() {
 		FakeClientSession alice = join("alice", null, ChannelMode.GLOBAL_PTT);

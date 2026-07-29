@@ -144,7 +144,21 @@ waiting/reserved) and re-broadcasts `FloorStatus` — offering the freed/advance
 talking-then-muted member stops. **Enforcement is relay-only** — WebRTC media is peer-to-peer (DTLS-SRTP), so a WebRTC talker's mute is
 best-effort at its own client (it still sees itself in `MuteStatus` and stops), matching the E2EE relay-only boundary.
 Only the owner may mute (`NOT_OWNER` otherwise); the owner can't mute itself and an unknown/left id is
-`UNKNOWN_TARGET`; the ownerless `global` room can't be muted (`NOT_OWNER` via its sentinel owner). Concurrency
+`UNKNOWN_TARGET`; the ownerless `global` room can't be muted (`NOT_OWNER` via its sentinel owner).
+**`MuteAll` is a one-shot over the members PRESENT**, so the standing rule is a separate owner flag:
+`SetMuteNewMembers` → broadcast `MuteNewMembersChanged`, riding in `Joined.muteNewMembers` like `locked` /
+`floorQueueEnabled`, backed by `Channel.muteNewMembers` (volatile) + `mutesNewMembers()`/`setMuteNewMembers`. It is
+applied in **`Channel.add`** — the one atomic publication point of a member, alongside the stream index — which is
+what lets the joiner learn of its own mute from `memberInfos()` in its OWN `Joined` roster (the bit each client's
+full-duplex mic auto-open reads inside its `Joined` handler) and the others from `MemberJoined(muted=true)`, with
+**no** `MuteStatus` for a join: that message is for CHANGES and would name an id nobody has been introduced to yet.
+Only on the FRESH `computeIfAbsent` path (an idempotent re-`Join` — the browser's Apply flow — must not re-apply it
+over a deliberate unmute) and **never the owner** (an owner can't unmute itself, so that would strand the channel's
+only moderator; `unmuteOwner` covers a later promotion). Arming it changes NOBODY already present — deliberately,
+so it can't cut off whoever is mid-sentence — and it starts OFF per channel with no `walkie.*` default, since a
+property-seeded ON would mute each channel's own creator. Web: an owner-only **Channel settings** block of three
+checkboxes (locked / raise-hand queue / mute on entry) plus a one-shot **Mute everyone now** button, with the three
+states shown to EVERYONE as badges beside the Members heading; Java: `entry on|off` and a 🔇 marker in `w`. Concurrency
 mirrors the floor discipline: the mute flip + floor release + `MuteStatus` broadcast run under
 `synchronized(channel)`, and `Channel.remove` scrubs `mutedMembers` **under that same monitor** (with a
 membership re-check in the handler) so a leave can't race a mute into a ghost entry that outlives the member. Both

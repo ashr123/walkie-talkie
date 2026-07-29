@@ -108,6 +108,7 @@ public final class WalkieClient implements AutoCloseable {
 			           mute <#id|all> / unmute <#id|all> = mute or unmute members
 			           lock / unlock = lock or unlock the channel to new members
 			           queue on / queue off = turn the push-to-talk floor queue on or off
+			           entry on / entry off = mute every member that JOINS from now on ('mute all' covers those already here)
 			           requests = list the newcomers waiting to be admitted (a locked channel parks them)
 			           admit <#id|all> / deny <#id|all> = let a waiting newcomer in, or turn it away""";
 	/// The one passphrase command a NON-owner has: adopt a rotation the owner announced but didn't auto-share (an
@@ -171,6 +172,7 @@ public final class WalkieClient implements AutoCloseable {
 	// visibility, mirroring currentMode/crypto; read ONCE into a local before use.
 	private volatile FloorSnapshot floorSnapshot = FloorSnapshot.IDLE;
 	private volatile boolean floorQueueEnabled;   // whether the owner-toggleable floor queue is on (from Joined / FloorQueueChanged)
+	private volatile boolean muteNewMembers;      // whether the owner mutes every arrival (from Joined / MuteNewMembersChanged)
 	// Set when the server tells us it's our turn (FloorReserved / a FloorStatus that makes us the reserved head);
 	// cleared when we claim (FloorGranted / a FloorStatus showing us live) or when the window lapses and the next
 	// FloorStatus drops us (then we log "[your turn passed]"). Listener-thread-only today, volatile for the same
@@ -426,6 +428,7 @@ public final class WalkieClient implements AutoCloseable {
 									  String ownerId,
 									  boolean locked,
 									  boolean floorQueueEnabled,
+									  boolean muteNewMembers,
 									  List<MemberInfo> members) -> {
 				boolean channelChanged = !channel.equals(this.currentChannel);
 				this.selfId = selfId;
@@ -438,6 +441,7 @@ public final class WalkieClient implements AutoCloseable {
 				// superseded key.
 				this.switchRollback = null;
 				this.floorQueueEnabled = floorQueueEnabled;   // adopt the channel's queue setting (authoritative on every Joined)
+				this.muteNewMembers = muteNewMembers;         // ditto for the standing "mute every arrival" rule
 				if (channelChanged) {
 					// Baseline the channel's announced key-check from the key we joined with — only on an ACTUAL
 					// channel change (a switch). switchTo deliberately doesn't advance it, so the transmit gate keeps
@@ -519,6 +523,12 @@ public final class WalkieClient implements AutoCloseable {
 			}
 			case ServerMessage.FloorStatus(String holderId, List<String> waiting) -> handleFloorStatus(holderId, waiting);
 			case ServerMessage.FloorReserved(long claimSeconds) -> handleFloorReserved(claimSeconds);
+			case ServerMessage.MuteNewMembersChanged(boolean enabled) -> {
+				muteNewMembers = enabled;
+				log(enabled
+						? "[mute on entry] new members will be muted as they join (this changes nobody already here)"
+						: "[mute on entry] off — new members can talk as soon as they join");
+			}
 			case ServerMessage.FloorQueueChanged(boolean enabled) -> {
 				floorQueueEnabled = enabled;
 				log(enabled
@@ -769,6 +779,7 @@ public final class WalkieClient implements AutoCloseable {
 		// connected-but-channel-less state and let the user pick another channel.
 		ownerId = null;
 		channelLocked = false;
+		muteNewMembers = false;
 		currentChannelKeyCheck = null;
 		memberNames.clear();
 		mutedMembers = Set.of();
@@ -841,6 +852,7 @@ public final class WalkieClient implements AutoCloseable {
 						System.lineSeparator() + "  - ",
 						"[members] " + memberNames.size() + " in this channel"
 								+ (channelLocked ? " 🔒 locked to new members" : "")
+								+ (muteNewMembers ? " 🔇 new members muted on entry" : "")
 								// A terminal has no badge to glance at, so the count rides the status line the user
 								// already types. Only the owner is sent the list, so it is silently 0 for anyone else.
 								+ (joinRequests.isEmpty() ? "" : " · " + joinRequests.size() + " waiting to join ('requests')")
@@ -869,6 +881,7 @@ public final class WalkieClient implements AutoCloseable {
 					case "lock" -> setChannelLock(true);
 					case "unlock" -> setChannelLock(false);
 					case "queue" -> setFloorQueue(parts.length > 1 ? parts[1] : "");
+					case "entry" -> setMuteNewMembers(parts.length > 1 ? parts[1] : "");
 					case "requests" -> listJoinRequests();
 					case "admit" -> resolveJoinRequest(parts.length > 1 ? parts[1] : "", true);
 					case "deny" -> resolveJoinRequest(parts.length > 1 ? parts[1] : "", false);
@@ -1377,6 +1390,29 @@ public final class WalkieClient implements AutoCloseable {
 				log("[queue] requesting to turn the floor queue off...");
 			}
 			default -> System.out.println("Usage: queue <on|off>");
+		}
+	}
+
+	/// `entry <on|off>` — owner-only: mute every member that JOINS from now on. The standing counterpart to
+	/// `mute all`, which is a one-shot over the members present, so an owner quieting a room and keeping it quiet
+	/// uses both; this one deliberately changes nobody who is already here. Gated locally to the owner (the server
+	/// enforces it too, and never trusts the client). No mode restriction: full-duplex has no floor, but that is
+	/// where mute matters most, since every mic is open.
+	private void setMuteNewMembers(String arg) {
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can change who is muted on entry");
+			return;
+		}
+		switch (arg.strip().toLowerCase(Locale.ROOT)) {
+			case "on" -> {
+				enqueue(new ClientMessage.SetMuteNewMembers(true));
+				log("[entry] requesting to mute new members on entry...");
+			}
+			case "off" -> {
+				enqueue(new ClientMessage.SetMuteNewMembers(false));
+				log("[entry] requesting to stop muting new members on entry...");
+			}
+			default -> System.out.println("Usage: entry <on|off>");
 		}
 	}
 

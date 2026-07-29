@@ -101,6 +101,7 @@ const state = {
 	// member's relay audio, so this drives UI only — it is never the enforcement boundary.
 	mutedMembers: new Set(),
 	locked: false,          // owner has locked the channel to new members (server-enforced; existing members unaffected)
+	muteNewMembers: false,  // owner mutes every member that JOINS (a standing rule; "Mute everyone now" covers the present)
 	// Relay full-duplex: one decode/playback "lane" per sender, keyed by the server-assigned stream index,
 	// mixed natively by ctx.destination. The maps relate stream indices to member ids for lifecycle/binding.
 	lanes: new Map(),        // stream id (uint8) -> {node, decoder, decoderChannels, decodeTs, rxChain, memberId, lastSeen}
@@ -771,6 +772,9 @@ function onWsMessage(ev) {
 		case 'floorQueueChanged':
 			onFloorQueueChanged(msg.enabled);
 			break;
+		case 'muteNewMembersChanged':
+			onMuteNewMembersChanged(msg.enabled);
+			break;
 		case 'modeChanged':
 			onModeChanged(msg.mode);
 			break;
@@ -841,6 +845,7 @@ function onJoined(msg) {
 	// refusal restore this channel's superseded key.
 	state.switchRollback = null;
 	state.floorQueueEnabled = msg.floorQueueEnabled;   // adopt the channel's queue setting (authoritative on every Joined; a fresh floorStatus follows)
+	state.muteNewMembers = msg.muteNewMembers;   // ditto for the standing "mute every arrival" rule; our OWN mute rides in the roster
 	if (channelChanged) {
 		// Baseline the announced key-check to what we joined with, and clear any pending rotation — ONLY on an
 		// actual channel change. A same-channel idempotent re-snapshot must NOT reset these, or it would revert a
@@ -907,7 +912,7 @@ function onModeChanged(mode) {
 	updateTalkButton();
 	updateModeControl();
 	updateGlobalModeLocks();
-	updateQueueControl();    // hide the owner queue toggle when the new mode is full-duplex (no floor), show it in PTT
+	updateChannelSettings();   // the queue row and badge drop out in full-duplex (no floor)
 	updateApplyControls();   // the live mode now matches the selector again → the Apply button settles
 	log(`Mode changed to ${mode}`);
 }
@@ -1015,7 +1020,19 @@ function onChannelLocked(locked) {
 	log(locked
 		? 'Channel locked by the owner — new members can\'t join (current members are unaffected).'
 		: 'Channel unlocked by the owner — new members can join again.');
-	updateLockControls();
+	updateChannelSettings();
+}
+
+/**
+ * The owner armed or disarmed the standing "mute every arrival" rule. It changes nobody's mute by itself — that is
+ * what "Mute everyone now" is for — so there is no mute snapshot behind this and nothing to re-render but the state.
+ */
+function onMuteNewMembersChanged(enabled) {
+	state.muteNewMembers = enabled;
+	log(enabled
+		? 'New members will now be muted as they join — this doesn\'t change anyone already here.'
+		: 'New members are no longer muted on entry.');
+	updateChannelSettings();
 }
 
 /**
@@ -1441,7 +1458,7 @@ function onFloorQueueChanged(enabled) {
 	log(enabled
 		? 'Floor queue enabled — a busy floor now forms a line; tap Talk to join it.'
 		: 'Floor queue disabled — a busy floor now refuses new requests until it frees.');
-	updateQueueControl();
+	updateChannelSettings();
 	updateTalkButton();
 }
 
@@ -2240,9 +2257,7 @@ function renderMembers() {
 			state.memberLis.set(id, li);
 			ul.appendChild(li);
 		});
-	updateMuteAllButton(); // show/hide + relabel the owner's "Mute all" toggle to match the roster's mute state
-	updateLockControls();  // show the 🔒 indicator to everyone + the owner's Lock/Unlock toggle (ownership may have changed)
-	updateQueueControl();  // show/relabel the owner's floor-queue toggle (ownership may have changed)
+	updateChannelSettings();   // badges for everyone + the owner's settings block (ownership and the roster may have changed)
 	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
 	renderJoinRequests();  // ownership may have just moved to (or away from) us, and only the owner sees the list
 	updateApplyControls(); // re-settle Apply/Reset: a rebuild may have dropped a now-departed pending owner pick
@@ -2253,16 +2268,41 @@ function renderMembers() {
  * "Unmute all" when every other member is already muted, else "Mute all". Disabled when the owner is alone —
  * there is no one to mute. The click handler recomputes the mute-vs-unmute intent from the live roster.
  */
-function updateMuteAllButton() {
-	const btn = byId('muteAllBtn');
+/**
+ * Renders EVERY channel-settings control from state: the badge row each member sees, the owner's three state
+ * checkboxes, and the owner's one-shot mute action. One function so no branch can leave a control stale — the same
+ * "every branch settles every write" discipline as updateTalkButton, and the reason the disconnect teardown can
+ * simply call this instead of hiding each node by hand.
+ *
+ * The three flags are checkboxes rather than flip-label buttons because they are persistent STATE: a label reading
+ * "Disable queue" makes the reader infer the current state from the verb, where a tick just shows it. "Mute everyone
+ * now" stays a button because it is a one-shot over the members present — and sits under the standing rule for
+ * arrivals, since an owner quieting a room usually wants both.
+ */
+function updateChannelSettings() {
 	const iAmOwner = ownsChannel();
-	btn.hidden = !iAmOwner;
+	// Badges: channel state, for everyone. The queue badge is meaningless in full-duplex, which has no floor.
+	byId('lockedBadge').hidden = !state.locked;
+	byId('queueBadge').hidden = !(state.floorQueueEnabled && state.mode !== 'FULL_DUPLEX');
+	byId('muteOnEntryBadge').hidden = !state.muteNewMembers;
+
+	byId('ownerSettings').hidden = !iAmOwner;
 	if (!iAmOwner) {
 		return;
 	}
+	// Re-assert every tick from state, not from the click that may have just flipped it: a checkbox toggles itself
+	// optimistically, while the server is authoritative and may refuse (ownership moved mid-click, wrong mode, a
+	// dropped socket). Re-asserting here snaps it back until the broadcast lands.
+	byId('lockToggle').checked = state.locked;
+	byId('queueToggle').checked = state.floorQueueEnabled;
+	byId('muteOnEntryToggle').checked = state.muteNewMembers;
+	// The floor queue applies only to push-to-talk; the server refuses the toggle in full-duplex with INVALID_MODE.
+	byId('queueToggleRow').hidden = state.mode === 'FULL_DUPLEX';
+
+	const btn = byId('muteAllBtn');
 	const others = [...state.members.keys()].filter(id => id !== state.ownerId);
 	const allMuted = others.length > 0 && others.every(id => state.mutedMembers.has(id));
-	btn.textContent = allMuted ? 'Unmute all' : 'Mute all';
+	btn.textContent = allMuted ? 'Unmute everyone' : 'Mute everyone now';
 	btn.disabled = others.length === 0;
 }
 
@@ -2271,33 +2311,12 @@ function updateMuteAllButton() {
  * see the toggle, still know newcomers are blocked); the "Lock/Unlock channel" toggle is owner-only (hidden for
  * others and in the ownerless global room). The button label follows state.locked, recomputed at click time.
  */
-function updateLockControls() {
-	const badge = byId('lockedBadge');
-	const btn = byId('lockBtn');
-	badge.hidden = !state.locked;
-	const iAmOwner = ownsChannel();
-	btn.hidden = !iAmOwner;
-	if (iAmOwner) {
-		btn.textContent = state.locked ? 'Unlock channel' : 'Lock channel';
-	}
-}
-
 /**
  * The owner-only floor-queue toggle: shown ONLY to the channel owner in a push-to-talk mode (never to a non-owner,
  * never in full-duplex — which has no floor — and never in the sentinel-owned global room, whose ownerId is
  * SERVER_OWNER so iAmOwner is already false there). Same visibility discipline as the Lock toggle. The label
  * reflects state.floorQueueEnabled; the server enforces NOT_OWNER (and refuses global / full-duplex) regardless.
  */
-function updateQueueControl() {
-	const btn = byId('queueBtn');
-	const iAmOwner = ownsChannel();
-	const show = iAmOwner && state.mode !== 'FULL_DUPLEX';
-	btn.hidden = !show;
-	if (show) {
-		btn.textContent = state.floorQueueEnabled ? 'Disable queue' : 'Enable queue';
-	}
-}
-
 /**
  * Renders the Talk control from the one decision (talkNow) — a pure projection, no rules of its own. Every branch
  * of that decision settles all four writes, so no earlier state can be left stranded on the button: the pulsing
@@ -2347,6 +2366,7 @@ function resetChannelState() {
 	state.members.clear();
 	state.mutedMembers.clear();
 	state.locked = false;   // onJoined re-seeds from the snapshot; this keeps a clean baseline for the disconnect path
+	state.muteNewMembers = false;   // ditto — a stale badge must not outlive the channel
 }
 
 function cleanup() {
@@ -2398,10 +2418,7 @@ function cleanup() {
 	byId('applyHint').hidden = true;
 	byId('ownerSelect').hidden = true;
 	byId('ownerLabel').hidden = true;
-	byId('muteAllBtn').hidden = true;      // owner-only moderation control; renderMembers only re-shows it while connected
-	byId('lockBtn').hidden = true;         // owner-only lock toggle; ditto
-	byId('queueBtn').hidden = true;        // owner-only floor-queue toggle; ditto
-	byId('lockedBadge').hidden = true;     // clear the 🔒 indicator on disconnect
+	updateChannelSettings();               // hides the owner block and every badge — ownsChannel() is false once disconnected
 	byId('shareRekeyRow').hidden = true;   // owner-only rotation control; updateApplyControls only runs while connected
 	byId('shareRekey').checked = true;     // back to the default-checked (auto-share) state for the next session
 	setStatus(false, 'Disconnected');
@@ -2438,10 +2455,23 @@ window.addEventListener('DOMContentLoaded', () => {
 		sendCtrl({type: 'muteAll', muted: !allMuted});
 	});
 	// Owner-only "Lock/Unlock channel" toggle: flip the current lock state (recomputed at click time). Immediate.
-	byId('lockBtn').addEventListener('click', () => sendCtrl({type: 'setLocked', locked: !state.locked}));
+	// Each toggle SENDS its intent and then re-asserts every tick from state: the server is authoritative, so a
+	// refused change (ownership moved mid-click, or the wrong mode) must snap the box back rather than leave the UI
+	// claiming something untrue. The matching broadcast is what actually flips it.
+	byId('lockToggle').addEventListener('change', e => {
+		sendCtrl({type: 'setLocked', locked: e.target.checked});
+		updateChannelSettings();
+	});
+	byId('muteOnEntryToggle').addEventListener('change', e => {
+		sendCtrl({type: 'setMuteNewMembers', enabled: e.target.checked});
+		updateChannelSettings();
+	});
 	// Owner-only floor-queue toggle: flip the current queue state (recomputed at click time). The echoed
 	// floorQueueChanged is what actually flips everyone's state; the server enforces NOT_OWNER. Immediate.
-	byId('queueBtn').addEventListener('click', () => sendCtrl({type: 'setFloorQueue', enabled: !state.floorQueueEnabled}));
+	byId('queueToggle').addEventListener('change', e => {
+		sendCtrl({type: 'setFloorQueue', enabled: e.target.checked});
+		updateChannelSettings();
+	});
 	byId('admitAllBtn').addEventListener('click', () => sendCtrl({type: 'resolveAllJoinRequests', admit: true}));
 	byId('denyAllBtn').addEventListener('click', () => sendCtrl({type: 'resolveAllJoinRequests', admit: false}));
 	byId('cancelRequestBtn').addEventListener('click', () => {

@@ -116,6 +116,38 @@
             flex: 1;
         }
 
+        /* The Members/Log row specifically. Without wrap + a min-width the Members panel's min-content (its
+           settings and badges) sets the row's floor, which squeezed the log panel to a few dozen pixels and pushed
+           the page into horizontal overflow well before the viewport got narrow. Wrapping lets them stack instead. */
+        .row.panels {
+            flex-wrap: wrap;
+            align-content: stretch;
+        }
+
+        .row.panels > div {
+            min-width: 280px;
+        }
+
+        /* One column on a phone: the 340px sidebar plus a panel cannot both fit, and the page was being scaled down
+           to compensate. */
+        @media (max-width: 640px) {
+            main {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto minmax(0, 1fr);
+                padding: 12px;
+                gap: 12px;
+            }
+
+            #setup {
+                max-height: none;
+                overflow-y: visible;
+            }
+
+            #log {
+                min-height: 160px;
+            }
+        }
+
         button {
             cursor: pointer;
             border: none;
@@ -273,18 +305,55 @@
             gap: 8px;
         }
 
-        #muteAllBtn, #lockBtn, #queueBtn {
+        #muteAllBtn {
             width: auto;
             padding: 5px 11px;
             font-size: 12px;
+            margin-top: 10px;
         }
 
-        /* Shown to ALL members when the channel is locked (added at runtime by app.js). */
+        /* Channel-state badges, shown to EVERY member (toggled at runtime by app.js). */
+        #channelBadges > span {
+            font-size: 12px;
+            color: var(--muted);
+            white-space: nowrap;
+        }
+
+        /* Locked is the one that blocks people, so it reads as a warning rather than as information. */
         /*noinspection CssUnusedSymbol*/
         #lockedBadge {
+            color: var(--bad) !important;
+        }
+
+        /* Owner-only channel settings: three state checkboxes plus the one-shot mute action. */
+        #ownerSettings {
+            margin: 10px 0 0;
+            padding: 10px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+        }
+
+        #ownerSettings h3 {
+            margin: 0 0 8px;
             font-size: 12px;
-            color: var(--bad);
-            white-space: nowrap;
+            font-weight: 600;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: .04em;
+        }
+
+        #ownerSettings label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0 0 6px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        #ownerSettings input[type=checkbox] {
+            width: auto;
+            margin: 0;
         }
         /* Owner-only: newcomers waiting to be admitted to a locked channel. Sits ABOVE the roster because it is
            the only part of this panel that needs a decision, and is accented so it reads as pending, not present. */
@@ -449,16 +518,31 @@
 			     decision, whose control is disabled and has no gesture to describe. -->
 			<div class="hint" hidden id="talkHint"></div>
 		</div>
-		<div class="row" style="gap:20px; flex:1; min-height:0;">
+		<div class="row panels" style="gap:20px; flex:1; min-height:0;">
 			<div class="panel" style="flex:1;">
 				<div class="members-header">
 					<h2>Members</h2>
-					<div class="members-controls">
-						<span hidden id="lockedBadge" title="The owner locked this channel — new members can't join">🔒 Locked</span>
-						<button class="secondary" hidden id="queueBtn" type="button" title="Turn the push-to-talk floor queue on or off">Enable queue</button>
-						<button class="secondary" hidden id="lockBtn" type="button">Lock channel</button>
-						<button class="secondary" hidden id="muteAllBtn" type="button">Mute all</button>
+					<!-- Channel STATE, shown to everyone (each badge hidden when off). The owner's toggles for the same
+					     three flags live in #ownerSettings below; this row is what a non-owner gets, and it is why the
+					     floor-queue state is no longer log-only. Written by updateChannelSettings in app.js. -->
+					<div class="members-controls" id="channelBadges">
+						<span hidden id="lockedBadge" title="The owner locked this channel — a newcomer has to be admitted">🔒 Locked</span>
+						<span hidden id="queueBadge" title="A busy floor forms a line — tap Talk to join it">✋ Queue on</span>
+						<span hidden id="muteOnEntryBadge" title="The owner mutes every member that joins">🔇 Joiners muted</span>
 					</div>
+				</div>
+				<!-- Owner-only channel settings. Checkboxes, not flip-label buttons, because these are persistent
+				     STATE: "Disable queue" makes you infer the state from the verb, a tick states it. "Mute everyone
+				     now" stays a button because it is a one-shot ACTION over the members present — the checkbox above
+				     it is the standing rule for arrivals, and the two are deliberately adjacent since an owner
+				     quieting a room usually wants both. -->
+				<div hidden id="ownerSettings">
+					<h3>Channel settings</h3>
+					<label><input id="lockToggle" type="checkbox"> Locked — a newcomer has to be admitted</label>
+					<label id="queueToggleRow"><input id="queueToggle" type="checkbox"> Raise-hand queue for a busy floor</label>
+					<label><input id="muteOnEntryToggle" type="checkbox"> Mute members as they join</label>
+					<button class="secondary" id="muteAllBtn" type="button"
+					        title="Mute or unmute everyone already in the channel — a one-shot, unlike the setting above">Mute everyone now</button>
 				</div>
 				<div hidden id="pendingBanner">
 					<span id="pendingText"></span>

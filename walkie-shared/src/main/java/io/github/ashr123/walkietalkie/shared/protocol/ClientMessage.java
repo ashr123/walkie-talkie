@@ -120,6 +120,22 @@ public sealed interface ClientMessage {
 	record SetLocked(boolean locked) implements ClientMessage {
 	}
 
+	/// Owner-only: mute every member that joins from now on. A standing channel rule, and the COMPLEMENT of
+	/// [MuteAll] — that one is a one-shot over the members present when it is sent, this one covers arrivals. So an
+	/// owner quieting a room and keeping it quiet sends both; neither implies the other, and in particular turning
+	/// this ON does not touch anyone already in the channel (which would otherwise cut off whoever is mid-sentence,
+	/// with no way to arm the rule without doing so).
+	///
+	/// A joiner is muted as it is added, so it learns of its own mute from [MemberInfo#muted] in its own
+	/// [ServerMessage.Joined] roster, and the other members learn of it from [ServerMessage.MemberJoined] — no
+	/// separate mute message is involved. The channel OWNER is never muted by it (an owner cannot unmute itself, so
+	/// that would lock the channel's only moderator out). On success the server broadcasts a
+	/// [ServerMessage.MuteNewMembersChanged]. The server-managed `global` room has a sentinel owner, so a toggle
+	/// there is refused.
+	@JsonTypeName("setMuteNewMembers")
+	record SetMuteNewMembers(boolean enabled) implements ClientMessage {
+	}
+
 	/// Owner-only: admit or deny ONE newcomer waiting at this locked channel's door. `sessionId` is the id from the
 	/// owner-only [ServerMessage.JoinRequests] snapshot; `admit` is true to let them in, false to turn them away.
 	/// A non-owner gets `NOT_OWNER`, sending it before joining gets `NOT_IN_CHANNEL`, and an id that isn't waiting
