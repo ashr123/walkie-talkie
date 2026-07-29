@@ -2015,6 +2015,9 @@ function renameMember(id, name) {
 	state.members.set(id, name);
 	renderMembers();
 	updateRenameButton();   // if this was our own rename, the field now matches the new name → Rename re-disables
+	// A rename is the one member change that arrives with no FloorStatus behind it, so the talk control has to be
+	// told: with the queue off it names the floor holder ("Floor held by X"), which would otherwise keep the old name.
+	updateTalkButton();
 	log(`${id === state.selfId ? 'You are' : `"${old}" is`} now "${name}"${idTag(id)}`);
 }
 
