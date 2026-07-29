@@ -96,15 +96,16 @@ public sealed interface ClientMessage {
 	/// `muted` is true to mute, false to unmute. A non-owner gets `NOT_OWNER`; an unknown target — or the owner
 	/// itself, which can't be muted — gets `UNKNOWN_TARGET`. On success the server records the state, DROPS that
 	/// member's relayed audio while muted (enforced server-side, so a client can't talk its way around it), frees
-	/// the floor if the muted member was holding it, and broadcasts a [ServerMessage.MemberMuted]. Enforcement is
-	/// relay-only — WebRTC media is peer-to-peer, so mute there is best-effort at the muted client.
+	/// the floor if the muted member was holding it, and broadcasts a fresh [ServerMessage.MuteStatus]. Enforcement
+	/// is relay-only — WebRTC media is peer-to-peer, so mute there is best-effort at the muted client.
 	@JsonTypeName("muteMember")
 	record MuteMember(String memberId, boolean muted) implements ClientMessage {
 	}
 
 	/// Owner-only moderation: mute or unmute EVERY other member of the channel at once (the owner is never muted).
-	/// Same server enforcement and per-member [ServerMessage.MemberMuted] broadcast (one for each member whose
-	/// state actually changed) as [MuteMember]. A non-owner gets `NOT_OWNER`.
+	/// Same server enforcement as [MuteMember], and ONE [ServerMessage.MuteStatus] for the whole change rather than
+	/// one message per member — which is what keeps a channel-wide mute O(N) frames instead of O(N²). A non-owner
+	/// gets `NOT_OWNER`; a no-op (everyone already in that state) broadcasts nothing at all.
 	@JsonTypeName("muteAll")
 	record MuteAll(boolean muted) implements ClientMessage {
 	}

@@ -38,7 +38,7 @@ public final class Channel {
 	/// Session ids the owner has muted. Their relayed audio is dropped in `ConnectionService.onAudio` before
 	/// fan-out, so a mute is enforced by the server rather than trusted to the client. A concurrent set so the
 	/// per-frame [#isMuted] read is lock-free; the mute/unmute mutations run under this channel's monitor when they
-	/// must be atomic with the `MemberMuted` broadcast and with freeing the floor of a member being muted —
+	/// must be atomic with the `MuteStatus` snapshot broadcast and with freeing the floor of a member being muted —
 	/// mirroring the floor discipline. Entries are dropped on [#remove], so a member's mute never outlives it.
 	private final Set<String> mutedMembers = ConcurrentHashMap.newKeySet();
 	/// The session id currently holding the floor, or `null` when the floor is free. Written only under this
@@ -327,16 +327,27 @@ public final class Channel {
 		return mutedMembers.contains(sessionId);
 	}
 
+	/// A point-in-time copy of the owner-muted ids — the `muted` set carried by `ServerMessage.MuteStatus`.
+	///
+	/// Deliberately unordered, and typed as a `Set` to say so: unlike [#floorQueue], whose order IS its meaning
+	/// (FIFO position), nothing about a mute has an order. Imposing one here would be the server doing a consumer's
+	/// job — a client that DISPLAYS several ids is the thing that knows how it wants them arranged (both reference
+	/// clients sort by display name, to match their rosters), and no client may depend on what arrives.
+	public synchronized Set<String> mutedMembers() {
+		return Set.copyOf(mutedMembers);
+	}
+
 	/// Sets one member's mute state; returns whether it actually changed (so the caller only broadcasts a real
-	/// transition). Call under this channel's monitor when the change must be atomic with the `MemberMuted`
+	/// transition). Call under this channel's monitor when the change must be atomic with the `MuteStatus` snapshot
 	/// broadcast and any floor release.
 	public boolean setMuted(String sessionId, boolean muted) {
 		return muted ? mutedMembers.add(sessionId) : mutedMembers.remove(sessionId);
 	}
 
 	/// Mutes or unmutes every current member EXCEPT `exceptId` (the owner, who is never muted), returning the ids
-	/// whose state actually changed so the caller broadcasts one `MemberMuted` per real transition. Call under the
-	/// monitor.
+	/// whose state actually changed. The caller needs them to detach each newly muted member from the floor, and to
+	/// tell a no-op apart from a real change — the broadcast itself is ONE [#mutedMembers] snapshot either way, not
+	/// one message per id. Call under the monitor.
 	public List<String> setMutedForAllExcept(String exceptId, boolean muted) {
 		return members.keySet().stream()
 				.filter(id -> !id.equals(exceptId) && setMuted(id, muted))

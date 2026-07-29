@@ -96,7 +96,10 @@ const state = {
 	warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
 	peers: new Map(),       // remoteId -> RTCPeerConnection (WebRTC)
 	members: new Map(),     // id -> displayName
-	mutedMembers: new Set(), // ids the owner has muted (server-authoritative; the server also DROPS their relay audio)
+	// The authoritative owner-mute snapshot (ServerMessage.MuteStatus): the whole set of muted ids, REPLACED
+	// wholesale on every change and seeded from the Joined roster's per-member flag. The server also DROPS a muted
+	// member's relay audio, so this drives UI only — it is never the enforcement boundary.
+	mutedMembers: new Set(),
 	locked: false,          // owner has locked the channel to new members (server-enforced; existing members unaffected)
 	// Relay full-duplex: one decode/playback "lane" per sender, keyed by the server-assigned stream index,
 	// mixed natively by ctx.destination. The maps relate stream indices to member ids for lifecycle/binding.
@@ -736,8 +739,8 @@ function onWsMessage(ev) {
 		case 'memberRenamed':
 			renameMember(msg.memberId, msg.displayName);
 			break;
-		case 'memberMuted':
-			onMemberMuted(msg.memberId, msg.muted);
+		case 'muteStatus':
+			onMuteStatus(msg.muted);
 			break;
 		case 'channelLocked':
 			onChannelLocked(msg.locked);
@@ -943,33 +946,64 @@ function onOwnerChanged(ownerId) {
  * so this is enforcement we merely reflect, not the enforcement itself). Update the roster mark; if WE are the one
  * affected, stop transmitting immediately and lock/unlock our talk control so the UI matches what the relay does.
  */
-function onMemberMuted(memberId, muted) {
-	if (muted) {
-		state.mutedMembers.add(memberId);
-	} else {
-		state.mutedMembers.delete(memberId);
-	}
-	if (memberId === state.selfId) {
-		if (muted) {
-			// We were muted. Stop our mic right now (best-effort on WebRTC, whose media is peer-to-peer and can't be
-			// relay-enforced; authoritative on the relay path, where onCapturedFrame also gates on state.transmitting).
-			// This covers PTT/global (drop the floor locally) and full-duplex (close the always-open mic) alike.
-			if (state.transmitting) {
-				endTransmit();
-				if (state.mode !== 'FULL_DUPLEX') {
-					sendCtrl({type: 'releaseFloor'});   // let the floor go so it isn't held idle in our name
-				}
+/**
+ * The authoritative owner-mute snapshot (ServerMessage.MuteStatus): EVERY currently-muted id, sent on every mute
+ * change. Handled like onFloorStatus — DIFF against what we held to derive the transitions, then replace the set
+ * wholesale — because the server sends state, not events: muting a whole channel is one message, not one per member.
+ *
+ * `mutedIds` is an ARRAY, where the retired per-member message carried a boolean of the same name. Never test it for
+ * truthiness: `[]` is truthy, so "nobody is muted" would read as "muted".
+ */
+function onMuteStatus(mutedIds) {
+	const next = new Set(Array.isArray(mutedIds) ? mutedIds : []);
+	// Diff BEFORE the write. A member that has already left appears in neither set — removeMember scrubs it and the
+	// server scrubs its own set on departure — so a leaver is never reported as unmuted.
+	const muted = [...next].filter(id => !state.mutedMembers.has(id));
+	const unmuted = [...state.mutedMembers].filter(id => !next.has(id));
+	state.mutedMembers = next;
+
+	if (muted.includes(state.selfId)) {
+		// We were muted. Stop our mic right now (best-effort on WebRTC, whose media is peer-to-peer and can't be
+		// relay-enforced; authoritative on the relay path, where onCapturedFrame also gates on state.transmitting).
+		// This covers PTT/global (drop the floor locally) and full-duplex (close the always-open mic) alike. Done
+		// before the floor snapshot that rides the same fan-out arrives, so that snapshot finds us already stopped.
+		if (state.transmitting) {
+			endTransmit();
+			if (state.mode !== 'FULL_DUPLEX') {
+				sendCtrl({type: 'releaseFloor'});   // let the floor go so it isn't held idle in our name
 			}
-			log('You were muted by the channel owner — you cannot talk until unmuted.');
-		} else {
-			log('You were unmuted by the channel owner — tap Talk to speak again.');
 		}
-		updateTalkButton();   // re-render the talk control's disabled state + label for the new mute state
-	} else {
-		log(`${memberLabel(memberId)}${muted ? ' was muted' : ' was unmuted'} by the owner`);
+		log('You were muted by the channel owner — you cannot talk until unmuted.');
+	} else if (unmuted.includes(state.selfId)) {
+		log('You were unmuted by the channel owner — tap Talk to speak again.');
 	}
-	// Re-render the roster: the muted mark and (for the owner) each row's Mute/Unmute label follow state.mutedMembers.
+	// Others: one line per member reads fine for a single mute, but a "Mute all" on a busy channel would otherwise
+	// print one line per member — the very fan-out this snapshot exists to collapse. Summarise past a pair.
+	logMuteChange(muted.filter(id => id !== state.selfId), 'muted');
+	logMuteChange(unmuted.filter(id => id !== state.selfId), 'unmuted');
+
+	// Both renders read state.mutedMembers, so they must follow the write: the roster for the 🔇 mark and (for the
+	// owner) each row's Mute/Unmute label plus the "Mute all" label, and the talk control for our own mute.
 	renderMembers();
+	updateTalkButton();
+}
+
+/**
+ * Logs a set of members that just became `verb` ("muted"/"unmuted"), naming them individually only when few.
+ *
+ * Ordered HERE, by display name, matching renderMembers: MuteStatus.muted is a Set on the wire precisely because
+ * arranging ids is a display decision, so the server sends no order and this is the display that picks one.
+ */
+function logMuteChange(ids, verb) {
+	if (ids.length === 0) {
+		return;
+	}
+	const named = [...ids]
+		.sort((a, b) => memberLabel(a).localeCompare(memberLabel(b), undefined, {sensitivity: 'base'}))
+		.map(memberLabel);
+	log(named.length <= 2
+		? `${named.join(', ')} ${named.length === 1 ? 'was' : 'were'} ${verb} by the owner`
+		: `${named.length} members were ${verb} by the owner`);
 }
 
 /**

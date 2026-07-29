@@ -22,6 +22,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -1671,10 +1672,9 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
 
 		assertTrue(channel("mute").isMuted("bob"), "the server records bob as muted");
-		// MemberMuted is broadcast to the whole channel, including the muted member (so its client can stop).
-		assertEquals("bob", firstOf(bob, ServerMessage.MemberMuted.class).memberId());
-		assertTrue(firstOf(bob, ServerMessage.MemberMuted.class).muted());
-		assertTrue(firstOf(alice, ServerMessage.MemberMuted.class).muted(), "the owner is notified too");
+		// The snapshot is broadcast to the whole channel, including the muted member (so its client can stop).
+		assertEquals(Set.of("bob"), lastOf(bob, ServerMessage.MuteStatus.class).muted());
+		assertEquals(Set.of("bob"), lastOf(alice, ServerMessage.MuteStatus.class).muted(), "the owner is notified too");
 
 		alice.audio.clear();
 		service.onAudio(bob, frame);
@@ -1719,8 +1719,8 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.MuteMember("alice", true));   // the owner can't mute itself
 		assertEquals(ErrorCode.UNKNOWN_TARGET, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channel("badtarget").isMuted("alice"), "the owner is never muted");
-		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MemberMuted.class::isInstance),
-				"a rejected mute (unknown target or the owner itself) broadcasts no MemberMuted to the channel");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MuteStatus.class::isInstance),
+				"a rejected mute (unknown target or the owner itself) broadcasts no snapshot to the channel");
 	}
 
 	@Test
@@ -1741,7 +1741,8 @@ class ConnectionServiceTest {
 		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
 						&& holderId == null),
 				"the other members learn the floor reopened");
-		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.MemberMuted mm && mm.muted()),
+		assertTrue(bob.sent.stream().anyMatch(m -> m instanceof ServerMessage.MuteStatus(Set<String> muted)
+						&& muted.contains("bob")),
 				"bob is also told it was muted");
 	}
 
@@ -1837,7 +1838,7 @@ class ConnectionServiceTest {
 
 		bob.sent.clear();
 		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));   // already muted -> no-op
-		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MemberMuted.class::isInstance),
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MuteStatus.class::isInstance),
 				"re-muting an already-muted member broadcasts nothing");
 	}
 
@@ -1899,7 +1900,7 @@ class ConnectionServiceTest {
 
 		bob.sent.clear();
 		service.onMessage(alice, new ClientMessage.MuteMember("bob", false));   // no-op unmute
-		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MemberMuted.class::isInstance),
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.MuteStatus.class::isInstance),
 				"unmuting an already-unmuted member is a no-op that broadcasts nothing");
 	}
 
@@ -1917,9 +1918,7 @@ class ConnectionServiceTest {
 		assertFalse(channel("mute-xfer").isMuted("bob"),
 				"the new owner is never muted — otherwise it could never talk and could not unmute itself");
 		assertTrue(bob.sent.stream().anyMatch(m ->
-						m instanceof ServerMessage.MemberMuted(
-								String memberId, boolean muted
-						) && memberId.equals("bob") && !muted),
+						m instanceof ServerMessage.MuteStatus(Set<String> muted) && !muted.contains("bob")),
 				"the channel is told the new owner was unmuted");
 		byte[] frame = {1, 2, 3};
 		alice.audio.clear();
@@ -1940,10 +1939,37 @@ class ConnectionServiceTest {
 		assertFalse(channel("mute-elect").isMuted("bob"),
 				"a departure-triggered auto-election of a muted member unmutes it (no muted-owner deadlock)");
 		assertTrue(bob.sent.stream().anyMatch(m ->
-						m instanceof ServerMessage.MemberMuted(
-								String memberId, boolean muted
-						) && memberId.equals("bob") && !muted),
+						m instanceof ServerMessage.MuteStatus(Set<String> muted) && !muted.contains("bob")),
 				"bob is told it was unmuted on promotion");
+	}
+
+	/// The reason mute is a snapshot: a channel-wide mute must cost each recipient a CONSTANT number of frames, not
+	/// one per member. Asserted by comparing two channel sizes rather than by a magic number — under the retired
+	/// per-member scheme the bigger channel delivered strictly more frames, which is the O(N^2) total this replaced.
+	/// It matters because the per-recipient control queue is bounded and its overflow DISCONNECTS the client, so a
+	/// burst that scales with channel size turns a moderation click into a way to drop everyone.
+	@Test
+	void muteAllCostsEachMemberTheSameFramesWhateverTheChannelSize() {
+		assertEquals(
+				muteAllFramesPerMember("small", 3),
+				muteAllFramesPerMember("large", 8),
+				"a channel-wide mute must fan out one snapshot, so a member's frame count cannot grow with the roster"
+		);
+	}
+
+	/// Mutes everyone in a fresh `channelName` of `members` (owner included) and returns how many messages the LAST
+	/// member received for that single click.
+	private int muteAllFramesPerMember(String channelName, int members) {
+		FakeClientSession owner = join("owner-" + channelName, channelName, ChannelMode.FULL_DUPLEX);
+		FakeClientSession last = null;
+		for (int i = 1; i < members; i++) {
+			last = join("m" + i + "-" + channelName, channelName, ChannelMode.FULL_DUPLEX);
+		}
+		last.sent.clear();
+		service.onMessage(owner, new ClientMessage.MuteAll(true));
+		assertEquals(1, last.sent.stream().filter(ServerMessage.MuteStatus.class::isInstance).count(),
+				"exactly one mute snapshot, however many members flipped");
+		return last.sent.size();
 	}
 
 	@Test

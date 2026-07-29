@@ -121,18 +121,31 @@ advance, relay-only), then reservation-expiry — each handing the freed floor t
 re-broadcasting `FloorStatus`, and only THEN a to-one `FloorReserved` to that head — see the ordering rule above).
 
 **Owner-enforced mute.** The owner can mute members (`MuteMember` for one, `MuteAll` for everyone but the owner
-→ broadcast `MemberMuted`, `ConnectionService.handleMuteMember` / `handleMuteAll`); the muted set is per-`Channel`
-state (`Channel.mutedMembers`, a `ConcurrentHashMap.newKeySet()`) surfaced in `MemberInfo.muted`. Enforcement is
+→ broadcast `MuteStatus`, `ConnectionService.handleMuteMember` / `handleMuteAll`); the muted set is per-`Channel`
+state (`Channel.mutedMembers`, a `ConcurrentHashMap.newKeySet()`) surfaced in `MemberInfo.muted`.
+**`MuteStatus(muted)` is ONE authoritative snapshot of every muted id**, not a per-member event — the same doctrine
+as `FloorStatus`, and the retirement of a per-member `MemberMuted` mirrors that of `FloorTaken`/`FloorIdle`/
+`FloorDenied`. It is what makes a channel-wide mute O(N) frames instead of O(N²): the old shape handed each of N
+members one message per changed member, and a 255-member channel (the stream-index cap) meant 254 frames per click
+against a 1024-deep control queue whose overflow *disconnects* the client — so an owner could spend the 200 msg/s
+inbound budget on toggling and drop the room. `Channel.mutedMembers()` is the snapshot accessor and
+`ConnectionService.muteStatusOf` the builder; it is an unordered `Set` on the wire (unlike `FloorStatus.waiting`,
+whose order IS its meaning) so the server never imposes an order — arranging ids for DISPLAY is the client's job,
+and both clients sort by display name to match their rosters. The initial value still rides in `MemberInfo.muted` on `Joined`
+(as `locked`/`floorQueueEnabled` do), so `MuteStatus` is only sent for a CHANGE and the join path keeps seeding
+synchronously — which is what keeps the full-duplex mic auto-open decision, made inside each client's `Joined`
+handler, race-free. Clients derive mute STATE from the snapshot and TRANSITIONS by DIFFING it (as `FloorStatus` is
+diffed), summarising a bulk change rather than printing a line per member. Enforcement is
 **server-side and does not trust the client**: `onAudio` drops a muted sender's frame (`Channel.isMuted`, a
 lock-free volatile-set read on the hot path, alongside the `holdsFloor` gate), and `handleRequestFloor` refuses a
 muted member the floor so it can't seize-and-hold it (blocking PTT) even though its audio would be dropped. Muting
 a member takes it off the floor entirely (`releaseFloor` if it was the live holder, `dequeueFloor` if it was
 waiting/reserved) and re-broadcasts `FloorStatus` — offering the freed/advanced floor to the queue head — so a
 talking-then-muted member stops. **Enforcement is relay-only** — WebRTC media is peer-to-peer (DTLS-SRTP), so a WebRTC talker's mute is
-best-effort at its own client (it still gets `MemberMuted` and stops), matching the E2EE relay-only boundary.
+best-effort at its own client (it still sees itself in `MuteStatus` and stops), matching the E2EE relay-only boundary.
 Only the owner may mute (`NOT_OWNER` otherwise); the owner can't mute itself and an unknown/left id is
 `UNKNOWN_TARGET`; the ownerless `global` room can't be muted (`NOT_OWNER` via its sentinel owner). Concurrency
-mirrors the floor discipline: the mute flip + floor release + `MemberMuted` broadcast run under
+mirrors the floor discipline: the mute flip + floor release + `MuteStatus` broadcast run under
 `synchronized(channel)`, and `Channel.remove` scrubs `mutedMembers` **under that same monitor** (with a
 membership re-check in the handler) so a leave can't race a mute into a ghost entry that outlives the member. Both
 clients reflect it: a muted member is shown 🔇/`[muted]`, and being muted disables the talk control ("Muted by

@@ -99,8 +99,8 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `rename`                 | `displayName`                                    | Change your own display name in place (→ `memberRenamed`, §3c)                                                                                                                                                                                               |
 | `changePassphrase`       | `keyCheck`, `wrappedKey`                         | Owner-only: rotate/clear the channel passphrase; `keyCheck` = the new one's KCV, or `null` to make it plaintext. Optional `wrappedKey` = the new passphrase encrypted under the OLD key so members auto-adopt; `null` opts out (§3c) (→ `passphraseChanged`) |
 | `transferOwnership`      | `newOwnerId`                                     | Owner-only: hand ownership to another current member (→ `ownerChanged`, §3c)                                                                                                                                                                                 |
-| `muteMember`             | `memberId`, `muted`                              | Owner-only: mute/unmute one member's relay audio; server-enforced (→ `memberMuted`, §3d)                                                                                                                                                                     |
-| `muteAll`                | `muted`                                          | Owner-only: mute/unmute every member but the owner at once (→ one `memberMuted` per changed member, §3d)                                                                                                                                                     |
+| `muteMember`             | `memberId`, `muted`                              | Owner-only: mute/unmute one member's relay audio; server-enforced (→ `muteStatus`, §3d)                                                                                                                                                                     |
+| `muteAll`                | `muted`                                          | Owner-only: mute/unmute every member but the owner at once (→ ONE `muteStatus`, §3d)                                                                                                                                                     |
 | `setLocked`              | `locked`                                         | Owner-only: lock/unlock the channel to NEW members (→ `channelLocked`, §3e); existing members unaffected                                                                                                                                                     |
 | `setFloorQueue`          | `enabled`                                        | Owner-only: turn this channel's push-to-talk floor queue on/off (→ `floorQueueChanged` + a fresh `floorStatus`, §3b); disabling clears any waiting queue. Full-duplex → `INVALID_MODE`; non-owner / `global` → `NOT_OWNER`                                   |
 | `resolveJoinRequest`     | `sessionId`, `admit`                             | Owner-only: admit or deny ONE newcomer waiting at this locked channel (§3f). Admitting records a one-shot approval and sends that newcomer `joinApproved` — it is its own re-sent `join` that completes the join                                             |
@@ -124,7 +124,7 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `modeChanged`       | `mode`                                                                             | The channel mode changed; reset talk state                                                                                                                                                                                               |
 | `ownerChanged`      | `ownerId`                                                                          | New owner (e.g. previous owner left)                                                                                                                                                                                                     |
 | `memberRenamed`     | `memberId`, `displayName`                                                          | A member changed its display name (incl. you — §3c)                                                                                                                                                                                      |
-| `memberMuted`       | `memberId`, `muted`                                                                | The owner muted/unmuted a member (broadcast to all, incl. the muted member — §3d)                                                                                                                                                        |
+| `muteStatus`        | `muted` (ids)                                                                      | Authoritative owner-mute snapshot: every muted id, on every change (broadcast to all, incl. the muted members — §3d)                                                                                                                                                        |
 | `channelLocked`     | `locked`                                                                           | The owner locked/unlocked the channel to new members (broadcast to all — §3e)                                                                                                                                                            |
 | `joinPending`       | `channel`                                                                          | Your `join` reached a locked channel that PARKS newcomers, so you are on its waiting list and its owner decides (§3f). You are not a member of it; if this was a switch you are still in the channel you were already in. Stay connected |
 | `joinApproved`      | `channel`                                                                          | You are cleared to join — **re-send `join`** to complete it (§3f). One trigger for three causes it deliberately does not distinguish: the owner admitted you, the owner unlocked, or the channel was dropped (your `join` recreates it)  |
@@ -306,10 +306,22 @@ each member).
 
 The channel owner can silence members. `muteMember { memberId, muted }` mutes (or unmutes) one member;
 `muteAll { muted }` mutes/unmutes **every member but the owner** at once. On each state change the server
-broadcasts `memberMuted { memberId, muted }` to the whole channel — **including the muted member itself**, so its
-client learns to disable its own talk control; `muteAll` emits one `memberMuted` per member whose state actually
-flipped. A member's mute state also rides in `MemberInfo.muted` in every `joined` snapshot and `memberJoined`, so
-a late joiner renders who's muted.
+broadcasts `muteStatus { muted }` — the **authoritative snapshot of every currently-muted id** — to the whole
+channel, **including the muted members themselves**, so each learns to disable its own talk control. It is ONE
+message however many members flipped, so `muteAll` costs each recipient a single frame rather than one per member.
+A member's mute state also rides in `MemberInfo.muted` in every `joined` snapshot and `memberJoined`, so a late
+joiner renders who's muted, and `muteStatus` is only ever sent for a CHANGE — the same shape as `locked` and
+`floorQueueEnabled` (§3e, §3b), which ride in `joined` and then have their own change broadcasts.
+
+The per-member `memberMuted { memberId, muted }` event is **retired**, subsumed by `muteStatus` — the same move
+that retired `floorTaken` / `floorIdle` / `floorDenied` in favour of `floorStatus` (§3b).
+
+Because it carries STATE, derive mute state directly (`me ∈ muted` → you are muted) and derive TRANSITIONS
+("you were muted", "X was unmuted") by **diffing** it against the set you held — exactly as `floorStatus` is
+diffed for "you lost the floor". Treat `muted` as a **set**: unlike `floorStatus.waiting`, whose order IS its
+meaning, the order here is unspecified and you must not depend on it — if you display several ids, impose your own
+order (both reference clients sort by display name, matching their rosters). A `muteAll` therefore yields one diff
+with many ids in it, which a client is free to summarise rather than reporting member by member.
 
 - **Server-enforced, client not trusted.** While a member is muted the server **drops its relayed audio**
   (the `onAudio` fan-out gate, alongside the floor check) and **refuses it the talk floor** (`requestFloor` is
@@ -317,7 +329,7 @@ a late joiner renders who's muted.
   channel. A muted member's transmit path is stopped best-effort at the client too (mic off, talk control
   disabled with a "muted" label), but that is courtesy — the guarantee is the server drop.
 - **Relay path only.** WebRTC media is peer-to-peer (DTLS-SRTP), so the server cannot drop it; a WebRTC talker
-  still receives `memberMuted` and stops as a courtesy, but the hard guarantee holds only on the relay
+  still sees itself in `muteStatus` and stops as a courtesy, but the hard guarantee holds only on the relay
   transport — the same boundary as the E2EE payload encryption (§7).
 - **Muting takes the member off the floor.** A muted member is released if it was the live holder and dequeued
   if it was waiting/reserved; the server then re-broadcasts `floorStatus` (§3b) — offering the freed floor to the
@@ -692,7 +704,7 @@ un-prefixed mode — a client that doesn't strip the prefix will decode **noise*
 - **`MemberInfo.streamId`** (`int`, `0..254`) carries each member's stream index, announced in `joined` /
   `memberJoined` so a client can pre-bind a lane (and its display name) before the first frame arrives.
 - **`MemberInfo.muted`** (`boolean`) carries the owner-mute state (§3d) in every `joined` / `memberJoined`, so a
-  late joiner renders who's muted without waiting for a `memberMuted`.
+  late joiner renders who's muted without waiting for a `muteStatus`.
 - The E2EE known-answer vectors (§7) are independent of the framing — the encrypted **body** is byte-unchanged;
   the stream-index prefix sits outside it (and outside the GCM envelope, §7).
 

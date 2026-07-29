@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.fasterxml.jackson.annotation.JsonTypeName;
 
 import java.util.List;
+import java.util.Set;
 
 /// Control-plane messages sent by the server to a client (as JSON text frames).
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "type")
@@ -40,12 +41,27 @@ public sealed interface ServerMessage {
 	record MemberRenamed(String memberId, String displayName) implements ServerMessage {
 	}
 
-	/// The owner muted or unmuted a member. Broadcast to the whole channel so everyone can render the state, and so
-	/// the affected member itself learns it is muted and stops transmitting (its audio is dropped server-side
-	/// regardless, but a well-behaved client also disables its talk control). `memberId` is the session id; `muted`
-	/// is the new state.
-	@JsonTypeName("memberMuted")
-	record MemberMuted(String memberId, boolean muted) implements ServerMessage {
+	/// The authoritative owner-mute snapshot: EVERY currently-muted member id, broadcast to the whole channel on
+	/// every mute change. It replaces a per-member `memberMuted` event, so muting a whole channel is ONE message
+	/// rather than one per member — the difference between N and N² frames for an N-member channel, against a
+	/// bounded per-recipient control queue whose overflow disconnects the client.
+	///
+	/// Being a snapshot, it also converges: a client that somehow missed one is corrected by the next, with no
+	/// incremental state to drift. The initial value is seeded from [MemberInfo#muted] in the [Joined] roster, so
+	/// this message is only ever sent for a CHANGE — the same shape as `locked` / `floorQueueEnabled`, which ride
+	/// in [Joined] and then have [ChannelLocked] / [FloorQueueChanged] for changes.
+	///
+	/// Clients therefore derive mute STATE directly (`me ∈ muted` → you are muted; render 🔇 for every listed id)
+	/// and derive TRANSITIONS ("you were muted", "X was unmuted") by DIFFING it against the set they held — as
+	/// [FloorStatus] is diffed for "you lost the floor".
+	///
+	/// A `Set`, unlike [FloorStatus#waiting]'s `List`, because order carries NO meaning here — `waiting`'s order IS
+	/// its meaning (FIFO position, and `waiting.get(0)` of a free floor is the reserved head). Saying that in the
+	/// type rather than in this sentence keeps the server from inventing an order, and leaves ordering where it
+	/// belongs: a client that DISPLAYS several ids imposes whatever order suits its own UI (both reference clients
+	/// sort by display name, matching their rosters). On the wire it is a JSON array either way.
+	@JsonTypeName("muteStatus")
+	record MuteStatus(Set<String> muted) implements ServerMessage {
 	}
 
 	/// The owner locked or unlocked the channel to new members. Broadcast to the whole channel so everyone renders

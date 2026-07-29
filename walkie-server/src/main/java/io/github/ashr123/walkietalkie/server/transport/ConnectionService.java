@@ -165,18 +165,24 @@ public class ConnectionService {
 		if (requested != null
 				&& requested.equals(session.channelName())
 				&& channelRegistry.find(requested) instanceof Some(Channel current)) {
-			broadcaster.toOne(
-					session,
-					new ServerMessage.Joined(
-							session.id(),
-							current.name(),
-							current.mode(),
-							current.ownerId(),
-							current.isLocked(),
-							current.isFloorQueueEnabled(),
-							current.memberInfos()
-					)
-			);
+			// Under the monitor because the roster carries each member's MUTE bit, and every mute flip runs under this
+			// same monitor: read lock-free, this re-snapshot could hand back a mute state a concurrent MuteStatus
+			// broadcast has already superseded, and nothing would correct it until the next mute change (a client
+			// re-seeds its whole mute set from this roster).
+			synchronized (current) {
+				broadcaster.toOne(
+						session,
+						new ServerMessage.Joined(
+								session.id(),
+								current.name(),
+								current.mode(),
+								current.ownerId(),
+								current.isLocked(),
+								current.isFloorQueueEnabled(),
+								current.memberInfos()
+						)
+				);
+			}
 			return;
 		}
 
@@ -565,7 +571,7 @@ public class ConnectionService {
 					// Auto-election can promote a muted member (it picks any remaining member): the new owner is
 					// never muted, so unmute it if needed — else it would be a muted owner nobody can unmute.
 					if (unmuteOwner(channel)) {
-						events.add(new ServerMessage.MemberMuted(newOwnerId, false));
+						events.add(muteStatusOf(channel));
 					}
 					// The waiting list is owner-only knowledge, and ownership just moved: hand the new owner the
 					// current list (to-one, so it doesn't ride the survivor fan-out) or it would inherit newcomers it
@@ -610,7 +616,7 @@ public class ConnectionService {
 		if (channel.isMuted(session.id())) {
 			// The owner muted this member: refuse the floor outright so a muted member can't seize and HOLD it
 			// (which would block everyone else in a PTT channel even though onAudio drops the muted member's frames).
-			// A conforming client never asks — its talk control is disabled on MemberMuted — so this is the server
+			// A conforming client never asks — its talk control is disabled by the mute snapshot — so this is the server
 			// enforcement boundary against a client that ignores its mute. Silent, like the onAudio frame drop.
 			// (Fast-path/full-duplex gate; the PTT acquire below re-checks under the monitor to close the race.)
 			log.debug("refused the floor to a muted member");
@@ -706,6 +712,17 @@ public class ConnectionService {
 		return new ServerMessage.FloorStatus(
 				channel.floorHolder() instanceof Some(String holder) ? holder : null,
 				channel.floorQueue());
+	}
+
+	/// The authoritative owner-mute snapshot for `channel`: every currently-muted member id. MUST be read under
+	/// `synchronized(channel)` so it can't tear against a concurrent mute flip or a leaver's scrub.
+	///
+	/// There is deliberately no `broadcastMuteStatus` mirror of [#broadcastFloorStatus]: every emitter either batches
+	/// this into an existing fan-out (the mute paths, and the auto-unmute of a newly elected or newly appointed
+	/// owner) or sends it to-one after a [ServerMessage.Joined], so a standalone-broadcast helper would have no
+	/// caller.
+	private static ServerMessage.MuteStatus muteStatusOf(Channel channel) {
+		return new ServerMessage.MuteStatus(channel.mutedMembers());
 	}
 
 	/// Broadcasts the current [#floorStatusOf] snapshot to the whole channel. Call under `synchronized(channel)` so
@@ -1125,7 +1142,7 @@ public class ConnectionService {
 					// The new owner is never muted: if the previous owner had muted this member before handing it
 					// ownership, unmute it now — otherwise it would be a muted owner with no way to unmute itself.
 					if (unmuteOwner(channel)) {
-						events.add(new ServerMessage.MemberMuted(channel.ownerId(), false));
+						events.add(muteStatusOf(channel));
 					}
 					broadcaster.toAll(channel, events.toArray(ServerMessage[]::new));
 				}
@@ -1143,7 +1160,7 @@ public class ConnectionService {
 	/// member, or the owner itself (which can never be muted), gets `UNKNOWN_TARGET`.
 	///
 	/// Concurrency: the membership re-check, the mute flip, the floor release (when the muted member was the one
-	/// talking) and the `MemberMuted` broadcast all run under the channel monitor — the same monitor every floor
+	/// talking) and the `MuteStatus` broadcast all run under the channel monitor — the same monitor every floor
 	/// transition and the mode/owner/passphrase broadcasts take — so the mute state, a freed floor and the notice
 	/// everyone sees stay consistent, and a member muted mid-transmission is dropped from the floor and told in one
 	/// atomic step. Enforcement engages within one frame: for a PTT floor holder the floor release above drops its
@@ -1151,8 +1168,8 @@ public class ConnectionService {
 	/// under the monitor so a just-muted member can't reacquire the floor. The [#onAudio] gate itself is a lock-free
 	/// hot-path read, so in FULL_DUPLEX a single frame already in flight when the mute lands may still be relayed
 	/// (bounded, real-time) — the mute is authoritative from the following frame. Enforcement is relay-only: WebRTC
-	/// media is peer-to-peer, so a WebRTC talker's mute is best-effort at its own client (it still gets `MemberMuted`
-	/// and stops).
+	/// media is peer-to-peer, so a WebRTC talker's mute is best-effort at its own client (it still sees itself in the
+	/// `MuteStatus` snapshot and stops).
 	///
 	/// The owner check reads the live `ownerId`; if a concurrent ownership transfer demotes the requester in the
 	/// window between the check and the mutation, its (already-authorized) mute may still land — harmless and
@@ -1178,12 +1195,15 @@ public class ConnectionService {
 			if (!channel.setMuted(memberId, muted)) {
 				return;   // already in that state: nothing to free, nothing to broadcast
 			}
-			// Fan out the mute state change, plus the fresh floor snapshot when muting took the member off the floor
-			// (holder released, or a waiter / reserved head dequeued) — in ONE pass. The FloorReserved trigger for a
-			// head that inherited the freed floor follows that pass rather than riding it: it is a to-one send, and it
-			// must reach the new head only after the snapshot it derives its turn from (see notifyReserved).
+			// Fan out the fresh mute snapshot, plus the fresh floor snapshot when muting took the member off the floor
+			// (holder released, or a waiter / reserved head dequeued) — in ONE pass. Mute FIRST, floor second: that is
+			// the causal order, and clients rely on it (a muted holder stops its own mic on the mute snapshot, so the
+			// floor snapshot that follows finds it already stopped rather than reporting a surprise release). The
+			// FloorReserved trigger for a head that inherited the freed floor follows the whole pass rather than riding
+			// it: it is a to-one send, and it must reach the new head only after the snapshot it derives its turn from
+			// (see notifyReserved).
 			List<ServerMessage> events = new ArrayList<>();
-			events.add(new ServerMessage.MemberMuted(memberId, muted));
+			events.add(muteStatusOf(channel));
 			ClientSession reserved = null;
 			if (detachFromFloorIfMuted(channel, memberId, muted)) {
 				reserved = reserveFloorHead(channel, clock.instant());
@@ -1200,36 +1220,42 @@ public class ConnectionService {
 	}
 
 	/// Mutes or unmutes EVERY other member of the channel at once, on the owner's request. The owner is never
-	/// muted. Same server enforcement as [#handleMuteMember]; a non-owner gets `NOT_OWNER`. Emits one `MemberMuted`
-	/// per member whose state actually changed — all fanned out together in a SINGLE pass, not one broadcast each.
-	/// If a muted member was on the floor, its floor is freed too (via [#detachFromFloorIfMuted]) and the fresh
-	/// snapshot rides the same fan-out.
+	/// muted. Same server enforcement as [#handleMuteMember]; a non-owner gets `NOT_OWNER`. Emits ONE
+	/// `MuteStatus` snapshot for the whole change, whatever its size, and — if a muted member was on the floor —
+	/// frees the floor too (via [#detachFromFloorIfMuted]) with the fresh floor snapshot riding the same fan-out.
 	private void handleMuteAll(ClientSession session, boolean muted) {
 		if (!(requireOwnedChannel(session, "mute members") instanceof Some(Channel channel))) {
 			return;
 		}
 		synchronized (channel) {
-			// setMutedForAllExcept flips the whole roster under the monitor and returns only the ids that changed;
-			// collect exactly one MemberMuted per genuine transition and fan them ALL out in a SINGLE pass. The old
-			// per-member broadcast was one full member-iteration each — O(N²) for an N-member channel.
-			List<ServerMessage> events = new ArrayList<>();
-			boolean floorChanged = false;
-			for (String memberId : channel.setMutedForAllExcept(channel.ownerId(), muted)) {
-				floorChanged |= detachFromFloorIfMuted(channel, memberId, muted);
-				events.add(new ServerMessage.MemberMuted(memberId, muted));
-			}
-			// If any muted member was on the floor (holder or waiting), advance/free it and append the fresh snapshot
-			// so it rides the SAME fan-out. The to-one FloorReserved for a head that inherited the floor waits until
-			// after that pass — it must not overtake the snapshot its turn is derived from (see notifyReserved).
-			ClientSession reserved = null;
-			if (floorChanged) {
-				reserved = reserveFloorHead(channel, clock.instant());
-				events.add(floorStatusOf(channel));
-			}
-			if (!events.isEmpty()) {   // nothing actually changed (idempotent) -> no fan-out at all
+			// setMutedForAllExcept flips the whole roster under the monitor and returns only the ids that changed. Those
+			// ids are needed to detach each newly muted member from the floor, and to tell an idempotent no-op from a
+			// real change — but NOT to build the fan-out, which is one snapshot however many members flipped. That is
+			// what keeps a channel-wide mute O(N) frames rather than O(N²): a 255-member channel used to hand every
+			// recipient 254 MemberMuted frames per click, a quarter of the bounded control queue whose overflow
+			// disconnects a client.
+			List<String> changed = channel.setMutedForAllExcept(channel.ownerId(), muted);
+			// Guarded on `changed`, NOT on the event list: the list always holds the snapshot, so testing it would fan
+			// out on every no-op click — exactly the toggle-spam this is meant to bound.
+			if (!changed.isEmpty()) {
+				boolean floorChanged = false;
+				for (String memberId : changed) {
+					floorChanged |= detachFromFloorIfMuted(channel, memberId, muted);
+				}
+				List<ServerMessage> events = new ArrayList<>();
+				events.add(muteStatusOf(channel));
+				// If any muted member was on the floor (holder or waiting), advance/free it and append the fresh
+				// snapshot so it rides the SAME fan-out. The to-one FloorReserved for a head that inherited the floor
+				// waits until after that pass — it must not overtake the snapshot its turn is derived from (see
+				// notifyReserved).
+				ClientSession reserved = null;
+				if (floorChanged) {
+					reserved = reserveFloorHead(channel, clock.instant());
+					events.add(floorStatusOf(channel));
+				}
 				broadcaster.toAll(channel, events.toArray(ServerMessage[]::new));
+				notifyReserved(reserved);
 			}
-			notifyReserved(reserved);
 		}
 		log.info("{} all members", muted ? "muted" : "unmuted");
 	}
@@ -1238,9 +1264,9 @@ public class ConnectionService {
 	/// dequeued from the waiting line (which, if it was the reserved head, ends its claim window so the next head
 	/// gets a fresh one — see [Channel#dequeueFloor]). A no-op when UNMUTING (unmuting never touches the floor).
 	/// Returns whether the floor state changed, so the caller can offer the freed/advanced floor to the queue head.
-	/// The caller broadcasts the `MemberMuted` itself so it can BATCH several into one fan-out — see [#handleMuteAll],
-	/// where a per-member broadcast would be one full member-iteration each (O(N²) for an N-member channel). MUST be
-	/// called while holding the channel monitor.
+	/// The caller broadcasts the `MuteStatus` snapshot itself, so a channel-wide mute batches ONE snapshot plus at
+	/// most one floor snapshot into a single fan-out rather than a message per member. MUST be called while holding
+	/// the channel monitor.
 	private static boolean detachFromFloorIfMuted(Channel channel, String memberId, boolean muted) {
 		if (!muted) {
 			return false;
@@ -1255,7 +1281,7 @@ public class ConnectionService {
 	/// muted by the previous owner it would otherwise be **permanently locked out**: [#onAudio] drops its audio,
 	/// [#handleRequestFloor] refuses it the floor, and it can't unmute ITSELF ([#handleMuteMember] rejects the owner
 	/// as a mute target) with no one else owner to do it. Returns true if the new owner really WAS muted — so the
-	/// caller batches a `MemberMuted(owner, false)` into its own fan-out (no spurious notice otherwise). MUST be
+	/// caller batches a fresh `MuteStatus` into its own fan-out (no spurious snapshot otherwise). MUST be
 	/// called under the channel monitor, after the ownership write. The global room's sentinel owner is never in the
 	/// mute set, so this returns false there.
 	private static boolean unmuteOwner(Channel channel) {

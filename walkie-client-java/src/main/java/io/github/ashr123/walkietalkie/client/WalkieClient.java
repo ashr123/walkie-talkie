@@ -127,9 +127,12 @@ public final class WalkieClient implements AutoCloseable {
 	private final AtomicBoolean reconnecting = new AtomicBoolean();
 	private final BlockingQueue<Outbound> sendQueue = new LinkedBlockingQueue<>();
 	private final Map<String, String> memberNames = new ConcurrentHashMap<>(); // session id -> display name
-	// Session ids the owner has muted (server-authoritative — the server also DROPS their relay audio). Read on the
-	// capture thread's frame sink (a lock-free concurrent set), mutated on the single listener thread from MemberMuted.
-	private final Set<String> mutedMembers = ConcurrentHashMap.newKeySet();
+	// Session ids the owner has muted (server-authoritative — the server also DROPS their relay audio). Held as ONE
+	// volatile IMMUTABLE set, republished whole on every change by the single listener thread — the FloorSnapshot
+	// discipline. Not a mutable concurrent set: applying a ServerMessage.MuteStatus snapshot in place (clear, then
+	// add-all) would expose an EMPTY set to the capture thread mid-swap, and that thread's per-frame read is the local
+	// stop for our own mute. A reader sees the whole old set or the whole new one, never a half-applied one.
+	private volatile Set<String> mutedMembers = Set.of();
 	private final AudioEngine audio;
 	// The live relay socket. Volatile (not final) because a CHANNEL_ROUTING_MISMATCH reconnect swaps it for a new
 	// socket bound to the target channel's instance; onOpen publishes each new socket here before it queues its Join.
@@ -399,7 +402,8 @@ public final class WalkieClient implements AutoCloseable {
 	/// announced — it does not depend on us having derived the new key yet.
 	private void sendAudioFrame(byte[] frame) {
 		if (mutedMembers.contains(selfId)) {
-			// Owner-muted: drop before the wire. We also stop the mic on MemberMuted, so this only closes the brief
+			// Owner-muted: drop before the wire. A volatile read of an immutable set — see the field's note on why it is
+			// republished whole rather than mutated in place. We also stop the mic on the mute snapshot, so this only closes the brief
 			// window where a frame captured just before the mute lands here — the server drops it anyway, this is the
 			// authoritative local stop. A lock-free concurrent-set read, cheap on the per-frame path.
 			return;
@@ -447,13 +451,16 @@ public final class WalkieClient implements AutoCloseable {
 					awaitingClaim = false;
 				}
 				memberNames.clear();
-				mutedMembers.clear();
+				// Seed the mute set from the roster so a member joining a channel where someone is already muted renders
+				// it — built into a local and published ONCE, so no reader ever sees it half-filled.
+				Set<String> seededMutes = new HashSet<>();
 				members.forEach(member -> {
 					memberNames.put(member.id(), member.displayName());
 					if (member.muted()) {
-						mutedMembers.add(member.id());   // seed the mute state so a member joining a channel with someone already muted renders it
+						seededMutes.add(member.id());
 					}
 				});
+				mutedMembers = Set.copyOf(seededMutes);
 				audio.setTransmitting(shouldAutoOpenMic(mode));
 				log("[joined] channel=" + channel + " mode=" + mode + (mode == options.mode() // If the channel already existed in another mode, its owner's mode wins and you adopt it.
 						? ""
@@ -488,7 +495,7 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.MemberLeft(String memberId) -> announceLeave(memberId);
 			case ServerMessage.MemberRenamed(String memberId, String displayName) ->
 					announceRename(memberId, displayName);
-			case ServerMessage.MemberMuted(String memberId, boolean muted) -> handleMuteChange(memberId, muted);
+			case ServerMessage.MuteStatus(Set<String> muted) -> handleMuteStatus(muted);
 			case ServerMessage.ChannelLocked(boolean locked) -> handleChannelLocked(locked);
 			case ServerMessage.JoinPending(String channel) ->
 				// Parked at a locked channel's door. We are NOT in it (and still in whatever channel we were in), so
@@ -654,7 +661,7 @@ public final class WalkieClient implements AutoCloseable {
 	private void announceJoin(MemberInfo member) {
 		memberNames.put(member.id(), member.displayName());
 		if (member.muted()) {
-			mutedMembers.add(member.id());   // a fresh joiner is never pre-muted, but honor the flag defensively
+			setMutedLocally(member.id(), true);   // a joiner is not pre-muted today, but honor the flag rather than assume
 		}
 		log("[+] " + name(member.id()));
 	}
@@ -662,32 +669,64 @@ public final class WalkieClient implements AutoCloseable {
 	private void announceLeave(String memberId) {
 		log("[-] " + name(memberId));
 		memberNames.remove(memberId);
-		mutedMembers.remove(memberId);   // a mute never outlives the member (mirrors the server's Channel.remove)
+		// A mute never outlives the member (mirrors the server's Channel.remove). Also what keeps the MuteStatus diff
+		// honest: without it a departed muted id would linger here and the next snapshot would read as "unmuted".
+		setMutedLocally(memberId, false);
 	}
 
-	/// The owner muted or unmuted a member. Server-authoritative: the server also DROPS a muted member's relay
-	/// audio, so this reflects enforcement rather than being it. Tracks the mute set for the roster; if WE are the
-	/// target, stops the mic at once and (in PTT) releases the floor so we don't hold it silently, and says why.
-	/// Runs on the single listener thread, so the read-then-act on `audio.isTransmitting()` needs no extra guard.
-	private void handleMuteChange(String memberId, boolean muted) {
-		if (muted) {
-			mutedMembers.add(memberId);
-		} else {
-			mutedMembers.remove(memberId);
-		}
-		if (!memberId.equals(selfId)) {
-			log("[" + (muted ? "muted" : "unmuted") + "] " + name(memberId) + " (by the owner)");
-			return;
-		}
-		if (muted) {
+	/// The authoritative owner-mute snapshot ([ServerMessage.MuteStatus]): every currently-muted id, sent on every
+	/// mute change so that muting a whole channel costs ONE message rather than one per member. Server-authoritative:
+	/// the server also DROPS a muted member's relay audio, so this reflects enforcement rather than being it.
+	///
+	/// Carries state, not transitions, so the lines we print are DERIVED by diffing it against the set we held — the
+	/// same way [#handleFloorStatus] derives "you lost the floor". If WE just became muted, stops the mic at once and
+	/// (in PTT) releases the floor so we don't hold it silently. Runs on the single listener thread, so the
+	/// read-then-act on `audio.isTransmitting()` needs no extra guard.
+	private void handleMuteStatus(Set<String> muted) {
+		Set<String> previous = mutedMembers;
+		Set<String> next = Set.copyOf(muted);   // defensive: the deserialized set is ours to keep, but publish an immutable one
+		// PUBLISH before acting: toggleTalk's full-duplex re-check relies on the gate engaging before the mic stops,
+		// so a `t` racing this handler either sees the old state entirely or is caught by the re-check.
+		mutedMembers = next;
+		if (next.contains(selfId) && !previous.contains(selfId)) {
 			boolean wasTransmitting = audio.isTransmitting();
 			audio.setTransmitting(false);   // stop the mic immediately — best-effort locally; the server drops us regardless
 			if (wasTransmitting && currentMode != ChannelMode.FULL_DUPLEX) {
 				enqueue(new ClientMessage.ReleaseFloor());   // don't keep holding the PTT floor while muted
 			}
 			log("[muted] the channel owner muted you — you can't talk until unmuted.");
-		} else {
+		} else if (previous.contains(selfId) && !next.contains(selfId)) {
 			log("[unmuted] the channel owner unmuted you — type 't' to talk again.");
+		}
+		logMuteChange(next.stream().filter(id -> !previous.contains(id) && !id.equals(selfId)).toList(), "muted");
+		logMuteChange(previous.stream().filter(id -> !next.contains(id) && !id.equals(selfId)).toList(), "unmuted");
+	}
+
+	/// Reports members that just became muted/unmuted, naming them only while few. A "mute all" on a busy channel
+	/// would otherwise print one line per member on the listener thread — the very per-member fan-out the snapshot
+	/// exists to collapse — and bury the roster the user is reading.
+	///
+	/// Ordered HERE, by display name then id, matching [#listMembers]: `MuteStatus.muted` is a `Set` precisely
+	/// because arranging ids is a display decision, and this is the display.
+	private void logMuteChange(List<String> ids, String verb) {
+		if (ids.isEmpty()) {
+			return;
+		}
+		List<String> named = ids.stream()
+				.sorted(Comparator.<String, String>comparing(id -> memberNames.getOrDefault(id, ""), String.CASE_INSENSITIVE_ORDER)
+						.thenComparing(Comparator.naturalOrder()))
+				.map(this::name)
+				.toList();
+		log("[" + verb + "] " + (named.size() <= 2 ? String.join(", ", named) : named.size() + " members") + " (by the owner)");
+	}
+
+	/// Adds or drops ONE id in the owner-mute set, republishing it whole. For the roster-driven edges (a joiner
+	/// carrying the flag, a member leaving) — the snapshot handler above replaces the set outright instead. Listener
+	/// thread only, so the read-modify-publish needs no CAS.
+	private void setMutedLocally(String memberId, boolean muted) {
+		Set<String> next = new HashSet<>(mutedMembers);
+		if (muted ? next.add(memberId) : next.remove(memberId)) {
+			mutedMembers = Set.copyOf(next);
 		}
 	}
 
@@ -732,7 +771,7 @@ public final class WalkieClient implements AutoCloseable {
 		channelLocked = false;
 		currentChannelKeyCheck = null;
 		memberNames.clear();
-		mutedMembers.clear();
+		mutedMembers = Set.of();
 		floorSnapshot = FloorSnapshot.IDLE;
 		awaitingClaim = false;
 		audio.setTransmitting(false);
@@ -783,6 +822,9 @@ public final class WalkieClient implements AutoCloseable {
 			log("[members] (none yet — join a channel first)");
 			return;
 		}
+		// One read of the mute snapshot for the whole walk: a mid-walk republish would otherwise render some rows
+		// against the old set and some against the new (cosmetic, but this file's rule is one read per decision).
+		Set<String> muted = mutedMembers;
 		log(memberNames.entrySet().stream()
 				.sorted(Map.Entry.<String, String>comparingByValue(String.CASE_INSENSITIVE_ORDER)
 						.thenComparing(Map.Entry.comparingByKey()))   // lexicographic by name, then id
@@ -793,7 +835,7 @@ public final class WalkieClient implements AutoCloseable {
 							: id.equals(ownerId)
 							  ? " (owner)"
 							  : "";
-					return name(id) + role + (mutedMembers.contains(id) ? " [muted]" : "");
+					return name(id) + role + (muted.contains(id) ? " [muted]" : "");
 				})
 				.collect(Collectors.joining(
 						System.lineSeparator() + "  - ",
@@ -861,14 +903,14 @@ public final class WalkieClient implements AutoCloseable {
 			return;
 		}
 		if (mutedMembers.contains(selfId)) {
-			// Owner-muted: refuse. We already stopped the mic on MemberMuted, so we're not transmitting here; this
+			// Owner-muted: refuse. We already stopped the mic on the mute snapshot, so we're not transmitting here; this
 			// just tells a user who tries to talk why they can't (the server would drop us and refuse us the floor).
 			log("[muted] you are muted by the channel owner — you can't talk until unmuted.");
 			return;
 		}
 		if (currentMode == ChannelMode.FULL_DUPLEX) {
 			// Full-duplex has no floor: `t` is a plain mic mute/unmute toggle. Opening the mic races the listener
-			// thread's owner-mute handler (handleMuteChange adds us to mutedMembers, THEN stops the mic): a mute that
+			// thread's owner-mute handler (handleMuteStatus PUBLISHES the snapshot, THEN stops the mic): a mute that
 			// lands after the guard above but before this write would otherwise be overwritten, leaving the mic live
 			// while muted — a privacy leak. So after opening, re-check mutedMembers and back off. Because the handler
 			// adds to the set before it stops the mic, either the mute is already visible here (we undo it) or it
@@ -1263,7 +1305,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// `mute <#id|all>` / `unmute <#id|all>` — owner-only moderation. `all` mutes (or unmutes) every OTHER member at
 	/// once; otherwise the target is identified by the start of its session id (the `#`-prefix shown in 'w', a
 	/// leading `#` optional). Gated locally to the owner (the server enforces it too, and never trusts the client);
-	/// the resulting [ServerMessage.MemberMuted] broadcast is what actually updates the roster and stops a muted
+	/// the resulting [ServerMessage.MuteStatus] broadcast is what actually updates the roster and stops a muted
 	/// member's mic. Applies immediately — there is no staged apply for moderation.
 	private void muteMember(String arg, boolean muted) {
 		String verb = muted ? "mute" : "unmute";
