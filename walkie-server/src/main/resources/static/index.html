@@ -42,8 +42,8 @@
             background: var(--bg);
             color: var(--text);
             line-height: 1.4;
-            /* Header + main stack vertically and main fills the rest of the viewport, so the inner scroll
-               containers (notably #log) can be height-bounded and actually scroll instead of growing the page. */
+            /* Header + main stack vertically and main takes the rest of the viewport, which is the floor the two
+               columns are laid out against (main can still grow past it — see there). */
             display: flex;
             flex-direction: column;
         }
@@ -67,11 +67,22 @@
         main {
             display: grid;
             grid-template-columns: 340px 1fr;
-            grid-template-rows: minmax(0, 1fr); /* one row that fills main and may shrink, so children can scroll */
+            /* ONE row, as tall as the TALLER of the two columns and no taller. While there are two columns that makes
+               the Connect panel the ruler — it is normally the taller — so the right-hand column ends level with it
+               instead of being stretched to the viewport or stopping short at its own content, and the Log box
+               absorbs whatever is left over (see #log). Crucially the row is NOT sized by how much text the log
+               holds: #log takes an absolute `0` flex basis, which keeps its content out of the intrinsic height
+               measured here (see the note there — that is the whole trick), so a long log scrolls in place. What the
+               row DOES grow for is a right-hand column whose fixed content — the roster, the owner's controls — needs
+               more than the Connect panel's height; then the page scrolls and the two columns simply differ.
+               `align-content: start` keeps the row at the top of any leftover space rather than centring it. */
+            grid-template-rows: auto;
+            align-content: start;
             gap: 20px;
             padding: 20px 24px;
-            flex: 1;       /* fill the viewport height below the header... */
-            min-height: 0; /* ...and let inner scroll containers (e.g. #log) bound themselves instead of growing */
+            /* Take the viewport height below the header; grow past it (no `min-height: 0`) only if the row genuinely
+               needs more than that, in which case the page scrolls rather than main's box ending above its content. */
+            flex: 1;
         }
 
         .panel {
@@ -81,13 +92,10 @@
             padding: 16px;
         }
 
-        /* Keep the Connect panel at its natural height (don't stretch it to fill the viewport-bounded row),
-           but never let it exceed the viewport — on a short screen it scrolls within itself rather than
-           growing the page. */
+        /* Keep the Connect panel at its natural height — it is what the row (and so the Log box) is measured
+           against, so stretching it would make the ruler elastic. */
         #setup {
             align-self: start;
-            max-height: 100%;
-            overflow-y: auto;
         }
 
         label {
@@ -127,9 +135,8 @@
             min-width: 0;
         }
 
-        /* Sizing lives here rather than inline so the stacked media query below can override it — an inline `flex`
-           would win over any rule. The log gets the larger share because it is the thing you read. */
-        /* The right-hand column: Talk above, then the Members/Log row filling what is left, so #log can be bounded. */
+        /* The right-hand column: Talk on top, then the Members/Log row taking what is left, so the Log box's height
+           is a leftover of the row above rather than a function of its own text. */
         #live {
             display: flex;
             flex-direction: column;
@@ -137,58 +144,52 @@
             min-height: 0;
         }
 
+        /* Panel sizing lives in these rules rather than in inline `style` attributes so the media queries below can
+           override it — an inline `flex` would beat any rule. The Log gets the larger share of the width because it is
+           the thing you read.
+           The basis is `auto` — the panels' own content height — so that a roster too tall for the Connect panel's
+           height makes the grid row above GROW (and the page scroll) rather than spilling out of the column, where it
+           would be clipped off the bottom of the page and unreachable. What it does NOT drag in is the log's text:
+           #log's basis is an absolute 0, so this measurement includes the log's min-height and nothing more.
+           `min-height: 0` still lets the row shrink when there is less space than that. */
         .row.panels {
             gap: 20px;
-            flex: 1;
+            flex: 1 1 auto;
             min-height: 0;
         }
 
         #membersPanel {
-            flex: 1;
+            flex: 1 1 0;
         }
 
         #logPanel {
-            flex: 2;
+            flex: 2 1 0;
             display: flex;
             flex-direction: column;
         }
 
-        /* Too narrow for the two panels side by side: stack them. They then no longer share one bounded height, so
-           the page scrolls — and #log is capped against the viewport so it still scrolls INTERNALLY (its
-           scroll-to-bottom in app.js depends on that) rather than growing forever. */
+        /* Too narrow for the two panels side by side: stack them. Still TWO columns though, so the right one goes on
+           matching the Connect panel's height — Members keeps its natural height and the Log absorbs the rest, which
+           is what leaves the two columns ending level. */
         @media (max-width: 900px) {
-            main {
-                grid-template-rows: auto;
-                min-height: auto;
-            }
-
-            /* Stacked, NOTHING should stretch to fill the viewport: the page's length is the scroll surface, so every
-               panel sizes to its content and the page is exactly as long as it needs to be. Stretching instead meant
-               a nearly-empty log — or an empty Members panel — was padded out with blank space that pushed the rest
-               below the fold. `align-items: start` stops the grid stretching the column, and the two `flex: 0 0 auto`
-               stop the column stretching the panels. */
-            main {
-                align-items: start;
-            }
-
             .row.panels {
                 flex-direction: column;
+            }
+
+            #membersPanel {
                 flex: 0 0 auto;
             }
 
             #logPanel {
-                flex: 0 0 auto;
-            }
-
-            /* The one bound kept: a long log scrolls inside itself instead of running off the page (its
-               scroll-to-bottom in app.js needs a scrollable box). */
-            #log {
-                max-height: 40vh;
+                flex: 1 1 0;
             }
         }
 
         /* One column on a phone: the 340px sidebar plus a panel cannot both fit, and the page was being scaled down
-           to compensate. */
+           to compensate. With no second column there is nothing to be level with, so nothing stretches — every panel
+           sizes to its content and the page's length is the scroll surface. The log then needs its own bound, or it
+           would run off the page: 40vh, which still leaves it a box that scrolls INTERNALLY (app.js's
+           scroll-to-bottom depends on there being one). */
         @media (max-width: 640px) {
             main {
                 grid-template-columns: 1fr;
@@ -196,9 +197,19 @@
                 gap: 12px;
             }
 
-            #setup {
-                max-height: none;
-                overflow-y: visible;
+            .row.panels {
+                flex: 0 0 auto;
+            }
+
+            #logPanel {
+                flex: 0 0 auto;
+            }
+
+            /* Two ids, because the `#log` rule this overrides sits further DOWN the stylesheet (with the rest of the
+               log's styling) and would otherwise win on source order. */
+            #logPanel > #log {
+                flex: 0 0 auto;   /* content-sized here, not a share of a bounded column */
+                max-height: 40vh;
             }
         }
 
@@ -498,7 +509,11 @@
             background: #0e151c;
             border-radius: 8px;
             padding: 12px;
-            flex: 1; /* fill the Log panel so its bottom aligns with the Connect panel */
+            /* Fill the Log panel, so the box's bottom lands level with the Connect panel's. The basis is an absolute
+               0 rather than `flex: 1`'s 0%: a percentage basis resolves to the item's content while the parent's
+               height is still unknown, which is exactly how the log's text used to inflate the grid row and lengthen
+               the page instead of scrolling in place. With `0` the log contributes only the min-height below. */
+            flex: 1 1 0;
             min-height: 140px;
             overflow-y: auto;
             white-space: pre-wrap;
