@@ -289,6 +289,15 @@
             margin: 8px 0 0;
         }
 
+        /* Empty states, via :empty rather than JS — there is no flag to set, nothing to keep in sync, and they
+           disappear the instant the first row or line arrives. Both are reachable while CONNECTED too (a refused
+           join leaves you in no channel), so neither mentions connecting. */
+        ul#members:empty::before {
+            content: 'Not in a channel yet.';
+            font-size: 13px;
+            color: var(--muted);
+        }
+
         ul#members li {
             padding: 6px 8px;
             border-radius: 6px;
@@ -476,6 +485,11 @@
             padding: 3px 9px;
             font-size: 12px;
             margin-left: auto;
+        }
+
+        #log:empty::before {
+            content: 'Nothing yet.';
+            color: var(--muted);
         }
 
         #log {
