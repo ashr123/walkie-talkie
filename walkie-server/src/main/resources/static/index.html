@@ -127,6 +127,32 @@
             min-width: 0;
         }
 
+        /* Sizing lives here rather than inline so the stacked media query below can override it — an inline `flex`
+           would win over any rule. The log gets the larger share because it is the thing you read. */
+        /* The right-hand column: Talk above, then the Members/Log row filling what is left, so #log can be bounded. */
+        #live {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            min-height: 0;
+        }
+
+        .row.panels {
+            gap: 20px;
+            flex: 1;
+            min-height: 0;
+        }
+
+        #membersPanel {
+            flex: 1;
+        }
+
+        #logPanel {
+            flex: 2;
+            display: flex;
+            flex-direction: column;
+        }
+
         /* Too narrow for the two panels side by side: stack them. They then no longer share one bounded height, so
            the page scrolls — and #log is capped against the viewport so it still scrolls INTERNALLY (its
            scroll-to-bottom in app.js depends on that) rather than growing forever. */
@@ -136,12 +162,28 @@
                 min-height: auto;
             }
 
-            .row.panels {
-                flex-direction: column;
+            /* Stacked, NOTHING should stretch to fill the viewport: the page's length is the scroll surface, so every
+               panel sizes to its content and the page is exactly as long as it needs to be. Stretching instead meant
+               a nearly-empty log — or an empty Members panel — was padded out with blank space that pushed the rest
+               below the fold. `align-items: start` stops the grid stretching the column, and the two `flex: 0 0 auto`
+               stop the column stretching the panels. */
+            main {
+                align-items: start;
             }
 
+            .row.panels {
+                flex-direction: column;
+                flex: 0 0 auto;
+            }
+
+            #logPanel {
+                flex: 0 0 auto;
+            }
+
+            /* The one bound kept: a long log scrolls inside itself instead of running off the page (its
+               scroll-to-bottom in app.js needs a scrollable box). */
             #log {
-                max-height: 50vh;
+                max-height: 40vh;
             }
         }
 
@@ -525,7 +567,7 @@
 		<div class="status"><span class="dot" id="statusDot"></span><span id="statusText">Disconnected</span></div>
 	</section>
 
-	<section style="display:flex; flex-direction:column; gap:20px; min-height:0;">
+	<section id="live">
 		<div class="panel">
 			<h2>Talk</h2>
 			<button disabled id="talkBtn">Connect first</button>
@@ -534,8 +576,8 @@
 			     decision, whose control is disabled and has no gesture to describe. -->
 			<div class="hint" hidden id="talkHint"></div>
 		</div>
-		<div class="row panels" style="gap:20px; flex:1; min-height:0;">
-			<div class="panel" style="flex:1;">
+		<div class="row panels">
+			<div class="panel" id="membersPanel">
 				<div class="members-header">
 					<h2>Members</h2>
 					<!-- Channel STATE, shown to everyone (each badge hidden when off). The owner's toggles for the same
@@ -569,7 +611,7 @@
 				</div>
 				<ul id="members"></ul>
 			</div>
-			<div class="panel" style="flex:2; display:flex; flex-direction:column;">
+			<div class="panel" id="logPanel">
 				<h2>Log</h2>
 				<div id="log"></div>
 			</div>
