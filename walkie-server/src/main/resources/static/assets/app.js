@@ -19,6 +19,7 @@ import {
 	wrapPassphrase
 } from './e2ee.js';
 import {CHANNEL_FLAGS, flagDisplay} from './channel-flags.js';
+import {micErrorMessage, NO_CAPTURE_API_MESSAGE} from './mic-errors.js';
 import {
 	FLOOR_IN_LINE,
 	FLOOR_LIVE,
@@ -1626,7 +1627,20 @@ async function setupAudio() {
 	// Acquire the mic first so we can negotiate the real channel count before building the nodes.
 	// Stereo only when the device actually reports 2 channels AND WebCodecs Opus is available — the raw
 	// PCM fallback stays mono.
-	state.micStream = await navigator.mediaDevices.getUserMedia({audio: captureConstraints()});
+	//
+	// Both failure shapes are translated into something actionable (see mic-errors.js), because the raw ones are not:
+	// an absent `mediaDevices` throws a TypeError about a property of undefined rather than mentioning the secure
+	// context it is really about, and the rejection people actually hit says only "The request is not allowed by the
+	// user agent or the platform in the current context". The message is rethrown for connect()'s catch to log, so the
+	// mic keeps ONE reporting path instead of logging here and again there.
+	if (!navigator.mediaDevices?.getUserMedia) {
+		throw new Error(NO_CAPTURE_API_MESSAGE);
+	}
+	try {
+		state.micStream = await navigator.mediaDevices.getUserMedia({audio: captureConstraints()});
+	} catch (err) {
+		throw new Error(micErrorMessage(err.name, err.message));
+	}
 	const micSettings = state.micStream.getAudioTracks()[0].getSettings();
 	state.channels = OPUS_SUPPORTED && micSettings.channelCount === 2 ? 2 : 1;
 	log(`Audio ready — context ${ctx.state} @ ${ctx.sampleRate} Hz, ${state.channels === 2 ? 'stereo' : 'mono'}, transport ${state.transport}`);
