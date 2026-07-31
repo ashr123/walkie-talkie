@@ -43,13 +43,15 @@ public interface ClientSession {
 
 	boolean supportsAudioRelay();
 
-	/// Whether this session is still live (its socket open / not torn down). Unlike [#channelName] (which is also
-	/// null before the first join), this is a lifecycle-wide signal, so a control-path caller can drop a late frame
-	/// from an already-closed session before it resurrects per-session state (e.g. a [SessionRateLimiter] bucket
-	/// after [io.github.ashr123.walkietalkie.server.transport.ConnectionService#onClose] forgot it). In-memory
-	/// fakes send synchronously and are always considered open.
-	default boolean isOpen() {
-		return true;
+	/// Whether this session has been torn down (its socket gone). Unlike [#channelName] (which is also null before
+	/// the first join), this is a lifecycle-wide signal, so a control-path caller can drop a late frame from an
+	/// already-closed session before it resurrects per-session state (e.g. a [SessionRateLimiter] bucket after
+	/// [io.github.ashr123.walkietalkie.server.transport.ConnectionService#onClose] forgot it). Phrased in the CLOSED
+	/// sense because that is the sense every caller and both implementations hold — the guards read it directly and
+	/// the implementations return their `closed` flag, so nobody negates anything. In-memory fakes send
+	/// synchronously and are never torn down, so the default reports false.
+	default boolean isClosed() {
+		return false;
 	}
 
 	/// Enqueues an already-serialized control message (its JSON wire form) as a text frame. All control goes out

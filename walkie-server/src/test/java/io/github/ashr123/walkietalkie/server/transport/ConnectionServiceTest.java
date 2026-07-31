@@ -2768,7 +2768,7 @@ class ConnectionServiceTest {
 	/// A late control frame from a session whose socket has already gone is dropped BEFORE anything acts on it.
 	/// The motivating case is the per-session rate-limiter bucket: `onClose` forgets it, and a straggler frame
 	/// reaching `tryAcquire` would re-create it — a permanent one-entry leak, because nothing forgets it a second
-	/// time. `afterConnectionClosed` closes the session before `onClose` runs, so the guard sees `isOpen() == false`
+	/// time. `afterConnectionClosed` closes the session before `onClose` runs, so the guard sees `isClosed() == true`
 	/// for the whole teardown. Only expressible now that [FakeClientSession] can actually be closed.
 	@Test
 	void aControlMessageFromAClosedSessionIsDropped() {

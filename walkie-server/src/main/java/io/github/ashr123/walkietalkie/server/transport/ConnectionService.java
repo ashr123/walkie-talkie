@@ -105,7 +105,7 @@ public class ConnectionService {
 		// computeIfAbsent would otherwise re-create a bucket for a session onClose already forgot, leaking one map
 		// entry that is never forgotten again (the audio path guards the same resurrection at its own tryAcquire,
 		// keyed off channelName — which can't be used here, since Join arrives before this session has a channel).
-		if (!session.isOpen()) {
+		if (session.isClosed()) {
 			return;
 		}
 		// Per-session control-plane flood guard: drop messages from a sender over its rate ceiling BEFORE doing

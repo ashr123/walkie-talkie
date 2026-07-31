@@ -97,7 +97,7 @@ public final class WebSocketClientSession implements ClientSession {
 	/// writable (e.g. a server-initiated [#terminateForBacklog] close), whereas on a peer-initiated disconnect the
 	/// socket is already gone and those sends fail fast and are swallowed.
 	private void drainLoop() {
-		while (!closed.get()) {
+		while (!isClosed()) {
 			work.acquireUninterruptibly();   // park until a frame is enqueued, or close() releases a wake permit
 			drainOne();
 		}
@@ -183,17 +183,17 @@ public final class WebSocketClientSession implements ClientSession {
 	}
 
 	@Override
-	public boolean isOpen() {
+	public boolean isClosed() {
 		// `closed` is flipped by close()/terminateForBacklog() at teardown; once set, a late inbound frame must not
 		// resurrect per-session server state. afterConnectionClosed calls close() BEFORE ConnectionService.onClose
-		// (which forgets the rate-limiter buckets), so this reads false throughout that forget() — the control-path
+		// (which forgets the rate-limiter buckets), so this reads true throughout that forget() — the control-path
 		// guard in onMessage is authoritative, not merely reliant on the container serializing inbound vs. close.
-		return !closed.get();
+		return closed.get();
 	}
 
 	@Override
 	public void sendEncoded(String encoded) {
-		if (closed.get()) {
+		if (isClosed()) {
 			return;
 		}
 		// Enqueue the encoded JSON directly — no per-message capturing Runnable; the drainer wraps it in a
@@ -210,7 +210,7 @@ public final class WebSocketClientSession implements ClientSession {
 
 	@Override
 	public void sendAudio(byte[] audio) {
-		if (closed.get()) {
+		if (isClosed()) {
 			return;
 		}
 		// Enqueue the payload directly — no per-frame capturing Runnable on the fan-out hot path; the drainer wraps

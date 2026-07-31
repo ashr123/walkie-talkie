@@ -87,7 +87,7 @@ class BaseWalkieHandlerTest {
 	}
 
 	/// The session is closed BEFORE [ConnectionService#onClose] runs, not after. That ordering is what makes the
-	/// `isOpen()` guard on the inbound paths authoritative: `onClose` forgets the per-session rate-limiter buckets,
+	/// `isClosed()` guard on the inbound paths authoritative: `onClose` forgets the per-session rate-limiter buckets,
 	/// so if `closed` were only flipped afterwards (the old `try { onClose } finally { close }` shape) a straggler
 	/// inbound frame could slip in during the forget and re-create a bucket nothing ever forgets again. Safe to do
 	/// first because `onClose` only broadcasts to the OTHER members, never to the session that is leaving.
