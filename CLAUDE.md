@@ -37,19 +37,27 @@ JAVA_OPTS= ./gradlew :walkie-server:test --tests '*ChannelTest.fullDuplexAlwaysG
 
 ## Build layout
 
-Three Gradle modules (Kotlin DSL); shared build logic lives in a **`buildSrc` precompiled script
-plugin** `walkietalkie.java-conventions` (sets `--release 25`, `-parameters`, JUnit Platform). Each
-module applies it via `plugins { id("walkietalkie.java-conventions") }`. Do **not** reintroduce
-`subprojects {}`/`allprojects {}`/`apply(plugin=...)` — that's the legacy pattern this replaced.
+Three Gradle modules (Kotlin DSL build scripts — Gradle has no Java DSL, so `settings.gradle.kts` and the
+per-module `build.gradle.kts` must stay Kotlin). Shared build logic, however, is **plain Java**: it lives in
+`buildSrc/src/main/java/JavaConventionsPlugin.java`, a binary `Plugin<Project>` published under the id
+`walkietalkie.java-conventions` by the `gradlePlugin` block in `buildSrc/build.gradle.kts` (sets `--release 25`,
+`-parameters`, JUnit Platform, jacoco). Each module applies it via
+`plugins { id("walkietalkie.java-conventions") }`. Do **not** reintroduce
+`subprojects {}`/`allprojects {}`/`apply(plugin=...)` — that's the legacy pattern this replaced — and do not turn
+it back into a precompiled `*.gradle.kts` script plugin: that is what used to drag the Kotlin compiler into
+`buildSrc`, and with it a JVM-target pin (Kotlin DSL could only target JVM 25 on this JDK 26 host while Gradle's
+Java task defaulted to 26, tripping the inconsistent-target warning).
 
 - `walkie-shared` — wire protocol only, zero Spring deps.
 - `walkie-server` — Spring Boot 4.1 (Spring Framework 7, Jackson 3, Jakarta EE 11); serves the browser
   client from `src/main/resources/static/`.
 - `walkie-client-java` — console client (`javax.sound.sampled` + JDK WebSocket + Concentus Opus).
 
-`check` (so `build`) also runs **`checkJavadocReferences`** — a `JavadocReferenceCheck` task written in **Java**
-(`buildSrc/src/main/java/`, alongside the Kotlin precompiled script plugin — `kotlin-dsl` brings the `java` plugin,
-and `buildSrc/build.gradle.kts` already pins both compilers to Java 25) that
+`check` (so `build`) also runs **`checkJavadocReferences`** — a `JavadocReferenceCheck` task
+(`buildSrc/src/main/java/`, next to the conventions plugin; `java-gradle-plugin` brings the `java` plugin both
+compile with, and `buildSrc/build.gradle.kts` pins that one compiler to Java 25). Both classes are in the **default
+package** on purpose: a class in a named package cannot import one from the default package, so giving the plugin a
+package would cut it off from this task type. It
 fails on a `///` Javadoc reference naming a type or member that doesn't exist (`[SomeType]`, `[Type#member]`,
 `[#member]`). The compiler treats those links as plain text, so a rename — or documenting something before writing
 it — otherwise leaves a silently broken reference. Each module scans its own sources while the type index spans the
