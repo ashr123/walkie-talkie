@@ -27,6 +27,7 @@ import {
 	grantOpensMic,
 	holdInProgress,
 	shouldAutoOpenMic,
+	spaceDrivesFloor,
 	talkDecision
 } from './talk.js';
 
@@ -2653,11 +2654,14 @@ window.addEventListener('DOMContentLoaded', () => {
 	// keyboard rides the same decision as the pointer instead of a rendered value that can lag the state behind it —
 	// and the 'duplex' exclusion is expressed once, in talk.js, rather than re-derived from state.mode here. In tap
 	// states pressTalk no-ops on key-down and releaseTalk toggles the queue on key-up, so Space "raises a hand" /
-	// leaves the line too.	const spaceDrivesTalk = () => {
-		const {mode} = talkNow();
-		return (mode === 'hold' || mode === 'tap') && document.activeElement.tagName !== 'INPUT';
+	// leaves the line too.
+	// What has keyboard focus, described for spaceDrivesFloor — null when nothing does. `isTalkButton` is an identity
+	// comparison rather than a tag or id match, so it cannot drift if the markup changes around it.
+	const focusedControl = () => {
+		const active = document.activeElement;
+		return active && {tagName: active.tagName, isTalkButton: active === talk};
 	};
-
+	const spaceDrivesTalk = () => spaceDrivesFloor(talkNow().mode, focusedControl());
 	window.addEventListener('keydown', e => {
 		if (e.code === 'Space' && !e.repeat && spaceDrivesTalk()) {
 			e.preventDefault();
@@ -2670,11 +2674,17 @@ window.addEventListener('DOMContentLoaded', () => {
 			return;
 		}
 		// EVERY Space up-edge ends the hold, including one the gate below then ignores (the control was disabled
-		// mid-hold by an owner mute, or focus moved into a field). Otherwise talkHeld stays true with nothing held,
-		// and a later floorReserved reads it as "already holding when the turn landed" and claims the floor unprompted.
+		// mid-hold by an owner mute, focus moved into a field, or focus DRIFTED onto another control — hold Space,
+		// press Tab, let go). Two things follow, and only the first used to be handled: the flag must clear, or a later
+		// floorReserved reads it as "already holding when the turn landed" and claims the floor unprompted; and a hold
+		// that was in progress must still RELEASE THE FLOOR, even though Space now belongs to whatever took focus —
+		// otherwise the floor taken on the down-edge stays held with the mic open. Read the flag before clearing it.
+		const drifted = holdInProgress(talkNow().mode, state.talkHeld);
 		state.talkHeld = false;
 		if (spaceDrivesTalk()) {
 			e.preventDefault();
+			releaseTalk();
+		} else if (drifted) {
 			releaseTalk();
 		}
 	});

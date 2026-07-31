@@ -118,6 +118,36 @@ export function holdInProgress(mode, talkHeld) {
 	return talkHeld === true && mode === 'hold';
 }
 
+/**
+ * Whether the Space key should drive the talk floor, given the control's interaction mode and what has keyboard focus
+ * — `focus` being `{tagName, isTalkButton}`, or null/undefined when nothing is focused.
+ *
+ * Space is not ours by right. It is the activation key of a focused `<button>` and the open key of a focused
+ * `<select>`, and it pages a scrollable document. Claiming it globally (the old gate excluded only `INPUT`) meant a
+ * keyboard user could not open the Channel mode dropdown at all: Space took the floor and `preventDefault()` swallowed
+ * the dropdown, so the control simply looked broken. On a `<button>` the two actions raced instead, and which one won
+ * depended on whether the keydown was prevented.
+ *
+ * So this is an ALLOW-list, not a deny-list: Space drives the floor only where no control owns it — nothing focused,
+ * focus parked on the document (`BODY`/`HTML`, which is where it sits after a click on any non-focusable part of the
+ * page), or focus on the Talk button itself. That last case keeps the common flow working: click Talk once with the
+ * mouse and Space keeps talking afterwards, which is safe because that button carries no click handler — it drives
+ * the floor from mousedown/mouseup, so a synthesized activation does nothing.
+ *
+ * An allow-list rather than enumerating INPUT/TEXTAREA/SELECT/BUTTON/`[contenteditable]` because the list is the part
+ * that rots: a `<textarea>` or a rich-text field added later is respected here without anyone remembering to extend a
+ * deny-list, and the failure direction if something unexpected has focus is "Space does what that element says",
+ * which is the browser's own answer.
+ */
+export function spaceDrivesFloor(mode, focus) {
+	if (mode !== 'hold' && mode !== 'tap') {
+		return false;   // full-duplex toggles with a click, and a disabled control has no gesture to drive
+	}
+	// Truthiness, not `=== true` as on talkHeld: this field is built inline from `active === talkButton`, so it is a
+	// boolean by construction — there is no loosely-typed source for the strictness to defend against.
+	return focus == null || focus.tagName === 'BODY' || focus.tagName === 'HTML' || focus.isTalkButton;
+}
+
 /** A decision with no floor message behind it: the disabled states and the full-duplex mic toggle. */
 function floorless(mode, label) {
 	return {mode, label, myTurn: false, action: null};

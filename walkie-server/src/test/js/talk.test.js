@@ -21,6 +21,7 @@ import {
 	floorIsFree,
 	floorStateFor,
 	holdInProgress,
+	spaceDrivesFloor,
 	grantOpensMic,
 	shouldAutoOpenMic,
 	talkDecision
@@ -589,6 +590,64 @@ test('holdInProgress: an indefinite held flag is not a hold in progress', () => 
 	[undefined, null, 'false', 1, 'yes'].forEach(held => {
 		assert.equal(holdInProgress('hold', held), false, `talkHeld = ${JSON.stringify(held)}`);
 	});
+});
+
+// --- whose key is Space? --------------------------------------------------------------------------
+// Space is the activation key of a focused button and the open key of a focused select. The old gate claimed it
+// globally except over INPUT, which left a keyboard user unable to open the Channel mode dropdown at all.
+
+const BODY = {tagName: 'BODY', isTalkButton: false};
+const TALK_BUTTON = {tagName: 'BUTTON', isTalkButton: true};
+
+test('spaceDrivesFloor: Space drives the floor when no control owns it', () => {
+	// Focus parked on the document — where it sits after a click on any non-focusable part of the page — and the case
+	// where nothing is focused at all (activeElement can be null).
+	assert.equal(spaceDrivesFloor('hold', BODY), true);
+	assert.equal(spaceDrivesFloor('hold', {tagName: 'HTML', isTalkButton: false}), true);
+	assert.equal(spaceDrivesFloor('hold', null), true);
+	assert.equal(spaceDrivesFloor('hold', undefined), true);
+});
+
+test('spaceDrivesFloor: the Talk button keeps Space after you click it', () => {
+	// The common flow: click Talk once with the mouse, then keep talking with Space. Safe precisely because that
+	// button has no click handler — it drives the floor from mousedown/mouseup — so the activation Space would
+	// otherwise trigger does nothing. Identified by identity, not by tag: a BUTTON that is NOT it is excluded below.
+	assert.equal(spaceDrivesFloor('hold', TALK_BUTTON), true);
+	assert.equal(spaceDrivesFloor('tap', TALK_BUTTON), true);
+});
+
+test('spaceDrivesFloor: a focused select keeps Space, so its dropdown still opens', () => {
+	// THE accessibility bug. Transport, Channel mode and the owner's transfer-ownership dropdown: Space is how you
+	// open them, and taking the floor plus preventDefault() left them looking simply broken to a keyboard user.
+	assert.equal(spaceDrivesFloor('hold', {tagName: 'SELECT', isTalkButton: false}), false);
+	assert.equal(spaceDrivesFloor('tap', {tagName: 'SELECT', isTalkButton: false}), false);
+});
+
+test('spaceDrivesFloor: any other focused button keeps Space, so it activates instead of talking', () => {
+	// Rename, Apply, Mute everyone now, Admit/Deny, the Lock toggle: Space is a button's activation key, and the two
+	// actions used to race with the winner decided by whether the keydown was prevented.
+	assert.equal(spaceDrivesFloor('hold', {tagName: 'BUTTON', isTalkButton: false}), false);
+});
+
+test('spaceDrivesFloor: text entry surfaces keep Space — including ones nobody remembered to list', () => {
+	// INPUT was the only exclusion the old gate had. TEXTAREA and a contenteditable host are covered here for free
+	// because this is an allow-list: the page has no textarea today, and adding one must not silently take Space.
+	[
+		{tagName: 'INPUT', isTalkButton: false},
+		{tagName: 'TEXTAREA', isTalkButton: false},
+		{tagName: 'DIV', isTalkButton: false},
+		{tagName: 'A', isTalkButton: false}
+	].forEach(focus => {
+		assert.equal(spaceDrivesFloor('hold', focus), false, focus.tagName);
+	});
+});
+
+test('spaceDrivesFloor: modes with no floor gesture ignore Space wherever focus is', () => {
+	// Full-duplex toggles its mic with a click and a disabled control has no gesture, so Space must fall through to
+	// whatever the page would do with it — scrolling, typically — rather than being swallowed.
+	assert.equal(spaceDrivesFloor('duplex', BODY), false);
+	assert.equal(spaceDrivesFloor('disabled', BODY), false);
+	assert.equal(spaceDrivesFloor('duplex', TALK_BUTTON), false);
 });
 
 test('the FLOOR_* values are the Java client\'s FloorState enum names', () => {
