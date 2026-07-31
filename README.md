@@ -400,10 +400,10 @@ otherwise mono — and interoperates with relay-mode browser clients.
   excess decode work. It counts frames without inspecting them, so it works on encrypted channels too — the
   per-frame **size** cap is `walkie.max-audio-frame-bytes` (default 8 KiB).
 - **Push-to-talk floor anti-hogging.** A half-duplex channel's talk floor can't be held forever: any holder is
-  force-released after `walkie.floor-max-hold-seconds` (default 300) of continuous holding — a periodic
+  force-released after `walkie.floor-max-hold` (default 300) of continuous holding — a periodic
   background sweep enforces this hard cap (a relay holder also hits it immediately on its next frame). On top of
   that, **idle auto-release** hands the floor to a waiting requester once the current holder has sent no audio
-  for `walkie.floor-idle-release-seconds` (default 5). Set either to `0` to disable. On a server-initiated
+  for `walkie.floor-idle-release` (default 5). Set either to `0` to disable. On a server-initiated
   release the (ex-)holder is told so its client stops transmitting. Idle auto-release applies to **relay
   holders only** — it needs a per-frame activity signal, which peer-to-peer WebRTC media doesn't give the
   server; max-hold is a pure time cap and bounds every holder, including WebRTC.
@@ -411,7 +411,7 @@ otherwise mono — and interoperates with relay-mode browser clients.
   **off** — a busy floor is simply not granted, as before). With it on, asking for a busy floor puts you **in
   line** (FIFO) and everyone sees their place; when the floor frees it passes to the head of the line. It is
   **grant-to-claim, never a hot mic**: when your turn arrives the floor is *reserved* for you for
-  `walkie.floor-reservation-seconds` (default 10) and you must take the normal talk action to go live — miss the
+  `walkie.floor-reservation` (default 10) and you must take the normal talk action to go live — miss the
   window and you're dropped and the floor moves to the next in line. The owner toggles it with `SetFloorQueue`;
   the on/off default a new channel adopts is `walkie.floor-queue-default` (default `false`). The reservation
   window is a positive claim window, so `0`/blank means "use the default", not "disabled" (unlike the two timers

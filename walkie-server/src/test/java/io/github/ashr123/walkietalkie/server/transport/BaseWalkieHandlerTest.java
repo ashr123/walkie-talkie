@@ -31,7 +31,7 @@ class BaseWalkieHandlerTest {
 
 	private final ConnectionService connectionService = mock(ConnectionService.class);
 	private final AudioRelayHandler handler = new AudioRelayHandler(connectionService, mock(MessageCodec.class),
-			new WalkieProperties(null, 0, 0, 0, 0, -1, -1, 0, false, 0, null, false, Duration.ZERO));
+			new WalkieProperties(null, 0, 0, 0, 0, Duration.ofSeconds(-1), Duration.ofSeconds(-1), Duration.ZERO, false, 0, null, false, Duration.ZERO));
 
 	@Test
 	void anUnauthenticatedHandshakeIsClosedWithAPolicyViolationAndNotRegistered() throws Exception {

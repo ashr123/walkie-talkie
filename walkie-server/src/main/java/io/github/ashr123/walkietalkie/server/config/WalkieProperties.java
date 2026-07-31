@@ -23,18 +23,17 @@ import java.time.temporal.ChronoUnit;
 ///                               Control traffic is sparse — a few floor presses, the odd join/rename/mode, and
 ///                               a WebRTC ICE-candidate burst at setup — so the default (200) is generous for an
 ///                               honest client while bounding a control flood. Also always on: 0/absent → default
-/// @param floorIdleReleaseSeconds push-to-talk idle auto-release (relay holders only): reclaim the floor for a
-///                               new requester when the current holder has sent no audio for this many seconds
-///                               (0 disables). Measured from frame timing only, so it works on encrypted channels
-/// @param floorMaxHoldSeconds    push-to-talk max-hold cap: force-release any holder once it has held the floor
-///                               this many seconds (0 disables). Enforced by a periodic background sweep, so it
-///                               is a true time cap that bounds even a holder gone silent without releasing —
-///                               and, unlike idle-release, applies to WebRTC holders too
-/// @param floorReservationSeconds when the owner-toggleable floor queue is on, how long the head is given to
-///                               CLAIM the floor once it is offered (its turn) before the server drops it and
-///                               offers the next member. A positive window — grant-to-claim needs one — so
-///                               0/absent falls back to the default (10), it is not "disabled". See
-///                               docs/CLIENT_PROTOCOL.md §3b
+/// @param floorIdleRelease      push-to-talk idle auto-release (relay holders only): reclaim the floor for a new
+///                               requester when the current holder has sent no audio for this long (`0s` disables).
+///                               Measured from frame timing only, so it works on encrypted channels
+/// @param floorMaxHold          push-to-talk max-hold cap: force-release any holder once it has held the floor this
+///                               long (`0s` disables). Enforced by a periodic background sweep, so it is a true time
+///                               cap that bounds even a holder gone silent without releasing — and, unlike
+///                               idle-release, applies to WebRTC holders too
+/// @param floorReservation      when the owner-toggleable floor queue is on, how long the head is given to CLAIM the
+///                               floor once it is offered (its turn) before the server drops it and offers the next
+///                               member. A positive window — grant-to-claim needs one — so `0s`/absent falls back to
+///                               the default (10 s), it is not "disabled". See docs/CLIENT_PROTOCOL.md §3b
 /// @param floorQueueDefault      the floor-queue on/off state a NEWLY created channel adopts (its owner can then
 ///                               toggle it per channel via `setFloorQueue`); default false, preserving the plain
 ///                               busy-floor-refused behaviour
@@ -74,9 +73,9 @@ public record WalkieProperties(
 		int maxTextMessageBytes,
 		long maxAudioFramesPerSecond,
 		long maxControlMessagesPerSecond,
-		long floorIdleReleaseSeconds,
-		long floorMaxHoldSeconds,
-		long floorReservationSeconds,
+		@DurationUnit(ChronoUnit.SECONDS) Duration floorIdleRelease,
+		@DurationUnit(ChronoUnit.SECONDS) Duration floorMaxHold,
+		@DurationUnit(ChronoUnit.SECONDS) Duration floorReservation,
 		boolean floorQueueDefault,
 		int maxJoinRequests,
 		String authSigningKey,
@@ -93,6 +92,18 @@ public record WalkieProperties(
 	/// and the next to still arrive in time.
 	private static final Duration DEFAULT_KEEPALIVE_PING = Duration.ofSeconds(30);
 
+	/// Long enough that a talker pausing for breath keeps the floor, short enough that someone who wandered off
+	/// mid-hold does not hold a queue up.
+	private static final Duration DEFAULT_FLOOR_IDLE_RELEASE = Duration.ofSeconds(5);
+
+	/// A backstop for a holder that never releases at all, so it is generous: a genuine monologue should not be cut
+	/// off, while an abandoned hold cannot own the floor indefinitely. `ofMinutes` because that is the unit it was
+	/// chosen in — the old `long` spelled it 300 with a comment saying "5 minutes".
+	private static final Duration DEFAULT_FLOOR_MAX_HOLD = Duration.ofMinutes(5);
+
+	/// How long "your turn" waits for a claim: long enough to notice a beep and press, short enough that an absent
+	/// member does not stall the queue.
+	private static final Duration DEFAULT_FLOOR_RESERVATION = Duration.ofSeconds(10);
 
 	public WalkieProperties {
 		if (allowedOrigins == null || allowedOrigins.length == 0) {
@@ -120,16 +131,17 @@ public record WalkieProperties(
 		} else if (maxControlMessagesPerSecond > MAX_RATE_PER_SECOND) {
 			maxControlMessagesPerSecond = MAX_RATE_PER_SECOND;
 		}
-		// Floor timers honor an explicit 0 (disabled); only a nonsensical negative falls back to the default.
-		if (floorIdleReleaseSeconds < 0) {
-			floorIdleReleaseSeconds = 5;
+		// The floor timers honour an explicit 0 (disabled); absent falls back, and for a Duration absent is NULL —
+		// unlike a `long`, which arrived as 0 and was indistinguishable from a deliberate "off".
+		if (floorIdleRelease == null || floorIdleRelease.isNegative()) {
+			floorIdleRelease = DEFAULT_FLOOR_IDLE_RELEASE;
 		}
-		if (floorMaxHoldSeconds < 0) {
-			floorMaxHoldSeconds = 300;   // 5 minutes
+		if (floorMaxHold == null || floorMaxHold.isNegative()) {
+			floorMaxHold = DEFAULT_FLOOR_MAX_HOLD;
 		}
-		if (floorReservationSeconds <= 0) {
-			// Grant-to-claim needs a positive window, so 0/blank means "use the default" (never "disabled").
-			floorReservationSeconds = 10;
+		if (floorReservation == null || floorReservation.isNegative() || floorReservation.isZero()) {
+			// Grant-to-claim needs a positive window, so 0/absent means "use the default" (never "disabled").
+			floorReservation = DEFAULT_FLOOR_RESERVATION;
 		}
 		if (keepalivePingInterval == null || keepalivePingInterval.isNegative()) {
 			// Absent binds as NULL for a Duration (unlike a `long`, which would arrive as 0), and 0 is meaningful

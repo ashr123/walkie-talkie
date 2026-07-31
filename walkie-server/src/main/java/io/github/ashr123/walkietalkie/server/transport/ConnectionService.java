@@ -83,9 +83,10 @@ public class ConnectionService {
 		this.audioRateLimiter = new SessionRateLimiter(properties.maxAudioFramesPerSecond(), clock);
 		this.controlRateLimiter = new SessionRateLimiter(properties.maxControlMessagesPerSecond(), clock);
 		this.clock = clock;
-		this.floorIdleRelease = Duration.ofSeconds(properties.floorIdleReleaseSeconds());
-		this.floorMaxHold = Duration.ofSeconds(properties.floorMaxHoldSeconds());
-		this.floorReservation = Duration.ofSeconds(properties.floorReservationSeconds());
+		// No conversion: the properties are Durations, so the unit lives in the configuration value.
+		this.floorIdleRelease = properties.floorIdleRelease();
+		this.floorMaxHold = properties.floorMaxHold();
+		this.floorReservation = properties.floorReservation();
 		this.channelDefaults = new Channel.Defaults(properties.floorQueueDefault(), properties.maxJoinRequests());
 	}
 

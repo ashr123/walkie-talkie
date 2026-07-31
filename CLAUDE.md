@@ -97,14 +97,20 @@ then `notifyReserved` triggers — one `reserveAndBroadcast` helper for the plai
 leave/mute sites whose snapshot rides a batched fan-out). `FloorGranted` is deliberately sent **before** its
 snapshot, because it is what opens the mic — snapshot-first there would render "LIVE" over a closed mic. Pinned by
 `ConnectionServiceTest`'s two index-based ordering tests plus `FloorLifecycleIntegrationTest`. **Floor anti-hogging** (PTT modes, in `ConnectionService`): a holder gone silent past
-`walkie.floor-idle-release-seconds` (default 5) is preempted when another member requests the floor (idle
+`walkie.floor-idle-release` (default 5) is preempted when another member requests the floor (idle
 auto-release — `Channel.preemptFloorIfIdle`, relay holders only, keyed off frame *timing* not content), and any
-holder is force-released after `walkie.floor-max-hold-seconds` (default 300) of continuous holding (max-hold —
+holder is force-released after `walkie.floor-max-hold` (default 300) of continuous holding (max-hold —
 a scheduled sweep `releaseExpiredFloors` via `Channel.releaseIfExpired`, plus an immediate check in `onAudio` on
 a relay holder's next frame). Max-hold is a pure time cap and bounds **any** holder incl. WebRTC; idle
 auto-release is relay-only. Both `0`-disable; on a server-initiated release the ex-holder learns it is no longer
 the holder from the re-broadcast `FloorStatus` and stops transmitting. Floor timing uses a `java.time.Clock` +
-`Instant` (injectable for tests). **The `global` channel is special and server-managed:** it is reachable *only*
+`Instant` (injectable for tests), and the three timers are bound as **`Duration`s** (`walkie.floor-idle-release: 5s`,
+`floor-max-hold: 5m`, `floor-reservation: 10s`) rather than bare second counts, so the unit lives in the configuration
+value and `ConnectionService` needs no conversion. `@DurationUnit(ChronoUnit.SECONDS)` on each record component is what
+makes a UNIT-LESS value (a command-line `--walkie.floor-max-hold=300`, an env var, an operator's older properties file)
+mean seconds — without it Spring's binder reads a bare number as MILLISECONDS, which was measured turning a bare `5` into a
+ping every 5 ms. Absent binds as `null` for a Duration (a `long` arrived as 0, indistinguishable from a deliberate
+"off"), so absent/negative fall back to the default while `0s` is honoured as disabled. **The `global` channel is special and server-managed:** it is reachable *only*
 via `GLOBAL_PTT` (a `MULTI_CHANNEL_PTT`/`FULL_DUPLEX` join naming `global` is rejected with
 `RESERVED_CHANNEL`); it is **always unencrypted** (a `GLOBAL_PTT` join carrying a `keyCheck` is rejected
 with `ENCRYPTION_NOT_ALLOWED`, so anyone can join without knowing a passphrase); and it is created with a
@@ -117,7 +123,7 @@ dropped when empty and recreated server-owned + unencrypted on the next join; cl
 (`SetFloorQueue` → broadcast `FloorQueueChanged`; the state rides in `Joined.floorQueueEnabled`, and a new channel
 adopts `walkie.floor-queue-default` — off == the pre-queue behaviour, where a busy floor is simply not granted).
 With the queue on, `RequestFloor` against a busy floor **enqueues** the member (FIFO, `Channel.enqueueFloor`)
-instead of refusing it; when the floor frees it is **RESERVED** to the head for `walkie.floor-reservation-seconds`
+instead of refusing it; when the floor frees it is **RESERVED** to the head for `walkie.floor-reservation`
 (default 10) — **grant-to-claim, never a hot mic**: the head must claim (a `RequestFloor` → `FloorGranted`) within
 that window or it is dropped and the floor passes to the next in line. The reserved member is **derived**, not
 stored — it is exactly the head of `waiting` whenever `holderId` is null, because the server reserves the head the

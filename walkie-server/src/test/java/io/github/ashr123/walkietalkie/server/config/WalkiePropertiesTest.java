@@ -18,9 +18,9 @@ class WalkiePropertiesTest {
 				-1,
 				0,
 				0,
-				-1,
-				-1,
-				10,
+				Duration.ofSeconds(-1),
+				Duration.ofSeconds(-1),
+				Duration.ofSeconds(10),
 				false, 0,
 				null,
 				false, Duration.ZERO);
@@ -29,8 +29,8 @@ class WalkiePropertiesTest {
 		assertEquals(16 * 1024, p.maxTextMessageBytes(), "a non-positive text size falls back to 16 KiB");
 		assertEquals(100, p.maxAudioFramesPerSecond(), "a non-positive frame rate falls back to 100 fps");
 		assertEquals(200, p.maxControlMessagesPerSecond(), "a non-positive control rate falls back to 200 msg/s");
-		assertEquals(5, p.floorIdleReleaseSeconds(), "a negative idle-release falls back to 5 s");
-		assertEquals(300, p.floorMaxHoldSeconds(), "a negative max-hold falls back to 300 s");
+		assertEquals(Duration.ofSeconds(5), p.floorIdleRelease(), "a negative idle-release falls back to 5 s");
+		assertEquals(Duration.ofMinutes(5), p.floorMaxHold(), "a negative max-hold falls back to 5 minutes");
 		assertNull(p.authSigningKey(), "the signing key is left as-is (null drives the dev random fallback)");
 	}
 
@@ -44,9 +44,9 @@ class WalkiePropertiesTest {
 						1,
 						1,
 						1,
-						1,
-						1,
-						1,
+						Duration.ofSeconds(1),
+						Duration.ofSeconds(1),
+						Duration.ofSeconds(1),
 						false, 0,
 						null,
 						false, Duration.ZERO)
@@ -62,9 +62,9 @@ class WalkiePropertiesTest {
 				16384,
 				200,
 				250,
-				7,
-				42,
-				15,
+				Duration.ofSeconds(7),
+				Duration.ofSeconds(42),
+				Duration.ofSeconds(15),
 				true, 0,
 				"secret",
 				false, Duration.ZERO);
@@ -73,9 +73,9 @@ class WalkiePropertiesTest {
 		assertEquals(16384, p.maxTextMessageBytes());
 		assertEquals(200, p.maxAudioFramesPerSecond());
 		assertEquals(250, p.maxControlMessagesPerSecond());
-		assertEquals(7, p.floorIdleReleaseSeconds());
-		assertEquals(42, p.floorMaxHoldSeconds());
-		assertEquals(15, p.floorReservationSeconds(), "a positive reservation window is kept as-is");
+		assertEquals(Duration.ofSeconds(7), p.floorIdleRelease());
+		assertEquals(Duration.ofSeconds(42), p.floorMaxHold());
+		assertEquals(Duration.ofSeconds(15), p.floorReservation(), "a positive reservation window is kept as-is");
 		// floorQueueDefault passthrough is asserted once, in the dedicated defaults test below (no duplication).
 		assertEquals("secret", p.authSigningKey());
 	}
@@ -88,14 +88,14 @@ class WalkiePropertiesTest {
 				1,
 				1,
 				1,
-				0,
-				0,
-				10,
+				Duration.ZERO,
+				Duration.ZERO,
+				Duration.ofSeconds(10),
 				false, 0,
 				null,
 				false, Duration.ZERO);
-		assertEquals(0, p.floorIdleReleaseSeconds(), "0 disables idle auto-release (not coerced to the default)");
-		assertEquals(0, p.floorMaxHoldSeconds(), "0 disables the max-hold cap (not coerced to the default)");
+		assertEquals(Duration.ZERO, p.floorIdleRelease(), "0 disables idle auto-release (not coerced to the default)");
+		assertEquals(Duration.ZERO, p.floorMaxHold(), "0 disables the max-hold cap (not coerced to the default)");
 	}
 
 	@Test
@@ -103,17 +103,17 @@ class WalkiePropertiesTest {
 		// Grant-to-claim needs a positive window, so — UNLIKE the idle/max-hold timers, where 0 means "off" — a
 		// 0 or negative reservation is coerced to the 10 s default rather than disabling anything. The queue
 		// on/off default is a plain flag with no coercion, so it passes through verbatim.
-		assertEquals(10, new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 0, false, 0, null, false, Duration.ZERO).floorReservationSeconds(),
+		assertEquals(Duration.ofSeconds(10), new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ZERO, false, 0, null, false, Duration.ZERO).floorReservation(),
 				"a zero reservation window falls back to the 10 s default");
-		assertEquals(10, new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, -1, false, 0, null, false, Duration.ZERO).floorReservationSeconds(),
+		assertEquals(Duration.ofSeconds(10), new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(-1), false, 0, null, false, Duration.ZERO).floorReservation(),
 				"a negative reservation window falls back to the 10 s default");
 		assertTrue(new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, true, 0, null, false, Duration.ZERO).floorQueueDefault(),
+				new String[]{"*"}, 1, 1, 1, 1, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(10), true, 0, null, false, Duration.ZERO).floorQueueDefault(),
 				"floorQueueDefault=true passes through");
 		assertFalse(new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, Duration.ZERO).floorQueueDefault(),
+				new String[]{"*"}, 1, 1, 1, 1, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(10), false, 0, null, false, Duration.ZERO).floorQueueDefault(),
 				"floorQueueDefault=false passes through");
 	}
 
@@ -124,16 +124,16 @@ class WalkiePropertiesTest {
 		// The default has to stay under the tightest idle timeout in the deployment story: nginx's 60 s
 		// proxy_read_timeout, and a Cloudflare tunnel's ~100 s.
 		assertEquals(Duration.ofSeconds(30), new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, null).keepalivePingInterval(),
+				new String[]{"*"}, 1, 1, 1, 1, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(10), false, 0, null, false, null).keepalivePingInterval(),
 				"an ABSENT keepalive (null, not 0) falls back to the 30 s default");
 		assertEquals(Duration.ofSeconds(30), new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, Duration.ofSeconds(-1))
+				new String[]{"*"}, 1, 1, 1, 1, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(10), false, 0, null, false, Duration.ofSeconds(-1))
 				.keepalivePingInterval(), "a negative keepalive falls back to the 30 s default");
 		assertEquals(Duration.ZERO, new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, Duration.ZERO)
+				new String[]{"*"}, 1, 1, 1, 1, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(10), false, 0, null, false, Duration.ZERO)
 				.keepalivePingInterval(), "0 disables the keepalive (not coerced to the default)");
 		assertEquals(Duration.ofSeconds(45), new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, Duration.ofSeconds(45))
+				new String[]{"*"}, 1, 1, 1, 1, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(10), false, 0, null, false, Duration.ofSeconds(45))
 				.keepalivePingInterval(), "a positive keepalive is kept as-is");
 	}
 
@@ -147,9 +147,9 @@ class WalkiePropertiesTest {
 				1,
 				2_000_000_000L,
 				2_000_000_000L,
-				5,
-				300,
-				10,
+				Duration.ofSeconds(5),
+				Duration.ofSeconds(300),
+				Duration.ofSeconds(10),
 				false, 0,
 				null,
 				false, Duration.ZERO);

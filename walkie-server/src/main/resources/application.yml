@@ -35,18 +35,22 @@ walkie:
   # Control is sparse (a few floor presses, the odd join/rename/mode, a WebRTC ICE-candidate burst at setup), so
   # this is generous for an honest client while bounding a control flood. Always on — 0/blank uses the default.
   max-control-messages-per-second: 200
-  # Push-to-talk floor anti-hogging (seconds; 0 disables). Both work off frame timing only — never audio
+  # Push-to-talk floor anti-hogging (0s disables). Both work off frame timing only — never audio
   # content — so they apply on encrypted channels too. idle-release: reclaim the floor for a new requester once
   # the holder has sent no audio for this long. max-hold: force-release after this much continuous holding.
-  floor-idle-release-seconds: 5
-  floor-max-hold-seconds: 300
+  # Durations, so the unit is part of the value — 5s / 5m / PT5M all bind, and 0s disables. A bare number would
+  # also work (@DurationUnit(SECONDS) on the record component makes it seconds rather than the binder's default of
+  # MILLISECONDS), but spelling the unit here is what makes the file readable without knowing that annotation
+  # exists, and what keeps the value correct if the annotation is ever removed.
+  floor-idle-release: 5s
+  floor-max-hold: 5m
   # Push-to-talk floor QUEUE ("raise hand", owner-toggleable per channel — see docs/CLIENT_PROTOCOL.md §3b).
-  # floor-reservation-seconds: when the queue is on, how long the head is given to CLAIM the floor once it is
+  # floor-reservation: when the queue is on, how long the head is given to CLAIM the floor once it is
   # offered (its turn) before the server drops it and offers the next member. Grant-to-claim needs a positive
-  # window, so — UNLIKE the timers above — 0/blank falls back to the default (10), it is not "disabled".
+  # window, so — UNLIKE the timers above — 0s/blank falls back to the default (10 s), it is not "disabled".
   # floor-queue-default: the on/off state a NEWLY created channel adopts (its owner can then toggle it); default
   # false preserves the plain busy-floor-refused behaviour.
-  floor-reservation-seconds: 10
+  floor-reservation: 10s
   floor-queue-default: false
   # Owner-approved join requests. A LOCKED channel does not refuse a newcomer outright — it PARKS it here for the
   # owner to admit or deny (the owner sees the waiting list; unlocking admits everyone still waiting). This caps

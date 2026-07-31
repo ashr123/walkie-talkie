@@ -21,10 +21,10 @@ import static org.junit.jupiter.api.Assertions.*;
 /// variants, release/leave/disconnect by the holder vs. a non-holder, the owner-toggleable floor QUEUE lifecycle
 /// (raise-hand -> reserve -> claim), and the audio-relay floor rules.
 ///
-/// Idle auto-release is disabled here (`floor-idle-release-seconds=0`) so the wire assertions can't race the
+/// Idle auto-release is disabled here (`floor-idle-release=0s`) so the wire assertions can't race the
 /// once-per-second background sweep reclaiming a briefly-idle holder mid-test; the idle-release path is covered
 /// deterministically with a controllable clock in the unit tests.
-@TestPropertySource(properties = "walkie.floor-idle-release-seconds=0")
+@TestPropertySource(properties = "walkie.floor-idle-release=0s")
 class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 
 	private static byte[] frame(String marker) {

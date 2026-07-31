@@ -211,9 +211,9 @@ busy floor simply is not granted and the snapshot keeps showing it busy (the pre
 The old imperative triggers `floorTaken` / `floorIdle` / `floorDenied` are **retired** (all subsumed by
 `floorStatus`), so a client learns it **lost the floor** purely from a `floorStatus` in which it is no longer
 `holderId` — treat that transition as "you lost the floor": stop transmitting and reset the talk control. The
-server revokes the floor by **idle auto-release** (a relay holder silent for `walkie.floor-idle-release-seconds`,
+server revokes the floor by **idle auto-release** (a relay holder silent for `walkie.floor-idle-release`,
 default 5, when another member wants the floor — relay-only, measured from frame *timing* so it works on
-encrypted channels) and **max-hold** (any holder past `walkie.floor-max-hold-seconds`, default 300 — a pure time
+encrypted channels) and **max-hold** (any holder past `walkie.floor-max-hold`, default 300 — a pure time
 cap that also bounds a WebRTC peer, §3a). Both `0`-disable. When the queue is on, a freed floor is offered to the
 queue head (a `floorStatus` to all, then a fresh `floorReserved` to that head — in that order, see above) instead
 of going idle. A normal active relay
@@ -673,10 +673,10 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 - **Inbound audio frame rate:** ≤ `walkie.max-audio-frames-per-second` per sender (default 100; ~50 fps is
   nominal). Excess frames are dropped **before** fan-out — a flood guard that counts frames without inspecting
   them, so it works on encrypted channels. Always on (0/blank → default, never disabled).
-- **PTT floor timers:** max-hold force-release of **any** holder after `walkie.floor-max-hold-seconds`
+- **PTT floor timers:** max-hold force-release of **any** holder after `walkie.floor-max-hold`
   (default 300; a periodic sweep, plus a relay holder's next frame) and idle auto-release of a silent **relay**
-  holder after `walkie.floor-idle-release-seconds` (default 5; on contention); each `0`-disables (§3b). When the
-  floor queue is on, the reserved head has `walkie.floor-reservation-seconds` (default 10) to claim its turn
+  holder after `walkie.floor-idle-release` (default 5; on contention); each `0`-disables (§3b). When the
+  floor queue is on, the reserved head has `walkie.floor-reservation` (default 10) to claim its turn
   before it is dropped and the floor passes to the next in line — a positive claim window, so `0`/blank falls
   back to the default, it is not "disabled" (§3b).
 - **Channel size:** ≤ **255 members** (one per stream index, 0..254). A join that would overflow is refused with

@@ -46,9 +46,9 @@ class ConnectionServiceTest {
 					65536,
 					100,
 					1_000_000,
-					5,
-					300,
-					10,
+					Duration.ofSeconds(5),
+					Duration.ofSeconds(300),
+					Duration.ofSeconds(10),
 					false, 0,
 					null, false, Duration.ZERO),
 			BROADCASTER
@@ -67,9 +67,9 @@ class ConnectionServiceTest {
 						65536,
 						1000,
 						1_000_000,
-						idleSeconds,
-						maxHoldSeconds,
-						10,
+						Duration.ofSeconds(idleSeconds),
+						Duration.ofSeconds(maxHoldSeconds),
+						Duration.ofSeconds(10),
 						false, 0,
 						null, false, Duration.ZERO),
 				BROADCASTER,
@@ -118,7 +118,7 @@ class ConnectionServiceTest {
 	private ConnectionService affinityService() {
 		return new ConnectionService(
 				channelRegistry,
-				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, 0, null, true, Duration.ZERO), BROADCASTER);
+				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(10), false, 0, null, true, Duration.ZERO), BROADCASTER);
 	}
 
 	/// Whether a channel with `name` currently exists — the absence counterpart to [#channel], for asserting a
@@ -1078,9 +1078,9 @@ class ConnectionServiceTest {
 						65536,
 						2,
 						1_000_000,
-						0,
-						0,
-						10,
+						Duration.ZERO,
+						Duration.ZERO,
+						Duration.ofSeconds(10),
 						false, 0,
 						null, false, Duration.ZERO),
 				BROADCASTER
@@ -1109,9 +1109,9 @@ class ConnectionServiceTest {
 						65536,
 						1,
 						1_000_000,
-						0,
-						0,
-						10,
+						Duration.ZERO,
+						Duration.ZERO,
+						Duration.ofSeconds(10),
 						false, 0,
 						null, false, Duration.ZERO),
 				BROADCASTER
@@ -1146,9 +1146,9 @@ class ConnectionServiceTest {
 						65536,
 						1000,
 						2,
-						0,
-						0,
-						10,
+						Duration.ZERO,
+						Duration.ZERO,
+						Duration.ofSeconds(10),
 						false, 0,
 						null, false, Duration.ZERO),
 				BROADCASTER,
@@ -2266,7 +2266,7 @@ class ConnectionServiceTest {
 		return new ConnectionService(
 				channelRegistry,
 				new WalkieProperties(
-						new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, cap, null, false, Duration.ZERO),
+						new String[]{"*"}, 8192, 65536, 100, 1_000_000, Duration.ofSeconds(5), Duration.ofSeconds(300), Duration.ofSeconds(10), false, cap, null, false, Duration.ZERO),
 				BROADCASTER
 		);
 	}
