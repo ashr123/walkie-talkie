@@ -24,6 +24,7 @@ import {
 	FLOOR_LIVE,
 	FLOOR_MY_TURN,
 	floorStateFor,
+	grantOpensMic,
 	shouldAutoOpenMic,
 	talkDecision
 } from './talk.js';
@@ -782,11 +783,7 @@ function onWsMessage(ev) {
 			renderJoinRequests();
 			break;
 		case 'floorGranted':
-			log('Floor granted — you are live');
-			clearTurnAlert();                   // we claimed — stop the "your turn" beep countdown / tab-title flash
-			state.awaitingClaim = false;
-			state.floorHolder = state.selfId;   // we hold the floor now (the authoritative floorStatus follows)
-			beginTransmit();
+			onFloorGranted();
 			break;
 		case 'floorStatus':
 			onFloorStatus(msg.holderId, msg.waiting);
@@ -1458,6 +1455,33 @@ function onFloorStatus(holderId, waiting) {
 	}
 	state.awaitingClaim = floorState === FLOOR_MY_TURN;   // so a later snapshot that drops us can log "your turn passed"
 	updateTalkButton();
+}
+
+/**
+ * Handles FloorGranted: the server says the floor is ours. It opens the mic only while the Talk control is still held
+ * — see grantOpensMic for why a grant can outlive the hold that asked for it, and why opening the mic then transmits
+ * speech the user believes they never sent.
+ *
+ * The stale branch hands the floor straight back rather than sitting on it with a closed mic. That is a SECOND
+ * releaseFloor on the normal path (the key-up already sent one), which costs nothing: the server treats a release
+ * from a non-holder who is not queued as a no-op — no state change, no reply — and sending it unconditionally covers
+ * the up-edges that took an early return (a control disabled mid-hold, focus moved into a field).
+ */
+function onFloorGranted() {
+	clearTurnAlert();          // we claimed, or the claim is moot — stop the "your turn" beep countdown / tab-title flash
+	state.awaitingClaim = false;
+	if (!grantOpensMic(state.mode, state.talkHeld)) {
+		// Deliberately NOT state.floorHolder = selfId here: claiming it locally would render "LIVE — release to stop"
+		// over a closed mic until the snapshot corrected it. Leaving it alone lets the floorStatus that follows say
+		// what is true — which, because our release is already in flight, is "Floor is free".
+		log('Floor granted after you let go — mic stayed off, floor released');
+		sendCtrl({type: 'releaseFloor'});
+		updateTalkButton();     // clearTurnAlert drops the countdown but does not re-render
+		return;
+	}
+	log('Floor granted — you are live');
+	state.floorHolder = state.selfId;   // we hold the floor now (the authoritative floorStatus follows)
+	beginTransmit();                    // renders via updateTalkButton
 }
 
 /**
@@ -2623,11 +2647,11 @@ window.addEventListener('DOMContentLoaded', () => {
 	// keyboard rides the same decision as the pointer instead of a rendered value that can lag the state behind it —
 	// and the 'duplex' exclusion is expressed once, in talk.js, rather than re-derived from state.mode here. In tap
 	// states pressTalk no-ops on key-down and releaseTalk toggles the queue on key-up, so Space "raises a hand" /
-	// leaves the line too.
-	const spaceDrivesTalk = () => {
+	// leaves the line too.	const spaceDrivesTalk = () => {
 		const {mode} = talkNow();
 		return (mode === 'hold' || mode === 'tap') && document.activeElement.tagName !== 'INPUT';
 	};
+
 	window.addEventListener('keydown', e => {
 		if (e.code === 'Space' && !e.repeat && spaceDrivesTalk()) {
 			e.preventDefault();

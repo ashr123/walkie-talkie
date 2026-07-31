@@ -20,6 +20,7 @@ import {
 	floorActionFor,
 	floorIsFree,
 	floorStateFor,
+	grantOpensMic,
 	shouldAutoOpenMic,
 	talkDecision
 } from '../../main/resources/static/assets/talk.js';
@@ -510,6 +511,44 @@ test('shouldAutoOpenMic: an owner-muted member\'s mic never auto-opens', () => {
 	// live mic ("Mic ON (click to mute)") while the server discarded every frame. It guards two real paths — a muted
 	// member re-joining its CURRENT channel re-snapshots itself as muted, and a switch to full-duplex while muted.
 	assert.equal(shouldAutoOpenMic('FULL_DUPLEX', false, true), false);
+});
+
+// --- whether an arriving grant opens the mic ------------------------------------------------------
+// Browser-only, like the whole hold-vs-tap axis: the Java client's talk command is a toggle, so a grant there is
+// always still wanted. What is pinned here is that a grant which outlived its hold cannot open a microphone.
+
+test('grantOpensMic: a grant that arrives while the control is held goes live', () => {
+	// The ordinary case, and both PTT modes, so a mutation that only handles one is caught.
+	assert.equal(grantOpensMic('MULTI_CHANNEL_PTT', true), true);
+	assert.equal(grantOpensMic('GLOBAL_PTT', true), true);
+});
+
+test('grantOpensMic: a grant that arrives after the user let go does NOT open the mic', () => {
+	// THE bug this rule exists for. Tap Space and release inside one round trip and the order is: requestFloor out,
+	// key-up (which sends releaseFloor), grant in. Opening the mic on that grant transmits speech AFTER the user let
+	// go, until our own release comes back as a snapshot and the release reconciliation closes it again — invisible on
+	// localhost, where the grant beats the key-up, and a real leak over any latency (it showed up first through a
+	// tunnel). It also made the client report the resulting self-release as "you were released from the floor", the
+	// wording reserved for the server taking it away.
+	assert.equal(grantOpensMic('MULTI_CHANNEL_PTT', false), false);
+	assert.equal(grantOpensMic('GLOBAL_PTT', false), false);
+});
+
+test('grantOpensMic: full-duplex never opens the mic from a grant, held or not', () => {
+	// Reachable, not defensive: request the floor in a PTT channel whose owner switches the mode while that request
+	// is in flight and ModeChanged overtakes the grant. In full-duplex the mic belongs to the user's own toggle, so a
+	// leftover grant must not open it — the button says "Mic OFF (click to talk)" and would be lying.
+	assert.equal(grantOpensMic('FULL_DUPLEX', true), false);
+	assert.equal(grantOpensMic('FULL_DUPLEX', false), false);
+});
+
+test('grantOpensMic: anything but a definite yes keeps the mic closed', () => {
+	// This decides whether a microphone starts transmitting, so it fails CLOSED on a value that is merely truthy or
+	// absent — `=== true`, not truthiness. A missing flag (a state object that never set it) must not open a mic, and
+	// neither must a stringified one: the string 'false' is TRUTHY in JavaScript.
+	[undefined, null, 'false', 'true', 1, 'yes', {}].forEach(held => {
+		assert.equal(grantOpensMic('MULTI_CHANNEL_PTT', held), false, `talkHeld = ${JSON.stringify(held)}`);
+	});
 });
 
 test('the FLOOR_* values are the Java client\'s FloorState enum names', () => {

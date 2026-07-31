@@ -66,6 +66,32 @@ export function shouldAutoOpenMic(mode, startMuted, selfMuted) {
 	return mode === 'FULL_DUPLEX' && !startMuted && !selfMuted;
 }
 
+/**
+ * Whether an arriving `FloorGranted` should OPEN THE MIC — the other half of the "should the mic open by itself?"
+ * question above, for the push-to-talk path where the mic follows the floor.
+ *
+ * A grant is an ANSWER, and the answer can outlive the question. Tap Space and let go inside one round trip and the
+ * order of events is: requestFloor out, key up (which sends releaseFloor), grant in. Opening the mic on that grant
+ * transmits audio AFTER the user let go — until our own releaseFloor comes back as a snapshot and the release
+ * reconciliation shuts it again. Invisible on localhost, where the grant beats the key-up; a real leak of speech the
+ * user believes was never sent as soon as there is any latency. So the mic opens only while the control is still held.
+ *
+ * This cannot refuse a legitimate tap-to-claim, because there is no such thing: every floor state whose grant opens
+ * the mic is a 'hold' state (LIVE / MY_TURN / IDLE with a free floor — see talkDecision), and the two 'tap' states
+ * only ever toggle queue membership. Claiming a reserved turn is itself a hold.
+ *
+ * Full-duplex is false rather than "not applicable": the server sends no grant where there is no floor, but a grant
+ * can still LAND in full-duplex — request the floor in a push-to-talk channel whose owner switches the mode while
+ * that request is in flight, and `ModeChanged` overtakes it. There the mic belongs to the user's own toggle, so a
+ * leftover grant must not open it (and could not say so honestly: the button reads "Mic OFF (click to talk)").
+ *
+ * `talkHeld === true` rather than truthiness, because a value that isn't a definite yes must fail CLOSED — this
+ * decides whether a microphone starts transmitting.
+ */
+export function grantOpensMic(mode, talkHeld) {
+	return mode !== 'FULL_DUPLEX' && talkHeld === true;
+}
+
 /** A decision with no floor message behind it: the disabled states and the full-duplex mic toggle. */
 function floorless(mode, label) {
 	return {mode, label, myTurn: false, action: null};
