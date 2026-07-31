@@ -93,6 +93,15 @@ export function grantOpensMic(mode, talkHeld) {
 }
 
 /**
+ * What to tell someone whose grant arrived after they let go. It COACHES rather than explains: on a phone a tap is
+ * routinely shorter than the round trip that fetches the floor, so this is the common case there rather than a rare
+ * one, and "hold it longer" is the only thing the user can act on. The mechanics it used to describe — the mic never
+ * opened, the floor went straight back — are documented on grantOpensMic and onFloorGranted, which is where someone
+ * debugging will actually look. The button's own hint already covers the Space alternative, so this does not repeat it.
+ */
+export const TOO_QUICK_TO_TALK = 'Too quick — hold the button while you talk';
+
+/**
  * Whether a HOLD is in progress right now: the control is a hold-gesture one and it is actually being held. Two
  * callers ask, both about an interruption that has to give the floor back even though no ordinary up-edge described it:
  *   - losing focus (another window taking it, the tab being hidden, a cancelled touch), where the keyup or mouseup is

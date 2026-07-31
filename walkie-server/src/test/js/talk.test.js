@@ -17,13 +17,14 @@ import {
 	FLOOR_IN_LINE,
 	FLOOR_LIVE,
 	FLOOR_MY_TURN,
+	TOO_QUICK_TO_TALK,
 	floorActionFor,
 	floorIsFree,
 	floorStateFor,
-	holdInProgress,
-	spaceDrivesFloor,
 	grantOpensMic,
+	holdInProgress,
 	shouldAutoOpenMic,
+	spaceDrivesFloor,
 	talkDecision
 } from '../../main/resources/static/assets/talk.js';
 
@@ -534,6 +535,14 @@ test('grantOpensMic: a grant that arrives after the user let go does NOT open th
 	// wording reserved for the server taking it away.
 	assert.equal(grantOpensMic('MULTI_CHANNEL_PTT', false), false);
 	assert.equal(grantOpensMic('GLOBAL_PTT', false), false);
+});
+
+test('the too-quick message coaches instead of describing the mechanics', () => {
+	// Spelled out here rather than imported, for the same reason as the gesture hints above: the point is that the
+	// module says exactly this. It replaced "Floor granted after you let go — mic stayed off, floor released", which
+	// described what the client did rather than what the user should do — and on a phone, where a tap is routinely
+	// shorter than the round trip that fetches the floor, this is the line people see most.
+	assert.equal(TOO_QUICK_TO_TALK, 'Too quick — hold the button while you talk');
 });
 
 test('grantOpensMic: full-duplex never opens the mic from a grant, held or not', () => {

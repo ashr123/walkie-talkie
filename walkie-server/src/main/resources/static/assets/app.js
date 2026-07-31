@@ -24,6 +24,7 @@ import {
 	FLOOR_IN_LINE,
 	FLOOR_LIVE,
 	FLOOR_MY_TURN,
+	TOO_QUICK_TO_TALK,
 	floorStateFor,
 	grantOpensMic,
 	holdInProgress,
@@ -1477,7 +1478,7 @@ function onFloorGranted() {
 		// Deliberately NOT state.floorHolder = selfId here: claiming it locally would render "LIVE — release to stop"
 		// over a closed mic until the snapshot corrected it. Leaving it alone lets the floorStatus that follows say
 		// what is true — which, because our release is already in flight, is "Floor is free".
-		log('Floor granted after you let go — mic stayed off, floor released');
+		log(TOO_QUICK_TO_TALK);
 		sendCtrl({type: 'releaseFloor'});
 		updateTalkButton();     // clearTurnAlert drops the countdown but does not re-render
 		return;
