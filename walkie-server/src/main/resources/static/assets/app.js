@@ -25,6 +25,7 @@ import {
 	FLOOR_MY_TURN,
 	floorStateFor,
 	grantOpensMic,
+	holdInProgress,
 	shouldAutoOpenMic,
 	talkDecision
 } from './talk.js';
@@ -2641,6 +2642,11 @@ window.addEventListener('DOMContentLoaded', () => {
 		state.talkHeld = false;
 		releaseTalk();
 	}, {passive: false});
+	// touchcancel is touchend's missing twin: the platform aborts the touch (an incoming call, a system gesture, the
+	// finger leaving the surface) and touchend NEVER fires. Same handling as a focus loss — see endHoldOnInterruption.
+	// Wrapped in an arrow deliberately: that `const` is declared BELOW this line, so passing the reference directly
+	// would read it in its temporal dead zone and throw while wiring up. Called later, it is initialised.
+	talk.addEventListener('touchcancel', () => endHoldOnInterruption(), {passive: true});
 
 	// Space is a push-to-talk key: it drives the floor gestures and deliberately leaves full-duplex alone, whose mic
 	// toggle stays a click. Both gates ask talkNow() rather than the button's own `disabled` attribute, so the
@@ -2672,4 +2678,30 @@ window.addEventListener('DOMContentLoaded', () => {
 			releaseTalk();
 		}
 	});
+
+	// A hold can also end without the page ever seeing its up-edge: alt-tab / Cmd-Tab / a click into another window
+	// while the button or Space is down delivers the keyup or mouseup to whatever took focus instead. The stale flag is
+	// then exactly the hazard the keyup comment above describes — plus, since grantOpensMic, a licence for an arriving
+	// grant to open the mic with nothing held.
+	//
+	// Whether it also RELEASES is decided by holdInProgress in talk.js, because both terms are easy to get wrong: releasing on every
+	// focus change would spend a control message per alt-tab, and treating the interruption as a TAP would silently
+	// drop you out of the queue you are waiting in (a tap toggles queue membership) or mute you mid-conference in
+	// full-duplex. Read the flag BEFORE clearing it, and note the whole thing is idempotent — browsers fire both blur
+	// and visibilitychange for a tab switch, and the second pass sees talkHeld already false.
+	const endHoldOnInterruption = () => {
+		const release = holdInProgress(talkNow().mode, state.talkHeld);
+		state.talkHeld = false;
+		if (release) {
+			releaseTalk();
+		}
+	};
+	window.addEventListener('blur', endHoldOnInterruption);
+	document.addEventListener('visibilitychange', () => {
+		if (document.hidden) {
+			endHoldOnInterruption();
+		}
+	});
+	// Deliberately no pagehide/beforeunload twin: the page going away closes the WebSocket, and the server's own
+	// disconnect path drops the member and frees any floor it held. A release racing the close would add nothing.
 });

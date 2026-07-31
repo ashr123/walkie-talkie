@@ -92,6 +92,32 @@ export function grantOpensMic(mode, talkHeld) {
 	return mode !== 'FULL_DUPLEX' && talkHeld === true;
 }
 
+/**
+ * Whether a HOLD is in progress right now: the control is a hold-gesture one and it is actually being held. Two
+ * callers ask, both about an interruption that has to give the floor back even though no ordinary up-edge described it:
+ *   - losing focus (another window taking it, the tab being hidden, a cancelled touch), where the keyup or mouseup is
+ *     delivered to whatever took focus and never reaches this page at all;
+ *   - a Space up-edge that arrives while focus has DRIFTED onto some other control since the down-edge (hold Space,
+ *     press Tab, release) — spaceDrivesFloor rightly says Space is not ours any more, but the floor we took on the
+ *     down-edge still has to come back, or the mic stays open with nothing held.
+ *
+ * Both terms carry weight:
+ *   - `talkHeld` is what stops an ordinary window switch from sending a releaseFloor. Alt-tabbing with nothing held is
+ *     the common case by far; the server would treat those as no-ops, but a control message per focus change is noise
+ *     on a plane whose budget is spent on real floor traffic.
+ *   - `mode === 'hold'` is what stops it toggling QUEUE MEMBERSHIP. The two 'tap' states release-to-leave and
+ *     request-to-join a line, so treating an interruption as a tap would silently drop you out of the queue you are
+ *     waiting in. Full-duplex is excluded for the same class of reason in the other direction: its mic is a user
+ *     toggle, and switching windows mid-conference must not mute you.
+ *
+ * `talkHeld === true` matches grantOpensMic's strictness: an indefinite value is not a hold in progress. That cannot
+ * strand a live mic, because in push-to-talk the mic only opens on a grant that grantOpensMic already required a
+ * definite hold for.
+ */
+export function holdInProgress(mode, talkHeld) {
+	return talkHeld === true && mode === 'hold';
+}
+
 /** A decision with no floor message behind it: the disabled states and the full-duplex mic toggle. */
 function floorless(mode, label) {
 	return {mode, label, myTurn: false, action: null};

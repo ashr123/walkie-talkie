@@ -20,6 +20,7 @@ import {
 	floorActionFor,
 	floorIsFree,
 	floorStateFor,
+	holdInProgress,
 	grantOpensMic,
 	shouldAutoOpenMic,
 	talkDecision
@@ -548,6 +549,45 @@ test('grantOpensMic: anything but a definite yes keeps the mic closed', () => {
 	// neither must a stringified one: the string 'false' is TRUTHY in JavaScript.
 	[undefined, null, 'false', 'true', 1, 'yes', {}].forEach(held => {
 		assert.equal(grantOpensMic('MULTI_CHANNEL_PTT', held), false, `talkHeld = ${JSON.stringify(held)}`);
+	});
+});
+
+// --- is a hold in progress? ----------------------------------------------------------------------
+// Asked by the two interruptions that must hand the floor back with no ordinary up-edge to describe them: focus lost
+// to another window / a hidden tab / a cancelled touch, and a Space up-edge arriving after focus drifted onto another
+// control mid-hold. Browser-only, like the rest of the hold axis.
+
+test('holdInProgress: a held hold-gesture control is a hold in progress', () => {
+	// The case that exists to stop a stale talkHeld: without this the flag stays true with nothing held, and then a
+	// FloorReserved claims the floor unprompted or an arriving grant opens the mic (grantOpensMic's guard reads the
+	// same flag, so it is only as honest as this).
+	assert.equal(holdInProgress('hold', true), true);
+});
+
+test('holdInProgress: nothing held is no hold, so an ordinary window switch sends nothing', () => {
+	// By far the common case — alt-tab while merely looking at the page. The server would no-op a release from a
+	// non-holder, but this is what keeps a control message off the wire per focus change rather than relying on that.
+	assert.equal(holdInProgress('hold', false), false);
+});
+
+test('holdInProgress: a tap gesture is never a hold, so an interruption cannot toggle queue membership', () => {
+	// The tap states are release-to-LEAVE and request-to-JOIN a line, so taking the release path in one would drop
+	// you out of the queue you are waiting in — a silent loss of your place, caused by looking at another window.
+	assert.equal(holdInProgress('tap', true), false);
+});
+
+test('holdInProgress: full-duplex and disabled are never holds, so switching windows cannot mute you', () => {
+	// Full-duplex's mic is the user's own toggle, and a conference keeps running while you read something else. The
+	// disabled control has no gesture to end either.
+	assert.equal(holdInProgress('duplex', true), false);
+	assert.equal(holdInProgress('disabled', true), false);
+});
+
+test('holdInProgress: an indefinite held flag is not a hold in progress', () => {
+	// Same strictness as grantOpensMic, and it cannot strand a live mic: in push-to-talk the mic only opens on a grant
+	// that grantOpensMic already required a definite hold for, so "no release" here cannot leave one transmitting.
+	[undefined, null, 'false', 1, 'yes'].forEach(held => {
+		assert.equal(holdInProgress('hold', held), false, `talkHeld = ${JSON.stringify(held)}`);
 	});
 });
 
