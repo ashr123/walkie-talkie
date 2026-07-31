@@ -31,6 +31,23 @@ public final class JavaConventionsPlugin implements Plugin<Project> {
 	/// source-compatibility change, not a flag flip.
 	private static final int JAVA_RELEASE = 25;
 
+	/// The Maven coordinates every module publishes under. `Project#setGroup`/`#setVersion` are typed `Object`, not
+	/// `String` — Gradle only ever calls `toString()` on them when it composes artifact names — but there is no
+	/// version type worth passing instead, so a plain String it is. Gradle's own are the wrong domain
+	/// (`GradleVersion` is Gradle's version, `ModuleVersionIdentifier` describes a dependency), and
+	/// `java.lang.Runtime.Version` implements the JAVA PLATFORM scheme of JEP 322, which cannot express this version
+	/// at all: its version number must neither begin nor end with a zero element, so every pre-1.0 version and every
+	/// `x.y.0` is rejected — `Runtime.Version.parse("0.1.0")` throws. It is also not `Serializable`, which the
+	/// configuration cache would eventually care about.
+	private static final String PROJECT_GROUP = "io.github.ashr123";
+	private static final String PROJECT_VERSION = "0.1.0";
+
+	/// Source encoding for every compile, fixed rather than inherited from the platform default so the build is
+	/// reproducible on a machine whose `file.encoding` differs. [CompileOptions#setEncoding] takes the javac
+	/// `-encoding` flag verbatim and has no `Charset` overload, hence the conversion here — via `name()`, the
+	/// canonical locale-independent IANA name, NOT `displayName()`, which is documented as possibly localized.
+	private static final String SOURCE_ENCODING = StandardCharsets.UTF_8.name();
+
 	/// The compiles Spring Boot's AOT engine GENERATES into `build/generated/aotSources` + `aotTestSources`
 	/// (bean-definition suppliers and friends), which get the strict lint switched off — see [#configureJavaCompile].
 	private static final String GENERATED_AOT_COMPILE_PREFIX = "compileAot";
@@ -40,8 +57,8 @@ public final class JavaConventionsPlugin implements Plugin<Project> {
 		project.getPluginManager().apply(JavaPlugin.class);
 		project.getPluginManager().apply(JacocoPlugin.class);
 
-		project.setGroup("io.github.ashr123");
-		project.setVersion("0.1.0");
+		project.setGroup(PROJECT_GROUP);
+		project.setVersion(PROJECT_VERSION);
 		project.getRepositories().mavenCentral();
 
 		project.getTasks().withType(JavaCompile.class).configureEach(this::configureJavaCompile);
@@ -73,7 +90,7 @@ public final class JavaConventionsPlugin implements Plugin<Project> {
 	private void configureJavaCompile(JavaCompile compile) {
 		CompileOptions options = compile.getOptions();
 		options.getRelease().set(JAVA_RELEASE);
-		options.setEncoding(StandardCharsets.UTF_8.displayName());
+		options.setEncoding(SOURCE_ENCODING);
 		options.getCompilerArgs().add("-parameters");
 		// The AOT-generated code is not ours and legitimately uses raw generic types (e.g.
 		// BeanInstanceSupplier<IncludeExcludeEndpointFilter> for the generic IncludeExcludeEndpointFilter<E>), so
