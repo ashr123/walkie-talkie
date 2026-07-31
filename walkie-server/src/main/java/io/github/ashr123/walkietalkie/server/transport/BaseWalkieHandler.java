@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
+import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
@@ -16,6 +17,7 @@ import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 
 import java.security.Principal;
+import java.time.Duration;
 
 /// Shared connect/text/close plumbing for both transports. Subclasses only differ in their
 /// [Transport] kind and in whether they consume binary (audio) frames.
@@ -27,11 +29,18 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 	protected final ConnectionService connectionService;
 	protected final MessageCodec codec;
 	private final Transport transport;
+	/// Resolved once here rather than per connection: every session this handler creates gets the same keepalive
+	/// interval, and the property cannot change under a running server.
+	private final Duration keepalive;
 
-	protected BaseWalkieHandler(ConnectionService connectionService, MessageCodec codec, Transport transport) {
+	protected BaseWalkieHandler(ConnectionService connectionService,
+	                            MessageCodec codec,
+	                            Transport transport,
+	                            WalkieProperties properties) {
 		this.connectionService = connectionService;
 		this.codec = codec;
 		this.transport = transport;
+		this.keepalive = properties.keepalivePingInterval();
 	}
 
 	protected static ClientSession lookup(WebSocketSession session) {
@@ -143,7 +152,8 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 						SEND_BUFFER_LIMIT_BYTES
 				),
 				transport,
-				(String) session.getAttributes().get(ChannelHandshakeInterceptor.HANDSHAKE_CHANNEL_ATTR)
+				(String) session.getAttributes().get(ChannelHandshakeInterceptor.HANDSHAKE_CHANNEL_ATTR),
+				keepalive
 		);
 		session.getAttributes().put(SESSION_KEY, clientSession);
 		// Start the outbound pump only after the session is registered, so afterConnectionClosed can always

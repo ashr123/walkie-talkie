@@ -59,8 +59,7 @@ class ConcurrencyStressTest {
 						10,
 						false, 0,
 						null,
-						false
-				),
+						false, Duration.ZERO),
 				BROADCASTER
 		);
 
@@ -153,8 +152,7 @@ class ConcurrencyStressTest {
 						10,
 						false, 0,
 						null,
-						false
-				),
+						false, Duration.ZERO),
 				BROADCASTER
 		);
 
@@ -254,8 +252,7 @@ class ConcurrencyStressTest {
 						10,
 						true, 0,
 						null,
-						false
-				),
+						false, Duration.ZERO),
 				BROADCASTER,
 				clock
 		);

@@ -1,8 +1,11 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
+import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
 import org.mockito.InOrder;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.CloseStatus;
@@ -27,7 +30,8 @@ import static org.mockito.Mockito.*;
 class BaseWalkieHandlerTest {
 
 	private final ConnectionService connectionService = mock(ConnectionService.class);
-	private final AudioRelayHandler handler = new AudioRelayHandler(connectionService, mock(MessageCodec.class));
+	private final AudioRelayHandler handler = new AudioRelayHandler(connectionService, mock(MessageCodec.class),
+			new WalkieProperties(null, 0, 0, 0, 0, -1, -1, 0, false, 0, null, false, Duration.ZERO));
 
 	@Test
 	void anUnauthenticatedHandshakeIsClosedWithAPolicyViolationAndNotRegistered() throws Exception {

@@ -380,7 +380,20 @@ fan-out caller `Channel.forEachOther` or other recipients), and the single consu
 in submission order (required by the stateful Opus decode). Audio and control are split: audio is bounded and
 **dropped** on overflow (lossy, real-time), while control (floor/mode/owner/membership) is delivered reliably and
 drained ahead of audio — a client too far behind even for control is disconnected to force a clean
-reconnect/re-sync. **A channel fan-out reaches only members whose CURRENT channel is that channel.** An in-place switch adds the
+reconnect/re-sync. **WebSocket keepalive (idle connections).** The drainer's park doubles as the idleness detector: it waits for work
+with a timeout of `walkie.keepalive-ping-interval` (a bindable `Duration` — `30s`, `PT30S` or a bare `30` via `@DurationUnit`; default 30 s, `0s` disables, absent binds as null and defaults), and a timeout — nothing to send for a
+whole interval — is exactly when it emits a WebSocket **Ping** instead (`WebSocketClientSession.awaitWork`). No
+scheduler, no session registry, and busy sessions are never pinged, because a queued frame satisfies the park first.
+This exists because an idle WebSocket is what middleboxes reap and this server is legitimately silent for minutes
+(`FloorStatus` and friends broadcast only on a CHANGE; a listening member sends nothing): an idle socket through a
+Cloudflare tunnel was measured closing at 125 s with a bare TCP FIN and no Close frame (Cloudflare documents ~100 s,
+Enterprise-only to change), and nginx's default `proxy_read_timeout` is 60 s — so the `deploy/` reverse-proxy story
+would drop a quiet channel too. A Ping and not an application message on purpose: it needs no `ClientMessage` type,
+no dispatch case and no client code, because browsers and the JDK's `java.net.http.WebSocket` both answer with a Pong
+automatically (the JDK guarantees it — "the WebSocket implementation will automatically send a reciprocal pong").
+Dead-peer detection is NOT built on it: nothing tracks whether the Pong came back.
+
+**A channel fan-out reaches only members whose CURRENT channel is that channel.** An in-place switch adds the
 session to its target and departs the old channel afterwards (so a refusal can't drop it from both), holding no lock
 on the old one across the gap — so a concurrent change there could otherwise fan out to a session that has already
 moved. `MessageBroadcaster.deliverIfStillIn` compares `channel.name()` against `ClientSession.channelName()`, which

@@ -2,6 +2,8 @@ package io.github.ashr123.walkietalkie.server.config;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /// The compact constructor of [WalkieProperties] fills in safe defaults for absent or non-positive values
@@ -21,8 +23,7 @@ class WalkiePropertiesTest {
 				10,
 				false, 0,
 				null,
-				false
-		);
+				false, Duration.ZERO);
 		assertArrayEquals(new String[]{"*"}, p.allowedOrigins(), "null origins default to the wildcard");
 		assertEquals(8 * 1024, p.maxAudioFrameBytes(), "a non-positive audio size falls back to 8 KiB");
 		assertEquals(16 * 1024, p.maxTextMessageBytes(), "a non-positive text size falls back to 16 KiB");
@@ -48,8 +49,7 @@ class WalkiePropertiesTest {
 						1,
 						false, 0,
 						null,
-						false
-				)
+						false, Duration.ZERO)
 						.allowedOrigins()
 		);
 	}
@@ -67,8 +67,7 @@ class WalkiePropertiesTest {
 				15,
 				true, 0,
 				"secret",
-				false
-		);
+				false, Duration.ZERO);
 		assertArrayEquals(new String[]{"https://example.test"}, p.allowedOrigins());
 		assertEquals(4096, p.maxAudioFrameBytes());
 		assertEquals(16384, p.maxTextMessageBytes());
@@ -94,8 +93,7 @@ class WalkiePropertiesTest {
 				10,
 				false, 0,
 				null,
-				false
-		);
+				false, Duration.ZERO);
 		assertEquals(0, p.floorIdleReleaseSeconds(), "0 disables idle auto-release (not coerced to the default)");
 		assertEquals(0, p.floorMaxHoldSeconds(), "0 disables the max-hold cap (not coerced to the default)");
 	}
@@ -106,17 +104,37 @@ class WalkiePropertiesTest {
 		// 0 or negative reservation is coerced to the 10 s default rather than disabling anything. The queue
 		// on/off default is a plain flag with no coercion, so it passes through verbatim.
 		assertEquals(10, new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 0, false, 0, null, false).floorReservationSeconds(),
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 0, false, 0, null, false, Duration.ZERO).floorReservationSeconds(),
 				"a zero reservation window falls back to the 10 s default");
 		assertEquals(10, new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, -1, false, 0, null, false).floorReservationSeconds(),
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, -1, false, 0, null, false, Duration.ZERO).floorReservationSeconds(),
 				"a negative reservation window falls back to the 10 s default");
 		assertTrue(new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, true, 0, null, false).floorQueueDefault(),
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, true, 0, null, false, Duration.ZERO).floorQueueDefault(),
 				"floorQueueDefault=true passes through");
 		assertFalse(new WalkieProperties(
-				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false).floorQueueDefault(),
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, Duration.ZERO).floorQueueDefault(),
 				"floorQueueDefault=false passes through");
+	}
+
+	@Test
+	void theKeepaliveHonoursAnExplicitZeroButDefaultsWhenAbsentOrNegative() {
+		// A Duration binds as NULL when the property is absent — unlike a `long`, which would arrive as 0 and be
+		// indistinguishable from an explicit "off" — so absent and negative both fall back while ZERO is kept.
+		// The default has to stay under the tightest idle timeout in the deployment story: nginx's 60 s
+		// proxy_read_timeout, and a Cloudflare tunnel's ~100 s.
+		assertEquals(Duration.ofSeconds(30), new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, null).keepalivePingInterval(),
+				"an ABSENT keepalive (null, not 0) falls back to the 30 s default");
+		assertEquals(Duration.ofSeconds(30), new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, Duration.ofSeconds(-1))
+				.keepalivePingInterval(), "a negative keepalive falls back to the 30 s default");
+		assertEquals(Duration.ZERO, new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, Duration.ZERO)
+				.keepalivePingInterval(), "0 disables the keepalive (not coerced to the default)");
+		assertEquals(Duration.ofSeconds(45), new WalkieProperties(
+				new String[]{"*"}, 1, 1, 1, 1, 5, 300, 10, false, 0, null, false, Duration.ofSeconds(45))
+				.keepalivePingInterval(), "a positive keepalive is kept as-is");
 	}
 
 	@Test
@@ -134,8 +152,7 @@ class WalkiePropertiesTest {
 				10,
 				false, 0,
 				null,
-				false
-		);
+				false, Duration.ZERO);
 		assertEquals(1_000_000_000L, p.maxAudioFramesPerSecond(), "audio rates above 1e9 are clamped to 1e9");
 		assertEquals(1_000_000_000L, p.maxControlMessagesPerSecond(), "control rates above 1e9 are clamped to 1e9");
 	}

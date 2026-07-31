@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
+import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
@@ -18,8 +19,8 @@ import java.nio.ByteBuffer;
 public class AudioRelayHandler extends BaseWalkieHandler {
 	private static final Logger log = LoggerFactory.getLogger(AudioRelayHandler.class);
 
-	public AudioRelayHandler(ConnectionService connectionService, MessageCodec codec) {
-		super(connectionService, codec, Transport.AUDIO_RELAY);
+	public AudioRelayHandler(ConnectionService connectionService, MessageCodec codec, WalkieProperties properties) {
+		super(connectionService, codec, Transport.AUDIO_RELAY, properties);
 	}
 
 	@Override

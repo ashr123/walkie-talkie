@@ -50,8 +50,7 @@ class ConnectionServiceTest {
 					300,
 					10,
 					false, 0,
-					null, false
-			),
+					null, false, Duration.ZERO),
 			BROADCASTER
 	);
 
@@ -72,8 +71,7 @@ class ConnectionServiceTest {
 						maxHoldSeconds,
 						10,
 						false, 0,
-						null, false
-				),
+						null, false, Duration.ZERO),
 				BROADCASTER,
 				clock
 		);
@@ -120,7 +118,7 @@ class ConnectionServiceTest {
 	private ConnectionService affinityService() {
 		return new ConnectionService(
 				channelRegistry,
-				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, 0, null, true), BROADCASTER);
+				new WalkieProperties(new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, 0, null, true, Duration.ZERO), BROADCASTER);
 	}
 
 	/// Whether a channel with `name` currently exists — the absence counterpart to [#channel], for asserting a
@@ -1084,8 +1082,7 @@ class ConnectionServiceTest {
 						0,
 						10,
 						false, 0,
-						null, false
-				),
+						null, false, Duration.ZERO),
 				BROADCASTER
 		);
 		FakeClientSession alice = session("alice");
@@ -1116,8 +1113,7 @@ class ConnectionServiceTest {
 						0,
 						10,
 						false, 0,
-						null, false
-				),
+						null, false, Duration.ZERO),
 				BROADCASTER
 		);
 		FakeClientSession alice = session("alice");
@@ -1154,8 +1150,7 @@ class ConnectionServiceTest {
 						0,
 						10,
 						false, 0,
-						null, false
-				),
+						null, false, Duration.ZERO),
 				BROADCASTER,
 				new MutableClock(Instant.EPOCH)
 		);
@@ -2271,8 +2266,7 @@ class ConnectionServiceTest {
 		return new ConnectionService(
 				channelRegistry,
 				new WalkieProperties(
-						new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, cap, null, false
-				),
+						new String[]{"*"}, 8192, 65536, 100, 1_000_000, 5, 300, 10, false, cap, null, false, Duration.ZERO),
 				BROADCASTER
 		);
 	}

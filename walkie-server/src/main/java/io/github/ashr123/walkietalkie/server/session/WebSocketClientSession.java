@@ -6,9 +6,11 @@ import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /// [ClientSession] backed by a Spring [WebSocketSession] (expected to be a
@@ -59,6 +61,9 @@ public final class WebSocketClientSession implements ClientSession {
 	/// one-per-drain, so the single consumer parks on it (never busy-waits) and wakes only on real work. [#stopPump]
 	/// releases one extra permit at close so a parked drainer unblocks, observes `closed`, and exits.
 	private final Semaphore work = new Semaphore(0);
+	/// How long the drainer waits for work before sending a keepalive Ping instead, in nanoseconds; 0 disables the
+	/// keepalive and restores an indefinite park. Nanoseconds because that is the unit [Semaphore#tryAcquire] takes.
+	private final long keepaliveNanos;
 
 	// Set when the client joins a channel (from the validated Join.displayName); "" until then.
 	private volatile String displayName = "";
@@ -68,12 +73,16 @@ public final class WebSocketClientSession implements ClientSession {
 	/// the join/withdraw, read on the teardown thread that scrubs the request.
 	private volatile String pendingChannel;
 
+	/// `keepalive` is how long an idle connection may go without a frame before the drainer sends a Ping; zero (or
+	/// negative) turns the keepalive off. See [io.github.ashr123.walkietalkie.server.config.WalkieProperties].
 	public WebSocketClientSession(WebSocketSession session,
 	                              Transport transport,
-	                              String handshakeChannel) {
+	                              String handshakeChannel,
+	                              Duration keepalive) {
 		this.session = session;
 		this.transport = transport;
 		this.handshakeChannel = handshakeChannel;
+		this.keepaliveNanos = keepalive.isNegative() ? 0 : keepalive.toNanos();
 	}
 
 	@Override
@@ -98,8 +107,18 @@ public final class WebSocketClientSession implements ClientSession {
 	/// socket is already gone and those sends fail fast and are swallowed.
 	private void drainLoop() {
 		while (!isClosed()) {
-			work.acquireUninterruptibly();   // park until a frame is enqueued, or close() releases a wake permit
-			drainOne();
+			if (awaitWork()) {
+				drainOne();
+			} else {
+				// Idle for a whole keepalive interval. A Ping's only job is to put bytes on the wire: an idle
+				// WebSocket is what proxies reap (a Cloudflare tunnel at ~100 s, nginx's proxy_read_timeout at 60 s
+				// by default), and this server is legitimately silent for minutes at a time — FloorStatus and friends
+				// are broadcast only on a CHANGE, and a member who is only listening sends nothing at all. A Ping
+				// rather than an application message because it needs no protocol change and no client code:
+				// browsers and the JDK's WebSocket both answer one with a Pong automatically. It goes through
+				// sendQuietly, so a socket that has already died is swallowed here exactly as for a real frame.
+				sendQuietly(new PingMessage());
+			}
 		}
 		// close() flips `closed` before releasing its wake permit, and `send*` refuse once `closed` is set, so no
 		// new frame can arrive here; deliver whatever is already queued — control fully first, then audio — before
@@ -109,6 +128,27 @@ public final class WebSocketClientSession implements ClientSession {
 		}
 		for (byte[] audio; (audio = audioOut.poll()) != null; ) {
 			sendQuietly(new BinaryMessage(audio));
+		}
+	}
+
+	/// Waits for something to send. True when a permit was acquired — a frame is queued, or [#close] released its wake
+	/// permit — and false when the keepalive interval elapsed with nothing to send, which is the drainer's only signal
+	/// that this connection is idle. With the keepalive off it parks indefinitely, exactly as it always did.
+	///
+	/// The park is uninterruptible by design: [#close] wakes the drainer with a PERMIT precisely so the wake cannot be
+	/// lost. An interrupt therefore arrives from outside this design and can only mean "stop", so it is recorded by
+	/// closing rather than by restoring the flag — restoring it would make the next `tryAcquire` throw immediately and
+	/// spin this thread. Returning true then lets the loop drain whatever is queued (a no-op if nothing is) and exit.
+	private boolean awaitWork() {
+		if (keepaliveNanos == 0) {
+			work.acquireUninterruptibly();
+			return true;
+		}
+		try {
+			return work.tryAcquire(keepaliveNanos, TimeUnit.NANOSECONDS);
+		} catch (InterruptedException _) {
+			stopPump();
+			return true;
 		}
 	}
 

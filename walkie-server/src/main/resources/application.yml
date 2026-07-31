@@ -53,6 +53,19 @@ walkie:
   # that list: it is a DoS bound, not a tuning knob, because every change re-sends the owner a full snapshot.
   # Set to 0 to go back to refusing newcomers outright (CHANNEL_LOCKED) — the "closed, don't even ask" setting.
   max-join-requests: 16
+  # WebSocket keepalive: send a Ping on a connection that has had nothing to send for this long (0s disables).
+  # An IDLE WebSocket is what middleboxes reap, and this server is legitimately silent for minutes — FloorStatus
+  # and friends are broadcast only on a CHANGE, and a member who is only listening sends nothing at all. Measured:
+  # an idle socket through a Cloudflare tunnel is closed after 125 s with a bare TCP FIN (Cloudflare documents
+  # ~100 s, Enterprise-only to change); nginx's default proxy_read_timeout is 60 s, so the reverse-proxy deployment
+  # in deploy/ would drop a quiet channel even sooner. 30 s stays under both with room for one lost ping.
+  # Costs nothing per client: browsers and the JDK's WebSocket both answer a Ping with a Pong automatically, so
+  # there is no protocol message and no client code involved. Only genuinely idle sessions are pinged — the
+  # outbound drainer emits one exactly when its wait for work times out (see WebSocketClientSession).
+  # A Duration, so the unit is in the value: 30s, PT30S and a bare 30 all bind (the bare form only means SECONDS
+  # because of @DurationUnit on the record component — Spring's binder would otherwise read a bare number as
+  # MILLISECONDS). Absent binds as null and falls back to the default; 0s is an explicit "off".
+  keepalive-ping-interval: 30s
 
 management:
   endpoints:

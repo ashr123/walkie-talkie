@@ -1,6 +1,10 @@
 package io.github.ashr123.walkietalkie.server.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.convert.DurationUnit;
+
+import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 
 /// Tunable server settings, bound from the `walkie.*` configuration namespace.
 ///
@@ -45,6 +49,18 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 ///                               `walkie.auth-signing-key` (env `WALKIE_AUTH_SIGNING_KEY`). Blank/absent means
 ///                               a random key is generated per process (dev only — tokens then don't survive a
 ///                               restart or span instances). Never hardcode a real key.
+/// @param keepalivePingInterval  how often the server sends a WebSocket **Ping** on an otherwise idle connection
+///                               (`0s` disables, absent falls back to the default). A `Duration`, so the unit lives
+///                               in the VALUE — `30s`, `PT30S` and a bare `30` all bind (the bare form needs
+///                               [DurationUnit], or Spring's binder would read it as 30 *milliseconds*). An idle WebSocket is what every middlebox in the path reaps: a
+///                               Cloudflare tunnel closes one after ~100 s (measured: 125 s, then a bare TCP FIN
+///                               with no Close frame), and nginx's default `proxy_read_timeout` is 60 s — so
+///                               without this a quiet channel simply drops, in the very deployment `deploy/`
+///                               documents. A Ping is the cheapest keepalive that needs no protocol change and no
+///                               client code: both browsers and the JDK's WebSocket answer one with a Pong
+///                               automatically. Only genuinely idle sessions are pinged — see
+///                               [io.github.ashr123.walkietalkie.server.session.WebSocketClientSession], whose
+///                               drainer thread emits one exactly when it has waited this long with nothing to send
 /// @param channelAffinity        multi-instance routing switch (`walkie.channel-affinity`, default `false`). When
 ///                               enabled, a socket may only serve a channel that this instance OWNS — the channel
 ///                               it was routed to at the handshake, or any channel it already hosts — and a switch
@@ -64,12 +80,19 @@ public record WalkieProperties(
 		boolean floorQueueDefault,
 		int maxJoinRequests,
 		String authSigningKey,
-		boolean channelAffinity) {
+		boolean channelAffinity,
+		@DurationUnit(ChronoUnit.SECONDS) Duration keepalivePingInterval) {
 
 	/// One second has this many nanoseconds; above this many events/second a rate limiter's per-token interval
 	/// (1 s ÷ rate) would round down to zero nanoseconds and its `Duration.dividedBy` would throw, so any rate is
 	/// clamped here. Far above any real audio/control rate, so legitimate values pass untouched.
 	private static final long MAX_RATE_PER_SECOND = 1_000_000_000L;
+
+	/// Comfortably under the tightest idle timeout in any documented deployment of this server — nginx's 60 s
+	/// `proxy_read_timeout`, and a Cloudflare tunnel's ~100 s (measured: 125 s) — with room for one ping to be lost
+	/// and the next to still arrive in time.
+	private static final Duration DEFAULT_KEEPALIVE_PING = Duration.ofSeconds(30);
+
 
 	public WalkieProperties {
 		if (allowedOrigins == null || allowedOrigins.length == 0) {
@@ -107,6 +130,12 @@ public record WalkieProperties(
 		if (floorReservationSeconds <= 0) {
 			// Grant-to-claim needs a positive window, so 0/blank means "use the default" (never "disabled").
 			floorReservationSeconds = 10;
+		}
+		if (keepalivePingInterval == null || keepalivePingInterval.isNegative()) {
+			// Absent binds as NULL for a Duration (unlike a `long`, which would arrive as 0), and 0 is meaningful
+			// here — an explicit "off", for a path with no idle reaper such as loopback or a proxy whose read timeout
+			// you set yourself — so absent and negative fall back while ZERO is honoured.
+			keepalivePingInterval = DEFAULT_KEEPALIVE_PING;
 		}
 		if (maxJoinRequests < 0) {
 			// Like the floor timers, an explicit 0 is meaningful ("refuse newcomers outright"), so only a

@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.transport;
 
+import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.Transport;
 import org.slf4j.Logger;
@@ -13,8 +14,8 @@ import org.springframework.stereotype.Component;
 public class SignalingHandler extends BaseWalkieHandler {
 	private static final Logger log = LoggerFactory.getLogger(SignalingHandler.class);
 
-	public SignalingHandler(ConnectionService connectionService, MessageCodec codec) {
-		super(connectionService, codec, Transport.SIGNALING);
+	public SignalingHandler(ConnectionService connectionService, MessageCodec codec, WalkieProperties properties) {
+		super(connectionService, codec, Transport.SIGNALING, properties);
 	}
 
 	@Override
