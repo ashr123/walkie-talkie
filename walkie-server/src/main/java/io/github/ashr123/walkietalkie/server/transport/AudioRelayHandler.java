@@ -29,8 +29,10 @@ public class AudioRelayHandler extends BaseWalkieHandler {
 			return;
 		}
 		// Hand the payload over as-is: ConnectionService copies it (once, into the prefixed frame) only after the
-		// frame has passed every gate, so a dropped frame costs no copy. Safe because that copy is synchronous
-		// within this call — the container may recycle the buffer as soon as this method returns.
+		// frame has passed every gate, so a dropped frame costs no copy at all. Safe because that copy happens
+		// synchronously inside this call, which is the contract to keep — Tomcat does give us a private per-message
+		// buffer, but the Jakarta API promises nothing about how long the argument stays valid, so nothing here may
+		// outlive the call.
 		connectionService.onAudio(clientSession, message.getPayload());
 	}
 

@@ -905,7 +905,13 @@ public class ConnectionService {
 	/// [#prefixedFrame], after every gate — a frame dropped as oversized, muted, floorless or rate-limited is never
 	/// copied at all, and the array that is finally built is the one shared with every recipient, so there is exactly
 	/// one copy per relayed frame rather than one in the transport plus one here. The buffer is consumed within this
-	/// call and never retained: the container may recycle it once the handler returns.
+	/// call and never retained — deliberately, though not because it is doomed: Tomcat hands the handler a PRIVATE
+	/// per-message buffer (`WsFrameBase.processDataBinary` allocates one, copies into it, and clears its own reusable
+	/// buffer before dispatch), so keeping it would in fact work there. What is missing is a promise —
+	/// `MessageHandler.Whole#onMessage` says nothing about the argument's lifetime — so retaining it would rest on a
+	/// container detail. It is moot regardless: the stream index has to be contiguous with the body in ONE payload
+	/// (`sendMessage` takes a single `BinaryMessage`; neither Spring nor the Jakarta API offers a gather write), so a
+	/// fresh buffer and a copy are required whatever the carrier type is.
 	public void onAudio(ClientSession session, ByteBuffer audio) {
 		// Read channelName ONCE into a local: the null-check and the registry lookup below both need it, and a
 		// concurrent onClose/leave (leftChannel() → null) landing between two separate reads would turn the second
