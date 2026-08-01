@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -85,7 +86,7 @@ class ConcurrencyStressTest {
 							case 1 -> service.onMessage(me, new ClientMessage.RequestFloor());
 							case 2 -> service.onMessage(me, new ClientMessage.ReleaseFloor());
 							case 3 -> service.onMessage(me, new ClientMessage.Rename("n-" + seed + "-" + i % 40));
-							case 4 -> service.onAudio(me, frame);
+							case 4 -> service.onAudio(me, ByteBuffer.wrap(frame));
 							case 5 -> service.onMessage(me, new ClientMessage.Leave());
 							// Passphrase rotation races joins/leaves on the SAME channel: only the channel's current
 							// owner succeeds (others get NOT_OWNER, no throw), so the registry's key-check write must
@@ -283,7 +284,7 @@ class ConcurrencyStressTest {
 							// Release interpreted by state: release the held floor, leave the queue, or decline a turn.
 							case 3 -> service.onMessage(me, new ClientMessage.ReleaseFloor());
 							case 4 -> service.onMessage(me, new ClientMessage.Leave());   // may drop the holder / reserved head
-							case 5 -> service.onAudio(me, frame);
+							case 5 -> service.onAudio(me, ByteBuffer.wrap(frame));
 							// Owner-only toggle: only the current owner succeeds (others get NOT_OWNER, no throw);
 							// disabling clears the queue + reservation mid-contention, re-enabling reopens it.
 							case 6 -> service.onMessage(me, new ClientMessage.SetFloorQueue(rnd.nextBoolean()));

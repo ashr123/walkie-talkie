@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.nio.ByteBuffer;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -899,15 +900,21 @@ public class ConnectionService {
 	/// Relays a raw audio frame to the other relay-capable members of the sender's channel. The frame
 	/// is dropped when the sender is not currently authorized to talk (push-to-talk floor not held), when
 	/// the owner has muted the sender, or when it violates the configured size bounds.
-	public void onAudio(ClientSession session, byte[] audio) {
+	///
+	/// Takes the frame as a [ByteBuffer] rather than a `byte[]` so the single copy of it happens HERE, in
+	/// [#prefixedFrame], after every gate — a frame dropped as oversized, muted, floorless or rate-limited is never
+	/// copied at all, and the array that is finally built is the one shared with every recipient, so there is exactly
+	/// one copy per relayed frame rather than one in the transport plus one here. The buffer is consumed within this
+	/// call and never retained: the container may recycle it once the handler returns.
+	public void onAudio(ClientSession session, ByteBuffer audio) {
 		// Read channelName ONCE into a local: the null-check and the registry lookup below both need it, and a
 		// concurrent onClose/leave (leftChannel() → null) landing between two separate reads would turn the second
 		// into find(null) → ConcurrentHashMap.get(null) → NPE, thrown on the per-frame audio hot path with no
 		// try/catch above it (handleBinaryMessage doesn't catch). One read also keeps the whole gate consistent.
 		String channelName = session.channelName();
 		if (!session.supportsAudioRelay()
-				|| audio.length == 0
-				|| audio.length > properties.maxAudioFrameBytes()
+				|| !audio.hasRemaining()
+				|| audio.remaining() > properties.maxAudioFrameBytes()
 				|| channelName == null
 				|| !(channelRegistry.find(channelName) instanceof Some(Channel channel))
 				|| !channel.holdsFloor(session.id())
@@ -984,13 +991,18 @@ public class ConnectionService {
 		// The sender's stream index was freed (it is leaving) — drop this straggler frame.
 	}
 
-	/// Prepends the 1-byte stream index to a relayed audio frame: `[sid][body]`. The body (plaintext
-	/// `[tag][payload]` or the E2EE `[scheme][IV][ct]` envelope) is copied verbatim — the server never
-	/// inspects it, and the index sits outside any encryption.
-	private static byte[] prefixedFrame(int streamIndex, byte[] body) {
-		byte[] out = new byte[body.length + 1];
+	/// Materialises a relayed audio frame as `[sid][body]`: the 1-byte stream index followed by the body verbatim —
+	/// the server never inspects the body (plaintext `[tag][payload]` or the E2EE `[scheme][IV][ct]` envelope), and
+	/// the index sits outside any encryption.
+	///
+	/// This is the ONE copy an inbound frame costs. The destination is allocated a byte longer than the body and the
+	/// bulk `get` writes straight past the reserved slot, so there is no second array and no `System.arraycopy` —
+	/// the transport used to materialise an exactly-sized array which this then re-copied. Doing it here rather than
+	/// in the handler is also what makes a DROPPED frame free: this runs only once every gate has passed.
+	private static byte[] prefixedFrame(int streamIndex, ByteBuffer body) {
+		byte[] out = new byte[body.remaining() + 1];
 		out[0] = (byte) streamIndex;
-		System.arraycopy(body, 0, out, 1, body.length);
+		body.get(out, 1, out.length - 1);
 		return out;
 	}
 

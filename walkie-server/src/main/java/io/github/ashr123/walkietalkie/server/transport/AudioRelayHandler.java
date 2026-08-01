@@ -11,7 +11,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.WebSocketSession;
 
-import java.nio.ByteBuffer;
 
 /// Transport where the server relays raw audio: clients stream PCM audio as binary frames and the
 /// server fans each frame out to the other members of the channel (`/ws/audio`).
@@ -29,10 +28,10 @@ public class AudioRelayHandler extends BaseWalkieHandler {
 		if (clientSession == null) {
 			return;
 		}
-		ByteBuffer payload = message.getPayload();
-		byte[] audio = new byte[payload.remaining()];
-		payload.get(audio);
-		connectionService.onAudio(clientSession, audio);
+		// Hand the payload over as-is: ConnectionService copies it (once, into the prefixed frame) only after the
+		// frame has passed every gate, so a dropped frame costs no copy. Safe because that copy is synchronous
+		// within this call — the container may recycle the buffer as soon as this method returns.
+		connectionService.onAudio(clientSession, message.getPayload());
 	}
 
 	@Override

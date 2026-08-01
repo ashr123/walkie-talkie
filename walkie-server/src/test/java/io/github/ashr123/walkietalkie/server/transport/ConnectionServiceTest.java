@@ -17,6 +17,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.nio.ByteBuffer;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -783,11 +784,11 @@ class ConnectionServiceTest {
 		FakeClientSession alice = join("alice", "fd", ChannelMode.FULL_DUPLEX);
 		FakeClientSession bob = join("bob", "fd", ChannelMode.FULL_DUPLEX);
 
-		service.onAudio(alice, new byte[0]);          // empty -> dropped
-		service.onAudio(alice, new byte[8193]);       // over the 8192 limit -> dropped
+		service.onAudio(alice, ByteBuffer.wrap(new byte[0]));          // empty -> dropped
+		service.onAudio(alice, ByteBuffer.wrap(new byte[8193]));       // over the 8192 limit -> dropped
 		assertEquals(0, bob.audio.size(), "empty and oversized frames are dropped");
 
-		service.onAudio(alice, new byte[8192]);       // exactly at the limit -> relayed
+		service.onAudio(alice, ByteBuffer.wrap(new byte[8192]));       // exactly at the limit -> relayed
 		assertEquals(1, bob.audio.size());
 		assertEquals(8192 + 1, bob.audio.getFirst().length, "the relayed frame is the body plus the 1-byte stream-index prefix");
 	}
@@ -800,18 +801,18 @@ class ConnectionServiceTest {
 		service.onMessage(carol, new ClientMessage.Join("room", ChannelMode.FULL_DUPLEX, "carol", null));
 
 		byte[] frame = {1, 2, 3};
-		service.onAudio(alice, frame);
+		service.onAudio(alice, ByteBuffer.wrap(frame));
 		assertEquals(1, bob.audio.size(), "an audio-relay member receives the frame");
 		assertEquals(0, carol.audio.size(), "a signaling member is skipped");
 
-		service.onAudio(carol, frame);   // a signaling sender cannot relay audio
+		service.onAudio(carol, ByteBuffer.wrap(frame));   // a signaling sender cannot relay audio
 		assertEquals(1, bob.audio.size(), "audio from a signaling sender is dropped");
 	}
 
 	@Test
 	void audioWithNoChannelIsDroppedWithoutException() {
 		FakeClientSession s = session("never-joined");
-		assertDoesNotThrow(() -> service.onAudio(s, new byte[]{1, 2, 3}));
+		assertDoesNotThrow(() -> service.onAudio(s, ByteBuffer.wrap(new byte[]{1, 2, 3})));
 	}
 
 	@Test
@@ -822,7 +823,7 @@ class ConnectionServiceTest {
 		service.onMessage(bad, new ClientMessage.Join("relayfail", ChannelMode.FULL_DUPLEX, "bad", null));
 
 		byte[] frame = {4, 5, 6};
-		assertDoesNotThrow(() -> service.onAudio(alice, frame));
+		assertDoesNotThrow(() -> service.onAudio(alice, ByteBuffer.wrap(frame)));
 		assertEquals(1, good.audio.size(), "the healthy recipient still receives despite a failing peer");
 		assertArrayEquals(frame, Arrays.copyOfRange(good.audio.getFirst(), 1, good.audio.getFirst().length),
 				"the delivered frame body is intact (after stripping the stream-index prefix)");
@@ -851,7 +852,7 @@ class ConnectionServiceTest {
 	void audioForAChannelThatNoLongerExistsIsDroppedWithoutException() {
 		FakeClientSession s = session("orphan");
 		s.joinedChannel("ghost");   // a channel that was already dropped from the registry (a leave-during-send race)
-		assertDoesNotThrow(() -> service.onAudio(s, new byte[]{1, 2, 3}));
+		assertDoesNotThrow(() -> service.onAudio(s, ByteBuffer.wrap(new byte[]{1, 2, 3})));
 	}
 
 	@Test
@@ -877,7 +878,7 @@ class ConnectionServiceTest {
 		FakeClientSession bob = join("bob", "fd-sid", ChannelMode.FULL_DUPLEX);
 
 		byte[] frame = {1, 2, 3};
-		service.onAudio(alice, frame);
+		service.onAudio(alice, ByteBuffer.wrap(frame));
 
 		byte[] received = bob.audio.getFirst();
 		int aliceSid = channel("fd-sid").requireStreamIndex("alice");
@@ -1028,11 +1029,11 @@ class ConnectionServiceTest {
 		alice.sent.clear();
 		bob.sent.clear();
 
-		svc.onAudio(alice, new byte[]{1, 2, 3});                  // within the cap -> relayed
+		svc.onAudio(alice, ByteBuffer.wrap(new byte[]{1, 2, 3}));                  // within the cap -> relayed
 		assertEquals(1, bob.audio.size(), "a frame within the hold cap is relayed");
 
 		clock.advance(Duration.ofSeconds(11));                   // past the 10 s cap
-		svc.onAudio(alice, new byte[]{4, 5, 6});
+		svc.onAudio(alice, ByteBuffer.wrap(new byte[]{4, 5, 6}));
 
 		assertEquals(1, bob.audio.size(), "the over-cap frame is dropped, not relayed");
 		assertTrue(alice.sent.stream().anyMatch(m -> m instanceof ServerMessage.FloorStatus(String holderId, _)
@@ -1056,7 +1057,7 @@ class ConnectionServiceTest {
 		assertTrue(channel("ptt-active").holdsFloor("alice"));
 
 		clock.advance(Duration.ofSeconds(4));
-		svc.onAudio(alice, new byte[]{1, 2, 3});                  // active speaker -> refreshes the activity mark to t=4 s
+		svc.onAudio(alice, ByteBuffer.wrap(new byte[]{1, 2, 3}));                  // active speaker -> refreshes the activity mark to t=4 s
 
 		clock.advance(Duration.ofSeconds(2));                    // t=6 s: only 2 s since the last frame (< 5 s idle window)
 		bob.sent.clear();
@@ -1091,10 +1092,10 @@ class ConnectionServiceTest {
 		svc.onMessage(bob, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, "bob", null));
 
 		byte[] frame = {1, 2, 3};
-		svc.onAudio(alice, frame);
-		svc.onAudio(alice, frame);
+		svc.onAudio(alice, ByteBuffer.wrap(frame));
+		svc.onAudio(alice, ByteBuffer.wrap(frame));
 		assertEquals(2, bob.audio.size(), "the burst-capacity frames are relayed");
-		svc.onAudio(alice, frame);   // over the per-sender rate -> dropped before fan-out
+		svc.onAudio(alice, ByteBuffer.wrap(frame));   // over the per-sender rate -> dropped before fan-out
 		assertEquals(2, bob.audio.size(), "a frame past the rate cap is dropped before fan-out");
 	}
 
@@ -1122,14 +1123,14 @@ class ConnectionServiceTest {
 		svc.onMessage(bob, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "bob", null));
 
 		byte[] frame = {1, 2, 3};
-		svc.onAudio(alice, frame);
-		svc.onAudio(alice, frame);   // exhausts the 1-token bucket
+		svc.onAudio(alice, ByteBuffer.wrap(frame));
+		svc.onAudio(alice, ByteBuffer.wrap(frame));   // exhausts the 1-token bucket
 		assertEquals(1, bob.audio.size(), "the second frame is over the cap and dropped");
 
 		svc.onClose(alice, "test close");          // must evict alice's bucket
 		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "alice", null));   // same id reconnects
 		bob.audio.clear();
-		svc.onAudio(alice, frame);
+		svc.onAudio(alice, ByteBuffer.wrap(frame));
 		assertEquals(1, bob.audio.size(), "after onClose evicts the bucket, the reconnecting id starts from a full bucket");
 	}
 
@@ -1596,7 +1597,7 @@ class ConnectionServiceTest {
 
 		clock.advance(Duration.ofSeconds(11));   // past the cap
 		bob.sent.clear();
-		svc.onAudio(alice, new byte[]{1, 2, 3});   // the holder's next frame trips the cap and releases the floor
+		svc.onAudio(alice, ByteBuffer.wrap(new byte[]{1, 2, 3}));   // the holder's next frame trips the cap and releases the floor
 
 		assertFalse(channel("qF").holdsFloor("alice"), "the over-cap frame releases the holder");
 		assertTrue(bob.sent.stream().anyMatch(ServerMessage.FloorReserved.class::isInstance),
@@ -1659,7 +1660,7 @@ class ConnectionServiceTest {
 		FakeClientSession bob = join("bob", "mute", ChannelMode.FULL_DUPLEX);
 
 		byte[] frame = {1, 2, 3};
-		service.onAudio(bob, frame);
+		service.onAudio(bob, ByteBuffer.wrap(frame));
 		assertEquals(1, alice.audio.size(), "before muting, bob's audio is relayed");
 
 		alice.sent.clear();
@@ -1672,7 +1673,7 @@ class ConnectionServiceTest {
 		assertEquals(Set.of("bob"), lastOf(alice, ServerMessage.MuteStatus.class).muted(), "the owner is notified too");
 
 		alice.audio.clear();
-		service.onAudio(bob, frame);
+		service.onAudio(bob, ByteBuffer.wrap(frame));
 		assertEquals(0, alice.audio.size(), "a muted member's audio is dropped server-side, not relayed");
 	}
 
@@ -1683,12 +1684,12 @@ class ConnectionServiceTest {
 		service.onMessage(alice, new ClientMessage.MuteMember("bob", true));
 
 		byte[] frame = {1, 2, 3};
-		service.onAudio(bob, frame);
+		service.onAudio(bob, ByteBuffer.wrap(frame));
 		assertEquals(0, alice.audio.size(), "while muted, bob's audio is dropped");
 
 		service.onMessage(alice, new ClientMessage.MuteMember("bob", false));
 		assertFalse(channel("unmute").isMuted("bob"));
-		service.onAudio(bob, frame);
+		service.onAudio(bob, ByteBuffer.wrap(frame));
 		assertEquals(1, alice.audio.size(), "after unmuting, bob's audio is relayed again");
 	}
 
@@ -1814,13 +1815,13 @@ class ConnectionServiceTest {
 
 		byte[] frame = {1, 2, 3};
 		alice.audio.clear();
-		service.onAudio(bob, frame);
-		service.onAudio(carol, frame);
+		service.onAudio(bob, ByteBuffer.wrap(frame));
+		service.onAudio(carol, ByteBuffer.wrap(frame));
 		assertEquals(0, alice.audio.size(), "both muted members' audio is dropped");
 
 		bob.audio.clear();
 		carol.audio.clear();
-		service.onAudio(alice, frame);   // the owner is not muted and can still be heard
+		service.onAudio(alice, ByteBuffer.wrap(frame));   // the owner is not muted and can still be heard
 		assertEquals(1, bob.audio.size(), "the owner can still talk");
 		assertEquals(1, carol.audio.size());
 	}
@@ -1866,7 +1867,7 @@ class ConnectionServiceTest {
 		assertFalse(channel("mute-leave").isMuted("bob"), "the rejoining id is not muted");
 		byte[] frame = {1, 2, 3};
 		alice.audio.clear();
-		service.onAudio(bobAgain, frame);
+		service.onAudio(bobAgain, ByteBuffer.wrap(frame));
 		assertEquals(1, alice.audio.size(), "the rejoined member is heard again");
 	}
 
@@ -1917,7 +1918,7 @@ class ConnectionServiceTest {
 				"the channel is told the new owner was unmuted");
 		byte[] frame = {1, 2, 3};
 		alice.audio.clear();
-		service.onAudio(bob, frame);
+		service.onAudio(bob, ByteBuffer.wrap(frame));
 		assertEquals(1, alice.audio.size(), "the new (unmuted) owner can be heard");
 	}
 
@@ -2027,7 +2028,7 @@ class ConnectionServiceTest {
 				"a join emits no mute snapshot — the rule changes nobody already present");
 		// Enforcement, not just bookkeeping.
 		alice.audio.clear();
-		service.onAudio(bob, new byte[]{1, 2, 3});
+		service.onAudio(bob, ByteBuffer.wrap(new byte[]{1, 2, 3}));
 		assertEquals(0, alice.audio.size(), "an entry-muted member's audio is dropped server-side");
 	}
 
@@ -2243,7 +2244,7 @@ class ConnectionServiceTest {
 		assertTrue(firstOf(bob, ServerMessage.ChannelLocked.class).locked(),
 				"an existing member is told the channel locked");
 		assertEquals(2, channel("lock-bcast").size(), "locking removes no existing members");
-		service.onAudio(bob, new byte[]{1, 2, 3});
+		service.onAudio(bob, ByteBuffer.wrap(new byte[]{1, 2, 3}));
 		assertEquals(1, alice.audio.size(), "an existing member's audio still relays while the channel is locked");
 
 		bob.sent.clear();
