@@ -18,6 +18,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.nio.ByteBuffer;
+import java.text.Normalizer;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -37,7 +38,24 @@ public class ConnectionService {
 
 	private static final Logger log = LoggerFactory.getLogger(ConnectionService.class);
 	private static final Pattern CHANNEL_NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
-	private static final Pattern DISPLAY_NAME = Pattern.compile("[A-Za-z0-9_.-]{1,32}");
+	/// Display names hold letters, combining marks and digits from ANY script — Hebrew, Han, accented Latin — plus a
+	/// plain space, `_`, `.` and `-`. Combining marks are not optional: Hebrew niqqud and Arabic diacritics are marks,
+	/// so omitting `\p{M}` would silently reject vocalised text.
+	///
+	/// What is excluded is everything that cannot be SEEN. Every other separator (`\p{Zs}` — NBSP, ideographic space,
+	/// the thin spaces) and every format or control character (`\p{C}` — ZWSP, ZWNJ, soft hyphen, the bidi overrides,
+	/// C0/C1) is refused. Not because they let one member impersonate another — both clients always print the session
+	/// id beside a name, so two look-alike names are still told apart — but because a control character can split a
+	/// log record in two (names reach the log through the MDC) and a bidi override such as U+202E reorders the text
+	/// AROUND it, so a roster row or log line could be made to read differently than it is.
+	///
+	/// Length is 1-32 CODE POINTS rather than UTF-16 units: Java matches a supplementary letter as one unit inside a
+	/// `\p{...}` class, so 32 astral letters pass and 33 do not. Verified rather than assumed.
+	private static final Pattern DISPLAY_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N} _.-]{1,32}");
+
+	/// Human wording for the rule above: the pattern itself is unreadable to anyone who has to act on the error.
+	private static final String DISPLAY_NAME_RULE =
+			"Display name must be 1-32 letters, digits or spaces (any language), '_', '.' or '-' — no invisible characters";
 	private static final String GLOBAL_CHANNEL = "global";
 	/// Owner id stamped on the server-managed "global" channel. It is deliberately NOT a session id — session
 	/// ids are Spring-generated UUID strings, so "server" can never collide — which means no real participant
@@ -97,6 +115,23 @@ public class ConnectionService {
 		try (RequestContext.Scope _ = RequestContext.scope(session)) {
 			log.info("connected (transport={})", session.transport());
 		}
+	}
+
+	/// The canonical form of a display name — what the server stores, broadcasts and compares: NFC-composed, then
+	/// stripped of leading and trailing whitespace. Null in, null out, so the callers' own null check still reads.
+	///
+	/// NFC because one name can arrive as two different byte sequences that render identically (`é` as a single code
+	/// point or as `e` plus a combining acute; Hebrew with niqqud likewise) — without it, a rename to a
+	/// visually-identical name is an invisible change, and two members can hold names nobody can tell apart for a
+	/// reason no client can explain. Strip because leading and trailing spaces carry no information and the browser
+	/// does not even render them (its roster collapses whitespace runs and drops the edges — measured, all four
+	/// variants came out the same pixel width).
+	///
+	/// The ORDER matters and is the reason this is not a one-liner at each call site: a name of nothing but spaces
+	/// satisfies the pattern's `{1,32}` on its own, so stripping has to happen first and leave an empty string for
+	/// the pattern to reject. Multiple spaces INSIDE a name are deliberately left alone.
+	private static String canonicalDisplayName(String requested) {
+		return requested == null ? null : Normalizer.normalize(requested, Normalizer.Form.NFC).strip();
 	}
 
 	/// Handles one decoded control message. The caller's identity is bound for the dynamic scope of the call and
@@ -199,9 +234,11 @@ public class ConnectionService {
 					"Channel name must match " + CHANNEL_NAME.pattern());
 			return;
 		}
-		if (join.displayName() == null || !DISPLAY_NAME.matcher(join.displayName()).matches()) {
-			sendError(session, ErrorCode.INVALID_DISPLAY_NAME,
-					"Display name must match " + DISPLAY_NAME.pattern());
+		// Canonicalise BEFORE validating, and carry the canonical form forward — it is what gets stored, broadcast and
+		// compared from here on, so every client sees the same bytes for the same name.
+		String displayName = canonicalDisplayName(join.displayName());
+		if (displayName == null || !DISPLAY_NAME.matcher(displayName).matches()) {
+			sendError(session, ErrorCode.INVALID_DISPLAY_NAME, DISPLAY_NAME_RULE);
 			return;
 		}
 		// The "global" channel is the server-managed broadcast room: reachable ONLY via global push-to-talk,
@@ -241,10 +278,10 @@ public class ConnectionService {
 		// registry captures under its lock reads it. So apply it now and undo it if the join doesn't happen — else a
 		// refused switcher would sit in its old channel under a name that channel was never told about.
 		String previousDisplayName = session.displayName();
-		session.setDisplayName(join.displayName());
+		session.setDisplayName(displayName);
 		// onMessage snapshotted the MDC name at scope entry, when it was still blank — advance it so this handler's
 		// lines carry name=... instead of name=-. The scope's restore-on-exit still cleans it up.
-		RequestContext.updateDisplayName(join.displayName());
+		RequestContext.updateDisplayName(displayName);
 
 		// Emit the joiner's initial state — its Joined snapshot then an authoritative FloorStatus snapshot — from
 		// INSIDE the registry's add monitor span (see joinOrCreate's onJoinUnderLock). Sending it there, atomically
@@ -1413,10 +1450,13 @@ public class ConnectionService {
 	/// member joining at the same instant therefore either captures the new name in its `Joined` roster, or is
 	/// already a member and receives this `MemberRenamed` — it can never be left showing the old name forever
 	/// (the same hazard the post-removal `MemberLeft` ordering avoids for departures).
-	private void handleRename(ClientSession session, String displayName) {
+	private void handleRename(ClientSession session, String requestedDisplayName) {
+		// Same canonical form as a join, for the same reason: what is compared and broadcast must be what is stored.
+		// It also makes "rename me to the same name with a trailing space" the no-op it looks like, rather than a
+		// broadcast the other members cannot see the point of.
+		String displayName = canonicalDisplayName(requestedDisplayName);
 		if (displayName == null || !DISPLAY_NAME.matcher(displayName).matches()) {
-			sendError(session, ErrorCode.INVALID_DISPLAY_NAME,
-					"Display name must match " + DISPLAY_NAME.pattern());
+			sendError(session, ErrorCode.INVALID_DISPLAY_NAME, DISPLAY_NAME_RULE);
 			return;
 		}
 		String previous = session.displayName();   // the old label, for the transition logged below (before overwrite)

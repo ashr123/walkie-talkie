@@ -19,6 +19,7 @@ import {
 	wrapPassphrase
 } from './e2ee.js';
 import {CHANNEL_FLAGS, flagDisplay} from './channel-flags.js';
+import {canonicalDisplayName, isValidDisplayName} from './names.js';
 import {micErrorMessage, NO_CAPTURE_API_MESSAGE} from './mic-errors.js';
 import {
 	FLOOR_IN_LINE,
@@ -49,7 +50,6 @@ const STEREO_BITRATE = 128000;   // stereo needs ~2x for equivalent quality
 const CODEC_OPUS = 1;
 const CODEC_PCM = 2;
 const OPUS_SUPPORTED = typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined';
-const DISPLAY_NAME = /^[A-Za-z0-9_.-]{1,32}$/;   // must match the server's display-name validation
 const CHANNEL_NAME = /^[A-Za-z0-9_-]{1,64}$/;    // must match the server's CHANNEL_NAME validation (no '.', unlike display names)
 const SERVER_OWNER = 'server';   // ownerId the server stamps on the server-managed "global" room (matches ConnectionService.GLOBAL_CHANNEL_OWNER); no participant owns it
 const MAX_ACTIVE_DECODERS = 8;   // cap on per-sender decoders we mix at once (O(N^2) fan-out guard); evict longest-silent
@@ -206,13 +206,15 @@ async function connect() {
 	state.mode = byId('mode').value;
 	state.hifi = byId('hifi').checked;
 	state.startMuted = byId('startMuted').checked;   // full-duplex only: join with the mic muted
-	const display = byId('display').value.trim();
+	// Canonicalise exactly as the server will (NFC + trim, see names.js): state.displayName has to hold the string
+	// the server ends up with, or the Rename button — which compares against it — argues with a name already accepted.
+	const display = canonicalDisplayName(byId('display').value);
 	state.displayName = display;   // what the Join below carries; a Joined/MemberRenamed later corrects it
 	const channel = byId('channel').value.trim();
 	const passphrase = byId('passphrase').value;   // read once; used only on the relay path (E2EE)
 
-	if (!DISPLAY_NAME.test(display)) {
-		log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
+	if (!isValidDisplayName(display)) {
+		log('Display name must be 1-32 letters, digits or spaces (any language), _ . or - — no invisible characters.');
 		return;
 	}
 	// A channel name is required (no silent default) — except in global mode, where the field is hidden and the
@@ -335,9 +337,9 @@ async function applyOrSwitch() {
 	const mode = byId('mode').value;
 	const channel = byId('channel').value.trim();
 	const passphrase = byId('passphrase').value;
-	const display = byId('display').value.trim();
-	if (!DISPLAY_NAME.test(display)) {
-		log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
+	const display = canonicalDisplayName(byId('display').value);
+	if (!isValidDisplayName(display)) {
+		log('Display name must be 1-32 letters, digits or spaces (any language), _ . or - — no invisible characters.');
 		return;
 	}
 	const effectiveChannel = mode === 'GLOBAL_PTT' ? 'global' : channel;
@@ -708,9 +710,9 @@ function rename() {
 	if (!isOpen()) {
 		return;
 	}
-	const display = byId('display').value.trim();
-	if (!DISPLAY_NAME.test(display)) {
-		log('Display name must be 1-32 chars of letters, digits, _ . or - (no spaces).');
+	const display = canonicalDisplayName(byId('display').value);
+	if (!isValidDisplayName(display)) {
+		log('Display name must be 1-32 letters, digits or spaces (any language), _ . or - — no invisible characters.');
 		return;
 	}
 	if (display === state.displayName) {
@@ -742,7 +744,7 @@ function updateRenameButton() {
 	// One comparison for both states — in a channel or waiting at its door — because state.displayName tracks what
 	// the server has either way. Comparing against the roster instead would enable Rename for every waiting newcomer
 	// whose name was already correct, since a waiting session has no roster entry.
-	btn.disabled = byId('display').value.trim() === state.displayName;
+	btn.disabled = canonicalDisplayName(byId('display').value) === state.displayName;
 }
 
 // --- incoming messages ----------------------------------------------------------------------------

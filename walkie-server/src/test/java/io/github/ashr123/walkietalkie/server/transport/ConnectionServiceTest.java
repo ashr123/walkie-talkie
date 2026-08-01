@@ -226,12 +226,89 @@ class ConnectionServiceTest {
 		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
 
-		service.onMessage(alice, new ClientMessage.Rename("bad name"));   // a space is not in the allowed charset
+		service.onMessage(alice, new ClientMessage.Rename("bad/name"));   // a slash is not in the allowed charset
 
 		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("alice", alice.displayName(), "the label is unchanged on rejection");
 		assertFalse(bob.sent.stream().anyMatch(ServerMessage.MemberRenamed.class::isInstance),
 				"no rename is broadcast for an invalid name");
+	}
+
+	@Test
+	void aDisplayNameMayHoldLettersFromAnyScriptAndSpaces() {
+		// The rule is deliberately not ASCII-only: a name is what other people see you as, so Hebrew, Han and
+		// accented Latin belong. Multi-word names are allowed too, and several spaces in a row are kept AS TYPED —
+		// nothing collapses them, because both clients always print the session id beside a name, so two names that
+		// look alike are still told apart.
+		assertEquals("יוסי כהן", joinWithName("hebrew", "יוסי כהן").displayName());
+		assertEquals("יוֹסֵי", joinWithName("niqqud", "יוֹסֵי").displayName(), "combining marks (niqqud) survive");
+		assertEquals("李雷", joinWithName("han", "李雷").displayName());
+		assertEquals("José", joinWithName("latin", "José").displayName());
+		assertEquals("Roy  Ash", joinWithName("runs", "Roy  Ash").displayName(), "internal spacing is left alone");
+	}
+
+	@Test
+	void aDisplayNameIsStrippedAndNfcNormalisedBeforeItIsStored() {
+		// The server owns the canonical form, so what it stores and broadcasts is what every client compares against.
+		// Padding is invisible in the browser roster (HTML drops the edges), so it must not be able to mint a second
+		// name; NFC because the same name can arrive composed or decomposed and a rename between the two would look
+		// like it did nothing.
+		assertEquals("Roy Ash", joinWithName("padded", "  Roy Ash  ").displayName(), "the edges are stripped");
+		assertEquals(1, joinWithName("nfc", "e\u0301").displayName().length(),
+				"e + combining acute is composed to one code point");
+		assertEquals("\u00e9", joinWithName("nfc2", "e\u0301").displayName());
+	}
+
+	@Test
+	void aDisplayNameOfNothingButSpacesIsRejected() {
+		// The pattern alone accepts a lone space (it is in the class, and {1,32} is satisfied) — only stripping BEFORE
+		// the match rejects it, by leaving an empty string. Reversing that order looks harmless, hence this test.
+		FakeClientSession session = session("blank");
+		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "   ", null));
+
+		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(session, ServerMessage.ErrorMessage.class).code());
+		assertFalse(channelExists("team"), "the channel is not created for a blank name");
+	}
+
+	@Test
+	void aDisplayNameCarryingInvisibleCharactersIsRejected() {
+		// Not an impersonation defence — the id tag always accompanies a name — but a control character can split a
+		// log record in two (names reach the log through the MDC) and a bidi override reorders the text AROUND it, so
+		// a roster row or log line could be made to read differently than it is. One case per family.
+		String[] invisible = {
+				"Alice\u200BBob",   // ZWSP: a format character, NOT whitespace, so "no whitespace" would miss it
+				"Alice\u202EBob",   // RIGHT-TO-LEFT OVERRIDE: reorders the surrounding text
+				"Roy\u00A0Ash",     // NBSP: renders as a space but is a different character
+				"Roy\u3000Ash",     // ideographic space
+				"Alice\u0007",      // BEL, a C0 control
+				"Alice\tBob",
+				"Alice\nBob"        // a newline would forge a second log line
+		};
+		for (String name : invisible) {
+			FakeClientSession session = session("inv-" + name.hashCode());
+			service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, name, null));
+			assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(session, ServerMessage.ErrorMessage.class).code(),
+					"rejected: " + name.replaceAll("\\p{C}", "?"));
+		}
+	}
+
+	@Test
+	void theDisplayNameLimitCountsCodePointsNotUtf16Units() {
+		// A supplementary letter is two UTF-16 units but one code point, and Java's \p{...} classes match it as one
+		// unit — so 32 astral letters must pass where a units-based count would see 64 and refuse.
+		assertEquals("\uD835\uDD04".repeat(32), joinWithName("astral", "\uD835\uDD04".repeat(32)).displayName());
+
+		FakeClientSession tooLong = session("too-long");
+		service.onMessage(tooLong, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "a".repeat(33), null));
+		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(tooLong, ServerMessage.ErrorMessage.class).code());
+	}
+
+	/// Joins `name` into its own channel and returns the session, so a test can assert on the name the SERVER settled
+	/// on (its canonical form) rather than on what was sent.
+	private FakeClientSession joinWithName(String channel, String name) {
+		FakeClientSession session = session("s-" + channel);
+		service.onMessage(session, new ClientMessage.Join(channel, ChannelMode.MULTI_CHANNEL_PTT, name, null));
+		return session;
 	}
 
 	@Test
@@ -333,7 +410,7 @@ class ConnectionServiceTest {
 	@Test
 	void aJoinWithAnInvalidDisplayNameIsRejected() {
 		FakeClientSession session = session("sess-1");
-		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "has spaces", null));
+		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "has/slash", null));
 
 		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(session, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("team"), "the channel is not created when the join is rejected");

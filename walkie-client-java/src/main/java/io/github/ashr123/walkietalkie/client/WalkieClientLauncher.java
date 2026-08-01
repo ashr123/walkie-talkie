@@ -47,7 +47,7 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 	private ChannelMode mode;
 
 	@Option(names = "--display", defaultValue = "guest",
-			description = "Display name shown to others; 1-32 chars of [A-Za-z0-9_.-] (default: ${DEFAULT-VALUE}).")
+			description = "Display name shown to others; 1-32 letters, digits or spaces in any language, plus _ . - (quote it if it contains spaces, e.g. --display \"Roy Ash\") (default: ${DEFAULT-VALUE}).")
 	private String display;
 
 	@Option(names = "--hifi", description = "Use the Opus music profile instead of the voice profile.")

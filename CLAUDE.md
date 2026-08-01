@@ -360,7 +360,22 @@ carry; clients can't choose or spoof it. (That authority holds only under the tr
 sender is read from the server-stamped, plaintext stream index, which no cryptography binds — so attribution is
 as trustworthy as the relay.) The **display name** is the only human label: the client sends it in `Join`, the server
 validates it
-against `[A-Za-z0-9_.-]{1,32}` (else `INVALID_DISPLAY_NAME`); clients append a short `#<id-prefix>` when two
+against `[\p{L}\p{M}\p{N} _.-]{1,32}` on its CANONICAL form — NFC-normalised then stripped, `ConnectionService.canonicalDisplayName`
+(else `INVALID_DISPLAY_NAME`). That is letters, combining marks and digits from ANY script (Hebrew, Han, accented
+Latin — `\p{M}` because niqqud and Arabic diacritics ARE marks) plus a plain space, `_`, `.` and `-`, 1-32 CODE
+POINTS. Everything invisible is refused: the other separators (`\p{Zs}`: NBSP, ideographic space) and every
+format/control character (`\p{C}`: ZWSP, soft hyphen, the bidi overrides, C0/C1). NOT as an impersonation defence —
+both clients always print the id beside a name — but because a control character can split a log record in two
+(names reach the log via the MDC) and a bidi override reorders the text AROUND it. Spaces INSIDE a name are kept as
+typed (nothing collapses runs); the roster renders with `white-space: pre-wrap` so the browser shows them, matching
+the Java client's terminal roster. Stripping precedes the pattern deliberately: a name of nothing but spaces would
+otherwise satisfy `{1,32}`. **Channel names deliberately keep the ASCII rule** `[A-Za-z0-9_-]{1,64}` — the channel
+name is the E2EE salt, derived CLIENT-side before the join is sent, so the server cannot canonicalise it
+unilaterally without both clients agreeing byte-for-byte; it is also a `ChannelRegistry` map key, the `?channel=`
+affinity routing key an external ingress hashes, and the `c <channel> [mode] [key]` console grammar splits on
+whitespace. The rule lives in three mirrored copies — server, `static/assets/names.js`, `WalkieClient` — pinned by
+the same vectors in `names.test.js` and `ConnectionServiceTest`, as the E2EE vectors are.
+Clients append a short `#<id-prefix>` when two
 members share one. The token's short TTL is the only bound on replay — the random nonce only makes each token
 unique/unguessable,
 it is **not** tracked, so a captured token is freely replayable to open new sockets within its ~60 s lifetime (no

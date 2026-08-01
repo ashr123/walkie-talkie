@@ -250,7 +250,8 @@ None of these needs a new socket — they all reuse the live connection (and its
   change it a client must reconnect (a new socket, hence a new `selfId`). The reference browser client does
   this transparently on a transport change.
 
-**Rename** — send `rename` with a new `displayName` (same `[A-Za-z0-9_.-]{1,32}` rule as `join`,
+**Rename** — send `rename` with a new `displayName` (same `[\p{L}\p{M}\p{N} _.-]{1,32}` rule as `join`, applied to the
+NFC-normalised + stripped form,
 §13). The server updates your label and broadcasts `memberRenamed { memberId, displayName }` to the channel
 **including you** — that echo, not local optimism, is the authority for your own roster label. Rename never
 touches channel membership, the floor, or stream indices.
@@ -667,7 +668,13 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 
 ## 13. Limits, validation & error codes
 
-- **Display name:** `[A-Za-z0-9_.-]{1,32}` (no spaces). **Channel name:** `[A-Za-z0-9_-]{1,64}`.
+- **Display name:** `[\p{L}\p{M}\p{N} _.-]{1,32}` — letters, combining marks and digits from any script, plus a plain space,
+  `_`, `.`, `-`; 1-32 CODE POINTS, validated on the NFC-normalised and stripped form. The server returns that
+  canonical form (trimmed, composed) in `Joined`/`MemberJoined`/`MemberRenamed`, so treat it as authoritative
+  rather than echoing what you sent. Every other separator (NBSP, ideographic space) and every format/control
+  character (ZWSP, soft hyphen, bidi overrides) is rejected with `INVALID_DISPLAY_NAME`. Runs of spaces inside a
+  name are preserved. **Channel name:** `[A-Za-z0-9_-]{1,64}` — unchanged and ASCII-only, because it is the E2EE
+  key-derivation salt (computed client-side), a routing key, and a map key.
 - **Inbound audio frame:** ≤ `walkie.max-audio-frame-bytes` (default 8192) — enforced on the **un-prefixed**
   inbound frame, so the outbound +1 SID never trips it. **Text frame:** ≤ 65536 (default).
 - **Inbound audio frame rate:** ≤ `walkie.max-audio-frames-per-second` per sender (default 100; ~50 fps is

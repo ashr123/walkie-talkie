@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.URLEncoder;
+import java.text.Normalizer;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -62,7 +63,21 @@ public final class WalkieClient implements AutoCloseable {
 	private static final String SERVER_OWNER = "server";
 	/// Display-name charset, mirrored from the server's validation so the `n` command can reject a bad name
 	/// locally before the round-trip (the server validates authoritatively too).
-	private static final Pattern DISPLAY_NAME = Pattern.compile("[A-Za-z0-9_.-]{1,32}");
+	/// Mirrors the server's DISPLAY_NAME (ConnectionService) and the browser's names.js: letters, combining marks and
+	/// digits from any script — `\p{M}` because Hebrew niqqud and Arabic diacritics ARE marks — plus a plain space,
+	/// `_`, `.` and `-`, 1-32 code points. Everything invisible is excluded: the other separators (`\p{Zs}`) and every
+	/// format/control character (`\p{C}`), since a control character can split a log line and a bidi override reorders
+	/// the text around it.
+	private static final Pattern DISPLAY_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N} _.-]{1,32}");
+
+	/// The canonical form the SERVER stores and broadcasts (its canonicalDisplayName): NFC, then stripped. Applied
+	/// here too so a locally-rejected name is judged on the same string the server would judge, and so `n <name>`
+	/// with a trailing space is the no-op it looks like rather than a rename the server quietly rewrites.
+	/// Normalising first and stripping second is deliberate: a name of nothing but spaces has to become empty for
+	/// the pattern to reject it. Spaces INSIDE the name are left as typed.
+	private static String canonicalDisplayName(String requested) {
+		return requested == null ? null : Normalizer.normalize(requested, Normalizer.Form.NFC).strip();
+	}
 	/// Channel-name charset, mirrored from the server (and the browser client's CHANNEL_NAME) so the `c` command
 	/// and the initial `--channel` are rejected locally before the round-trip. Note `.` is allowed in a display
 	/// name but NOT a channel name.
@@ -193,8 +208,11 @@ public final class WalkieClient implements AutoCloseable {
 		// Validate the startup identity/channel locally before opening audio or a socket — the same checks the `n`
 		// and `c` commands apply, and the browser client applies on connect. The server validates authoritatively
 		// too, but failing fast here avoids a connected-but-not-joined dead-end on a bad --display/--channel.
-		if (!DISPLAY_NAME.matcher(options.display()).matches()) {
-			throw new IllegalArgumentException("--display must be 1-32 chars of letters, digits, _ . or - (got: \"" + options.display() + "\").");
+		// Judge the canonical form, since that is what the server will store — otherwise `--display "Roy Ash "`
+		// would be accepted here and then come back subtly different in the roster.
+		if (!DISPLAY_NAME.matcher(canonicalDisplayName(options.display())).matches()) {
+			throw new IllegalArgumentException("--display must be 1-32 letters, digits or spaces (any language), "
+					+ "'_', '.' or '-' with no invisible characters (got: \"" + options.display() + "\").");
 		}
 		// Global forces the channel to "global" server-side, so the --channel name only matters for the other modes.
 		if (options.mode() != ChannelMode.GLOBAL_PTT && !CHANNEL_NAME.matcher(options.channel()).matches()) {
@@ -1190,9 +1208,12 @@ public final class WalkieClient implements AutoCloseable {
 	/// Asks the server to change our display name. Validated locally for a fast no, but the server validates
 	/// authoritatively and the resulting [ServerMessage.MemberRenamed] (broadcast back to us) is what actually
 	/// updates the roster — so a rejected name surfaces as an `[error]` line instead.
-	private void rename(String newName) {
+	private void rename(String requestedName) {
+		// The console hands over the rest of the line (`split("\\s+", 2)`), so a name with spaces arrives whole; the
+		// canonical form is what is compared and sent, matching the server byte for byte.
+		String newName = canonicalDisplayName(requestedName);
 		if (!DISPLAY_NAME.matcher(newName).matches()) {
-			System.out.println("Usage: n <new-name>  (1-32 chars of letters, digits, _ . or -)");
+			System.out.println("Usage: n <new-name>  (1-32 letters, digits or spaces in any language, '_', '.' or '-')");
 			return;
 		}
 		if (newName.equals(memberNames.get(selfId))) {

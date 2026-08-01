@@ -310,6 +310,11 @@
         }
 
         ul#members li {
+            /* Render a display name exactly as its owner typed it. HTML's default `normal` collapses runs of spaces
+               and drops the edges, so "Roy  Ash" and "Roy Ash" came out the same pixel width when measured — while
+               the Java client's terminal roster shows both spaces. pre-wrap makes the two clients agree, and the
+               server trims the edges so this cannot be used to indent a row. */
+            white-space: pre-wrap;
             padding: 6px 8px;
             border-radius: 6px;
             background: #0e151c;
@@ -541,7 +546,7 @@
 	<section class="panel" id="setup">
 		<h2>Connect</h2>
 		<label for="display">Display name</label>
-		<input autocomplete="off" id="display" placeholder="1-32 chars of A-Z a-z 0-9 _ . -" value="Alice">
+		<input autocomplete="off" id="display" placeholder="1-32 letters, digits or spaces (any language), _ . -" value="Alice">
 		<div class="hint">Shown to others. Your identity in a channel is a per-connection id; if two people
 			share a display name, each is shown with a short <code>#id</code> to tell them apart.
 		</div>
