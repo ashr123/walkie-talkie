@@ -73,8 +73,18 @@ public final class WebSocketClientSession implements ClientSession {
 	/// the join/withdraw, read on the teardown thread that scrubs the request.
 	private volatile String pendingChannel;
 
-	/// `keepalive` is how long an idle connection may go without a frame before the drainer sends a Ping; zero (or
-	/// negative) turns the keepalive off. See [io.github.ashr123.walkietalkie.server.config.WalkieProperties].
+	/// `keepalive` is how long an idle connection may go without a frame before the drainer sends a Ping, with
+	/// [Duration#ZERO] turning the keepalive off — it needs no special case, since `ZERO.toNanos()` is already the 0
+	/// that selects the indefinite park.
+	///
+	/// It must not be NEGATIVE, and nothing here re-checks that: the value comes from
+	/// [io.github.ashr123.walkietalkie.server.config.WalkieProperties], whose compact constructor turns an absent or
+	/// negative interval into the default, and the only production caller is
+	/// [io.github.ashr123.walkietalkie.server.transport.BaseWalkieHandler]. Worth stating rather than assuming
+	/// silently, because a negative would not merely mis-time anything: `Semaphore.tryAcquire` does not wait at all
+	/// for a non-positive timeout (`AbstractQueuedSynchronizer.tryAcquireSharedNanos` opens with
+	/// `if (nanosTimeout <= 0L) return false;`), so [#awaitWork] would return false immediately and forever and the
+	/// drainer would spin, pinging as fast as the socket accepts.
 	public WebSocketClientSession(WebSocketSession session,
 	                              Transport transport,
 	                              String handshakeChannel,
@@ -82,7 +92,7 @@ public final class WebSocketClientSession implements ClientSession {
 		this.session = session;
 		this.transport = transport;
 		this.handshakeChannel = handshakeChannel;
-		this.keepaliveNanos = keepalive.isNegative() ? 0 : keepalive.toNanos();
+		this.keepaliveNanos = keepalive.toNanos();
 	}
 
 	@Override

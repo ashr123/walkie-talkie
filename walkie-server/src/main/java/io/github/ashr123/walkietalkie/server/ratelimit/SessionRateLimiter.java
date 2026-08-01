@@ -19,7 +19,12 @@ public final class SessionRateLimiter {
 	private final Clock clock;
 
 	/// @param maxPerSecond sustained per-session ceiling; also the burst capacity (one second's worth), which
-	///                     absorbs a brief batched delivery without penalizing an honest client
+	///                     absorbs a brief batched delivery without penalizing an honest client. Must be at least 1
+	///                     and at most one billion — nothing here re-checks that, because
+	///                     [io.github.ashr123.walkietalkie.server.config.WalkieProperties] clamps both rates to
+	///                     exactly that range. Both ends matter: 0 makes `perToken` a divide-by-zero here, and a
+	///                     rate above a billion rounds `perToken` down to zero nanoseconds, which then throws
+	///                     inside `TokenBucket.tryConsume` on EVERY event rather than once at startup
 	/// @param clock        time source (injected so tests can drive it deterministically)
 	public SessionRateLimiter(long maxPerSecond, Clock clock) {
 		this.capacity = maxPerSecond;
