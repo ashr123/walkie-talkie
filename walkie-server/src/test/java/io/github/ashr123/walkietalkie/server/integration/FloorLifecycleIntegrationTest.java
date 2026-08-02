@@ -229,9 +229,11 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 			// The owner enables the queue.
 			send(sa, new ClientMessage.SetFloorQueue(true));
 			assertTrue(awaitType(a.messages, ServerMessage.FloorQueueChanged.class).enabled(), "the queue is enabled");
-			awaitType(a.messages, ServerMessage.FloorStatus.class);   // drain the toggle snapshot (Alice)
 			awaitType(b.messages, ServerMessage.FloorQueueChanged.class);
-			awaitType(b.messages, ServerMessage.FloorStatus.class);   // drain the toggle snapshot (Bob)
+			// No snapshot to drain here any more: ENABLING the queue changes who may wait, not who is waiting, so the
+			// server no longer fans out a FloorStatus that repeats the floor verbatim. (That these two lines used to
+			// exist, described as "drain the toggle snapshot", was the tell that it was noise — every client narrated
+			// it as "Floor is free".)
 
 			// Alice grabs the floor.
 			send(sa, new ClientMessage.RequestFloor());

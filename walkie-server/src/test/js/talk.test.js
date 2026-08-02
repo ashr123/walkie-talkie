@@ -20,6 +20,7 @@ import {
 	TOO_QUICK_TO_TALK,
 	floorActionFor,
 	floorIsFree,
+	floorNarration,
 	floorStateFor,
 	grantOpensMic,
 	holdInProgress,
@@ -560,6 +561,67 @@ test('grantOpensMic: anything but a definite yes keeps the mic closed', () => {
 	[undefined, null, 'false', 'true', 1, 'yes', {}].forEach(held => {
 		assert.equal(grantOpensMic('MULTI_CHANNEL_PTT', held), false, `talkHeld = ${JSON.stringify(held)}`);
 	});
+});
+
+// --- what a floor snapshot is worth saying ---------------------------------------------------------
+// FloorStatus is an authoritative snapshot re-sent on occasions that do not all MOVE the floor, so the narration
+// has to describe a transition. The bug that prompted this: toggling the raise-hand queue logged "Floor is free"
+// into a floor that was already free, once per toggle. Mirrored by WalkieClient.floorNarration, key for key.
+
+const IDLE_VIEW = {
+	selfId: SELF, holderId: null, waiting: [], released: false, awaitingClaim: false, floorQueueEnabled: false
+};
+
+test('floorNarration: the same situation twice yields the same key, so the second is silent', () => {
+	// THE regression. The caller logs only on a key change, so two identical snapshots must agree on the key.
+	assert.equal(floorNarration(IDLE_VIEW).key, floorNarration(IDLE_VIEW).key);
+	assert.equal(floorNarration(IDLE_VIEW).key, 'free');
+});
+
+test('floorNarration: a real change produces a different key', () => {
+	// The other half — suppression must not swallow anything that actually moved.
+	assert.notEqual(floorNarration({...IDLE_VIEW, holderId: HOLDER}).key, floorNarration(IDLE_VIEW).key);
+	assert.notEqual(floorNarration({...IDLE_VIEW, holderId: HOLDER}).key,
+			floorNarration({...IDLE_VIEW, holderId: OTHER}).key, 'a different speaker is a different situation');
+});
+
+test('floorNarration: holding the floor or being offered it says nothing here', () => {
+	// FloorGranted and FloorReserved are the imperative triggers for those; narrating them from the snapshot too
+	// would talk over the alert on every queue churn.
+	assert.equal(floorNarration({...IDLE_VIEW, holderId: SELF}), null, 'LIVE');
+	assert.equal(floorNarration({...IDLE_VIEW, waiting: [SELF]}), null, 'MY_TURN');
+});
+
+test('floorNarration: a queue position is part of the situation', () => {
+	// Moving from #3 to #2 IS news, so the key has to carry the position — not just "in line".
+	const third = floorNarration({...IDLE_VIEW, holderId: HOLDER, waiting: [OTHER, 'x', SELF]});
+	const second = floorNarration({...IDLE_VIEW, holderId: HOLDER, waiting: [OTHER, SELF]});
+	assert.equal(third.kind, 'in-line');
+	assert.equal(third.position, 3);
+	assert.notEqual(third.key, second.key);
+});
+
+test('floorNarration: the transitions outrank the states that would otherwise be reported', () => {
+	// A released holder sees "released", not "free"; a lapsed claim sees "your turn passed", not "free".
+	assert.equal(floorNarration({...IDLE_VIEW, released: true}).kind, 'released');
+	assert.equal(floorNarration({...IDLE_VIEW, awaitingClaim: true, floorQueueEnabled: true}).kind, 'turn-passed');
+	assert.equal(floorNarration({...IDLE_VIEW, awaitingClaim: true, floorQueueEnabled: false}).kind, 'free',
+			'with the queue switched off underneath us, FloorQueueChanged already explained the drop');
+});
+
+test('floorNarration: an offered floor names the head, and a held one names the holder', () => {
+	assert.equal(floorNarration({...IDLE_VIEW, waiting: [OTHER]}).memberId, OTHER);
+	assert.equal(floorNarration({...IDLE_VIEW, waiting: [OTHER]}).kind, 'offered');
+	assert.equal(floorNarration({...IDLE_VIEW, holderId: HOLDER}).memberId, HOLDER);
+	assert.equal(floorNarration({...IDLE_VIEW, holderId: HOLDER}).kind, 'talking');
+});
+
+test('floorNarration: the floor passing from one waiting member to the next is news', () => {
+	// The head declining and the offer moving on is exactly the kind of change the queue exists to show, so the
+	// offered member has to be IN the key. Without it both offers share the key 'offered' and the second is
+	// suppressed — the queue would appear to stall on the first name.
+	assert.notEqual(floorNarration({...IDLE_VIEW, waiting: [OTHER, HOLDER]}).key,
+			floorNarration({...IDLE_VIEW, waiting: [HOLDER]}).key);
 });
 
 // --- is a hold in progress? ----------------------------------------------------------------------

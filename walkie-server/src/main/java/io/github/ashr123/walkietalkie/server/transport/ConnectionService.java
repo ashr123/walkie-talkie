@@ -1413,8 +1413,15 @@ public class ConnectionService {
 			return;
 		}
 		synchronized (channel) {
-			channel.setFloorQueueEnabled(enabled);   // clears the queue + reservation when disabling
-			broadcaster.toAll(channel, new ServerMessage.FloorQueueChanged(enabled), floorStatusOf(channel));
+			// The snapshot rides along ONLY when the toggle actually moved the floor — disabling with people queued
+			// drops them, and they have to see that. Enabling changes who MAY wait, not who is waiting, and disabling
+			// an empty queue changes nothing; sending a snapshot then fans out a message that repeats the floor
+			// verbatim, and every client narrates it ("Floor is free") as though something had happened.
+			if (channel.setFloorQueueEnabled(enabled)) {
+				broadcaster.toAll(channel, new ServerMessage.FloorQueueChanged(enabled), floorStatusOf(channel));
+			} else {
+				broadcaster.toAll(channel, new ServerMessage.FloorQueueChanged(enabled));
+			}
 		}
 		log.info("floor queue {}", enabled ? "enabled" : "disabled");
 	}

@@ -536,14 +536,23 @@ public final class Channel {
 
 	/// Turns the owner-controlled floor queue on or off. Disabling also **clears** the queue and any reservation
 	/// (there is nowhere to wait), so the caller should snapshot [#floorQueue] first if it needs to notify the
-	/// dropped members, and re-broadcast `FloorStatus`. Call under the monitor so the flip, the clear and the
-	/// broadcast are one atomic transition (mirrors the mode/lock/passphrase discipline).
-	public synchronized void setFloorQueueEnabled(boolean enabled) {
+	/// dropped members. Call under the monitor so the flip, the clear and the broadcast are one atomic transition
+	/// (mirrors the mode/lock/passphrase discipline).
+	///
+	/// Returns whether the FLOOR state changed — that is, whether this call actually dropped waiters or ended a
+	/// running claim window — so the caller can re-broadcast `FloorStatus` only when there is something new to say.
+	/// The flag itself is not the floor: enabling a queue changes who MAY wait, not who is waiting, and disabling an
+	/// empty one changes nothing at all. Both used to fan out a snapshot that repeated the floor verbatim, which
+	/// every client dutifully narrated ("Floor is free") on a toggle that had not touched the floor.
+	public synchronized boolean setFloorQueueEnabled(boolean enabled) {
 		floorQueueEnabled = enabled;
-		if (!enabled) {
-			floorQueue.clear();
-			floorReservedAt = Instant.EPOCH;
+		if (enabled) {
+			return false;
 		}
+		boolean floorChanged = !floorQueue.isEmpty() || !floorReservedAt.equals(Instant.EPOCH);
+		floorQueue.clear();
+		floorReservedAt = Instant.EPOCH;
+		return floorChanged;
 	}
 
 	/// Appends `sessionId` to the tail of the floor queue — a no-op (returns `false`) if it already holds the

@@ -193,6 +193,9 @@ public final class WalkieClient implements AutoCloseable {
 	// FloorStatus drops us (then we log "[your turn passed]"). Listener-thread-only today, volatile for the same
 	// warn-once-survives-a-refactor rationale as warnedDecrypt.
 	private volatile boolean awaitingClaim;
+	/// The floor situation this client last LOGGED (see [#floorNarration]); an unchanged one is not narrated again,
+	/// so a snapshot that repeats the status quo — a queue toggle, a mute change, a member leaving — passes quietly.
+	private String lastFloorNarration;
 	/// What an in-place switch optimistically overwrote, kept so a REFUSED switch can put it back. The server departs
 	/// our current channel only once a join succeeds, so a refusal leaves us still in it — and without this we would
 	/// sit there holding the target's key, which the transmit gate would (correctly) mute us for. Null when no switch
@@ -473,6 +476,7 @@ public final class WalkieClient implements AutoCloseable {
 					awaitingClaim = false;
 				}
 				memberNames.clear();
+		lastFloorNarration = null;   // a new channel narrates its floor afresh
 				// Seed the mute set from the roster so a member joining a channel where someone is already muted renders
 				// it — built into a local and published ONCE, so no reader ever sees it half-filled.
 				Set<String> seededMutes = new HashSet<>();
@@ -639,32 +643,74 @@ public final class WalkieClient implements AutoCloseable {
 			audio.setTransmitting(false);
 		}
 		FloorState state = floorStateFor(self, holderId, waiting);
-		switch (state) {
-			case LIVE -> { /* we hold the floor; FloorGranted already announced it — stay quiet on queue churn */ }
-			case MY_TURN -> { /* FloorReserved fires the prominent "your turn" alert; nothing to add from the snapshot */ }
-			case IN_LINE ->
-					log("[in line #" + (waiting.indexOf(self) + 1) + " of " + waiting.size() + "] — type 't' to leave the queue");
-			case IDLE -> {
-				if (awaitingClaim && floorQueueEnabled) {
-					// We were the reserved head and let the claim window lapse (or declined): the server dropped us and
-					// offered the floor onward (grant-to-claim, miss → dropped). Report it once; the flag resets below.
-					// Guard on floorQueueEnabled: if the owner just DISABLED the queue out from under us, the
-					// FloorQueueChanged("disabled") that arrives right before this snapshot already explained it — don't
-					// also (wrongly) claim we "didn't claim in time" or tell us to rejoin a queue that is now off.
-					log("[your turn passed] you didn't claim in time — type 't' to rejoin the queue");
-				} else if (released) {
-					log("[released] the floor is no longer yours — type 't' to request it again");
-				} else if (holderId != null) {
-					log("[talking] " + name(holderId));
-				} else if (!waiting.isEmpty()) {
-					log("[floor reserved] being offered to " + name(waiting.getFirst()));
-				} else {
-					log("[floor free] — type 't' to talk");
-				}
+		// What is worth SAYING about this snapshot, and whether it repeats what was already said. FloorStatus is
+		// re-sent on plenty of occasions that do not move the floor (a member leaving, a mute change, a re-join), so
+		// an unchanged situation stays silent — mirrors floorNarration in the browser's talk.js, key for key.
+		FloorNarration narration = floorNarration(self, holderId, waiting, released, awaitingClaim, floorQueueEnabled);
+		if (narration != null && !narration.key().equals(lastFloorNarration)) {
+			switch (narration.kind()) {
+				// We were the reserved head and let the claim window lapse (or declined): the server dropped us and
+				// offered the floor onward (grant-to-claim, miss → dropped). floorNarration reports this only while
+				// the queue is still ON — if the owner just disabled it, the FloorQueueChanged that arrives right
+				// before this snapshot already explained the drop.
+				case TURN_PASSED -> log("[your turn passed] you didn't claim in time — type 't' to rejoin the queue");
+				case RELEASED -> log("[released] the floor is no longer yours — type 't' to request it again");
+				case IN_LINE -> log("[in line #" + narration.position() + " of " + narration.size()
+						+ "] — type 't' to leave the queue");
+				case TALKING -> log("[talking] " + name(narration.memberId()));
+				case OFFERED -> log("[floor reserved] being offered to " + name(narration.memberId()));
+				case FREE -> log("[floor free] — type 't' to talk");
 			}
 		}
+		// Remembered even when nothing was logged, so LIVE/MY_TURN (which narrate nothing) cannot let the next IDLE
+		// snapshot repeat the line that preceded them.
+		lastFloorNarration = narration == null ? null : narration.key();
 		// Remember whether it is now OUR turn, so a later snapshot that drops us can log "[your turn passed]" above.
 		awaitingClaim = state == FloorState.MY_TURN;
+	}
+
+	/// What a floor snapshot is worth saying, if anything — the Java mirror of `floorNarration` in the browser's
+	/// talk.js, key for key, so the two clients fall silent on exactly the same snapshots. `null` means say nothing.
+	///
+	/// `key` identifies the SITUATION; the caller logs only when it differs from the last one it logged. LIVE and
+	/// MY_TURN say nothing at all here: FloorGranted and FloorReserved are the imperative triggers that announce
+	/// those, and repeating them on queue churn would talk over the alert.
+	static FloorNarration floorNarration(String self,
+	                                     String holderId,
+	                                     List<String> waiting,
+	                                     boolean released,
+	                                     boolean awaitingClaim,
+	                                     boolean floorQueueEnabled) {
+		FloorState state = floorStateFor(self, holderId, waiting);
+		if (state == FloorState.LIVE || state == FloorState.MY_TURN) {
+			return null;
+		}
+		if (state == FloorState.IN_LINE) {
+			int position = waiting.indexOf(self) + 1;
+			return new FloorNarration(FloorNarration.Kind.IN_LINE, "in-line:" + position + "/" + waiting.size(),
+					null, position, waiting.size());
+		}
+		if (awaitingClaim && floorQueueEnabled) {
+			return new FloorNarration(FloorNarration.Kind.TURN_PASSED, "turn-passed", null, 0, 0);
+		}
+		if (released) {
+			return new FloorNarration(FloorNarration.Kind.RELEASED, "released", null, 0, 0);
+		}
+		if (holderId != null) {
+			return new FloorNarration(FloorNarration.Kind.TALKING, "talking:" + holderId, holderId, 0, 0);
+		}
+		if (!waiting.isEmpty()) {
+			String head = waiting.getFirst();
+			return new FloorNarration(FloorNarration.Kind.OFFERED, "offered:" + head, head, 0, 0);
+		}
+		return new FloorNarration(FloorNarration.Kind.FREE, "free", null, 0, 0);
+	}
+
+	/// One narration decision: which line to print (`kind`), the situation it describes (`key`, compared against the
+	/// last one logged), and the parameters the wording needs.
+	record FloorNarration(Kind kind, String key, String memberId, int position, int size) {
+
+		enum Kind {IN_LINE, TURN_PASSED, RELEASED, TALKING, OFFERED, FREE}
 	}
 
 	/// Handles [ServerMessage.FloorReserved]: it is our turn, reserved for `claimSeconds`. Alerts the user (terminal

@@ -157,6 +157,47 @@ export function spaceDrivesFloor(mode, focus) {
 	return focus == null || focus.tagName === 'BODY' || focus.tagName === 'HTML' || focus.isTalkButton;
 }
 
+/**
+ * What a floor snapshot is worth SAYING, if anything — `null` when it should pass in silence.
+ *
+ * Returns `{kind, key}`: `kind` selects the wording (each client phrases it its own way), and `key` identifies the
+ * SITUATION. A client logs only when the key differs from the one it last logged, which is what stops a snapshot
+ * that repeats the status quo from narrating it again. That matters because FloorStatus is an authoritative
+ * snapshot re-sent on many occasions — a member leaving, a mute change, a re-join — and not all of them move the
+ * floor. The case that prompted this: toggling the raise-hand queue printed "Floor is free" into a floor that was
+ * already free, once per toggle.
+ *
+ * LIVE and MY_TURN say nothing here on purpose: FloorGranted and FloorReserved are the imperative triggers that
+ * announce those, and repeating them on every queue churn would talk over the alert.
+ *
+ * `released` and `turnPassed` are transitions rather than states, and both are self-clearing (the client stops
+ * transmitting / drops its awaiting-claim flag as it handles them), so they cannot repeat back-to-back — they are
+ * keyed anyway so an intervening situation lets them be said again.
+ */
+export function floorNarration(view) {
+	const floorState = floorStateFor(view.selfId, view.holderId, view.waiting);
+	if (floorState === FLOOR_LIVE || floorState === FLOOR_MY_TURN) {
+		return null;
+	}
+	if (floorState === FLOOR_IN_LINE) {
+		const position = view.waiting.indexOf(view.selfId) + 1;
+		return {kind: 'in-line', position, size: view.waiting.length, key: `in-line:${position}/${view.waiting.length}`};
+	}
+	if (view.awaitingClaim && view.floorQueueEnabled) {
+		return {kind: 'turn-passed', key: 'turn-passed'};
+	}
+	if (view.released) {
+		return {kind: 'released', key: 'released'};
+	}
+	if (view.holderId) {
+		return {kind: 'talking', memberId: view.holderId, key: `talking:${view.holderId}`};
+	}
+	if (view.waiting.length > 0) {
+		return {kind: 'offered', memberId: view.waiting[0], key: `offered:${view.waiting[0]}`};
+	}
+	return {kind: 'free', key: 'free'};
+}
+
 /** A decision with no floor message behind it: the disabled states and the full-duplex mic toggle. */
 function floorless(mode, label) {
 	return {mode, label, myTurn: false, action: null};

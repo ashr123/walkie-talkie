@@ -312,6 +312,45 @@ class ConnectionServiceTest {
 	}
 
 	@Test
+	void togglingTheFloorQueueBroadcastsNoSnapshotWhenTheFloorDidNotMove() {
+		// The queue flag is not the floor: enabling changes who MAY wait, not who IS waiting, and disabling an empty
+		// queue drops nobody. A snapshot then repeats the floor verbatim and every client narrates it — which is how
+		// a plain toggle came to log "Floor is free" into a floor that was already free, twice per round trip.
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(false));
+
+		assertEquals(2, bob.sent.stream().filter(ServerMessage.FloorQueueChanged.class::isInstance).count(),
+				"both toggles are still announced");
+		assertEquals(0, bob.sent.stream().filter(ServerMessage.FloorStatus.class::isInstance).count(),
+				"but neither moved the floor, so no snapshot is fanned out");
+	}
+
+	@Test
+	void disablingTheFloorQueueWithSomeoneWaitingStillBroadcastsTheSnapshot() {
+		// The other side of the guard: disabling DOES clear the queue, and the members it drops have to see that —
+		// suppressing the snapshot here would leave them showing a queue position they no longer hold.
+		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(true));
+		service.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds the floor
+		service.onMessage(bob, new ClientMessage.RequestFloor());     // bob is queued behind her
+		// lastOf, not firstOf: bob's FIRST FloorStatus is the snapshot that follows his own Joined, long before he
+		// queued. What matters here is the state he currently believes.
+		assertEquals(List.of(bob.id()), lastOf(bob, ServerMessage.FloorStatus.class).waiting(),
+				"precondition: bob really is waiting");
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.SetFloorQueue(false));
+
+		ServerMessage.FloorStatus snapshot = firstOf(bob, ServerMessage.FloorStatus.class);
+		assertTrue(snapshot.waiting().isEmpty(), "the queue was cleared, and the snapshot says so");
+	}
+
+	@Test
 	void aNoOpRenameToTheSameNameIsIgnoredWithoutChurnOrError() {
 		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		FakeClientSession bob = join("bob", "team", ChannelMode.MULTI_CHANNEL_PTT);

@@ -26,6 +26,7 @@ import {
 	FLOOR_LIVE,
 	FLOOR_MY_TURN,
 	TOO_QUICK_TO_TALK,
+	floorNarration,
 	floorStateFor,
 	grantOpensMic,
 	holdInProgress,
@@ -132,6 +133,7 @@ const state = {
 	floorQueueEnabled: false, // whether the owner-toggleable floor queue is on (from joined.floorQueueEnabled + floorQueueChanged)
 	awaitingClaim: false,    // true while it's our turn (reserved) — so a later snapshot that drops us can say "your turn passed"
 	talkHeld: false,         // whether the Talk button is physically held right now — a floorReserved landing mid-hold auto-claims
+	lastFloorNarration: null,   // the last floor situation we LOGGED (see floorNarration); an unchanged one stays silent
 	claimSecondsLeft: 0,     // display-only "your turn" countdown shown in the button (the server owns the real window)
 	claimTimer: null,        // interval id ticking claimSecondsLeft down
 	turnTitleTimer: null,    // interval id flashing the tab title while it's our turn
@@ -1435,30 +1437,45 @@ function onFloorStatus(holderId, waiting) {
 	if (floorState !== FLOOR_MY_TURN) {
 		clearTurnAlert();   // no longer our turn (claimed → LIVE, left, or the window lapsed) — stop beep/flash/countdown
 	}
-	switch (floorState) {
-		case FLOOR_LIVE:
-			break;   // we hold it; floorGranted already said so — stay quiet on queue churn
-		case FLOOR_MY_TURN:
-			break;   // floorReserved fires the prominent alert; nothing to add from the snapshot
-		case FLOOR_IN_LINE:
-			log(`In line #${state.floorWaiting.indexOf(self) + 1} of ${state.floorWaiting.length} — tap Talk to leave the queue`);
-			break;
-		default: // IDLE
-			if (prevAwaiting && state.floorQueueEnabled) {
+	// What to say — and whether this snapshot is worth saying anything about at all. FloorStatus is re-sent on
+	// plenty of occasions that do not move the floor (a member leaving, a mute change, a re-join), so narrate only
+	// when the SITUATION changed: floorNarration returns a key, and an unchanged key stays silent. Without this a
+	// queue toggle logged "Floor is free" into a floor that was already free.
+	const narration = floorNarration({
+		selfId: self,
+		holderId: state.floorHolder,
+		waiting: state.floorWaiting,
+		released,
+		awaitingClaim: prevAwaiting,
+		floorQueueEnabled: state.floorQueueEnabled
+	});
+	if (narration !== null && narration.key !== state.lastFloorNarration) {
+		switch (narration.kind) {
+			case 'in-line':
+				log(`In line #${narration.position} of ${narration.size} — tap Talk to leave the queue`);
+				break;
+			case 'turn-passed':
 				// A genuine miss (the queue is still on). If the owner just DISABLED the queue out from under us,
 				// the FloorQueueChanged("disabled") that arrives right before this snapshot already explained it, so
-				// don't also claim we "did not claim in time" or tell us to rejoin a queue that is now off.
+				// floorNarration does not report this case at all then.
 				log('Your turn passed — you did not claim in time. Tap Talk to rejoin the queue.');
-			} else if (released) {
+				break;
+			case 'released':
 				log('You were released from the floor — tap Talk to speak again');
-			} else if (holderId) {
-				log(`Talking: ${memberLabel(holderId)}`);
-			} else if (state.floorWaiting.length > 0) {
-				log(`Floor is being offered to ${memberLabel(state.floorWaiting[0])}`);
-			} else {
+				break;
+			case 'talking':
+				log(`Talking: ${memberLabel(narration.memberId)}`);
+				break;
+			case 'offered':
+				log(`Floor is being offered to ${memberLabel(narration.memberId)}`);
+				break;
+			default:
 				log('Floor is free');
-			}
+		}
 	}
+	// Remember it even when nothing was logged, so LIVE/MY_TURN (which narrate nothing) do not let the next IDLE
+	// snapshot repeat the line that preceded them.
+	state.lastFloorNarration = narration === null ? null : narration.key;
 	state.awaitingClaim = floorState === FLOOR_MY_TURN;   // so a later snapshot that drops us can log "your turn passed"
 	updateTalkButton();
 }
@@ -2455,6 +2472,9 @@ function updateTalkButton() {
  * can't leak the old channel's peer connections, decoders, members, or "talking" state.
  */
 function resetChannelState() {
+	// A new channel starts a new narration: without this, switching from one idle channel to another would suppress
+	// the new channel's floor line, since the situation key ('free') would not have changed.
+	state.lastFloorNarration = null;
 	state.peers.forEach((_, id) => closePeer(id));
 	state.peers.clear();
 	closeAllLanes();
