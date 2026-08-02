@@ -122,6 +122,10 @@ dropped when empty and recreated server-owned + unencrypted on the next join; cl
 **Push-to-talk floor queue ("raise hand"), owner-toggleable per channel, default OFF.** The owner turns it on/off
 (`SetFloorQueue` → broadcast `FloorQueueChanged`; the state rides in `Joined.floorQueueEnabled`, and a new channel
 adopts `walkie.floor-queue-default` — off == the pre-queue behaviour, where a busy floor is simply not granted).
+The toggle carries a `FloorStatus` **only when it moved the floor** — `Channel.setFloorQueueEnabled` returns whether
+it dropped waiters or ended a claim window, and the broadcast is guarded on that. It used to send one
+unconditionally, which is not a floor change at all: enabling decides who MAY wait, and both clients dutifully
+narrated the unchanged snapshot as "Floor is free" once per toggle.
 With the queue on, `RequestFloor` against a busy floor **enqueues** the member (FIFO, `Channel.enqueueFloor`)
 instead of refusing it; when the floor frees it is **RESERVED** to the head for `walkie.floor-reservation`
 (default 10) — **grant-to-claim, never a hot mic**: the head must claim (a `RequestFloor` → `FloorGranted`) within
@@ -474,7 +478,7 @@ helper) and integration (`WebSocketRelayIntegrationTest`, which boots on a rando
 **Browser client tests** live in `walkie-server/src/test/js/` (outside `static/`, so they're not served) and
 run on **Node's built-in runner** (`node --test`), no npm deps. `app.js` itself is NOT importable under Node (a
 top-level `window.addEventListener` throws), so anything worth testing is pulled out into a **DOM-free sibling
-module** that `app.js` imports — the pattern to follow for any new pure browser rule. There are two:
+module** that `app.js` imports — the pattern to follow for any new pure browser rule. There are five:
 - `static/assets/e2ee.js` — E2EE + the outbound transmit-gate decision, testable because Node exposes the same
   Web Crypto API. `e2ee.test.js` pins the SAME known-answer vectors as Java's `FrameCryptoTest` (keeping the two
   clients byte-identical) plus the `frameDisposition` no-plaintext gate. Java mirror: `WalkieClient.outboundFrame`.
@@ -489,16 +493,32 @@ module** that `app.js` imports — the pattern to follow for any new pure browse
   something untrue; `channel-flags.test.js` states that property directly, and pins the per-message wire field
   (`setLocked` carries `locked`, the others `enabled`) and that `field` matches the `Joined` component it is filled
   from.
+- `static/assets/mic-errors.js` — what to tell the user when `getUserMedia` fails: advice per `DOMException.name`
+  (plus the legacy Chrome/WebKit aliases, which survive longest in the embedded WebViews most likely to refuse
+  capture) and the missing-`mediaDevices` message. Phrased as what to DO, because the raw text people actually hit —
+  "The request is not allowed by the user agent or the platform in the current context" — is accurate and useless.
+  Anything unrecognised keeps the raw message so no detail is lost.
+- `static/assets/names.js` — the display-name rule: the pattern plus `canonicalDisplayName` (NFC, then trim), which
+  MUST match the server's `ConnectionService.canonicalDisplayName` and `WalkieClient`'s copy, since the server is the
+  authority and the Rename button compares the typed value against the name the server confirmed.
 - `static/assets/talk.js` — the floor rules (`floorStateFor`/`floorActionFor`/`floorIsFree`), the full-duplex
-  mic auto-open policy (`shouldAutoOpenMic`, whose three terms are mode / "Connect muted" / owner-mute), and
+  mic auto-open policy (`shouldAutoOpenMic`, whose three terms are mode / "Connect muted" / owner-mute),
+  `grantOpensMic` (a grant that outlived its hold must NOT open the mic — see the hold-vs-tap note below),
+  `holdInProgress` (whether an interruption — lost focus, a hidden tab, a cancelled touch, or a Space up-edge after
+  focus drifted — has a hold to end), `spaceDrivesFloor` (an ALLOW-list: Space drives the floor only when nothing
+  owns it — nothing focused, the document body, or the Talk button — so a focused `<select>` keeps the key that
+  opens it), `floorNarration` (what a `FloorStatus` is worth SAYING: `null`, or a `{kind, key}` whose key identifies
+  the SITUATION so an unchanged one stays silent — the snapshot is re-sent on plenty of occasions that do not move
+  the floor), the `TOO_QUICK_TO_TALK` coaching line, and
   `talkDecision`,
   the Talk control's ONE decision: state in, `{mode, label, myTurn, action}` out, with `btn.disabled` derived as
   `mode === 'disabled'`. `app.js` holds only the projection of state into it (`talkNow`), a four-write renderer
   (`updateTalkButton`) and the gesture handlers. `talk.test.js` pins every reachable button state, incl. that a
   channel-less client is `'disabled'` — a **disabled button still dispatches `mouseleave`**, so a `'hold'` there
   made a cursor crossing the control release a floor it never held. Java mirrors: `WalkieClient.floorStateFor` /
-  `floorActionFor` / `shouldAutoOpenMic` (pinned by `WalkieClientTest`), which the FLOOR_* names, positional
-  signatures and cases deliberately match; the hold-vs-tap axis is browser-only.
+  `floorActionFor` / `shouldAutoOpenMic` / `floorNarration` (pinned by `WalkieClientTest`), which the FLOOR_* names,
+  positional signatures, cases and — for the narration — the KEYS deliberately match, so the two clients fall silent
+  on exactly the same snapshots; the hold-vs-tap axis and the Space-ownership rule are browser-only.
 
 The `:walkie-server:jsTest` Gradle task (an `Exec` guarded by an `onlyIf` Node-on-PATH check, hooked into `check`)
 runs them as part of `build`, and picks up a new `*.test.js` with no build change. `walkie-server/package.json`

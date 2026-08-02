@@ -102,7 +102,7 @@ change it, and ownership transfers to another member if the owner leaves. (Excep
 | `muteMember`             | `memberId`, `muted`                              | Owner-only: mute/unmute one member's relay audio; server-enforced (→ `muteStatus`, §3d)                                                                                                                                                                     |
 | `muteAll`                | `muted`                                          | Owner-only: mute/unmute every member but the owner at once (→ ONE `muteStatus`, §3d)                                                                                                                                                     |
 | `setLocked`              | `locked`                                         | Owner-only: lock/unlock the channel to NEW members (→ `channelLocked`, §3e); existing members unaffected                                                                                                                                                     |
-| `setFloorQueue`          | `enabled`                                        | Owner-only: turn this channel's push-to-talk floor queue on/off (→ `floorQueueChanged` + a fresh `floorStatus`, §3b); disabling clears any waiting queue. Full-duplex → `INVALID_MODE`; non-owner / `global` → `NOT_OWNER`                                   |
+| `setFloorQueue`          | `enabled`                                        | Owner-only: turn this channel's push-to-talk floor queue on/off (→ `floorQueueChanged`, §3b). A `floorStatus` follows **only when the toggle moved the floor** — that is, disabling while members were queued, which drops them. Enabling never does; do not block waiting for one. Full-duplex → `INVALID_MODE`; non-owner / `global` → `NOT_OWNER`                                   |
 | `setMuteNewMembers`      | `enabled`                                        | Owner-only: mute every member that JOINS from now on (→ `muteNewMembersChanged`, §3d). A standing rule, the complement of `muteAll`'s one-shot; changes nobody already present. Non-owner / `global` → `NOT_OWNER`                                            |
 | `resolveJoinRequest`     | `sessionId`, `admit`                             | Owner-only: admit or deny ONE newcomer waiting at this locked channel (§3f). Admitting records a one-shot approval and sends that newcomer `joinApproved` — it is its own re-sent `join` that completes the join                                             |
 | `resolveAllJoinRequests` | `admit`                                          | Owner-only: admit or deny EVERY waiting newcomer, in arrival order (§3f). A no-op when nobody is waiting                                                                                                                                                     |
@@ -204,7 +204,10 @@ busy) joins the FIFO queue; `releaseFloor` stops talking if you hold the floor, 
 your turn if you are waiting or reserved.
 
 **The queue is owner-toggleable per channel** (`setFloorQueue` → broadcast `floorQueueChanged`; the current
-state also rides in `joined.floorQueueEnabled`), **default off**. With it off there is no line — a request for a
+state also rides in `joined.floorQueueEnabled`), **default off**. A `floorStatus` accompanies the toggle **only when
+it actually moved the floor**: disabling with members queued drops them, and the snapshot is how they learn their
+place is gone. Enabling changes who MAY wait, not who is waiting, so nothing follows it — a client that waits for a
+snapshot there will hang, and one that narrates every snapshot will announce a floor that did not change. With it off there is no line — a request for a
 busy floor simply is not granted and the snapshot keeps showing it busy (the pre-queue behaviour). The ownerless
 `global` room is always off; full-duplex has no floor or queue.
 
