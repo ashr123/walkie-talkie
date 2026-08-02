@@ -66,6 +66,15 @@ whole build (references cross modules routinely). It is deliberately conservativ
 simple name in a file with a wildcard import — but NOT an `Outer.Nested` whose outer half is one of ours, since a
 wildcard import can't explain that away. Report: `<module>/build/reports/javadoc-references.txt`.
 
+`check` also runs **`checkBrowserModuleDocs`** (`BrowserModuleDocCheck`, same directory), which keeps the
+browser-module list further down this file honest: every DOM-free module must be named here and must have a
+`<name>.test.js`, and the count word introducing that list must match how many there are. Five commits in one
+sitting added `mic-errors.js`, `names.js` and four rules to `talk.js` without touching that list — each change was
+self-contained and correct, and the documentation sat one directory up, so nothing pointed at the drift. The module
+set is not a list this task maintains: it is whatever `app.js` imports from `./`, so a new module is covered the
+moment it is wired up and `audio-worklet.js` (loaded by URL, never imported) stays correctly out of scope. Report:
+`<module>/build/reports/browser-modules.txt`.
+
 Project rule: **no `var` keyword** anywhere. A linter may reformat saved files (tabs, `///` Javadoc,
 `_` for unused catch/pattern vars) — match the existing style rather than fighting it.
 
@@ -478,7 +487,9 @@ helper) and integration (`WebSocketRelayIntegrationTest`, which boots on a rando
 **Browser client tests** live in `walkie-server/src/test/js/` (outside `static/`, so they're not served) and
 run on **Node's built-in runner** (`node --test`), no npm deps. `app.js` itself is NOT importable under Node (a
 top-level `window.addEventListener` throws), so anything worth testing is pulled out into a **DOM-free sibling
-module** that `app.js` imports — the pattern to follow for any new pure browser rule. There are five:
+module** that `app.js` imports — the pattern to follow for any new pure browser rule. Adding one to `app.js`'s
+imports without adding a bullet below (or a test) fails `check` — see `checkBrowserModuleDocs` above. There are
+five:
 - `static/assets/e2ee.js` — E2EE + the outbound transmit-gate decision, testable because Node exposes the same
   Web Crypto API. `e2ee.test.js` pins the SAME known-answer vectors as Java's `FrameCryptoTest` (keeping the two
   clients byte-identical) plus the `frameDisposition` no-plaintext gate. Java mirror: `WalkieClient.outboundFrame`.

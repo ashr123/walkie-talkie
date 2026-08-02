@@ -71,6 +71,7 @@ public final class JavaConventionsPlugin implements Plugin<Project> {
 		});
 
 		registerJavadocReferenceCheck(project);
+		registerBrowserModuleDocCheck(project);
 
 		project.getTasks().named("jacocoTestReport", JacocoReport.class, report -> {
 			report.dependsOn(project.getTasks().named(JavaPlugin.TEST_TASK_NAME));
@@ -104,6 +105,31 @@ public final class JavaConventionsPlugin implements Plugin<Project> {
 		} else {
 			options.getCompilerArgs().add("-Xlint:all");
 		}
+	}
+
+	/// Verify that every DOM-free browser module is described in CLAUDE.md and has a test, and fail `check` when one
+	/// is not. Registered for every module like the Javadoc check; only walkie-server has a browser client, and
+	/// [BrowserModuleDocCheck] makes itself a no-op wherever `static/assets/app.js` is absent.
+	///
+	/// The documentation lives at the repository root, so `rootDir` — a plain File — is the only thing read from
+	/// outside this project, exactly as in the Javadoc check.
+	private void registerBrowserModuleDocCheck(Project project) {
+		TaskProvider<BrowserModuleDocCheck> checkBrowserModuleDocs = project.getTasks()
+				.register("checkBrowserModuleDocs", BrowserModuleDocCheck.class, task -> {
+					task.setGroup(LifecycleBasePlugin.VERIFICATION_GROUP);
+					task.setDescription("Fails when a browser module app.js imports is undocumented or untested.");
+					task.getEntryPoint().from(project.fileTree(project.getProjectDir(),
+							tree -> tree.include("src/main/resources/static/assets/app.js")));
+					task.getModuleTests().from(project.fileTree(project.getProjectDir(),
+							tree -> tree.include("src/test/js/*.test.js")));
+					task.getDocumentation().from(project.fileTree(project.getRootDir(),
+							tree -> tree.include("CLAUDE.md")));
+					task.getReport().set(project.getLayout().getBuildDirectory().file("reports/browser-modules.txt"));
+				});
+
+		project.getTasks()
+				.named(LifecycleBasePlugin.CHECK_TASK_NAME)
+				.configure(check -> check.dependsOn(checkBrowserModuleDocs));
 	}
 
 	/// Verify this module's `///` Javadoc references actually resolve, and fail `check` when one doesn't. Registered
