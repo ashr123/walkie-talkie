@@ -134,6 +134,12 @@ they also pin the push-to-talk floor rules the two clients share, and every stat
 `./gradlew build` runs them via the `:walkie-server:jsTest` task when `node` is on `PATH` (it logs a skip if
 not). To run them directly: `node --test 'walkie-server/src/test/js/**/*.test.js'`.
 
+`build` also verifies this documentation against the code, so a build can fail on a doc rather than a test. Each
+check derives what it expects from source — the control messages and their fields, the wire error codes, the
+`walkie.*` configuration keys, the client's command-line flags — and fails when one of them is missing from
+README.md or [`docs/CLIENT_PROTOCOL.md`](docs/CLIENT_PROTOCOL.md). The message names what to add and where;
+`build/reports/` in the relevant module lists everything that was checked.
+
 ### Run the server
 
 ```bash

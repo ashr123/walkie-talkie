@@ -75,6 +75,37 @@ set is not a list this task maintains: it is whatever `app.js` imports from `./`
 moment it is wired up and `audio-worklet.js` (loaded by URL, never imported) stays correctly out of scope. Report:
 `<module>/build/reports/browser-modules.txt`.
 
+Four more `check` tasks apply that same idea to README.md and docs/CLIENT_PROTOCOL.md — derive the truth from
+source, fail when the prose has fallen behind. Each is registered on the module that OWNS the source (so an
+empty source set is a hard "the file moved" failure rather than a silent pass, and the failure lands on whoever
+is editing the code):
+
+| Task | Module | Source of truth | Bar |
+|------|--------|-----------------|-----|
+| `checkProtocolMessageDocs` | walkie-shared | `@JsonTypeName` + record components of `ClientMessage`/`ServerMessage` | a §3 table row keyed by the wire name, listing every field |
+| `checkErrorCodeDocs` | walkie-shared | `ErrorCode` constants | a §13 table row (bidirectional) |
+| `checkConfigurationKeyDocs` | walkie-server | `WalkieProperties` record components | `walkie.the-key` written as code anywhere in README |
+| `checkClientOptionDocs` | walkie-client-java | picocli `@Option` names | a row in README's options table (bidirectional) |
+
+Three design points worth not re-deriving. **Where the token has to appear decides whether the check is worth
+anything.** "Mentioned somewhere in the file" is nearly worthless for a prose-heavy document: measured, deleting
+BOTH §3 message tables still leaves 39 of 40 wire names matching a word-boundary search, because the later
+sections cross-reference almost all of them. So the bar is a table row wherever a table IS the reference, and
+otherwise an inline code span — and code spans are found by splitting a line on backticks (odd indices are code)
+rather than by regex, because ``` `[^`]*TOKEN[^`]*` ``` also matches the prose BETWEEN two code spans.
+**Field names are checked inside their own row**, never document-wide: `channel`, `member`, `mode`, `code` and
+`from` are ordinary English that a 66 KB document satisfies by accident. **Defaults are not checked at all** —
+`8 * 1024` against "8 KiB" and `Duration.ofMinutes(5)` against `5m` are both correct, so a value check would cry
+wolf and still miss real drift.
+
+Two anti-rot guards, because a pattern that stops matching stops checking and reports success:
+`DocumentedTokensCheck` takes a `sentinel` (one real token, near the END of the set — patterns break by
+truncating) and fails loudly if the extraction stops finding it; `ProtocolMessageDocCheck` fails when the
+number of parsed record headers differs from the number of `@JsonTypeName` annotations. `ErrorCode`'s
+`@JsonEnumDefaultValue` constant is exempted *by the annotation*, not by name — it is the forward-compatibility
+fallback, never something the server sends. Reports: `<module>/build/reports/{protocol-messages,error-codes,
+configuration-keys,client-options}.txt`.
+
 Project rule: **no `var` keyword** anywhere. A linter may reformat saved files (tabs, `///` Javadoc,
 `_` for unused catch/pattern vars) — match the existing style rather than fighting it.
 

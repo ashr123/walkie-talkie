@@ -1,6 +1,10 @@
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
+import org.gradle.api.Task;
+import org.gradle.api.file.ConfigurableFileCollection;
+import org.gradle.api.file.RegularFile;
 import org.gradle.api.plugins.JavaPlugin;
+import org.gradle.api.provider.Provider;
 import org.gradle.api.tasks.TaskProvider;
 import org.gradle.api.tasks.compile.CompileOptions;
 import org.gradle.api.tasks.compile.JavaCompile;
@@ -72,6 +76,7 @@ public final class JavaConventionsPlugin implements Plugin<Project> {
 
 		registerJavadocReferenceCheck(project);
 		registerBrowserModuleDocCheck(project);
+		registerDocumentationChecks(project);
 
 		project.getTasks().named("jacocoTestReport", JacocoReport.class, report -> {
 			report.dependsOn(project.getTasks().named(JavaPlugin.TEST_TASK_NAME));
@@ -105,6 +110,141 @@ public final class JavaConventionsPlugin implements Plugin<Project> {
 		} else {
 			options.getCompilerArgs().add("-Xlint:all");
 		}
+	}
+
+	/// Keep README.md and docs/CLIENT_PROTOCOL.md honest the way [BrowserModuleDocCheck] keeps CLAUDE.md honest:
+	/// derive the truth from source, and fail `check` when the documentation has fallen behind it.
+	///
+	/// Registered per OWNING module rather than everywhere, because each of these checks is about specific files.
+	/// That is deliberate: it means an empty source set is a hard failure ("the file moved") instead of a silent
+	/// pass, which is the failure mode a documentation check must not have. It also puts each failure in front of
+	/// the person editing the code it describes — change `ErrorCode` and it is walkie-shared's `check` that stops.
+	private void registerDocumentationChecks(Project project) {
+		switch (project.getName()) {
+			case "walkie-shared" -> {
+				registerProtocolMessageDocCheck(project);
+				registerErrorCodeDocCheck(project);
+			}
+			case "walkie-server" -> registerConfigurationKeyDocCheck(project);
+			case "walkie-client-java" -> registerClientOptionDocCheck(project);
+			default -> {   // the root project and anything added later document nothing of their own
+			}
+		}
+	}
+
+	/// Every control message and every one of its JSON fields must appear in the §3 tables of the protocol
+	/// document. See [ProtocolMessageDocCheck] for why the fields are checked per row rather than document-wide.
+	private void registerProtocolMessageDocCheck(Project project) {
+		TaskProvider<ProtocolMessageDocCheck> task = project.getTasks()
+				.register("checkProtocolMessageDocs", ProtocolMessageDocCheck.class, check -> {
+					check.setGroup(LifecycleBasePlugin.VERIFICATION_GROUP);
+					check.setDescription("Fails when a control message or field is missing from CLIENT_PROTOCOL.md.");
+					check.getMessageSources().from(project.fileTree(project.getProjectDir(), tree ->
+							tree.include("src/main/java/**/protocol/ClientMessage.java",
+									"src/main/java/**/protocol/ServerMessage.java")));
+					check.getDocumentation().from(clientProtocol(project));
+					check.getReport().set(report(project, "protocol-messages.txt"));
+				});
+		dependOnCheck(project, task);
+	}
+
+	/// Every wire error code must have a row in the §13 table. The `@JsonEnumDefaultValue` constant is excluded
+	/// BY THE ANNOTATION rather than by name: it is the deserialization fallback for a code minted by a newer
+	/// server, not something the server can ever send, so demanding a row for it would be a wrong failure — and
+	/// deriving the exemption keeps this from becoming the hand-maintained list the pattern exists to avoid.
+	private void registerErrorCodeDocCheck(Project project) {
+		TaskProvider<DocumentedTokensCheck> task = project.getTasks()
+				.register("checkErrorCodeDocs", DocumentedTokensCheck.class, check -> {
+					check.setGroup(LifecycleBasePlugin.VERIFICATION_GROUP);
+					check.setDescription("Fails when a wire error code has no row in CLIENT_PROTOCOL.md §13.");
+					check.getSources().from(project.fileTree(project.getProjectDir(), tree ->
+							tree.include("src/main/java/**/protocol/ErrorCode.java")));
+					check.getTokenPattern().set("(?m)(?<!@JsonEnumDefaultValue\n)^\t([A-Z][A-Z0-9_]*),?$");
+					check.getSentinel().set("CHANNEL_ROUTING_MISMATCH");
+					check.getDocumentation().from(clientProtocol(project));
+					check.getDocRowPattern().set("(?m)^\\|\\s*`([A-Z][A-Z0-9_]*)`\\s*\\|");
+					check.getSubject().set("wire error codes");
+					check.getHint().set("Add a row to the error table in §13 of docs/CLIENT_PROTOCOL.md saying what "
+							+ "TRIGGERS the code. A client switches on these, so an undocumented one is a branch "
+							+ "nobody else writes.");
+					configure(check, project, "error-codes.txt");
+				});
+		dependOnCheck(project, task);
+	}
+
+	/// Every `walkie.*` knob must be discoverable in the README. A weaker bar than the table checks — the key has
+	/// to appear as code SOMEWHERE — and deliberately so: the README documents these across several prose
+	/// sections rather than in one table, and a dotted, hyphenated key cannot be satisfied by accident the way an
+	/// English word could. It enforces "an operator can find out this knob exists", nothing more.
+	///
+	/// Default VALUES are not checked, and should not be: the same value has several correct spellings (`8 * 1024`
+	/// against "8 KiB", `Duration.ofMinutes(5)` against "5m"), so a value check would both cry wolf and miss real
+	/// drift.
+	private void registerConfigurationKeyDocCheck(Project project) {
+		TaskProvider<DocumentedTokensCheck> task = project.getTasks()
+				.register("checkConfigurationKeyDocs", DocumentedTokensCheck.class, check -> {
+					check.setGroup(LifecycleBasePlugin.VERIFICATION_GROUP);
+					check.setDescription("Fails when a walkie.* configuration key is undocumented in README.md.");
+					check.getSources().from(project.fileTree(project.getProjectDir(), tree ->
+							tree.include("src/main/java/**/config/WalkieProperties.java")));
+					// Line-anchored at the record header's indent, so the compact constructor's statements and
+					// any method parameter are out of reach.
+					check.getTokenPattern()
+							.set("(?m)^\t\t(?:@\\w+(?:\\([^()]*\\))?\\s+)*[\\w.]+(?:<[^>]*>)?(?:\\[])?\\s+([a-z]\\w*)\\s*[,)]");
+					check.getSentinel().set("keepalivePingInterval");   // the LAST component: truncation drops it first
+					check.getDocumentation().from(project.getRootProject().file("README.md"));
+					check.getTokenPrefix().set("walkie.");
+					check.getRelaxedBinding().set(true);
+					check.getSubject().set("configuration keys");
+					check.getHint().set("Document the key in README.md — in the properties table or the section "
+							+ "about the feature it controls — spelled `walkie.the-key` in backticks. An "
+							+ "undocumented knob is one nobody can find when they need it.");
+					configure(check, project, "configuration-keys.txt");
+				});
+		dependOnCheck(project, task);
+	}
+
+	/// Every console-client flag must have a row in the README's options table. Bidirectional, which is safe only
+	/// because it is scoped to that one table: the README's prose legitimately mentions `--args`, `--release` and
+	/// `--test`, none of which are rows. `--version` and `--help` correctly never appear in the derived set —
+	/// picocli's `mixinStandardHelpOptions` provides them, not an `@Option`.
+	private void registerClientOptionDocCheck(Project project) {
+		TaskProvider<DocumentedTokensCheck> task = project.getTasks()
+				.register("checkClientOptionDocs", DocumentedTokensCheck.class, check -> {
+					check.setGroup(LifecycleBasePlugin.VERIFICATION_GROUP);
+					check.setDescription("Fails when a client command-line flag has no row in README.md.");
+					check.getSources().from(project.fileTree(project.getProjectDir(), tree ->
+							tree.include("src/main/java/**/*.java")));
+					check.getTokenPattern().set("@Option\\(\\s*names\\s*=\\s*\"(--[a-z0-9-]+)\"");
+					check.getSentinel().set("--muted");
+					check.getDocumentation().from(project.getRootProject().file("README.md"));
+					// The row key carries a metavar (`--server <url>`), so match the flag as its prefix.
+					check.getDocRowPattern().set("(?m)^\\|\\s*`(--[a-z0-9-]+)[^`]*`\\s*\\|");
+					check.getSubject().set("client command-line options");
+					check.getHint().set("Add a row to the options table in README.md's \"Java desktop client\" "
+							+ "section with the flag, its default and what it does.");
+					configure(check, project, "client-options.txt");
+				});
+		dependOnCheck(project, task);
+	}
+
+	/// The defaults every [DocumentedTokensCheck] needs but most registrations have nothing to say about.
+	private void configure(DocumentedTokensCheck check, Project project, String reportName) {
+		check.getTokenPrefix().convention("");
+		check.getRelaxedBinding().convention(false);
+		check.getReport().set(report(project, reportName));
+	}
+
+	private ConfigurableFileCollection clientProtocol(Project project) {
+		return project.files(project.getRootProject().file("docs/CLIENT_PROTOCOL.md"));
+	}
+
+	private Provider<RegularFile> report(Project project, String name) {
+		return project.getLayout().getBuildDirectory().file("reports/" + name);
+	}
+
+	private void dependOnCheck(Project project, TaskProvider<? extends Task> task) {
+		project.getTasks().named(LifecycleBasePlugin.CHECK_TASK_NAME).configure(check -> check.dependsOn(task));
 	}
 
 	/// Verify that every DOM-free browser module is described in CLAUDE.md and has a test, and fail `check` when one
