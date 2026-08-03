@@ -200,6 +200,17 @@ loopback) behind a proxy. Ready-to-edit configs are in [`deploy/`](deploy): a [`
 HTTPS origin so the handshake's origin check (anti-CSWSH) accepts only your real site. TLS 1.3 / 1.2 only
 throughout.
 
+**Idle connections behind a proxy.** Anything between the client and the server will eventually close a socket
+that has said nothing — nginx's `proxy_read_timeout` defaults to 60 s, and a Cloudflare quick tunnel reaps at
+about 100 s (measured: 125 s), with a bare TCP FIN and no WebSocket Close frame, so the client just goes quiet.
+The server therefore sends a WebSocket Ping to any connection idle for `walkie.keepalive-ping-interval`
+(default `30s`; `0s` disables it). Browsers and the JDK client both answer Pongs automatically, so no client
+code is involved. Lower it if your proxy is stricter than 60 s; a value at or above the proxy's timeout is the
+same as having none.
+
+The health endpoints `/actuator/health` and `/actuator/info` are exposed unauthenticated for a load balancer to
+probe; everything else under `/actuator` is not.
+
 ### Browser client
 
 1. Open <https://localhost:8443> (or <https://[::1]:8443>) and accept the one-time self-signed-certificate
@@ -399,12 +410,16 @@ otherwise mono — and interoperates with relay-mode browser clients.
   (`walkie.max-audio-frames-per-second`, default 100 ≈ 2× the ~50 fps nominal); frames over the rate are
   dropped **before** fan-out, so one client can't amplify load across the channel (N recipients) or force
   excess decode work. It counts frames without inspecting them, so it works on encrypted channels too — the
-  per-frame **size** cap is `walkie.max-audio-frame-bytes` (default 8 KiB).
+  per-frame **size** cap is `walkie.max-audio-frame-bytes` (default 8 KiB). Control traffic has its own pair of
+  caps: `walkie.max-control-messages-per-second` (default 200) rate-limits the JSON channel, and
+  `walkie.max-text-message-bytes` (default 16 KiB) bounds a single control/signaling frame — deliberately well
+  under a WebSocket stack's usual 64 KiB, since that buffer is reserved **per connection** and the largest
+  legitimate message is a WebRTC SDP offer.
 - **Push-to-talk floor anti-hogging.** A half-duplex channel's talk floor can't be held forever: any holder is
-  force-released after `walkie.floor-max-hold` (default 300) of continuous holding — a periodic
+  force-released after `walkie.floor-max-hold` (default `5m`) of continuous holding — a periodic
   background sweep enforces this hard cap (a relay holder also hits it immediately on its next frame). On top of
   that, **idle auto-release** hands the floor to a waiting requester once the current holder has sent no audio
-  for `walkie.floor-idle-release` (default 5). Set either to `0` to disable. On a server-initiated
+  for `walkie.floor-idle-release` (default `5s`). Set either to `0s` to disable. On a server-initiated
   release the (ex-)holder is told so its client stops transmitting. Idle auto-release applies to **relay
   holders only** — it needs a per-frame activity signal, which peer-to-peer WebRTC media doesn't give the
   server; max-hold is a pure time cap and bounds every holder, including WebRTC.
@@ -412,7 +427,7 @@ otherwise mono — and interoperates with relay-mode browser clients.
   **off** — a busy floor is simply not granted, as before). With it on, asking for a busy floor puts you **in
   line** (FIFO) and everyone sees their place; when the floor frees it passes to the head of the line. It is
   **grant-to-claim, never a hot mic**: when your turn arrives the floor is *reserved* for you for
-  `walkie.floor-reservation` (default 10) and you must take the normal talk action to go live — miss the
+  `walkie.floor-reservation` (default `10s`) and you must take the normal talk action to go live — miss the
   window and you're dropped and the floor moves to the next in line. The owner toggles it with `SetFloorQueue`;
   the on/off default a new channel adopts is `walkie.floor-queue-default` (default `false`). The reservation
   window is a positive claim window, so `0`/blank means "use the default", not "disabled" (unlike the two timers

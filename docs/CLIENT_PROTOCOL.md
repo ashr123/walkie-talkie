@@ -679,7 +679,9 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
   name are preserved. **Channel name:** `[A-Za-z0-9_-]{1,64}` — unchanged and ASCII-only, because it is the E2EE
   key-derivation salt (computed client-side), a routing key, and a map key.
 - **Inbound audio frame:** ≤ `walkie.max-audio-frame-bytes` (default 8192) — enforced on the **un-prefixed**
-  inbound frame, so the outbound +1 SID never trips it. **Text frame:** ≤ 65536 (default).
+  inbound frame, so the outbound +1 SID never trips it. **Text frame:** ≤ `walkie.max-text-message-bytes`
+  (default 16384). Size your control messages against that, not against the 64 KiB a WebSocket stack might
+  otherwise allow: the largest thing a client sends is a WebRTC SDP offer, and an oversized one is cut off.
 - **Inbound audio frame rate:** ≤ `walkie.max-audio-frames-per-second` per sender (default 100; ~50 fps is
   nominal). Excess frames are dropped **before** fan-out — a flood guard that counts frames without inspecting
   them, so it works on encrypted channels. Always on (0/blank → default, never disabled).
@@ -714,6 +716,7 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 | `TOO_MANY_JOIN_REQUESTS` | `join` at a locked channel whose waiting list is already at `walkie.max-join-requests` (§3f). Transient — the list drains as the owner decides, so retrying later may work                        |
 | `JOIN_REQUEST_DENIED`    | The owner declined your request to join (§3f). Not a malformed request: the answer was simply no, so stop waiting and stay connected                                                              |
 | `UNKNOWN_TARGET`         | WebRTC signal, `transferOwnership`, or `muteMember` (unknown/left id, or the owner itself) — a target not mutable in the channel                                                                  |
+| `CHANNEL_ROUTING_MISMATCH` | Multi-instance deployments only (`walkie.channel-affinity`): a `join`/switch to a channel this instance does not own. **Not fatal and not your bug** — reconnect with `?channel=<target>` on the handshake so the ingress re-pins you to the owning instance, then re-send the `join`. Both reference clients do this automatically. A single-instance server never sends it |
 
 ---
 
