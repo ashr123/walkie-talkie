@@ -66,6 +66,31 @@ whole build (references cross modules routinely). It is deliberately conservativ
 simple name in a file with a wildcard import — but NOT an `Outer.Nested` whose outer half is one of ours, since a
 wildcard import can't explain that away. Report: `<module>/build/reports/javadoc-references.txt`.
 
+**A channel is SINGLE-transport, and the first member decides.** `Transport` (`server/session/Transport.java`) is
+a property of the SESSION — which endpoint you dialled, `/ws/audio` or `/ws/signal` — not of the `Channel`, and
+`ServerMessage.Joined` carries no transport field, so no client can learn what anyone else uses. It used to be
+possible to mix them in one channel, and that was silently broken rather than flexible: the relay fan-out skips a
+signaling member and a signaling sender's frames are dropped on arrival, so a mixed channel is a full roster with
+working floor control and NO audio in either direction — indistinguishable from working. Worse, a WebRTC member
+would offer to a relay member, whose browser answered and attached its microphone to a peer connection outside
+every server gate (see `micTrackEnabled` below).
+
+So `ChannelRegistry.joinOrCreate` refuses a mismatched joiner with `TRANSPORT_MISMATCH`, decided under the same
+bin lock as the key-check and AFTER it (the passphrase is the membership credential, so someone who cannot present
+it learns nothing about the channel's configuration). `Channel.firstMemberTransport()` DERIVES the answer from the
+roster rather than storing it, which is what makes "an emptied channel decides afresh" structural — a channel is
+dropped the instant its last member leaves, so there is no stale value to inherit. The browser follows the
+refusal ONCE per Connect (flipping the selector and reconnecting, like it already follows
+`CHANNEL_ROUTING_MISMATCH`); the bound matters because a channel's transport is not stable and each lap costs a
+fresh `getUserMedia` + `AudioContext`. The Java client cannot follow at all — it is relay-only, since there is no
+mature pure-Java WebRTC stack — so it explains that instead.
+
+Transport is deliberately NOT modelled as a channel property that joiners adopt the way `mode` is. Three reasons,
+all concrete: the console client would be permanently unable to join any WebRTC-created channel; ICE is STUN-only
+with no TURN, so forcing a phone onto WebRTC across networks can fail with the same silent no-audio symptom; and a
+transport change requires a reconnect, which mints a new session id — so an owner could not change it without
+ceasing to be the owner.
+
 `check` also runs **`checkBrowserModuleDocs`** (`BrowserModuleDocCheck`, same directory), which keeps the
 browser-module list further down this file honest: every DOM-free module must be named here and must have a
 `<name>.test.js`, and the count word introducing that list must match how many there are. Five commits in one

@@ -157,6 +157,14 @@ relay SDP/ICE; the **server rewrites `target` → `from` = the sender's session 
 peer-to-peer (each peer is its own independently-decoded Opus stream — which is why WebRTC has no relay-style
 single-decoder limit).
 
+**A channel is single-transport.** Which endpoint you dialled — `/ws/audio` or `/ws/signal` — is the transport,
+and the FIRST member of a channel decides it: a `join` from the other endpoint is refused with
+`TRANSPORT_MISMATCH` (§13). The two media planes never meet, so a mixed channel would carry no audio in either
+direction while looking entirely healthy (full roster, working floor control), which is why this is a refusal
+rather than a warning. A signal whose sender or target is not on `/ws/signal` is dropped silently for the same
+reason — and because answering an offer attaches a microphone to media that takes neither the server's floor and
+owner-mute enforcement nor the passphrase E2EE, both of which exist only on the relay frame path.
+
 - Send `offer`/`answer`/`ice` with a `target` (a member id); the recipient receives
   `signalOffer`/`signalAnswer`/`signalIce` with `from` = your id.
 - Reference client uses STUN `stun:stun.l.google.com:19302`, tunes Opus via SDP fmtp
@@ -750,6 +758,7 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
 | `NOT_IN_CHANNEL`           | `requestFloor` / `releaseFloor` / `changeMode` / `changePassphrase` / `transferOwnership` / `muteMember` / `muteAll` / `setLocked` / `setFloorQueue` / signal before `join`                                                                                                                                                                                                            |
 | `NOT_OWNER`                | `changeMode`, `changePassphrase`, `transferOwnership`, `muteMember`, `muteAll`, `setLocked` or `setFloorQueue` by a non-owner                                                                                                                                                                                                                                                          |
 | `PASSPHRASE_MISMATCH`      | `join` with a `keyCheck` differing from the channel's (E2EE §7). On an in-place switch (§3c) you KEEP your current channel — a switch is all-or-nothing                                                                                                                                                                                                                                |
+| `TRANSPORT_MISMATCH`       | A `join`/switch to a channel whose members all use the OTHER transport. The FIRST member of a channel decides it (`/ws/audio` = relay, `/ws/signal` = WebRTC) and everyone else must match, because the two media planes never meet: the relay fan-out skips a signaling member and a signaling sender's frames are dropped on arrival, so a mixed channel would be a full roster with working floor control and **no audio in either direction**. Not transient — reconnect on the other endpoint (the message names which) rather than retrying as you are |
 | `CHANNEL_LOCKED`           | `join` (or in-place switch) to a locked channel on a server configured NOT to park newcomers (`walkie.max-join-requests: 0`, §3e). Otherwise a locked channel replies `joinPending` instead (§3f)                                                                                                                                                                                      |
 | `CHANNEL_FULL`             | `join` (or in-place switch) to a channel already at its member cap (one stream index per member, 0..254 → 255 members). You keep your current channel                                                                                                                                                                                                                                  |
 | `TOO_MANY_JOIN_REQUESTS`   | `join` at a locked channel whose waiting list is already at `walkie.max-join-requests` (§3f). Transient — the list drains as the owner decides, so retrying later may work                                                                                                                                                                                                             |

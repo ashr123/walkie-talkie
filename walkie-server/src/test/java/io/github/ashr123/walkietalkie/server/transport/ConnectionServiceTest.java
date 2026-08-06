@@ -885,6 +885,19 @@ class ConnectionServiceTest {
 		return new FakeClientSession(id, Transport.SIGNALING, id);
 	}
 
+	/// Builds the mixed-transport channel the join path now REFUSES, by adding the second member to the channel
+	/// directly instead of through `Join`.
+	///
+	/// That is deliberate, and it is the right shape for a defence-in-depth gate: the signaling gate below is the
+	/// server-side BELT, so its test must construct the state the invariant forbids and assert the backstop still
+	/// holds. Routing through `Join` would make these tests pass vacuously — the join is refused, so the member is
+	/// never there to be signalled at — which is exactly what happened to an earlier version of them.
+	private FakeClientSession forceIntoChannel(String channelName, FakeClientSession session) {
+		channel(channelName).add(session);
+		session.joinedChannel(channelName);
+		return session;
+	}
+
 	@Test
 	void webRtcSignalingIsNotRelayedToAMemberOnTheAudioTransport() {
 		// The audio path is transport-gated in both directions; signaling was gated in neither, so a relay member
@@ -894,8 +907,7 @@ class ConnectionServiceTest {
 		// owed a reply, and an error per ICE candidate would be a flood.
 		FakeClientSession webrtc = signaling("webrtc");
 		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
-		FakeClientSession relay = session("relay");
-		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		FakeClientSession relay = forceIntoChannel("room", session("relay"));
 		relay.sent.clear();
 		webrtc.sent.clear();
 
@@ -911,10 +923,9 @@ class ConnectionServiceTest {
 	void signalingFromAMemberOnTheAudioTransportIsAlsoDropped() {
 		// The other direction, for symmetry: a relay member that sends signaling (an older client, or one confused
 		// about its own transport) must not reach a WebRTC member either.
-		FakeClientSession relay = session("relay");
-		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
 		FakeClientSession webrtc = signaling("webrtc");
-		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession relay = forceIntoChannel("room", session("relay"));
 		webrtc.sent.clear();
 
 		service.onMessage(relay, new ClientMessage.Answer("webrtc", "sdp-answer"));
@@ -922,6 +933,107 @@ class ConnectionServiceTest {
 
 		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.SignalAnswer.class::isInstance));
 		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.SignalIce.class::isInstance));
+	}
+
+	@Test
+	void aJoinerOnTheOtherTransportIsRefusedAndTheChannelIsUndisturbed() {
+		// The structural fix: one transport per channel, decided by whoever joined first. A mixed channel is a full
+		// roster with working floor control and NO audio path in either direction — it looks like it works, which is
+		// why it is refused rather than merely warned about.
+		FakeClientSession relay = session("relay");
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		relay.sent.clear();
+		FakeClientSession webrtc = signaling("webrtc");
+
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+
+		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(webrtc, ServerMessage.ErrorMessage.class).code());
+		assertEquals(1, channel("room").size(), "the refused joiner is not added");
+		assertTrue(relay.sent.stream().noneMatch(ServerMessage.MemberJoined.class::isInstance),
+				"and the incumbent is not told about a member that never joined");
+	}
+
+	@Test
+	void theMirrorImageIsRefusedToo() {
+		FakeClientSession webrtc = signaling("webrtc");
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession relay = session("relay");
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(relay, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void theFirstMemberDecidesTheTransportAndAnEmptiedChannelDecidesAfresh() {
+		// The answer to "what about a channel that was left": there is no such thing to inherit from. A channel is
+		// dropped the instant its last member leaves, so the next creator decides. Deriving the transport from the
+		// roster (rather than storing it) is what makes that structural instead of something to remember.
+		FakeClientSession relay = session("relay");
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onClose(relay, "bye");
+		assertFalse(channelExists("room"), "the channel is dropped once empty");
+
+		FakeClientSession webrtc = signaling("webrtc");
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		assertEquals("room", firstOf(webrtc, ServerMessage.Joined.class).channel(),
+				"the new first member sets the transport, whatever the old one used");
+
+		FakeClientSession late = session("late");
+		service.onMessage(late, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "carol", "kcv-A"));
+		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(late, ServerMessage.ErrorMessage.class).code(),
+				"...and now it is the relay transport that is refused");
+	}
+
+	@Test
+	void aLockedChannelRefusesAWrongTransportKnockerWithoutTroublingTheOwner() {
+		// The gate exists in BOTH branches of joinOrCreate, and a mutation run showed the locked/parking one was
+		// uncovered. It sits BEFORE knock() on purpose — the same argument the LOCKED and key-check gates above it
+		// make: never ask an owner to approve someone who could not be admitted anyway.
+		ConnectionService svc = serviceParking(16);
+		FakeClientSession alice = session("alice");
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.SetLocked(true));
+		alice.sent.clear();
+		FakeClientSession webrtc = signaling("webrtc");
+
+		svc.onMessage(webrtc, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+
+		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(webrtc, ServerMessage.ErrorMessage.class).code());
+		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.JoinPending.class::isInstance),
+				"refused outright, not parked");
+		assertNull(webrtc.pendingChannel(), "and not left marked as waiting");
+		assertTrue(alice.sent.stream().noneMatch(ServerMessage.JoinRequests.class::isInstance),
+				"the owner is never shown a request it could not usefully approve");
+	}
+
+	@Test
+	void aWrongPassphraseIsReportedAheadOfAWrongTransport() {
+		// Ordering: the passphrase is the membership credential, so it stays the FIRST gate. Someone who cannot
+		// present it must learn nothing about how the channel is configured.
+		FakeClientSession relay = session("relay");
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession wrong = signaling("wrong");
+
+		service.onMessage(wrong, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-DIFFERENT"));
+
+		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(wrong, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void aRefusedTransportSwitchKeepsTheChannelAndRollsBackTheName() {
+		// A switch is a fresh Join, so the all-or-nothing guarantee has to hold for this refusal too: the refused
+		// switcher keeps its channel AND the display name it had, since handleJoin applies the new name before the
+		// atomic join and undoes it on refusal.
+		FakeClientSession relay = session("relay");
+		service.onMessage(relay, new ClientMessage.Join("home", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession webrtc = signaling("webrtc");
+		service.onMessage(webrtc, new ClientMessage.Join("webrtc-room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		relay.sent.clear();
+
+		service.onMessage(relay, new ClientMessage.Join("webrtc-room", ChannelMode.MULTI_CHANNEL_PTT, "renamed", "kcv-A"));
+
+		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(relay, ServerMessage.ErrorMessage.class).code());
+		assertEquals("home", relay.channelName(), "the refused switch left us where we were");
+		assertEquals("alice", relay.displayName(), "and rolled the display name back");
 	}
 
 	@Test

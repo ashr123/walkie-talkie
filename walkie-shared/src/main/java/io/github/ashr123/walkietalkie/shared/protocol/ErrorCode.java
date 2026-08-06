@@ -37,6 +37,12 @@ public enum ErrorCode {
 	NOT_OWNER,
 	/// `join` with a key-check differing from the channel's — wrong (or missing) end-to-end-encryption passphrase.
 	PASSPHRASE_MISMATCH,
+	/// `join`/switch to a channel whose members all use the OTHER transport (WebSocket relay vs WebRTC). The two
+	/// media planes never meet — the relay fan-out skips a signaling member and a signaling sender's frames are
+	/// dropped on arrival — so a mixed channel would be a full roster with working floor control and no audio path
+	/// in either direction. The first member of a channel decides its transport; everyone else must match. Not
+	/// transient: reconnect on the other transport (the message names which) rather than retrying as you are.
+	TRANSPORT_MISMATCH,
 	/// `join` refused because the owner has locked the channel to new members AND it does not park them for
 	/// approval (`walkie.max-join-requests` is 0). When it does park them the join is neither admitted nor refused:
 	/// the joiner receives [ServerMessage.JoinPending] instead and waits for the owner's decision.

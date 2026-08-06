@@ -3,6 +3,7 @@ package io.github.ashr123.walkietalkie.server.channel;
 import io.github.ashr123.option.Option;
 import io.github.ashr123.option.Some;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
+import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import org.springframework.stereotype.Component;
@@ -63,7 +64,10 @@ public class ChannelRegistry {
 			LOCKED,
 			FULL,
 			PASSPHRASE_MISMATCH,
-			WAITING_LIST_FULL
+			WAITING_LIST_FULL,
+			/// The joiner's transport disagrees with the one every current member uses. Relay audio and WebRTC media
+			/// never meet, so a mixed channel is a full roster with working floor control and no audio path at all.
+			TRANSPORT_MISMATCH
 		}
 	}
 
@@ -132,6 +136,12 @@ public class ChannelRegistry {
 						outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.PASSPHRASE_MISMATCH));
 						return channel;
 					}
+					if (transportMismatch(channel, session)) {
+						// Before knocking, not after: never ask an owner to approve someone who could not be
+						// admitted anyway — the same argument the LOCKED/key-check gates above already make.
+						outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.TRANSPORT_MISMATCH));
+						return channel;
+					}
 					outcome.set(switch (channel.knock(session)) {
 						case REGISTERED -> new JoinOutcome.Pending(channel, false);
 						case ALREADY_WAITING -> new JoinOutcome.Pending(channel, true);
@@ -148,7 +158,16 @@ public class ChannelRegistry {
 				outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.FULL));
 				return channel;
 			}
-			if (Objects.equals(channel.keyCheck(), keyCheck)) {
+			// One transport per channel — see Channel#firstMemberTransport for why a mixed one carries no audio.
+			// Evaluated under the same bin lock as the key-check, so the verdict cannot race a concurrent join or
+			// the channel's last member leaving. A freshly created channel matches by construction: it was created
+			// BY this session, which is exactly how the FIRST member comes to decide.
+			//
+			// AFTER the key-check on purpose: the passphrase is the membership credential, so someone who cannot
+			// present it learns nothing about how this channel is configured.
+			if (Objects.equals(channel.keyCheck(), keyCheck) && transportMismatch(channel, session)) {
+				outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.TRANSPORT_MISMATCH));
+			} else if (Objects.equals(channel.keyCheck(), keyCheck)) {
 				// Add the joiner, snapshot its view, AND let the caller emit that view to it — all ATOMICALLY under
 				// the channel monitor (bin→monitor, the established lock order — never the reverse). Doing the
 				// add (which makes the joiner broadcast-eligible), the snapshot, and the joiner's initial-state
@@ -170,6 +189,12 @@ public class ChannelRegistry {
 			return channel;   // keep the channel even on a key-check mismatch (don't drop it)
 		});
 		return outcome.get();
+	}
+
+	/// Whether `session` may not join `channel` because its transport disagrees with the members already there.
+	/// False for a memberless channel — the joiner is about to become the first member and therefore decides.
+	private static boolean transportMismatch(Channel channel, ClientSession session) {
+		return channel.firstMemberTransport() instanceof Some(Transport theirs) && theirs != session.transport();
 	}
 
 	public Option<Channel> find(String name) {

@@ -566,6 +566,18 @@ public class ConnectionService {
 					ErrorCode.PASSPHRASE_MISMATCH,
 					"This channel is using a different encryption passphrase (or none) — you can't join it."
 			);
+			// There are exactly two transports, so the joiner's OWN transport names the other by elimination — this
+			// refusal exists precisely because they differ. The switch is exhaustive on purpose: adding a third
+			// transport stops this compiling, which is the moment the required one must be carried ON the refusal
+			// rather than derived here.
+			case TRANSPORT_MISMATCH -> sendError(
+					session,
+					ErrorCode.TRANSPORT_MISMATCH,
+					"Every member of this channel is on the " + switch (session.transport()) {
+						case AUDIO_RELAY -> "WebRTC";
+						case SIGNALING -> "WebSocket relay";
+					} + " transport — switch to it to join them."
+			);
 			case WAITING_LIST_FULL -> sendError(
 					session,
 					ErrorCode.TOO_MANY_JOIN_REQUESTS,

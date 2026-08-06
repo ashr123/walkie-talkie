@@ -651,6 +651,11 @@ public final class WalkieClient implements AutoCloseable {
 					// another. They used to exit the process, which threw away a healthy connection and left the user
 					// nothing to do but restart.
 					case PASSPHRASE_MISMATCH -> joinRefused("this channel needs a different --key.");
+					// This client is relay-only — there is no mature pure-Java WebRTC stack (see the README's known
+					// constraints), so unlike the browser it cannot follow the channel onto the other transport.
+					// Say so plainly instead of leaving the user with a bare [error] line and no way forward.
+					case TRANSPORT_MISMATCH -> joinRefused("this channel is on the WebRTC transport, and the console "
+							+ "client speaks only the WebSocket relay — join it from a browser instead.");
 					case CHANNEL_LOCKED -> joinRefused("this channel is locked by its owner.");
 					case CHANNEL_FULL -> joinRefused("this channel is full — it has reached its member limit.");
 					// The target channel lives on another instance (channel affinity): an in-place switch can't reach

@@ -5,6 +5,7 @@ import io.github.ashr123.option.Option;
 import io.github.ashr123.option.OptionInt;
 import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
+import io.github.ashr123.walkietalkie.server.session.Transport;
 import io.github.ashr123.walkietalkie.server.transport.ConnectionService;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.JoinRequestInfo;
@@ -267,6 +268,25 @@ public final class Channel {
 
 	public int size() {
 		return members.size();
+	}
+
+	/// The transport every member of this channel uses — absent only for a memberless channel, which the registry
+	/// never publishes (a channel is dropped the instant its last member leaves).
+	///
+	/// DERIVED from a member rather than stored, so it cannot drift from who is actually here. The invariant is
+	/// "every member of a channel shares one transport" (enforced in [ChannelRegistry#joinOrCreate]); a field would
+	/// be a second answer to a question the roster already answers, and would have to be maintained on every add
+	/// and remove. Any member will do, precisely because they agree.
+	///
+	/// Why the invariant exists: relay audio and WebRTC media never meet. The fan-out skips a signaling member and
+	/// a signaling sender's frames are dropped on arrival, so a mixed channel is a full roster with working floor
+	/// control and NO audio path in either direction — it looks like it works.
+	///
+	/// Concurrency: read inside the registry's `channels.compute(name, …)` span, which is where every add and
+	/// remove for this name runs, so it cannot change under the join being validated against it.
+	public Option<Transport> firstMemberTransport() {
+		// Option.of(Optional) + map — the same idiom as member() and anyMember() just below.
+		return Option.of(members.values().stream().findAny()).map(member -> member.session().transport());
 	}
 
 	public Option<ClientSession> member(String sessionId) {

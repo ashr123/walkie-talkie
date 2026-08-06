@@ -109,6 +109,7 @@ const state = {
 	warnedDecrypt: false,
 	warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
 	warnedSignaling: false,       // warn once if WebRTC signaling arrives while we are on the relay transport
+	followedTransport: false,     // a TRANSPORT_MISMATCH auto-follow already happened; don't ping-pong (cleared on a successful join)
 	peers: new Map(),       // remoteId -> RTCPeerConnection (WebRTC)
 	members: new Map(),     // id -> displayName
 	// The authoritative owner-mute snapshot (ServerMessage.MuteStatus): the whole set of muted ids, REPLACED
@@ -909,6 +910,31 @@ function onWsMessage(ev) {
 				onJoinRefused('The owner declined your request to join.');
 			} else if (msg.code === 'TOO_MANY_JOIN_REQUESTS') {
 				onJoinRefused('Too many people are already waiting to join this channel — try again shortly.');
+			} else if (msg.code === 'TRANSPORT_MISMATCH') {
+				// Every member of the target channel is on the other transport, and a mixed channel carries no audio
+				// at all, so follow them: flip the selector and reconnect through the transport-change path
+				// (pendingReconnect → disconnect → ws.onclose → connect), which re-reads the form.
+				//
+				// ONCE per Connect. A channel's transport is not stable — it is whoever joined first, and the channel
+				// is dropped when it empties — so an unbounded follow could ping-pong, and each lap costs a fresh
+				// getUserMedia + AudioContext. The flag clears when a join succeeds (onJoined).
+				//
+				// The two directions are NOT equally safe, which is why the second attempt only advises. Following
+				// TOWARD the relay is reliable: it is one TLS connection to the server, the one already carrying
+				// control. Following toward WebRTC depends on ICE, and with STUN-only config (no TURN) two devices on
+				// different networks may fail to connect at all — silently, since a failed negotiation looks exactly
+				// like this bug: full roster, working floor, no audio.
+				if (state.followedTransport) {
+					log(`${msg.message} Switch the Transport selector yourself and press Connect.`);
+					onJoinRefused('That channel uses the other transport.');
+				} else {
+					state.followedTransport = true;
+					const target = state.transport === 'webrtc' ? 'relay' : 'webrtc';
+					byId('transport').value = target;
+					log(`${msg.message} Reconnecting on ${target === 'webrtc' ? 'WebRTC' : 'the WebSocket relay'}…`);
+					state.pendingReconnect = true;
+					disconnect();
+				}
 			} else if (msg.code === 'CHANNEL_ROUTING_MISMATCH') {
 				// Channel affinity (multi-instance): the channel we tried to switch to lives on another instance, so
 				// an in-place switch can't reach it. Reconnect as a NEW session — reusing the transport-change path
@@ -941,6 +967,7 @@ function onJoined(msg) {
 	state.selfId = msg.selfId;
 	state.ownerId = msg.ownerId;
 	state.mode = msg.mode;
+	state.followedTransport = false;   // this join landed, so a future mismatch may follow once again
 	state.channel = msg.channel;
 	state.locked = msg.locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join too)
 	// The join landed, so what the switch overwrote is now the truth; a stale rollback here would let a LATER

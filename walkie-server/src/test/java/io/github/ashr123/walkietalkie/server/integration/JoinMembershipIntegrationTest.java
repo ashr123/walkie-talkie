@@ -163,20 +163,24 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
-	void membershipIsTransportAgnosticAcrossAudioAndSignalingClients() throws Exception {
+	void aChannelIsSINGLETransportAcrossRealSockets() throws Exception {
+		// The inverse of what this test used to assert. Membership WAS transport-agnostic, and that turned out to be
+		// the bug rather than the feature: relay audio and WebRTC media never meet (the fan-out skips a signaling
+		// member, and a signaling sender's frames are dropped on arrival), so a mixed channel was a full roster with
+		// working floor control and no audio path in either direction — indistinguishable from working.
 		CollectingHandler audioPeer = new CollectingHandler();
 		CollectingHandler signalPeer = new CollectingHandler();
 		try (WebSocketSession sAudio = connect(AUDIO, audioPeer, login());
 		     WebSocketSession sSignal = connect(SIGNAL, signalPeer, login())) {
 			send(sAudio, new ClientMessage.Join("mix", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
-			ServerMessage.Joined joinedAudio = awaitType(audioPeer.messages, ServerMessage.Joined.class);
+			awaitType(audioPeer.messages, ServerMessage.Joined.class);
 
 			send(sSignal, new ClientMessage.Join("mix", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
-			ServerMessage.Joined joinedSignal = awaitType(signalPeer.messages, ServerMessage.Joined.class);
 
-			// The signaling client joined the same channel and the audio client is notified of it.
-			assertTrue(joinedSignal.members().stream().anyMatch(m -> m.id().equals(joinedAudio.selfId())));
-			assertEquals(joinedSignal.selfId(), awaitType(audioPeer.messages, ServerMessage.MemberJoined.class).member().id());
+			assertEquals(ErrorCode.TRANSPORT_MISMATCH,
+					awaitType(signalPeer.messages, ServerMessage.ErrorMessage.class).code());
+			assertTrue(signalPeer.messages.stream().noneMatch(ServerMessage.Joined.class::isInstance),
+					"the refused joiner never gets a Joined snapshot");
 		}
 	}
 
