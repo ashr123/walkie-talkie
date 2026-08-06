@@ -590,10 +590,19 @@ six:
   `canonicalDisplayName` and `CHANNEL_NAME` + `canonicalChannelName` (each NFC, then trim). All four MUST match
   the server's copies in `ConnectionService` and the Java client's in `WalkieClient` — the server is the authority,
   and the Rename button compares the typed value against the name the server confirmed.
-  A channel name is the stricter rule: the same allow-list minus whitespace and `.`. Whitespace is excluded
-  because the Java client parses `c <channel> [mode] [key]` by splitting on it, and because an allow-list keeps
-  every invisible character out — which matters more here than for a display name, since a channel name is a
-  rendezvous key with no `#id` printed beside it.
+  A channel name is the stricter rule: the same allow-list minus `.`, with a plain space allowed. Being an
+  allow-list keeps every invisible character out, which matters more here than for a display name since a channel
+  name is a rendezvous key with no `#id` printed beside it.
+  Two things about whitespace are load-bearing. **Only U+0020 is in the pattern**, and `canonicalChannelName`
+  COLLAPSES runs of `[\p{Zs}\t\n\r\v\f]` to one plain space before trimming — so NBSP, the ideographic space
+  and a double space all converge on the same room instead of minting invisible duplicates of it. That is a
+  deliberate deviation from `canonicalDisplayName`, which leaves `Roy  Ash` as typed: a display name is a label
+  beside an id, a channel name IS the rendezvous. **And the set is written out rather than using `\s`**, because
+  JavaScript's `\s` matches NBSP while Java's does not — using the shorthand would have the browser accept a name
+  the server rejected. `\p{Zs}` has identical membership in both. Parity is pinned by the same vector list in
+  `names.test.js` and `WalkieClientTest`. The console client's `c <channel> [mode] [key]` now takes a quoted name
+  (`c "my room" ptt secret`) via `splitChannelArgs`, which quotes only the CHANNEL — the trailing passphrase stays
+  a remainder, because it may contain spaces too.
   **Canonicalising a channel name is not cosmetic the way it is for a display name: it is the PBKDF2 salt.** Two
   members whose channel names differ by one byte derive DIFFERENT KEYS and sit in one room hearing nothing, each
   told `PASSPHRASE_MISMATCH` for a passphrase that is provably identical — unfalsifiable from the UI. Measured:

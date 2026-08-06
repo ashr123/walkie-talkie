@@ -82,8 +82,19 @@ public final class WalkieClient implements AutoCloseable {
 	/// with the precomposed presentation form U+FB2A and as U+05E9 U+05C1 renders identically and derives a
 	/// different key before NFC, the same key after. Mirrors `ConnectionService.canonicalChannelName` and the
 	/// browser's `canonicalChannelName` in `static/assets/names.js`.
+	/// Whether `raw` is an acceptable channel name once canonicalised — the same question the browser's
+	/// `isValidChannelName` answers, exposed so the parity vectors can assert it without reaching for the pattern.
+	static boolean isValidChannelName(String raw) {
+		return CHANNEL_NAME.matcher(canonicalChannelName(raw)).matches();
+	}
+
 	static String canonicalChannelName(String requested) {
-		return requested == null ? null : Normalizer.normalize(requested, Normalizer.Form.NFC).strip();
+		if (requested == null) {
+			return null;
+		}
+		return CHANNEL_WHITESPACE.matcher(Normalizer.normalize(requested, Normalizer.Form.NFC))
+				.replaceAll(" ")
+				.strip();
 	}
 
 	private static String canonicalDisplayName(String requested) {
@@ -98,7 +109,15 @@ public final class WalkieClient implements AutoCloseable {
 	/// No whitespace, and that restriction is load-bearing HERE specifically: [#switchChannel] parses
 	/// `c <channel> [mode] [key]` by splitting on `\s+`, so a room name with a space in it could not be typed at
 	/// this prompt at all.
-	private static final Pattern CHANNEL_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N}_-]{1,64}");
+	/// Collapsed whitespace: `\p{Zs}` (every Unicode space separator) plus the five ASCII control whitespace
+	/// characters, written out rather than as `\s` because Java's `\s` is ASCII-only while JavaScript's matches
+	/// NBSP — using `\s` on both sides would have the browser accept a name (collapsing the NBSP) that this
+	/// rejected, which is exactly the two-clients-disagree failure the channel-name rules exist to prevent.
+	/// `\p{Zs}` has identical membership in both languages. See the browser's `canonicalChannelName` in
+	/// `static/assets/names.js`, and the parity vectors in `names.test.js` / `ConnectionServiceTest`.
+	private static final Pattern CHANNEL_WHITESPACE = Pattern.compile("[\\p{Zs}\\t\\n\\r\\x0B\\f]+");
+
+	private static final Pattern CHANNEL_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N} _-]{1,64}");
 	/// First byte of an end-to-end-encrypted frame (mirrors FrameCrypto's scheme marker); lets the receive path
 	/// distinguish encrypted audio from a plaintext peer's `[codec tag][payload]` when we hold no key.
 	private static final int E2EE_SCHEME = 0xE2;
@@ -122,7 +141,7 @@ public final class WalkieClient implements AutoCloseable {
 	private static final String COMMON_COMMANDS = """
 			Commands:  t = talk/stop — in push-to-talk it's state-driven: grab a free floor, claim your turn, or join/leave the queue when busy
 			           w = who's here
-			           c <channel> [mode] [key] = switch channel
+			           c <channel> [mode] [key] = switch channel (quote a name with spaces)
 			           n <name> = rename
 			           f = hi-fi on/off
 			           cancel = stop waiting to be admitted to a locked channel
@@ -1265,22 +1284,44 @@ public final class WalkieClient implements AutoCloseable {
 	/// Switches to a different channel WITHOUT dropping the session: the server treats a fresh Join as
 	/// "leave the old channel, join the new one" on the same socket, so the session id (and the audio loops)
 	/// survive. Mode and passphrase are optional and default to the current ones. Usage: `c <channel> [mode] [key]`.
+	/// Splits `c` command arguments into `{channel, rest}`, honouring double quotes around the channel name.
+	///
+	/// Needed because channel names may now contain spaces, so `split` on whitespace could no longer tell where the
+	/// name ends. Only the CHANNEL is quotable, and the rest is deliberately left as ONE string for the caller to
+	/// split again: the trailing passphrase may itself contain spaces (`c room ptt correct horse battery staple`
+	/// worked before this change and has to keep working), so it must stay a remainder rather than become tokens.
+	///
+	/// An unterminated quote takes the rest of the line as the name — forgiving on purpose, since the usage line the
+	/// caller then prints is about the name the user actually typed rather than a complaint about quoting.
+	static String[] splitChannelArgs(String args) {
+		String trimmed = args.strip();
+		if (trimmed.startsWith("\"")) {
+			int close = trimmed.indexOf('\"', 1);
+			return close < 0
+					? new String[]{trimmed.substring(1), ""}
+					: new String[]{trimmed.substring(1, close), trimmed.substring(close + 1).strip()};
+		}
+		String[] head = trimmed.split("\\s+", 2);
+		return new String[]{head[0], head.length > 1 ? head[1] : ""};
+	}
+
 	private void switchChannel(String args) {
-		String[] parts = args.strip().split("\\s+", 3);
-		String channel = canonicalChannelName(parts[0]);   // the salt's form; see [#canonicalChannelName]
-		ChannelMode mode = parts.length > 1 ? parseMode(parts[1], currentMode) : currentMode;
+		String[] split = splitChannelArgs(args);
+		String channel = canonicalChannelName(split[0]);   // the salt's form; see [#canonicalChannelName]
+		String[] parts = split[1].isEmpty() ? new String[0] : split[1].split("\\s+", 2);
+		ChannelMode mode = parts.length > 0 ? parseMode(parts[0], currentMode) : currentMode;
 		// Validate the name locally before the round-trip (like the `n` command and the browser client). Global
 		// forces the channel to "global" server-side, so the name only matters — and is only checked — otherwise.
 		if (mode != ChannelMode.GLOBAL_PTT && !CHANNEL_NAME.matcher(channel).matches()) {
-			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]  "
-					+ "(channel = 1-64 letters or digits in any language, plus _ or -, no whitespace)");
+			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]  (channel = 1-64 letters, "
+					+ "digits or spaces in any language, plus _ or -; quote a name with spaces: c \"my room\" ptt secret)");
 			return;
 		}
 		// Every channel but the global room is end-to-end encrypted, so a switch has to bring a passphrase — either
 		// given here or carried over from the channel we are in. Without one the server refuses the join with
 		// PASSPHRASE_REQUIRED, so say so here, where it can name the argument to add. Reachable in practice by
 		// switching out of the global room (whose passphrase is empty) into a named one.
-		String passphrase = parts.length > 2 ? parts[2] : currentPassphrase;
+		String passphrase = parts.length > 1 ? parts[1] : currentPassphrase;
 		if (mode != ChannelMode.GLOBAL_PTT && (passphrase == null || passphrase.isBlank())) {
 			System.out.println("Usage: c <channel> [ptt|global|duplex] <passphrase>  — '" + channel + "' needs an "
 					+ "encryption passphrase (every channel except the global room is encrypted).");

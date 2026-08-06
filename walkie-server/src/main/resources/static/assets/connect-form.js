@@ -25,7 +25,7 @@ export const GLOBAL_MODE = 'GLOBAL_PTT';
 
 /**
  * Whether a field is simply not filled in yet, or holds something that cannot work. Worth distinguishing because
- * the summary line above the button would otherwise lie: telling someone who typed `my team` that a channel name is
+ * the summary line above the button would otherwise lie: telling someone who typed `team.one` that a channel name is
  * "missing" sends them looking for an empty box. It also matches how the two cases actually differ in likelihood —
  * on a freshly loaded page everything is ABSENT, which is not a mistake, while INVALID means the user tried.
  */
@@ -77,7 +77,7 @@ export function connectProblems(form) {
 			problems.push({
 				field: CHANNEL_FIELD,
 				kind: INVALID,
-				message: '1-64 letters or digits in any language, plus _ or - — no spaces or dots.',
+				message: '1-64 letters, digits or spaces in any language, plus _ or - — no dots, and nothing invisible.',
 			});
 		}
 
@@ -115,8 +115,8 @@ export function canConnect(form) {
  * same problem list, so it can never disagree with the per-field messages, and ordered by field so it does not
  * reshuffle as the user types.
  *
- * The two kinds are worded separately because one summary for both was measured lying in the browser: a channel of
- * `my team` reported "Missing: channel name", sending the reader to look for an empty box.
+ * The two kinds are worded separately because one summary for both was measured lying in the browser: an illegal
+ * channel name reported "Missing: channel name", sending the reader to look for an empty box.
  *
  * No de-duplication, because [#connectProblems] reports **at most one problem per field** — every rule above is an
  * `else if` on the field before it, since the second rule for a field is only meaningful once the first has passed

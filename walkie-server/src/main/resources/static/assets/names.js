@@ -54,33 +54,52 @@ export function isValidDisplayName(raw) {
 }
 
 /**
- * The channel-name rule: letters, combining marks and digits from ANY script, plus `_` and `-`, 1 to 64 code
- * points. Mirrors the server's `CHANNEL_NAME` in ConnectionService and the Java client's copy.
+ * The channel-name rule: letters, combining marks and digits from ANY script, a plain space, plus `_` and `-`,
+ * 1 to 64 code points. Mirrors the server's `CHANNEL_NAME` in ConnectionService and the Java client's copy.
  *
- * Deliberately stricter than [DISPLAY_NAME] in two ways, and both are load-bearing rather than tidiness:
+ * The space is U+0020 and ONLY U+0020 — not `\p{Zs}`. That is the important part of this rule, not a detail:
+ * NBSP, the ideographic space and the thin spaces all render IDENTICALLY to a plain space, so allowing them
+ * would make `my room` typed with a space and `my room` typed with an NBSP two different rooms with two
+ * different keys (the name is the PBKDF2 salt) that no user could tell apart. That is the same class of failure
+ * NFC normalisation exists to prevent here, except invisible rather than merely obscure. Being an ALLOW-list is
+ * what buys that for free, along with excluding every format and control character (`\p{C}` — ZWSP, ZWNJ, soft
+ * hyphen, the bidi overrides). It matters more for a channel name than for a display name, because a channel
+ * name is a rendezvous key with no `#id` printed beside it: a name carrying something unprintable is a room
+ * nobody else can retype.
  *
- * - **No whitespace.** The Java console client's channel command is `c <channel> [mode] [key]`, split on `\s+`,
- *   so a room name containing a space would break that parse. A room name gains nothing from spaces anyway.
- * - **No `.`** — unchanged from when this was ASCII-only. Nothing depends on it, but nothing wants it either.
- *
- * As with a display name this is an ALLOW-list, so everything invisible is excluded for free: every separator
- * (`\p{Zs}`) and every format/control character (`\p{C}` — ZWSP, ZWNJ, soft hyphen, the bidi overrides) is
- * simply not in the class. That matters more here than for a display name: a channel name is a rendezvous key
- * with no `#id` beside it, so a name carrying an invisible character would be a room nobody else can retype.
+ * Still no `.`, unchanged from when this was ASCII-only. Nothing depends on it and nothing wants it.
  */
-export const CHANNEL_NAME = /^[\p{L}\p{M}\p{N}_-]{1,64}$/u;
+export const CHANNEL_NAME = /^[\p{L}\p{M}\p{N} _-]{1,64}$/u;
 
 /**
- * The canonical form of a channel name: NFC-composed, then trimmed. **This is the form that must reach the wire
- * AND the key derivation**, because the channel name is the PBKDF2 salt — see this module's header for the
- * measured two-keys-one-room failure it prevents. The server canonicalises again on receipt (it cannot trust a
- * client to have done it), so both sides agree on the map key too.
+ * The canonical form of a channel name: NFC-composed, internal whitespace runs collapsed to one plain space, then
+ * trimmed. **This is the form that must reach the wire AND the key derivation**, because the channel name is the
+ * PBKDF2 salt — see this module's header for the measured two-keys-one-room failure it prevents. The server
+ * canonicalises again on receipt (it cannot trust a client to have done it), so both sides agree on the map key.
  *
- * Trimmed for the same reason display names are: a trailing space off a copy-paste is not a different room. It
- * cannot be part of a valid name anyway, so trimming turns "this is invalid" into "this just works".
+ * Collapsing runs is a DEVIATION from [#canonicalDisplayName], which deliberately leaves `Roy  Ash` as typed, and
+ * the difference is the job each name does. A display name is a label beside an id; two members whose names differ
+ * by an invisible double space are still told apart by the `#id` every client prints. A channel name IS the
+ * rendezvous — get one space wrong and you are alone in a room that looks right, holding a key nobody else
+ * derives. So the goal here is convergence: every spelling that LOOKS the same must reduce to the same string.
+ * The collapsed set is written out as `[\p{Zs}\t\n\r\v\f]` rather than `\s`, and that is a cross-platform
+ * requirement, not pedantry: JavaScript's `\s` matches NBSP and the other Unicode spaces, while **Java's `\s`
+ * does not** (it is ASCII-only unless UNICODE_CHARACTER_CLASS is set). Using `\s` on both sides would therefore
+ * have the browser collapse an NBSP to a space — making the name valid — while the server and the Java client
+ * rejected the very same name, which is the two-clients-disagree failure this whole rule exists to avoid.
+ * `\p{Zs}` is a Unicode category with identical membership in both languages, and the five ASCII control
+ * whitespace characters are unambiguous, so the two implementations provably agree. Everything outside that set
+ * that merely looks blank — ZWSP (`\p{Cf}`), the line/paragraph separators (`\p{Zl}`/`\p{Zp}`) — is left alone
+ * and then rejected by the allow-list, on both sides, which is the right answer for a character nobody can retype.
+ *
+ * Collapsing an NBSP rather than rejecting it is deliberate and is the better half of the bargain: the user who
+ * pasted one gets the room everybody else is in, instead of a validation error about a character they cannot see.
+ *
+ * Trimmed last, for the same reason display names are: a leading or trailing space off a copy-paste is not a
+ * different room.
  */
 export function canonicalChannelName(raw) {
-	return raw.normalize('NFC').trim();
+	return raw.normalize('NFC').replace(/[\p{Zs}\t\n\r\v\f]+/gu, ' ').trim();
 }
 
 /** Whether `raw` is an acceptable channel name once canonicalised. */

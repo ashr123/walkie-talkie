@@ -68,11 +68,10 @@ test('each required field is required on its own', () => {
 });
 
 test('a whitespace-only entry reads as EMPTY, not as an illegal name', () => {
-	// canonicalDisplayName trims, and the channel rule is applied to the trimmed value, so neither can be
-	// satisfied by pressing space. Asserting the MESSAGE, not just the field: without the trim the value would
-	// still be rejected (spaces are not in either pattern) but by the format rule, so the user would be told
-	// their spaces are the wrong SHAPE rather than that the field is blank. A mutant that drops the trim
-	// survives a field-only assertion.
+	// Both canonicalisers trim, so neither field can be satisfied by pressing space — and for a CHANNEL name that
+	// is now the only thing standing in the way, since spaces are legal inside one: '   ' collapses to a single
+	// space and then trims to nothing. Asserting the MESSAGE, not just the field, because a mutant that drops the
+	// trim would still report the right field (with the format message) and survive a field-only assertion.
 	assert.deepEqual(connectProblems(validForm({displayName: '   '})),
 			[{field: DISPLAY_FIELD, kind: ABSENT, message: 'Enter a display name.'}]);
 	assert.deepEqual(connectProblems(validForm({channel: '   '})),
@@ -95,7 +94,7 @@ test('at most one problem per field — the invariant readinessSummary relies on
 	// be wrong, in both modes.
 	[
 		{displayName: ''}, {displayName: '   '}, {displayName: 'x'.repeat(33)}, {displayName: 'bad\u200bname'},
-		{channel: ''}, {channel: '   '}, {channel: 'my team'}, {channel: 'x'.repeat(65)},
+		{channel: ''}, {channel: '   '}, {channel: 'team.one'}, {channel: 'x'.repeat(65)},
 		{passphrase: ''}, {passphrase: 'secret', secureContext: false}, {passphrase: '', secureContext: false},
 		{displayName: '', channel: '', passphrase: '', secureContext: false},
 	].forEach(override => {
@@ -109,20 +108,20 @@ test('at most one problem per field — the invariant readinessSummary relies on
 
 test('an illegal value is reported differently from an absent one', () => {
 	// Two distinct messages on purpose: "enter something" for the common unfinished case, and the format rule only
-	// when what was typed cannot work. Telling a user who typed 'my team' to "enter a channel name" would be a lie.
+	// when what was typed cannot work. Telling a user who typed 'team.one' to "enter a channel name" would be a lie.
 	const absent = connectProblems(validForm({channel: ''}))[0].message;
-	const illegal = connectProblems(validForm({channel: 'my team'}))[0].message;
+	const illegal = connectProblems(validForm({channel: 'team.one'}))[0].message;
 	assert.notEqual(absent, illegal);
-	assert.match(illegal, /no spaces/);
+	assert.match(illegal, /no dots/);
 });
 
-test('the channel rule is the server\'s: any script, no whitespace, no dots, 1-64', () => {
-	['a', 'team-1', 'A_b-9', 'x'.repeat(64), 'שלום', '李雷', 'Ελένη', 'Аня', 'צוות-1', 'יוֹסֵי']
+test('the channel rule is the server\'s: any script, plain spaces, no dots, 1-64', () => {
+	['a', 'team-1', 'A_b-9', 'x'.repeat(64), 'שלום', '李雷', 'Ελένη', 'Аня', 'צוות-1', 'יוֹסֵי', 'my room', 'שלום עולם']
 			.forEach(name => assert.ok(CHANNEL_NAME.test(name), `should accept ${name}`));
-	// Whitespace stays out because the Java client's `c <channel> [mode] [key]` command splits on it; dots stay out
-	// as they always were; invisible characters stay out because a channel name is a rendezvous key with no `#id`
-	// beside it, so a name nobody can retype is a room nobody else can reach.
-	['', 'x'.repeat(65), 'my team', 'שלום עולם', 'team.one', 'a/b', 'bad\u200bname', 'team\u202e']
+	// Dots stay out as they always were. Invisible characters stay out because a channel name is a rendezvous key
+	// with no `#id` beside it, so a name nobody can retype is a room nobody else can reach — and unlike the visible
+	// whitespace variants, they are NOT in the collapsed set, so they survive canonicalisation and are refused here.
+	['', 'x'.repeat(65), 'team.one', 'a/b', 'bad\u200bname', 'team\u202e']
 			.forEach(name => assert.ok(!CHANNEL_NAME.test(name), `should reject ${JSON.stringify(name)}`));
 });
 
@@ -210,16 +209,16 @@ test('readinessSummary names each outstanding field once, in form order', () => 
 });
 
 test('readinessSummary says "Check" for a value that is wrong, not "Missing"', () => {
-	// Found by driving the real form in a browser: `my team` reported "Missing: channel name", which sends the
+	// Found by driving the real form in a browser: an illegal name reported "Missing: channel name", which sends the
 	// reader hunting for an empty box. An unfinished field and a mistyped one are different situations and the
 	// one line above the button is where the difference has to show.
-	assert.equal(readinessSummary(validForm({channel: 'my team'})), 'Check: channel name');
+	assert.equal(readinessSummary(validForm({channel: 'team.one'})), 'Check: channel name');
 	assert.equal(readinessSummary(validForm({displayName: 'x'.repeat(33)})), 'Check: display name');
 	assert.equal(readinessSummary(validForm({secureContext: false})), 'Check: passphrase');
 });
 
 test('readinessSummary reports both kinds when the form is some of each', () => {
-	assert.equal(readinessSummary(validForm({displayName: '', channel: 'my team'})),
+	assert.equal(readinessSummary(validForm({displayName: '', channel: 'team.one'})),
 			'Missing: display name · Check: channel name');
 });
 
@@ -228,7 +227,7 @@ test('every problem carries a kind, and it matches whether the field was filled 
 	// the summary tests happen to exercise.
 	[
 		[{displayName: ''}, ABSENT], [{displayName: 'x'.repeat(33)}, INVALID],
-		[{channel: ''}, ABSENT], [{channel: 'my team'}, INVALID],
+		[{channel: ''}, ABSENT], [{channel: 'team.one'}, INVALID],
 		[{passphrase: ''}, ABSENT], [{secureContext: false}, INVALID],
 	].forEach(([override, kind]) => {
 		const problems = connectProblems(validForm(override));

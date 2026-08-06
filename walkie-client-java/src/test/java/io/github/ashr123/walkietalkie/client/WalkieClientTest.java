@@ -238,4 +238,71 @@ class WalkieClientTest {
 		assertInstanceOf(ClientMessage.RequestFloor.class, WalkieClient.floorActionFor(WalkieClient.FloorState.MY_TURN));
 		assertInstanceOf(ClientMessage.RequestFloor.class, WalkieClient.floorActionFor(WalkieClient.FloorState.IDLE));
 	}
+
+	// --- channel names: spaces allowed, and every spelling that LOOKS the same must reduce to one string ------
+
+	@Test
+	void aChannelNameMayContainPlainSpaces() {
+		assertEquals("my room", WalkieClient.canonicalChannelName("my room"));
+		assertEquals("\u05E9\u05DC\u05D5\u05DD \u05E2\u05D5\u05DC\u05DD",
+				WalkieClient.canonicalChannelName("\u05E9\u05DC\u05D5\u05DD \u05E2\u05D5\u05DC\u05DD"));
+	}
+
+	@Test
+	void everyVisibleWhitespaceSpellingCollapsesToOnePlainSpace() {
+		// THE PARITY VECTOR, and the reason the collapsed set is written out rather than using `\\s`: Java's `\\s` is
+		// ASCII-only while JavaScript's matches NBSP, so `\\s` on both sides would have the browser accept a name
+		// this rejected. `\\p{Zs}` has identical membership in both languages. The SAME inputs are asserted in
+		// names.test.js — if the two ever disagree, one of these two tests fails.
+		//
+		// Collapsing rather than rejecting is the better half of the bargain: someone who pasted an NBSP gets the
+		// room everybody else is in instead of an error about a character they cannot see.
+		java.util.List.of(
+						"my room",              // plain space
+						"my\u00A0room",         // NBSP
+						"my\u3000room",         // ideographic space
+						"my\u2009room",         // thin space
+						"my\troom",             // tab
+						"my   room",            // a run
+						"  my \u00A0 room  ")    // mixed, with edges
+				.forEach(spelling -> assertEquals("my room", WalkieClient.canonicalChannelName(spelling),
+						() -> "should collapse to one room: " + spelling));
+	}
+
+	@Test
+	void charactersNobodyCanRetypeAreStillRejected() {
+		// ZWSP, the line/paragraph separators and the BOM are NOT in the collapsed set, so they survive
+		// canonicalisation and are then refused by the allow-list — on both sides, identically. A channel name is a
+		// rendezvous key with no id printed beside it, so a name holding one is a room nobody else can reach.
+		java.util.List.of("my\u200Broom", "my\u2028room", "my\uFEFFroom")
+				.forEach(name -> assertFalse(WalkieClient.isValidChannelName(name),
+						() -> "should stay invalid: " + name));
+	}
+
+	@Test
+	void theChannelCommandQuotesANameWithSpaces() {
+		// `c <channel> [mode] [passphrase]` used to split on whitespace, which stopped working once a name could
+		// contain one. Only the CHANNEL is quotable; the rest stays a single remainder because the passphrase may
+		// itself contain spaces.
+		assertArrayEquals(new String[]{"my room", "ptt secret"}, WalkieClient.splitChannelArgs("\"my room\" ptt secret"));
+		assertArrayEquals(new String[]{"team-1", "ptt secret"}, WalkieClient.splitChannelArgs("team-1 ptt secret"));
+		assertArrayEquals(new String[]{"team-1", ""}, WalkieClient.splitChannelArgs("  team-1  "));
+		assertArrayEquals(new String[]{"my room", ""}, WalkieClient.splitChannelArgs("\"my room\""));
+	}
+
+	@Test
+	void aPassphraseWithSpacesStillSurvivesTheChannelCommand() {
+		// The behaviour that must NOT regress: the trailing passphrase was always the remainder of the line, so a
+		// four-word passphrase worked. Splitting the whole line into tokens would have broken it silently.
+		String[] split = WalkieClient.splitChannelArgs("\"my room\" ptt correct horse battery staple");
+		assertEquals("my room", split[0]);
+		String[] rest = split[1].split("\\s+", 2);
+		assertEquals("ptt", rest[0]);
+		assertEquals("correct horse battery staple", rest[1]);
+	}
+
+	@Test
+	void anUnterminatedQuoteTakesTheRestOfTheLineAsTheName() {
+		assertArrayEquals(new String[]{"my room ptt", ""}, WalkieClient.splitChannelArgs("\"my room ptt"));
+	}
 }

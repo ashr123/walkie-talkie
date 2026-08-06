@@ -718,12 +718,15 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
   canonical form (trimmed, composed) in `Joined`/`MemberJoined`/`MemberRenamed`, so treat it as authoritative
   rather than echoing what you sent. Every other separator (NBSP, ideographic space) and every format/control
   character (ZWSP, soft hyphen, bidi overrides) is rejected with `INVALID_DISPLAY_NAME`. Runs of spaces inside a
-  name are preserved. **Channel name:** `[\p{L}\p{M}\p{N}_-]{1,64}` (code points, any script) — the display-name
-  rule minus whitespace and `.`. Whitespace is excluded because the reference console client parses
-  `c <channel> [mode] [key]` by splitting on it, and because a room name gains nothing from spaces; being an
-  allow-list it also excludes every invisible character, which matters more here than for a display name since a
-  channel name is a rendezvous key with no `#id` printed beside it. **A client MUST send the NFC-normalised,
-  trimmed form**, because it is the E2EE
+  name are preserved. **Channel name:** `[\p{L}\p{M}\p{N} _-]{1,64}` (code points, any script) — the display-name
+  rule minus `.`. The space is U+0020 and only U+0020; being an allow-list, the rule also excludes every invisible
+  character, which matters more here than for a display name since a channel name is a rendezvous key with no
+  `#id` printed beside it. **A client MUST send the canonical form: NFC-normalised, whitespace runs collapsed to
+  one plain space, then trimmed.** Collapsing is not cosmetic — NBSP, the ideographic space and the thin spaces
+  render identically to a plain space, so without it `my room` typed two ways would be two rooms with two keys
+  nobody could tell apart. Collapse `[\p{Zs}\t\n\r\v\f]` specifically, NOT a regex `\s` shorthand: that
+  differs between languages (JavaScript's matches NBSP, Java's does not), and the two reference clients had to
+  write the set out to stay byte-identical. The canonical form matters because it is the E2EE
   key-derivation salt (computed client-side), a routing key, and a map key.
 - **Inbound audio frame:** ≤ `walkie.max-audio-frame-bytes` (default 8192) — enforced on the **un-prefixed**
   inbound frame, so the outbound +1 SID never trips it. **Text frame:** ≤ `walkie.max-text-message-bytes`

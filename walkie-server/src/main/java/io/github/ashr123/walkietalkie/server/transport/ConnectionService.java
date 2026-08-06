@@ -45,7 +45,15 @@ public class ConnectionService {
 	/// format/control character for free — which matters more here than for a display name, because a channel name
 	/// is a rendezvous key with no `#id` printed beside it, so a name carrying an invisible character is a room
 	/// nobody else can retype.
-	private static final Pattern CHANNEL_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N}_-]{1,64}");
+	/// Collapsed whitespace: `\p{Zs}` (every Unicode space separator) plus the five ASCII control whitespace
+	/// characters, written out rather than as `\s` because Java's `\s` is ASCII-only while JavaScript's matches
+	/// NBSP — using `\s` on both sides would have the browser accept a name (collapsing the NBSP) that this
+	/// rejected, which is exactly the two-clients-disagree failure the channel-name rules exist to prevent.
+	/// `\p{Zs}` has identical membership in both languages. See the browser's `canonicalChannelName` in
+	/// `static/assets/names.js`, and the parity vectors in `names.test.js` / `ConnectionServiceTest`.
+	private static final Pattern CHANNEL_WHITESPACE = Pattern.compile("[\\p{Zs}\\t\\n\\r\\x0B\\f]+");
+
+	private static final Pattern CHANNEL_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N} _-]{1,64}");
 	/// Display names hold letters, combining marks and digits from ANY script — Hebrew, Han, accented Latin — plus a
 	/// plain space, `_`, `.` and `-`. Combining marks are not optional: Hebrew niqqud and Arabic diacritics are marks,
 	/// so omitting `\p{M}` would silently reject vocalised text.
@@ -154,7 +162,16 @@ public class ConnectionService {
 	/// different passphrase. (Measured: Hebrew `שׁלום` written with the precomposed presentation form U+FB2A and as
 	/// U+05E9 U+05C1 render identically and derive different keys before NFC, the same key after.)
 	private static String canonicalChannelName(String requested) {
-		return requested == null ? null : Normalizer.normalize(requested, Normalizer.Form.NFC).strip();
+		if (requested == null) {
+			return null;
+		}
+		// NFC, then collapse whitespace runs to ONE plain space, then strip. Collapsing is what makes every spelling
+		// that LOOKS the same reduce to the same string — which for a channel name is the whole point, since it is
+		// both the registry key and each client's PBKDF2 salt. A display name deliberately keeps its runs
+		// (see canonicalDisplayName): it is a label beside an id, not a rendezvous.
+		return CHANNEL_WHITESPACE.matcher(Normalizer.normalize(requested, Normalizer.Form.NFC))
+				.replaceAll(" ")
+				.strip();
 	}
 
 	/// Handles one decoded control message. The caller's identity is bound for the dynamic scope of the call and

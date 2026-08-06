@@ -469,10 +469,39 @@ class ConnectionServiceTest {
 	}
 
 	@Test
-	void aChannelNameWithWhitespaceOrADotIsStillRejected() {
-		// Whitespace stays out because the Java console client parses `c <channel> [mode] [key]` by splitting on it;
-		// dots stay out as they always were. Invisible characters stay out because the rule is an allow-list.
-		List.of("my team", "\u05E9\u05DC\u05D5\u05DD \u05E2\u05D5\u05DC\u05DD", "team.one", "bad\u200bname", "team\u202e")
+	void aChannelNameMayContainSpacesAndEveryVisibleSpellingIsONEChannel() {
+		// Spaces are allowed now. What matters more is that they CONVERGE: the name is the registry key and each
+		// client's PBKDF2 salt, so two members typing what looks like the same room must land in one room with one
+		// key. NBSP, the ideographic space, a tab and a double space all collapse to a single plain space.
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("my room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		assertEquals("my room", firstOf(alice, ServerMessage.Joined.class).channel());
+
+		List.of("my\u00A0room", "my\u3000room", "my\troom", "my   room", "  my room  ")
+				.forEach(spelling -> {
+					FakeClientSession peer = session("peer-" + spelling.hashCode());
+					service.onMessage(peer, new ClientMessage.Join(spelling, ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+					assertEquals("my room", firstOf(peer, ServerMessage.Joined.class).channel(),
+							() -> "should be the same room: " + spelling);
+				});
+		assertEquals(1, channelRegistry.channelCount(), "every spelling joined ONE channel");
+	}
+
+	@Test
+	void aChannelNameOfNothingButWhitespaceIsRejected() {
+		// Collapse-then-strip reduces it to the empty string, which the pattern refuses — the same discipline
+		// canonicalDisplayName follows, so a name cannot be minted out of invisible padding.
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join(" \u00A0\t ", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(alice, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void aChannelNameWithADotOrAnInvisibleCharacterIsStillRejected() {
+		// Spaces are now allowed (and collapsed), so what is left to reject is a dot, and anything invisible: the
+		// rule is an allow-list, and ZWSP / the bidi overrides are not in the collapsed-whitespace set either, so
+		// they survive canonicalisation and are then refused.
+		List.of("team.one", "bad\u200bname", "team\u202e", "a/b")
 				.forEach(name -> {
 					FakeClientSession session = session("bad-" + name.hashCode());
 					service.onMessage(session, new ClientMessage.Join(name, ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
@@ -552,7 +581,7 @@ class ConnectionServiceTest {
 		// passphrase check sits after the name checks for exactly this reason, and putting it earlier was measured
 		// to break four name-validation tests.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("bad name", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		service.onMessage(alice, new ClientMessage.Join("bad.name", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 
 		FakeClientSession bob = session("bob");
@@ -1074,7 +1103,7 @@ class ConnectionServiceTest {
 	@Test
 	void channelNameValidationHappensBeforeDisplayNameValidation() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join("bad name", ChannelMode.MULTI_CHANNEL_PTT, "also bad!!", TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join("bad.name", ChannelMode.MULTI_CHANNEL_PTT, "also bad!!", TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code(),
 				"the channel name is validated before the display name");
 	}
