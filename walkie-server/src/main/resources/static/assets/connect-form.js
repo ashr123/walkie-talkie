@@ -14,15 +14,7 @@
 // arrives with no key-check (PASSPHRASE_REQUIRED). Checking them here does not make the server's checks
 // redundant — a client cannot be trusted — it just means the user is told before a round trip.
 
-import {canonicalDisplayName, DISPLAY_NAME} from './names.js';
-
-/**
- * The channel-name rule, mirroring the server's `CHANNEL_NAME` in ConnectionService and the Java client's copy.
- * ASCII-only and deliberately NOT the display-name rule: a channel name is the E2EE key-derivation salt
- * (§7 of the protocol doc), a routing key for channel-affinity ingress, and a map key, so it stays narrow.
- * No `.`, unlike display names.
- */
-export const CHANNEL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+import {canonicalChannelName, canonicalDisplayName, CHANNEL_NAME, DISPLAY_NAME} from './names.js';
 
 /**
  * The global room is the server-managed broadcast channel: its name is forced to `global` and it is the one
@@ -76,14 +68,16 @@ export function connectProblems(form) {
 	// Global forces the channel name server-side and refuses a passphrase outright (ENCRYPTION_NOT_ALLOWED), so
 	// asking for either would be asking for something that cannot be used. Both fields are hidden in that mode.
 	if (form.mode !== GLOBAL_MODE) {
-		const channel = (form.channel ?? '').trim();
+		// Canonicalised, not merely trimmed: this is the string the key derivation salts on (names.js), so the
+		// value the form validates has to be the value that reaches the wire.
+		const channel = canonicalChannelName(form.channel ?? '');
 		if (channel === '') {
 			problems.push({field: CHANNEL_FIELD, kind: ABSENT, message: 'Enter a channel name.'});
 		} else if (!CHANNEL_NAME.test(channel)) {
 			problems.push({
 				field: CHANNEL_FIELD,
 				kind: INVALID,
-				message: '1-64 letters, digits, _ or - — no spaces or dots.',
+				message: '1-64 letters or digits in any language, plus _ or - — no spaces or dots.',
 			});
 		}
 

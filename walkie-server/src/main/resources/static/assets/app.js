@@ -19,8 +19,8 @@ import {
 	wrapPassphrase
 } from './e2ee.js';
 import {CHANNEL_FLAGS, flagDisplay} from './channel-flags.js';
-import {canonicalDisplayName, isValidDisplayName} from './names.js';
-import {canConnect, CHANNEL_NAME, connectProblems, readinessSummary} from './connect-form.js';
+import {canonicalChannelName, canonicalDisplayName, CHANNEL_NAME, isValidDisplayName} from './names.js';
+import {canConnect, connectProblems, readinessSummary} from './connect-form.js';
 import {micErrorMessage, NO_CAPTURE_API_MESSAGE} from './mic-errors.js';
 import {
 	FLOOR_IN_LINE,
@@ -278,7 +278,10 @@ async function connect() {
 	// the server ends up with, or the Rename button — which compares against it — argues with a name already accepted.
 	const display = canonicalDisplayName(byId('display').value);
 	state.displayName = display;   // what the Join below carries; a Joined/MemberRenamed later corrects it
-	const channel = byId('channel').value.trim();
+	// Canonicalise ONCE, here, and use that string for all three of its jobs — the E2EE salt, the ?channel=
+	// routing key and the Join — so they cannot disagree. See names.js: an un-normalised channel name derives a
+	// different key, which looks like a wrong passphrase rather than a spelling difference.
+	const channel = canonicalChannelName(byId('channel').value);
 	const passphrase = byId('passphrase').value;   // read once; used only on the relay path (E2EE)
 
 	// The same verdict the Connect button is disabled by (connect-form.js), re-checked here rather than trusted:
@@ -394,7 +397,7 @@ async function applyOrSwitch() {
 	}
 	const transport = byId('transport').value;
 	const mode = byId('mode').value;
-	const channel = byId('channel').value.trim();
+	const channel = canonicalChannelName(byId('channel').value);   // see connect(): the salt and the wire must agree
 	const passphrase = byId('passphrase').value;
 	const display = canonicalDisplayName(byId('display').value);
 	if (!isValidDisplayName(display)) {

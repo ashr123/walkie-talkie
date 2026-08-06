@@ -20,6 +20,8 @@ import {
 	wrapPassphrase,
 	unwrapPassphrase,
 } from '../../main/resources/static/assets/e2ee.js';
+// canonicalChannelName lives with the other name rules; the salt's form is defined there.
+import {canonicalChannelName} from '../../main/resources/static/assets/names.js';
 
 /**
  * Fixed inputs shared with FrameCryptoTest (Java). If the browser's PBKDF2/AES-GCM ever drifts from the Java
@@ -27,6 +29,8 @@ import {
  */
 const PASSPHRASE = 'correct horse battery staple';
 const CHANNEL = 'lobby';
+// A non-ASCII channel name, so the salt exercises multi-byte UTF-8. `שלום`.
+const HEBREW_CHANNEL = '\u05E9\u05DC\u05D5\u05DD';
 const IV = Uint8Array.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
 const PLAINTEXT = Uint8Array.of(1, 16, 32, 48, 64);
 
@@ -38,6 +42,34 @@ const hex = bytes => [...bytes].map(b => Number(b).toString(16).padStart(2, '0')
 
 test('derives the same AES key as the Java client (PBKDF2-HMAC-SHA512, 600k iters)', async () => {
 	assert.equal(await deriveKeyBytesHex(PASSPHRASE, CHANNEL), EXPECTED_KEY_HEX);
+});
+
+test('derives the same key as the Java client for a NON-ASCII channel name', async () => {
+	// The salt is `"walkie-talkie:e2ee:" + channel`, so once channel names may be non-ASCII both clients must agree
+	// on its BYTES — TextEncoder here against Java's String.getBytes(UTF_8). Mirrors
+	// FrameCryptoTest.derivesTheSameKeyAsWebCryptoForANonAsciiChannel. A disagreement would reach users as a
+	// PASSPHRASE_MISMATCH for a passphrase that is provably identical, which is unfalsifiable from the UI.
+	assert.equal(await deriveKeyBytesHex(PASSPHRASE, HEBREW_CHANNEL),
+			'0573e6b667537933818594212c8772c3b2f0c1a79fa7430c45c66add8f9a1fd8');
+	const {keyCheck} = await deriveKey(PASSPHRASE, HEBREW_CHANNEL);
+	assert.equal(keyCheck, 'adc9eaaf0fd50288934c090df35c4013');
+});
+
+test('canonicalisation is what makes two spellings of one channel derive one key', async () => {
+	// The failure NFC exists to prevent, as arithmetic rather than prose. Hebrew SHIN WITH SHIN DOT is a
+	// composition EXCLUSION, so U+FB2A and U+05E9 U+05C1 render identically, normalise to the same string, and are
+	// different strings on the way in. Mirrors FrameCryptoTest's version of this test.
+	const precomposed = '\uFB2A\u05DC\u05D5\u05DD';
+	const decomposed = '\u05E9\u05C1\u05DC\u05D5\u05DD';
+	assert.notEqual(precomposed, decomposed);
+	assert.notEqual(await deriveKeyBytesHex(PASSPHRASE, precomposed),
+			await deriveKeyBytesHex(PASSPHRASE, decomposed),
+			'un-normalised, the same visible room name derives two different keys — this is the bug');
+	const viaPre = await deriveKeyBytesHex(PASSPHRASE, canonicalChannelName(precomposed));
+	assert.equal(viaPre, await deriveKeyBytesHex(PASSPHRASE, canonicalChannelName(decomposed)),
+			'canonicalised, both spellings derive one key');
+	assert.equal(viaPre, '94de75c7866c774fbb6ea45f79a5185c95899b69732aabe25c7136ad0e571d69',
+			'and it is the key the Java client derives for the same name');
 });
 
 test('derives the same key-check value as the Java client', async () => {

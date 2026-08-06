@@ -75,13 +75,30 @@ public final class WalkieClient implements AutoCloseable {
 	/// with a trailing space is the no-op it looks like rather than a rename the server quietly rewrites.
 	/// Normalising first and stripping second is deliberate: a name of nothing but spaces has to become empty for
 	/// the pattern to reject it. Spaces INSIDE the name are left as typed.
+	/// The canonical form of a channel name — NFC, then stripped — the form that must be used for the key
+	/// derivation, the `?channel=` routing key and the `Join`, because it is the PBKDF2 SALT. Two members whose
+	/// channel names differ by one byte derive DIFFERENT keys and hear nothing from each other in the same room,
+	/// reported as a `PASSPHRASE_MISMATCH` for a passphrase that looks identical. Measured: Hebrew `שׁלום` written
+	/// with the precomposed presentation form U+FB2A and as U+05E9 U+05C1 renders identically and derives a
+	/// different key before NFC, the same key after. Mirrors `ConnectionService.canonicalChannelName` and the
+	/// browser's `canonicalChannelName` in `static/assets/names.js`.
+	static String canonicalChannelName(String requested) {
+		return requested == null ? null : Normalizer.normalize(requested, Normalizer.Form.NFC).strip();
+	}
+
 	private static String canonicalDisplayName(String requested) {
 		return requested == null ? null : Normalizer.normalize(requested, Normalizer.Form.NFC).strip();
 	}
 	/// Channel-name charset, mirrored from the server (and the browser client's CHANNEL_NAME) so the `c` command
 	/// and the initial `--channel` are rejected locally before the round-trip. Note `.` is allowed in a display
 	/// name but NOT a channel name.
-	private static final Pattern CHANNEL_NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+	/// Letters, combining marks and digits from ANY script, plus `_` and `-`, 1-64 code points. Mirrors the
+	/// server's `ConnectionService.CHANNEL_NAME` and the browser's in `static/assets/names.js`.
+	///
+	/// No whitespace, and that restriction is load-bearing HERE specifically: [#switchChannel] parses
+	/// `c <channel> [mode] [key]` by splitting on `\s+`, so a room name with a space in it could not be typed at
+	/// this prompt at all.
+	private static final Pattern CHANNEL_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N}_-]{1,64}");
 	/// First byte of an end-to-end-encrypted frame (mirrors FrameCrypto's scheme marker); lets the receive path
 	/// distinguish encrypted audio from a plaintext peer's `[codec tag][payload]` when we hold no key.
 	private static final int E2EE_SCHEME = 0xE2;
@@ -217,21 +234,25 @@ public final class WalkieClient implements AutoCloseable {
 			throw new IllegalArgumentException("--display must be 1-32 letters, digits or spaces (any language), "
 					+ "'_', '.' or '-' with no invisible characters (got: \"" + options.display() + "\").");
 		}
+		// Canonicalise ONCE and use that string for every one of its jobs — validation, the key derivation, the
+		// ?channel= routing key and the Join — so they cannot disagree. See [#canonicalChannelName].
+		String channel = canonicalChannelName(options.channel());
 		// Global forces the channel to "global" server-side, so the --channel name only matters for the other modes.
-		if (options.mode() != ChannelMode.GLOBAL_PTT && !CHANNEL_NAME.matcher(options.channel()).matches()) {
-			throw new IllegalArgumentException("--channel must be 1-64 chars of letters, digits, _ or - (got: \"" + options.channel() + "\").");
+		if (options.mode() != ChannelMode.GLOBAL_PTT && !CHANNEL_NAME.matcher(channel).matches()) {
+			throw new IllegalArgumentException("--channel must be 1-64 letters or digits in any language, plus '_' or "
+					+ "'-', with no whitespace (got: \"" + options.channel() + "\").");
 		}
 		this.httpClient = HttpClient.newBuilder()
 				.sslContext(TlsTrust.forServer(options.server(), options.tlsTruststore()))
 				.build();
 		this.currentMode = options.mode();
-		this.currentChannel = options.channel();
-		this.connectTarget = new ConnectTarget(options.channel(), options.mode());
+		this.currentChannel = channel;
+		this.connectTarget = new ConnectTarget(channel, options.mode());
 		this.currentPassphrase = options.key();
 		this.audio = new AudioEngine(options, this::sendAudioFrame);
 		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
 		String token = login();
-		crypto = deriveCrypto(options.key(), options.mode(), options.channel());
+		crypto = deriveCrypto(options.key(), options.mode(), channel);
 		currentChannelKeyCheck = crypto == null ? null : crypto.keyCheck();   // baseline the channel's key-check from our own join key
 		audio.start();
 		System.out.println("Audio: " + audio.description()
@@ -1241,12 +1262,13 @@ public final class WalkieClient implements AutoCloseable {
 	/// survive. Mode and passphrase are optional and default to the current ones. Usage: `c <channel> [mode] [key]`.
 	private void switchChannel(String args) {
 		String[] parts = args.strip().split("\\s+", 3);
-		String channel = parts[0];
+		String channel = canonicalChannelName(parts[0]);   // the salt's form; see [#canonicalChannelName]
 		ChannelMode mode = parts.length > 1 ? parseMode(parts[1], currentMode) : currentMode;
 		// Validate the name locally before the round-trip (like the `n` command and the browser client). Global
 		// forces the channel to "global" server-side, so the name only matters — and is only checked — otherwise.
 		if (mode != ChannelMode.GLOBAL_PTT && !CHANNEL_NAME.matcher(channel).matches()) {
-			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]  (channel = 1-64 chars of letters, digits, _ or -)");
+			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]  "
+					+ "(channel = 1-64 letters or digits in any language, plus _ or -, no whitespace)");
 			return;
 		}
 		// Every channel but the global room is end-to-end encrypted, so a switch has to bring a passphrase — either

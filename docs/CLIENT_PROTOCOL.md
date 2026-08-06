@@ -556,7 +556,11 @@ On the relay path, the sender encrypts the **whole** `[codec tag][payload]` plai
 
 - **Key derivation:** `PBKDF2-HMAC-SHA512(passphrase, salt, 600000)` → **384 bits**, where
   `salt = "walkie-talkie:e2ee:" + effectiveChannel` (`effectiveChannel = "global"` in `GLOBAL_PTT`, else the
-  channel name). First **32 bytes** = AES-256 key; next **16 bytes** = **key-check value (KCV)**. (The `global`
+  channel name, **NFC-normalised and trimmed**, UTF-8 encoded). Normalising is not cosmetic: Hebrew `שׁלום`
+  written with the precomposed presentation form U+FB2A and as U+05E9 U+05C1 renders identically and derives a
+  DIFFERENT key — measured — so two members typing the same visible room name would sit in one channel hearing
+  nothing, each told `PASSPHRASE_MISMATCH` for a passphrase that is provably identical. The server normalises the
+  channel name too, so "same visible name" means both one room and one key. First **32 bytes** = AES-256 key; next **16 bytes** = **key-check value (KCV)**. (The `global`
   branch is for byte-compatibility only — the server forces the `global` room to be unencrypted, rejecting a
   `GLOBAL_PTT` join that carries a `keyCheck` with `ENCRYPTION_NOT_ALLOWED`, so E2EE never actually runs there.
   Derive nothing for `GLOBAL_PTT`, whatever passphrase the user has typed, or the join is refused.)
@@ -706,7 +710,12 @@ PTT never exceeds **one** active SID, so none of these caps engage there.
   canonical form (trimmed, composed) in `Joined`/`MemberJoined`/`MemberRenamed`, so treat it as authoritative
   rather than echoing what you sent. Every other separator (NBSP, ideographic space) and every format/control
   character (ZWSP, soft hyphen, bidi overrides) is rejected with `INVALID_DISPLAY_NAME`. Runs of spaces inside a
-  name are preserved. **Channel name:** `[A-Za-z0-9_-]{1,64}` — unchanged and ASCII-only, because it is the E2EE
+  name are preserved. **Channel name:** `[\p{L}\p{M}\p{N}_-]{1,64}` (code points, any script) — the display-name
+  rule minus whitespace and `.`. Whitespace is excluded because the reference console client parses
+  `c <channel> [mode] [key]` by splitting on it, and because a room name gains nothing from spaces; being an
+  allow-list it also excludes every invisible character, which matters more here than for a display name since a
+  channel name is a rendezvous key with no `#id` printed beside it. **A client MUST send the NFC-normalised,
+  trimmed form**, because it is the E2EE
   key-derivation salt (computed client-side), a routing key, and a map key.
 - **Inbound audio frame:** ≤ `walkie.max-audio-frame-bytes` (default 8192) — enforced on the **un-prefixed**
   inbound frame, so the outbound +1 SID never trips it. **Text frame:** ≤ `walkie.max-text-message-bytes`

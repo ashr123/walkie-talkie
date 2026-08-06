@@ -561,14 +561,30 @@ six:
   capture) and the missing-`mediaDevices` message. Phrased as what to DO, because the raw text people actually hit —
   "The request is not allowed by the user agent or the platform in the current context" — is accurate and useless.
   Anything unrecognised keeps the raw message so no detail is lost.
-- `static/assets/names.js` — the display-name rule: the pattern plus `canonicalDisplayName` (NFC, then trim), which
-  MUST match the server's `ConnectionService.canonicalDisplayName` and `WalkieClient`'s copy, since the server is the
-  authority and the Rename button compares the typed value against the name the server confirmed.
+- `static/assets/names.js` — BOTH name rules, each with its canonicaliser: `DISPLAY_NAME` +
+  `canonicalDisplayName` and `CHANNEL_NAME` + `canonicalChannelName` (each NFC, then trim). All four MUST match
+  the server's copies in `ConnectionService` and the Java client's in `WalkieClient` — the server is the authority,
+  and the Rename button compares the typed value against the name the server confirmed.
+  A channel name is the stricter rule: the same allow-list minus whitespace and `.`. Whitespace is excluded
+  because the Java client parses `c <channel> [mode] [key]` by splitting on it, and because an allow-list keeps
+  every invisible character out — which matters more here than for a display name, since a channel name is a
+  rendezvous key with no `#id` printed beside it.
+  **Canonicalising a channel name is not cosmetic the way it is for a display name: it is the PBKDF2 salt.** Two
+  members whose channel names differ by one byte derive DIFFERENT KEYS and sit in one room hearing nothing, each
+  told `PASSPHRASE_MISMATCH` for a passphrase that is provably identical — unfalsifiable from the UI. Measured:
+  Hebrew `שׁלום` written with the precomposed presentation form U+FB2A and as U+05E9 U+05C1 renders identically
+  and derives a different key before NFC, the same key after (SHIN WITH SHIN DOT is a composition EXCLUSION, so
+  NFC decomposes it). Both `e2ee.test.js` and `FrameCryptoTest` pin that convergence and a Hebrew-salt
+  known-answer vector; `ConnectionServiceTest` pins that the two spellings land in ONE channel. Canonicalise once
+  per entry point and use that string for all three of its jobs — the salt, the `?channel=` routing key and the
+  `Join` — which is what `connect()`/`applyOrSwitch()` and `WalkieClient`'s constructor/`c` command now do. The
+  handshake interceptor normalises the query param too, or the affinity comparison rejects a name that looks
+  identical.
 - `static/assets/connect-form.js` — whether the Connect form is ready to send: `connectProblems` returns
   `{field, kind, message}` per unsatisfied field (`kind` is `absent` or `invalid`, which is what lets the summary
   say "Missing: …" for an empty box and "Check: …" for a mistyped one), with `canConnect` and `readinessSummary`
-  derived from it, plus the
-  `CHANNEL_NAME` pattern (which app.js no longer keeps its own copy of). It exists because the SAME verdict drives
+  derived from it. The name rules themselves live in `names.js`; this module composes them. It exists because the
+  SAME verdict drives
   two surfaces — the button's `disabled` state, recomputed on every keystroke, and the guard inside
   `connect()`/`applyOrSwitch()` when they act — and those were previously separate code, which is how a rule
   tightened in one place and not the other starts either blocking a legal form or letting an illegal one through.

@@ -11,6 +11,7 @@ import org.springframework.web.socket.WebSocketHandler;
 import org.springframework.web.socket.server.HandshakeInterceptor;
 import org.springframework.web.util.UriComponentsBuilder;
 
+import java.text.Normalizer;
 import java.util.Map;
 
 /// Captures the `channel` query param from the WebSocket handshake URL into the session attributes, so
@@ -34,7 +35,11 @@ public class ChannelHandshakeInterceptor implements HandshakeInterceptor {
 	@Override
 	public boolean beforeHandshake(@NonNull ServerHttpRequest request, @NonNull ServerHttpResponse response,
 	                               @NonNull WebSocketHandler wsHandler, @NonNull Map<String, Object> attributes) {
-		String channel = UriComponentsBuilder.fromUri(request.getURI()).build().getQueryParams().getFirst("channel");
+		String raw = UriComponentsBuilder.fromUri(request.getURI()).build().getQueryParams().getFirst("channel");
+		// NFC, to the same form handleJoin canonicalises a Join's channel to. Otherwise a client whose ?channel=
+		// spelling differs from its Join's (or from another instance's idea of the name) fails the affinity
+		// comparison and is bounced with CHANNEL_ROUTING_MISMATCH forever, for a name that looks identical.
+		String channel = raw == null ? null : Normalizer.normalize(raw, Normalizer.Form.NFC).strip();
 		if (channel == null || channel.isBlank()) {
 			if (properties.channelAffinity()) {
 				response.setStatusCode(HttpStatus.BAD_REQUEST);

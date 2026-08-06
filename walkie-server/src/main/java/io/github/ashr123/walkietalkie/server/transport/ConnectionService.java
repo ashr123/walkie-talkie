@@ -37,7 +37,15 @@ import java.util.regex.Pattern;
 public class ConnectionService {
 
 	private static final Logger log = LoggerFactory.getLogger(ConnectionService.class);
-	private static final Pattern CHANNEL_NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+	/// Letters, combining marks and digits from ANY script, plus `_` and `-`, 1-64 code points. Mirrored in the
+	/// browser's `static/assets/names.js` and the Java client's `WalkieClient`, and pinned against the same vectors.
+	///
+	/// Stricter than [#DISPLAY_NAME] on purpose: no whitespace (the Java console client's `c <channel> [mode] [key]`
+	/// command splits on it) and no `.`. Being an ALLOW-list, it also excludes every separator and every
+	/// format/control character for free — which matters more here than for a display name, because a channel name
+	/// is a rendezvous key with no `#id` printed beside it, so a name carrying an invisible character is a room
+	/// nobody else can retype.
+	private static final Pattern CHANNEL_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N}_-]{1,64}");
 	/// Display names hold letters, combining marks and digits from ANY script — Hebrew, Han, accented Latin — plus a
 	/// plain space, `_`, `.` and `-`. Combining marks are not optional: Hebrew niqqud and Arabic diacritics are marks,
 	/// so omitting `\p{M}` would silently reject vocalised text.
@@ -134,6 +142,21 @@ public class ConnectionService {
 		return requested == null ? null : Normalizer.normalize(requested, Normalizer.Form.NFC).strip();
 	}
 
+	/// The canonical form of a channel name — NFC, then stripped — applied to every join before the name is
+	/// validated, used as the registry key, or echoed in a `Joined` snapshot.
+	///
+	/// Canonicalising SERVER-side is not redundant with the clients doing it. The channel name is each client's
+	/// PBKDF2 salt, so two members who spell the same visible name differently derive different keys; if the server
+	/// also kept them as different registry keys they would at least be in different rooms and merely puzzled,
+	/// whereas keying them together and letting the key-checks disagree produces a `PASSPHRASE_MISMATCH` for a
+	/// passphrase that is, as far as either user can see, identical. Normalising here means the server's idea of
+	/// "same channel" matches the clients' idea of "same salt": either both agree, or the mismatch is a genuinely
+	/// different passphrase. (Measured: Hebrew `שׁלום` written with the precomposed presentation form U+FB2A and as
+	/// U+05E9 U+05C1 render identically and derive different keys before NFC, the same key after.)
+	private static String canonicalChannelName(String requested) {
+		return requested == null ? null : Normalizer.normalize(requested, Normalizer.Form.NFC).strip();
+	}
+
 	/// Handles one decoded control message. The caller's identity is bound for the dynamic scope of the call and
 	/// surfaced on the log lines emitted while handling it (via the MDC) — see [RequestContext#scope]. The audio
 	/// relay path ([#onAudio]) is deliberately not scoped, to avoid per-frame MDC churn.
@@ -195,7 +218,7 @@ public class ConnectionService {
 	}
 
 	private void handleJoin(ClientSession session, ClientMessage.Join join) {
-		String requested = join.mode() == ChannelMode.GLOBAL_PTT ? GLOBAL_CHANNEL : join.channel();
+		String requested = join.mode() == ChannelMode.GLOBAL_PTT ? GLOBAL_CHANNEL : canonicalChannelName(join.channel());
 
 		// Connect guard: a duplicate Join for the channel this session is already in is idempotent — re-send
 		// the current snapshot so the client re-syncs, but do NOT churn membership (no leave/rejoin, no

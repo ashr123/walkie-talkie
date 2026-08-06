@@ -457,6 +457,62 @@ class ConnectionServiceTest {
 	}
 
 	@Test
+	void aChannelNameInAnyScriptIsAccepted() {
+		// Channel names used to be ASCII-only. They are now the same allow-list as display names minus whitespace
+		// and dots, so a Hebrew or Han room name is a room name.
+		List.of("\u05E9\u05DC\u05D5\u05DD", "\u674E\u96F7", "\u0395\u03BB\u03AD\u03BD\u03B7", "\u05E6\u05D5\u05D5\u05EA-1")
+				.forEach(name -> {
+					FakeClientSession session = session("s-" + name);
+					service.onMessage(session, new ClientMessage.Join(name, ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+					assertEquals(name, firstOf(session, ServerMessage.Joined.class).channel(), name);
+				});
+	}
+
+	@Test
+	void aChannelNameWithWhitespaceOrADotIsStillRejected() {
+		// Whitespace stays out because the Java console client parses `c <channel> [mode] [key]` by splitting on it;
+		// dots stay out as they always were. Invisible characters stay out because the rule is an allow-list.
+		List.of("my team", "\u05E9\u05DC\u05D5\u05DD \u05E2\u05D5\u05DC\u05DD", "team.one", "bad\u200bname", "team\u202e")
+				.forEach(name -> {
+					FakeClientSession session = session("bad-" + name.hashCode());
+					service.onMessage(session, new ClientMessage.Join(name, ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+					assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(session, ServerMessage.ErrorMessage.class).code(),
+							() -> "should reject " + name);
+				});
+	}
+
+	@Test
+	void twoSpellingsOfOneChannelNameLandInTheSAMEChannel() {
+		// The whole reason the server canonicalises. Hebrew SHIN WITH SHIN DOT is a composition EXCLUSION, so
+		// U+FB2A and the U+05E9 U+05C1 sequence render identically while being different strings. Both clients
+		// derive their key from this name (it is the PBKDF2 salt), so if the server kept them as two registry keys
+		// these two users would be in separate rooms; and if it keyed them together WITHOUT normalising, their
+		// key-checks would disagree and each would be told PASSPHRASE_MISMATCH for a passphrase that is identical.
+		// Normalising on both sides is what makes "same visible name" mean "same room AND same key".
+		String precomposed = "\uFB2A\u05DC\u05D5\u05DD";
+		String decomposed = "\u05E9\u05C1\u05DC\u05D5\u05DD";
+		assertNotEquals(precomposed, decomposed, "the two spellings really are different strings");
+
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join(precomposed, ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join(decomposed, ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+
+		String joined = firstOf(alice, ServerMessage.Joined.class).channel();
+		assertEquals(decomposed, joined, "the canonical (NFC) form is what the server stores and echoes");
+		assertEquals(joined, firstOf(bob, ServerMessage.Joined.class).channel());
+		assertEquals(2, channel(joined).size(), "both spellings put their author in ONE channel");
+		assertEquals(1, channelRegistry.channelCount(), "and only one channel was created");
+	}
+
+	@Test
+	void aChannelNameIsStrippedSoACopyPastedSpaceIsTheSameRoom() {
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("  team-1  ", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		assertEquals("team-1", firstOf(alice, ServerMessage.Joined.class).channel());
+	}
+
+	@Test
 	void aJoinWithNoKeyCheckIsRefusedOutsideTheGlobalRoom() {
 		// The new rule: an ordinary channel cannot be plaintext, so a join has to bring a key-check. Distinct from
 		// PASSPHRASE_MISMATCH, which is about DISAGREEING with a channel's key — this fires before any channel

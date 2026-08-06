@@ -17,7 +17,6 @@ import {
 	ABSENT,
 	canConnect,
 	CHANNEL_FIELD,
-	CHANNEL_NAME,
 	connectProblems,
 	DISPLAY_FIELD,
 	GLOBAL_MODE,
@@ -25,6 +24,8 @@ import {
 	PASSPHRASE_FIELD,
 	readinessSummary,
 } from '../../main/resources/static/assets/connect-form.js';
+// The channel-name rule itself lives in names.js, beside the display-name rule it is mirrored against.
+import {CHANNEL_NAME} from '../../main/resources/static/assets/names.js';
 
 /** A form that is ready to send, so each test can express exactly one thing being wrong with it. */
 function validForm(overrides = {}) {
@@ -115,11 +116,36 @@ test('an illegal value is reported differently from an absent one', () => {
 	assert.match(illegal, /no spaces/);
 });
 
-test('the channel rule is the server\'s: ASCII, no spaces, no dots, 1-64', () => {
-	['a', 'team-1', 'A_b-9', 'x'.repeat(64)].forEach(name =>
-			assert.ok(CHANNEL_NAME.test(name), `should accept ${name}`));
-	['', 'x'.repeat(65), 'my team', 'team.one', 'שלום', 'a/b'].forEach(name =>
-			assert.ok(!CHANNEL_NAME.test(name), `should reject ${name}`));
+test('the channel rule is the server\'s: any script, no whitespace, no dots, 1-64', () => {
+	['a', 'team-1', 'A_b-9', 'x'.repeat(64), 'שלום', '李雷', 'Ελένη', 'Аня', 'צוות-1', 'יוֹסֵי']
+			.forEach(name => assert.ok(CHANNEL_NAME.test(name), `should accept ${name}`));
+	// Whitespace stays out because the Java client's `c <channel> [mode] [key]` command splits on it; dots stay out
+	// as they always were; invisible characters stay out because a channel name is a rendezvous key with no `#id`
+	// beside it, so a name nobody can retype is a room nobody else can reach.
+	['', 'x'.repeat(65), 'my team', 'שלום עולם', 'team.one', 'a/b', 'bad\u200bname', 'team\u202e']
+			.forEach(name => assert.ok(!CHANNEL_NAME.test(name), `should reject ${JSON.stringify(name)}`));
+});
+
+test('a channel name in any script passes the whole form', () => {
+	['שלום', '李雷', 'צוות-1'].forEach(channel =>
+			assert.deepEqual(connectProblems(validForm({channel})), [], channel));
+});
+
+test('the channel name is CANONICALISED, not merely trimmed — the two-keys-one-room guard', () => {
+	// The reason this matters is not tidiness. The channel name is the PBKDF2 salt, so two members whose names
+	// differ by one byte derive different keys and sit in the same room hearing nothing, with a
+	// PASSPHRASE_MISMATCH neither can explain. Hebrew SHIN WITH SHIN DOT is a composition EXCLUSION, so the
+	// precomposed presentation form U+FB2A and the U+05E9 U+05C1 sequence render identically and normalise to the
+	// same thing — measured: different AES keys before NFC, identical after.
+	const precomposed = '\uFB2A\u05DC\u05D5\u05DD';        // שׁלום typed via the presentation form
+	const decomposed = '\u05E9\u05C1\u05DC\u05D5\u05DD';   // the same name, base letter + dot
+	assert.notEqual(precomposed, decomposed, 'the two spellings really are different strings');
+	// Both must be accepted, and both must reduce to the same string the salt will see.
+	assert.deepEqual(connectProblems(validForm({channel: precomposed})), []);
+	assert.deepEqual(connectProblems(validForm({channel: decomposed})), []);
+	assert.equal(precomposed.normalize('NFC'), decomposed.normalize('NFC'));
+	// And a trailing space off a copy-paste is the same room, not an invalid name.
+	assert.deepEqual(connectProblems(validForm({channel: '  שלום  '})), []);
 });
 
 test('a display name in any script is accepted, matching names.js', () => {
