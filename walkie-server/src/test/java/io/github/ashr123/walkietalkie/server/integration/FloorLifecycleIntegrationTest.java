@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.integration;
 
+import io.github.ashr123.walkietalkie.server.TestKeyChecks;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
@@ -38,9 +39,9 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	private String[] joinPair(String channel, ChannelMode mode,
 	                          WebSocketSession sa, CollectingHandler a,
 	                          WebSocketSession sb, CollectingHandler b) throws Exception {
-		send(sa, new ClientMessage.Join(channel, mode, "Alice", null));
+		send(sa, new ClientMessage.Join(channel, mode, "Alice", TestKeyChecks.keyCheckFor(mode)));
 		ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
-		send(sb, new ClientMessage.Join(channel, mode, "Bob", null));
+		send(sb, new ClientMessage.Join(channel, mode, "Bob", TestKeyChecks.keyCheckFor(mode)));
 		ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 		awaitType(a.messages, ServerMessage.MemberJoined.class);
 		awaitType(b.messages, ServerMessage.FloorStatus.class);

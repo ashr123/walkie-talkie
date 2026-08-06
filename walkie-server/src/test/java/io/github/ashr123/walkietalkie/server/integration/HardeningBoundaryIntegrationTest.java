@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.integration;
 
+import io.github.ashr123.walkietalkie.server.TestKeyChecks;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
@@ -53,7 +54,7 @@ class HardeningBoundaryIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler handler = new CollectingHandler();
 		try (WebSocketSession session = connect(AUDIO, handler, login(), origin(ALLOWED_ORIGIN))) {
 			// A normal (small) control frame works under the cap.
-			send(session, new ClientMessage.Join("cap", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
+			send(session, new ClientMessage.Join("cap", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
 			awaitType(handler.messages, ServerMessage.Joined.class);
 
 			// A text frame past walkie.max-text-message-bytes (256 here) is refused by the transport, which closes

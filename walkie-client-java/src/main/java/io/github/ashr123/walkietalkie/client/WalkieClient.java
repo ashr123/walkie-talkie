@@ -117,7 +117,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// these from a non-owner, so hiding them is UI honesty, not the security boundary.
 	private static final String OWNER_COMMANDS = """
 			Owner:     m <ptt|global|duplex> = change the mode for everyone ('m global' switches YOU to the global room)
-			           p [passphrase] = change the passphrase (blank = turn encryption off; members auto-adopt)
+			           p <passphrase> = rotate the passphrase for everyone (members auto-adopt); it can't be turned off
 			           p! [passphrase] = change the passphrase WITHOUT auto-sharing (members must re-enter it)
 			           o <#id> = give ownership to another member
 			           mute <#id|all> / unmute <#id|all> = mute or unmute members
@@ -279,18 +279,29 @@ public final class WalkieClient implements AutoCloseable {
 	/// access) so the invariant below is unit-testable without a live socket.
 	///
 	/// Invariant — **only ever put on the wire what the channel's CURRENT key-check matches:**
-	/// - channel unencrypted (`announcedKeyCheck == null`) → send the frame in the clear;
-	/// - we hold the matching key (`key.keyCheck().equals(announcedKeyCheck)`) → send ciphertext;
-	/// - otherwise → **drop** (stay silent). This covers both a member with NO key (the plaintext→encrypted
-	///   *enable* — never leak plaintext) AND a member still holding a STALE key after a rotation it hasn't
+	/// - `plaintextAllowed` AND we hold no key → send the frame in the clear. That flag is the CALLER's own knowledge — true only for
+	///   the server-managed `global` room, the one channel that is plaintext by design — and it is the whole point
+	///   of this signature. The gate used to infer "unencrypted" from `announcedKeyCheck == null`, a value the
+	///   SERVER supplies, so one forged `passphraseChanged { keyCheck: null }` flipped a whole encrypted channel
+	///   into transmitting cleartext. Deciding from a fact the client owns means no value the server sends can
+	///   produce a plaintext frame in a named channel; the worst it achieves is getting us dropped, i.e. silence;
+	/// - else we hold the matching key (`key.keyCheck().equals(announcedKeyCheck)`) → send ciphertext;
+	/// - else → **drop** (stay silent). That covers a member still holding a STALE key after a rotation it hasn't
 	///   adopted (don't emit audio the rekeyed channel can't decode, and don't desync — a straggler is muted until
-	///   it adopts the new key, so the experience is symmetric for everyone).
-	static byte[] outboundFrame(byte[] frame, FrameCrypto key, String announcedKeyCheck) throws GeneralSecurityException {
-		return announcedKeyCheck == null ?
-				frame :
-				key != null && announcedKeyCheck.equals(key.keyCheck()) ?
-						key.encrypt(frame) :
-						null;
+	///   it adopts the new key, so the experience is symmetric for everyone), a member holding NO key for an
+	///   encrypted channel, and — deliberately — a named channel with nothing announced and nothing held, which
+	///   used to fall through to plaintext.
+	static byte[] outboundFrame(byte[] frame, FrameCrypto key, String announcedKeyCheck, boolean plaintextAllowed)
+			throws GeneralSecurityException {
+		// BOTH terms: `plaintextAllowed` comes from the mode, which arrives in the Joined snapshot, so a server that
+		// lied about it could otherwise still ask a member of a named channel to talk in the clear. Whether we hold
+		// a key is ours alone — we derived it from a passphrase the user typed — and holding one means encryption
+		// was intended. So plaintext needs the channel to permit it AND us to have never derived a key for it.
+		if (plaintextAllowed && key == null) {
+			return frame;
+		}
+		// `key.keyCheck()` first, so a null `announcedKeyCheck` compares unequal instead of throwing.
+		return key != null && key.keyCheck().equals(announcedKeyCheck) ? key.encrypt(frame) : null;
 	}
 
 	/// Pure decision behind the full-duplex mic auto-open: open only when the mode is full-duplex, the user did not
@@ -303,12 +314,18 @@ public final class WalkieClient implements AutoCloseable {
 		return mode == ChannelMode.FULL_DUPLEX && !startMuted && !selfMuted;
 	}
 
+	/// The pure decision for an announced passphrase change. Mirrors the browser's `rekeyAction` in e2ee.js.
+	///
+	/// A null announced key-check maps to `KEEP`, not to dropping the key. It used to mean "the owner turned
+	/// encryption off", and this returned a third `DISABLE` action that cleared `crypto`. No conformant server can
+	/// send that any more — `ChannelRegistry.changePassphrase` refuses a null new key-check with
+	/// `PASSPHRASE_REQUIRED` — and obeying it would have become a DOWNGRADE rather than a feature: with `crypto`
+	/// cleared, [#outboundFrame] sends in the clear, so one forged or buggy broadcast would put every member of an
+	/// encrypted channel on the air unencrypted. Keeping the key we hold fails closed instead.
 	static RekeyAction rekeyAction(String announcedKeyCheck, FrameCrypto candidate) {
-		return announcedKeyCheck == null ?
-				RekeyAction.DISABLE :
-				candidate != null && announcedKeyCheck.equals(candidate.keyCheck()) ?
-						RekeyAction.APPLY :
-						RekeyAction.KEEP;
+		return announcedKeyCheck != null && candidate != null && announcedKeyCheck.equals(candidate.keyCheck()) ?
+				RekeyAction.APPLY :
+				RekeyAction.KEEP;
 	}
 
 	/// Derives this client's floor state from the authoritative [ServerMessage.FloorStatus] snapshot (`holderId` +
@@ -424,6 +441,12 @@ public final class WalkieClient implements AutoCloseable {
 	/// `currentChannelKeyCheck` *before* `crypto`, so the no-plaintext gate engages the instant encryption is
 	/// announced — it does not depend on us having derived the new key yet.
 	private void sendAudioFrame(byte[] frame) {
+		// No channel, no audio. The server routes such a frame nowhere anyway, but the local stop is what matters:
+		// the channel-less state also nulls currentChannelKeyCheck (see the initial-connect refusal path), so
+		// without this the gate below would be deciding for a channel we are not in.
+		if (currentChannel == null) {
+			return;
+		}
 		if (mutedMembers.contains(selfId)) {
 			// Owner-muted: drop before the wire. A volatile read of an immutable set — see the field's note on why it is
 			// republished whole rather than mutated in place. We also stop the mic on the mute snapshot, so this only closes the brief
@@ -432,7 +455,7 @@ public final class WalkieClient implements AutoCloseable {
 			return;
 		}
 		try {
-			byte[] out = outboundFrame(frame, crypto, currentChannelKeyCheck);
+			byte[] out = outboundFrame(frame, crypto, currentChannelKeyCheck, currentMode == ChannelMode.GLOBAL_PTT);
 			if (out != null) {
 				sendQueue.offer(new Outbound.Binary(out));
 			}
@@ -1064,7 +1087,8 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	/// `p [passphrase]` / `p! [passphrase]` — change the channel's end-to-end-encryption passphrase. For the OWNER
-	/// this rotates it for everyone (a blank passphrase turns encryption off); the new key is applied only when the
+	/// this rotates it for everyone (a blank passphrase is refused — encryption cannot be turned off); the new key
+	/// is applied only when the
 	/// server echoes [ServerMessage.PassphraseChanged], so a rejected request leaves the old key intact. With `p`
 	/// (when this is an encrypted→encrypted rotation, so an OLD key exists) the new passphrase is also wrapped under
 	/// that old key and relayed so connected members ADOPT it automatically (the server still never sees it); `p!`
@@ -1079,15 +1103,20 @@ public final class WalkieClient implements AutoCloseable {
 			log("[passphrase] the global room is the server's unencrypted broadcast channel — encryption isn't available there.");
 			return;
 		}
+		// A blank argument used to mean "make this channel plaintext". It cannot any more — the server refuses a
+		// cleared key-check with PASSPHRASE_REQUIRED — so refuse it here, where the reason fits on one line.
+		if (passphrase.isBlank()) {
+			log("[passphrase] encryption can't be turned off — give the new passphrase to rotate it: p <passphrase>");
+			return;
+		}
 		if (selfId.equals(ownerId)) {
 			try {
-				FrameCrypto next = deriveCrypto(passphrase, currentMode, currentChannel);   // blank -> null -> no encryption
+				FrameCrypto next = deriveCrypto(passphrase, currentMode, currentChannel);
 				FrameCrypto old = crypto;   // the key we currently hold — read once off the volatile
 				// Auto-distribution: wrap the new passphrase under the OLD key so connected members adopt it
-				// automatically. Only for an encrypted→encrypted rotation (an old key must exist) and only when
-				// sharing — a plaintext→encrypted ENABLE has no old key to wrap under (first secret goes out-of-band),
-				// disabling carries nothing, and `p!` deliberately withholds it (revocation-style). Server relays the
-				// blob blindly; only an old-key holder can unwrap it.
+				// automatically, when sharing. Every rotation is encrypted→encrypted now, so an old key always
+				// exists; `p!` deliberately withholds the wrap (revocation-style). Server relays the blob blindly;
+				// only an old-key holder can unwrap it.
 				String wrappedKey = share && old != null && next != null ? old.wrap(passphrase) : null;
 				pendingPassphrase = next == null ? null : passphrase;
 				rekeyInFlight = true;
@@ -1125,13 +1154,14 @@ public final class WalkieClient implements AutoCloseable {
 	/// never falling back to plaintext, which would broadcast in the clear into a still-encrypted channel.
 	private void applyMemberPassphrase(String passphrase) {
 		try {
-			FrameCrypto candidate = currentChannelKeyCheck == null ? null : deriveCrypto(passphrase, currentMode, currentChannel);
+			// currentChannelKeyCheck is null only in the global room, which is never encrypted and has no passphrase
+			// to adopt — deriving there and calling it a re-key would be nonsense, so say what is true and stop.
+			if (currentChannelKeyCheck == null) {
+				log("[passphrase] the global room is the server's unencrypted broadcast channel — no passphrase to apply.");
+				return;
+			}
+			FrameCrypto candidate = deriveCrypto(passphrase, currentMode, currentChannel);
 			switch (rekeyAction(currentChannelKeyCheck, candidate)) {
-				case DISABLE -> {
-					crypto = null;
-					currentPassphrase = null;
-					log("[passphrase] this channel is currently unencrypted.");
-				}
 				case APPLY -> {
 					crypto = candidate;
 					currentPassphrase = passphrase;
@@ -1145,14 +1175,24 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	/// Applies an owner's passphrase rotation echoed by the server. The server relays only the new key-check (or
-	/// `null` to disable encryption), never the passphrase — so we re-derive the key from a passphrase we already
+	/// Applies an owner's passphrase rotation echoed by the server. The server relays only the new key-check —
+	/// which is always non-null, since a clearing rotation is refused with `PASSPHRASE_REQUIRED`, and one that
+	/// arrives null anyway is ignored below — never the passphrase, so we re-derive the key from a passphrase we already
 	/// hold and verify it against `keyCheck` via [#rekeyAction]. If we initiated this (we are the owner) that is
 	/// the passphrase we just submitted; for a member it is the one currently in use, which won't match until the
 	/// user re-enters the new one with `p`. On a mismatch we KEEP the old key (no plaintext fallback). The
 	/// volatile `crypto` swap is read once by the capture/listener threads, so the worst a transition does is drop
 	/// a few frames on a failed GCM tag.
 	private void handlePassphraseChanged(String keyCheck, String wrappedKey) {
+		// BEFORE the write, not after it. A null announced key-check is a server telling us to stop encrypting;
+		// recording it would poison `currentChannelKeyCheck`, which is the value the transmit gate consults — so
+		// returning later (as an earlier version of this guard did) kept the KEY while still handing the gate a
+		// null, and `outboundFrame` sent in the clear. Keeping our own value is what actually refuses the
+		// downgrade. `outboundFrame`'s `plaintextAllowed` argument is the belt to this braces.
+		if (keyCheck == null) {
+			log("[passphrase] ignored a change that would have turned encryption off — this channel stays encrypted.");
+			return;
+		}
 		currentChannelKeyCheck = keyCheck;
 		// A new key era — re-arm the one-shot decrypt-failure warning (set on the first failure in onBinary and
 		// otherwise never cleared) so a member who misses THIS rotation still gets a fresh cue to re-key. Same WS
@@ -1181,13 +1221,8 @@ public final class WalkieClient implements AutoCloseable {
 			}
 		}
 		try {
-			FrameCrypto candidate = keyCheck == null ? null : deriveCrypto(passphrase, currentMode, currentChannel);
+			FrameCrypto candidate = deriveCrypto(passphrase, currentMode, currentChannel);
 			switch (rekeyAction(keyCheck, candidate)) {
-				case DISABLE -> {
-					crypto = null;
-					currentPassphrase = null;
-					log("[passphrase] the owner turned encryption OFF for this channel.");
-				}
 				case APPLY -> {
 					crypto = candidate;
 					currentPassphrase = passphrase;
@@ -1214,7 +1249,17 @@ public final class WalkieClient implements AutoCloseable {
 			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]  (channel = 1-64 chars of letters, digits, _ or -)");
 			return;
 		}
-		switchTo(channel, mode, parts.length > 2 ? parts[2] : currentPassphrase);
+		// Every channel but the global room is end-to-end encrypted, so a switch has to bring a passphrase — either
+		// given here or carried over from the channel we are in. Without one the server refuses the join with
+		// PASSPHRASE_REQUIRED, so say so here, where it can name the argument to add. Reachable in practice by
+		// switching out of the global room (whose passphrase is empty) into a named one.
+		String passphrase = parts.length > 2 ? parts[2] : currentPassphrase;
+		if (mode != ChannelMode.GLOBAL_PTT && (passphrase == null || passphrase.isBlank())) {
+			System.out.println("Usage: c <channel> [ptt|global|duplex] <passphrase>  — '" + channel + "' needs an "
+					+ "encryption passphrase (every channel except the global room is encrypted).");
+			return;
+		}
+		switchTo(channel, mode, passphrase);
 	}
 
 	/// Re-derives the E2EE key for the new channel (the key salts on the channel name) and sends the Join; the
@@ -1610,8 +1655,9 @@ public final class WalkieClient implements AutoCloseable {
 	/// client derived from the passphrase it currently holds. Pure (no field access) so the security rule — NEVER
 	/// adopt a key whose key-check doesn't match the announced one, and only clear the key on an explicit disable
 	/// — is unit-testable without a live socket. `APPLY`: adopt `candidate`. `KEEP`: hold the current key (we
-	/// don't have the new passphrase yet, or it mismatched). `DISABLE`: the owner turned encryption off.
-	enum RekeyAction {APPLY, KEEP, DISABLE}
+	/// don't have the new passphrase yet, or it mismatched — including an announcement of NO key-check, which is
+	/// refused rather than obeyed; see [#rekeyAction]).
+	enum RekeyAction {APPLY, KEEP}
 
 	/// This client's push-to-talk floor state, derived from the latest [ServerMessage.FloorStatus] via
 	/// [#floorStateFor]. Drives both the status log and the state-driven `t` control ([#floorActionFor]).
@@ -1699,8 +1745,9 @@ public final class WalkieClient implements AutoCloseable {
 				FrameCrypto key = crypto;   // read the volatile once — a concurrent channel switch may swap it
 				if (key == null) {
 					if (body.length > 0 && (body[0] & 0xFF) == E2EE_SCHEME) {
-						// Encrypted audio arriving while we hold no key (a plaintext->encrypted enable we haven't
-						// adopted): drop it — the engine would treat 0xE2 as an unknown codec tag and silently emit
+						// Encrypted audio arriving while we hold no key (the global room should never carry any, and
+						// elsewhere we should always have one): drop it — the engine would treat 0xE2 as an unknown
+						// codec tag and silently emit
 						// nothing — and explain once, like the browser's warnedEncryptedNoKey path.
 						if (!warnedEncryptedNoKey) {
 							warnedEncryptedNoKey = true;

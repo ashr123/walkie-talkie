@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.integration;
 
+import io.github.ashr123.walkietalkie.server.TestKeyChecks;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
@@ -24,11 +25,11 @@ class WebSocketRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler handlerB = new CollectingHandler();
 		try (WebSocketSession sessionA = connect(AUDIO, handlerA, tokenA);
 		     WebSocketSession sessionB = connect(AUDIO, handlerB, tokenB)) {
-			send(sessionA, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
+			send(sessionA, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedA = awaitType(handlerA.messages, ServerMessage.Joined.class);
 			assertEquals("team", joinedA.channel());
 
-			send(sessionB, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Bob", null));
+			send(sessionB, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
 			awaitType(handlerB.messages, ServerMessage.Joined.class);
 
 			// Alice's queue should see Bob arrive (this also drains Alice's own join FloorStatus snapshot).

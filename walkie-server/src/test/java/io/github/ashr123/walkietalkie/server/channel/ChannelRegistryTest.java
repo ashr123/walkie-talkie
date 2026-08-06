@@ -131,7 +131,7 @@ class ChannelRegistryTest {
 		return result.roster().stream().map(MemberInfo::id).collect(Collectors.toSet());
 	}
 
-	// --- changePassphrase outcome matrix (the OK / NOT_OWNER / NOT_FOUND contract + same-object channel()) ---
+	// --- changePassphrase outcome matrix (Ok / NotOwner / NotFound / EncryptionRequired + same-object channel()) ---
 
 	@Test
 	void changePassphraseRotatesForTheOwnerAndReturnsTheSameChannel() {
@@ -154,6 +154,27 @@ class ChannelRegistryTest {
 	@Test
 	void changePassphraseOnAMissingChannelIsNotFound() {
 		assertInstanceOf(ChannelRegistry.RekeyResult.NotFound.class, registry.changePassphrase("ghost", "a", "kcv-B"));
+	}
+
+	@Test
+	void changePassphraseToNullIsRefusedAsEncryptionRequired() {
+		// Clearing a passphrase would leave an ordinary channel plaintext, which nothing may do. Refused at the
+		// registry, inside the same bin lock as the write, so the channel is never even momentarily unencrypted for
+		// a concurrent joiner to slip into.
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"))).channel();
+		assertInstanceOf(ChannelRegistry.RekeyResult.EncryptionRequired.class,
+				registry.changePassphrase("team", "a", null));
+		assertEquals("kcv-A", created.keyCheck(), "the channel keeps the passphrase it had");
+	}
+
+	@Test
+	void aNonOwnerClearingThePassphraseStillHearsNotOwner() {
+		// Ordering: the owner check comes FIRST, so a non-owner is told the true thing about their request rather
+		// than being lectured about encryption they were never allowed to change.
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"))).channel();
+		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("b"));
+		assertInstanceOf(ChannelRegistry.RekeyResult.NotOwner.class, registry.changePassphrase("team", "b", null));
+		assertEquals("kcv-A", created.keyCheck());
 	}
 
 	// --- transferOwnership outcome matrix (Ok / NotOwner / NotAMember / NotFound + same-object channel on Ok) ---

@@ -6,12 +6,12 @@ two reference clients, and three channel modes.
 
 ## What it does
 
-| Choice           | Options                                                                                                                                                              |
-|------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Transport**    | **WebSocket relay** — the server forwards raw audio frames between members · **WebRTC** — the server relays signaling only, audio flows peer-to-peer                 |
-| **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared, server-managed, always-unencrypted room) · **Full-duplex** (everyone talks at once)   |
-| **Clients**      | A zero-install **browser** client · a **Java 25 desktop** client                                                                                                     |
-| **Encryption**   | Optional **end-to-end encryption** on the relay path (AES-256-GCM from a shared passphrase) · WebRTC media is already end-to-end encrypted (DTLS-SRTP, peer-to-peer) |
+| Choice           | Options                                                                                                                                                                                                                                             |
+|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Transport**    | **WebSocket relay** — the server forwards raw audio frames between members · **WebRTC** — the server relays signaling only, audio flows peer-to-peer                                                                                                |
+| **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared, server-managed, always-unencrypted room) · **Full-duplex** (everyone talks at once)                                                                                  |
+| **Clients**      | A zero-install **browser** client · a **Java 25 desktop** client                                                                                                                                                                                    |
+| **Encryption**   | **End-to-end encryption is mandatory** — every channel except the server-managed global room needs a shared passphrase (AES-256-GCM on the relay path; on WebRTC the media is already end-to-end via DTLS-SRTP and the passphrase gates membership) |
 
 ## Architecture
 
@@ -58,7 +58,7 @@ once, for Bob.)
 
 ```
   Alice  (sender client)
-    │   capture 20 ms  →  Opus encode  →  (optional) AES-256-GCM encrypt
+    │   capture 20 ms  →  Opus encode  →  AES-256-GCM encrypt (all but the global room)
     │   binary  [tag][payload]   (or  [0xE2][IV][ciphertext])
     ▼   /ws/audio   —  handled on Alice's inbound VIRTUAL THREAD
   ┌─────────────────────────────────────────────────────────────────────────────────────┐
@@ -173,7 +173,7 @@ WALKIE_AUTH_SIGNING_KEY="$(openssl rand -base64 64)" java -jar walkie-server/bui
 ### Transport encryption (TLS / WSS)
 
 **TLS is on by default**, so the whole connection is encrypted in transit — control messages, the binary
-audio frames, the HTTPS login, and the `?token=` on the WebSocket handshake. (The optional audio passphrase
+audio frames, the HTTPS login, and the `?token=` on the WebSocket handshake. (The audio passphrase
 is a separate, end-to-end layer that protects only the audio *payload* between participants; it is **not** a
 substitute for transport TLS, and control messages are never passphrase-encrypted because the server has to
 read and act on them.)
@@ -224,7 +224,9 @@ probe; everything else under `/actuator` is not.
 2. Pick a transport, channel mode, and channel (optionally tick **High fidelity** to disable the mic
    noise-suppression/echo-cancellation DSP — this can be toggled **live** while connected and applies
    immediately). To encrypt audio **end-to-end**, set the same **Encryption
-   passphrase** as everyone else in the channel (relay transport only; needs HTTPS or `localhost`).
+   passphrase** as everyone else in the channel — **required** on both transports, for every channel except
+   the global room. Deriving the key needs a secure context (HTTPS or `localhost`), and there is no longer an
+   unencrypted way to connect, so a plain-HTTP page can only reach the global room.
    Click **Connect** and allow microphone access.
 3. **Push-to-talk** modes: hold the big button (or hold **Space**). If the owner has enabled the channel's
    **floor queue** (a "raise hand" line — owner-only **Enable queue**/**Disable queue** control) and the floor
@@ -258,7 +260,7 @@ connected). Change any of them and click the single adaptive button:
   (a different endpoint + audio pipeline), so it reconnects transparently as a new session.
 - It's **disabled** when nothing has changed.
 
-The owner rotating the **passphrase** (or clearing it to turn encryption off) never reaches the server as a
+The owner rotating the **passphrase** never reaches the server as a
 secret — the client only sends the new *key-check*. By default the owner also **auto-shares** the new
 passphrase: it's wrapped (encrypted) under the channel's *old* key and relayed, so connected members decrypt it
 with the key they already hold and **adopt it automatically** — the server still never sees the passphrase. The
@@ -331,19 +333,20 @@ java -jar walkie-client-java/build/libs/walkie-client-java-0.1.0-all.jar \
   --server https://localhost:8443 --channel team1 --mode ptt --display Alice
 ```
 
-All flags are optional (run with `--args="--help"` for the full list):
+`--display`, `--channel` and `--key` are **required** (`--key` may come from `WALKIE_KEY`; global mode needs
+neither `--channel` nor `--key`). The rest are optional — run with `--args="--help"` for the full list:
 
-| Flag                         | Default                  | Purpose                                                                                                                                                                                                                                                                      |
-|------------------------------|--------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--server <url>`             | `https://localhost:8443` | Base URL of the server (on localhost the dev cert is auto-trusted; use `http://…` for a server run with `walkie.tls.enabled=false`).                                                                                                                                         |
-| `--channel <name>`           | `lobby`                  | Channel to join (ignored for global mode; the name `global` is reserved for global mode).                                                                                                                                                                                    |
-| `--mode ptt\|global\|duplex` | `ptt`                    | Conversation mode **when creating** a channel; a later joiner adopts the channel's existing mode.                                                                                                                                                                            |
-| `--display <name>`           | `guest`                  | Name shown to others — **1–32 letters, digits or spaces in any language** (Hebrew, Han, accented Latin), plus `_`, `.`, `-`; invisible characters are rejected. Quote it if it has spaces: `--display "Roy Ash"`.                                                                                                                                                                     |
-| `--hifi`                     | off                      | Start in the Opus **music** profile (vs. voice); toggle live with `f` at the prompt.                                                                                                                                                                                         |
-| `--input <substr>`           | system default           | Capture from the input device whose name contains `<substr>`. Run `--help` to see the detected device names.                                                                                                                                                                 |
-| `--key <passphrase>`         | `$WALKIE_KEY`            | **End-to-end encrypt** the audio (AES-256-GCM). Everyone in the channel — including browser peers — must use the same passphrase on the same channel/mode; a mismatch is rejected at join. Ignored in global mode — that room is the server's unencrypted broadcast channel. |
-| `--tls-truststore <pem>`     | —                        | Extra PEM certificate to trust for TLS, besides the system CAs and (on localhost) the server's auto-generated dev cert. Verification stays on.                                                                                                                               |
-| `--muted`                    | off                      | Full-duplex only: join with the mic muted (type `t` to unmute). Ignored in push-to-talk modes.                                                                                                                                                                               |
+| Flag                         | Default                  | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+|------------------------------|--------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--server <url>`             | `https://localhost:8443` | Base URL of the server (on localhost the dev cert is auto-trusted; use `http://…` for a server run with `walkie.tls.enabled=false`).                                                                                                                                                                                                                                                                                                                                                        |
+| `--channel <name>`           | **required**             | Channel to join. Required for every mode except global, which always uses the reserved `global` room.                                                                                                                                                                                                                                                                                                                                                                                       |
+| `--mode ptt\|global\|duplex` | `ptt`                    | Conversation mode **when creating** a channel; a later joiner adopts the channel's existing mode.                                                                                                                                                                                                                                                                                                                                                                                           |
+| `--display <name>`           | **required**             | Name shown to others — **1–32 letters, digits or spaces in any language** (Hebrew, Han, accented Latin), plus `_`, `.`, `-`; invisible characters are rejected. Quote it if it has spaces: `--display "Roy Ash"`.                                                                                                                                                                                                                                                                           |
+| `--hifi`                     | off                      | Start in the Opus **music** profile (vs. voice); toggle live with `f` at the prompt.                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `--input <substr>`           | system default           | Capture from the input device whose name contains `<substr>`. Run `--help` to see the detected device names.                                                                                                                                                                                                                                                                                                                                                                                |
+| `--key <passphrase>`         | `$WALKIE_KEY`, required  | **End-to-end encrypt** the audio (AES-256-GCM). **Required** for every mode except global — a channel with no passphrase is refused with `PASSPHRASE_REQUIRED`. Everyone in the channel — including browser peers — must use the same passphrase on the same channel/mode; a mismatch is rejected at join. Reads `WALKIE_KEY` when the flag is omitted, which keeps the secret out of your shell history. Ignored in global mode — that room is the server's unencrypted broadcast channel. |
+| `--tls-truststore <pem>`     | —                        | Extra PEM certificate to trust for TLS, besides the system CAs and (on localhost) the server's auto-generated dev cert. Verification stays on.                                                                                                                                                                                                                                                                                                                                              |
+| `--muted`                    | off                      | Full-duplex only: join with the mic muted (type `t` to unmute). Ignored in push-to-talk modes.                                                                                                                                                                                                                                                                                                                                                                                              |
 
 > Tip: run `--help` to see the detected capture-device names, then pass a distinctive substring to
 > `--input` (e.g. `--input "USB"`).
@@ -353,10 +356,10 @@ a free floor, claims your turn when the floor is reserved for you, or (when the 
 and the floor is busy) joins/leaves the "raise hand" line, showing your place and alerting you when it's your
 turn · `queue on` / `queue off` toggle this channel's push-to-talk floor queue (owner only) · `w` list who's in the channel · `m
 <ptt|global|duplex>` change the mode — `ptt`/`duplex` change the current channel's mode (owner only); `m global` **switches you** to the server-managed global room (like the browser's mode selector, this is a room switch, not a mode change) · `c <channel> [mode] [key]` switch channel without dropping
-the session (mode/key default to the current ones) · `p [passphrase]` change the passphrase (owner; blank turns
-encryption off; auto-shares the new passphrase so members adopt it automatically — a member uses `p` to apply
-the owner's new passphrase) · `p! [passphrase]` rotate **without** auto-sharing (revocation-style; members must
-re-enter it) · `o <#id>` hand ownership to another member (owner; `<#id>` is the prefix shown next to a member)
+the session (mode/key default to the current ones) · `p <passphrase>` rotate the passphrase (owner; encryption
+cannot be turned off; auto-shares the new passphrase so members adopt it automatically — a member uses `p` to
+apply the owner's new passphrase) · `p! <passphrase>` rotate **without** auto-sharing (revocation-style; members
+must re-enter it) · `o <#id>` hand ownership to another member (owner; `<#id>` is the prefix shown next to a member)
 · `mute <#id|all>` / `unmute <#id|all>` mute or unmute a member — or everyone but yourself — as the owner (the
 server enforces it: a muted member's audio is dropped and it's shown `[muted]` in `w`; being muted stops your
 mic and refuses `t` until you're unmuted) · `lock` / `unlock` lock or unlock the channel to new members as the
@@ -384,7 +387,7 @@ otherwise mono — and interoperates with relay-mode browser clients.
   ownership and routing. The display name is a separate, validated label (`[\p{L}\p{M}\p{N} _.-]{1,32}` on its NFC-normalised,
   stripped form — any script, spaces allowed, nothing invisible), and
   duplicate display names are disambiguated for the user with a short `#id` prefix.
-- **Optional end-to-end encryption (relay path).** With a shared passphrase, audio frames are encrypted
+- **Mandatory end-to-end encryption.** Every channel but the global room requires a shared passphrase, so audio frames are encrypted
   with **AES-256-GCM** before they leave the client and decrypted only by other holders of the passphrase —
   the server relays ciphertext opaquely and never holds the key. Because the key is **shared per channel**, this
   proves a frame came from *some* passphrase-holder (confidentiality and integrity against the relay and
@@ -395,7 +398,7 @@ otherwise mono — and interoperates with relay-mode browser clients.
   member whose passphrase doesn't match** the channel's (`PASSPHRASE_MISMATCH`) — without ever seeing the
   passphrase or the key. Browser E2EE needs a secure context (HTTPS or `localhost`). This is confidentiality
   between participants on top of transport security, not a replacement for serving over WSS/HTTPS. The channel
-  **owner** can rotate that passphrase — or toggle encryption on/off — live, via a `ChangePassphrase` →
+  **owner** can rotate that passphrase live (but never remove it) via a `ChangePassphrase` →
   `PassphraseChanged` flow that carries only the new key-check (never the passphrase). By default the owner
   **auto-distributes** the new passphrase: it wraps it (encrypts it) under the channel's *old* key and the
   server relays that blob opaquely, so any member still holding the old key unwraps it and adopts the new
@@ -548,10 +551,10 @@ classpath — tests have no generated context there and must stay reflective.
   need a shared backplane (not implemented). Off by default = single instance, everything served locally.
 - **End-to-end encryption uses one shared passphrase per channel** (a pre-shared key, no key exchange):
   no forward secrecy, no per-sender keys, and frame *metadata* (who is transmitting, when, and frame
-  sizes) stays visible to the server. A channel is **uniformly** encrypted or plaintext: a joiner whose
+  sizes) stays visible to the server. Every channel is encrypted and **uniformly** so: a joiner whose
   passphrase doesn't match the channel's is **rejected at join** (`PASSPHRASE_MISMATCH`) via a key-check
   value the server compares without ever learning the passphrase. The **owner** can rotate that passphrase
-  (or toggle encryption on/off) live and, by default, **auto-distribute** it by wrapping the new key under
+  live — rotation only, never removal — and by default **auto-distribute** it by wrapping the new key under
   the old one so members adopt it automatically (the server stays blind) — but because the new key is wrapped
   under the old, **rotation is a transition, not revocation**: it is only as secret as the old key, so to
   exclude a member you move to a fresh channel. The owner can opt out of auto-distribution for a

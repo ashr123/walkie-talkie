@@ -57,11 +57,12 @@ public sealed interface ClientMessage {
 	record ChangeMode(ChannelMode mode) implements ClientMessage {
 	}
 
-	/// Ask the server to change (rotate, set, or clear) the current channel's end-to-end-encryption passphrase.
-	/// Honored only for the channel owner (a non-owner gets `NOT_OWNER`; sending it before joining gets
-	/// `NOT_IN_CHANNEL`). `keyCheck` is the key-check value derived from the **new** passphrase (see the clients'
-	/// key derivation), or `null` to make the channel unencrypted. As with [Join#keyCheck] the server never sees
-	/// the passphrase itself — it only records the new key-check and broadcasts a [ServerMessage.PassphraseChanged].
+	/// Ask the server to ROTATE the current channel's end-to-end-encryption passphrase. Honored only for the
+	/// channel owner (a non-owner gets `NOT_OWNER`; sending it before joining gets `NOT_IN_CHANNEL`). `keyCheck` is
+	/// the key-check value derived from the **new** passphrase (see the clients' key derivation) and **must be
+	/// non-null**: a null one used to make the channel unencrypted and is now refused with `PASSPHRASE_REQUIRED`,
+	/// leaving the channel's passphrase untouched. As with [Join#keyCheck] the server never sees the passphrase
+	/// itself — it only records the new key-check and broadcasts a [ServerMessage.PassphraseChanged].
 	///
 	/// `wrappedKey` is an OPTIONAL convenience: the new passphrase encrypted under the channel's **OLD** key
 	/// (base64 of an AES-256-GCM blob the owner computes with the key it currently holds), or `null`. When
@@ -69,7 +70,7 @@ public sealed interface ClientMessage {
 	/// automatically — so a rotation needs no out-of-band step. The server still never learns the passphrase (it
 	/// relays the blob opaquely, exactly like the audio it forwards). It is `null` when the owner opts out (a
 	/// revocation-style rotation that forces out-of-band re-entry, since anyone holding the old key could unwrap
-	/// it), when there is no old key (a plaintext→encrypted *enable*), or when disabling encryption.
+	/// it). There is always an old key to wrap under, since every rotation is now encrypted→encrypted.
 	@JsonTypeName("changePassphrase")
 	record ChangePassphrase(String keyCheck, String wrappedKey) implements ClientMessage {
 	}

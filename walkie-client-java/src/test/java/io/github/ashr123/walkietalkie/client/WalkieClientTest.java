@@ -15,9 +15,14 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 /// Pins the client's outbound transmit-gate invariant: a client NEVER emits plaintext into a channel whose owner
-/// has announced encryption. Exercises [WalkieClient#outboundFrame] directly (no live socket) across the
-/// passphrase-rotation transitions — most importantly the plaintext→encrypted ENABLE case, where a not-yet-rekeyed
-/// member holds no key and must go silent rather than leak cleartext.
+/// has announced encryption. Exercises [WalkieClient#outboundFrame] directly (no live socket).
+///
+/// The headline case used to be the plaintext→encrypted ENABLE transition. That transition no longer exists —
+/// every channel but the server-managed `global` room is encrypted from creation, a join with no key-check is
+/// refused with `PASSPHRASE_REQUIRED`, and a clearing rotation is refused too — so what these tests now pin is
+/// the FAIL-CLOSED default itself: holding no key, or a stale one, for a channel that announces encryption emits
+/// nothing. That matters more than it did, not less: with no legitimate way to reach a plaintext state, any
+/// announcement that would put us in one is a downgrade attempt, and this gate is what refuses it.
 class WalkieClientTest {
 
 	/// A captured `[codec tag][payload]` plaintext frame (contents are arbitrary for this test).
@@ -25,19 +30,48 @@ class WalkieClientTest {
 
 	private static final byte E2EE_SCHEME = (byte) 0xE2;   // first byte of an end-to-end-encrypted frame
 
+	/// `plaintextAllowed` for the two kinds of channel, named so the call sites below read as the situation they are.
+	private static final boolean GLOBAL_ROOM = true;
+	private static final boolean NAMED_CHANNEL = false;
+
 	@Test
-	void plaintextChannelSendsTheFrameInTheClear() throws GeneralSecurityException {
-		// No key and no announced key-check = a genuinely unencrypted channel: send the frame as-is.
-		assertArrayEquals(FRAME, WalkieClient.outboundFrame(FRAME, null, null));
+	void theGlobalRoomSendsTheFrameInTheClear() throws GeneralSecurityException {
+		// The one channel that is plaintext by design. Note the decision comes from the CALLER's mode, not from the
+		// announced key-check — which is what stops a named channel ever reaching this branch.
+		assertArrayEquals(FRAME, WalkieClient.outboundFrame(FRAME, null, null, GLOBAL_ROOM));
 	}
 
 	@Test
-	void enablingEncryptionMutesAMemberWithoutTheKey() throws GeneralSecurityException {
-		// THE LEAK CASE: the owner just turned encryption ON (announced key-check is non-null) but this member
-		// joined while the channel was plaintext and has not entered the new passphrase, so it holds no key.
-		// It MUST emit nothing — never the plaintext frame — into the now-encrypted channel.
-		assertNull(WalkieClient.outboundFrame(FRAME, null, "non-null-kcv"),
+	void aMemberHoldingNoKeyForAnEncryptedChannelIsMuted() throws GeneralSecurityException {
+		// THE LEAK CASE, and the fail-closed default: the channel announces a key-check and we hold no key at all.
+		// No conformant server produces this state any more (it used to be the plaintext→encrypted enable), which
+		// is exactly why the assertion is kept — a channel announcing a key we have nothing for is the shape a
+		// downgrade attempt takes, and the answer must be silence, never the plaintext frame.
+		assertNull(WalkieClient.outboundFrame(FRAME, null, "non-null-kcv", NAMED_CHANNEL),
 				"a not-yet-rekeyed member must emit NO frame into an announced-encrypted channel");
+	}
+
+	@Test
+	void holdingAKeyBeatsAModeClaimingTheChannelIsPlaintext() throws GeneralSecurityException {
+		// The second term. `plaintextAllowed` is derived from the mode, and the mode arrives in the Joined snapshot,
+		// so a server that lied about it could otherwise ask a member of a named channel to talk in the clear.
+		// Holding a key is the client's own fact and means encryption was intended, so it wins.
+		FrameCrypto key = FrameCrypto.fromPassphrase("secret", "team");
+		assertNull(WalkieClient.outboundFrame(FRAME, key, null, GLOBAL_ROOM),
+				"a claimed-global mode must not override a key we derived ourselves");
+	}
+
+	@Test
+	void aNamedChannelAnnouncingNoKeyCheckIsMutedRatherThanSentInTheClear() throws GeneralSecurityException {
+		// THE DOWNGRADE, and the reason this method takes a `plaintextAllowed` argument at all. Both of these used
+		// to return the frame verbatim, because the gate read "unencrypted" off the SERVER-supplied key-check: one
+		// forged `passphraseChanged { keyCheck: null }` therefore turned every member of an encrypted channel into
+		// a cleartext transmitter. Outside the global room the answer must be silence whatever the server says.
+		FrameCrypto key = FrameCrypto.fromPassphrase("secret", "team");
+		assertNull(WalkieClient.outboundFrame(FRAME, key, null, NAMED_CHANNEL),
+				"a forged clearing rotation must not talk us into sending in the clear");
+		assertNull(WalkieClient.outboundFrame(FRAME, null, null, NAMED_CHANNEL),
+				"nothing announced and nothing held is fail-closed in a named channel, not plaintext");
 	}
 
 	@Test
@@ -45,7 +79,7 @@ class WalkieClientTest {
 		// encrypted -> encrypted rotation: we still hold the OLD key, which no longer matches the channel's
 		// announced key-check. We must stay SILENT (not emit stale-key audio the rekeyed channel can't decode and
 		// not desync) until we adopt the new key — symmetric with everyone else.
-		assertNull(WalkieClient.outboundFrame(FRAME, FrameCrypto.fromPassphrase("old-secret", "team"), "new-kcv-we-cannot-match"),
+		assertNull(WalkieClient.outboundFrame(FRAME, FrameCrypto.fromPassphrase("old-secret", "team"), "new-kcv-we-cannot-match", NAMED_CHANNEL),
 				"a member holding a stale key after a rotation it hasn't adopted must be muted");
 	}
 
@@ -54,8 +88,8 @@ class WalkieClientTest {
 		// During a channel switch the server still routes our audio to the OLD (encrypted) channel until it
 		// processes the Join. switchTo clears the key for a plaintext target but deliberately leaves the OLD
 		// channel's key-check in effect, so the gate must DROP rather than leak plaintext into the channel we are
-		// leaving. (Same predicate as the enable case, pinned separately because it is a distinct real trigger.)
-		assertNull(WalkieClient.outboundFrame(FRAME, null, "old-encrypted-channel-kcv"),
+		// leaving. (Same predicate as the no-key case, pinned separately because it is a distinct real trigger.)
+		assertNull(WalkieClient.outboundFrame(FRAME, null, "old-encrypted-channel-kcv", NAMED_CHANNEL),
 				"a switch out of an encrypted channel must not leak plaintext during the join round-trip");
 	}
 
@@ -63,7 +97,7 @@ class WalkieClientTest {
 	void aMatchingKeySendsCiphertext() throws GeneralSecurityException {
 		// The owner's own seamless re-key (or a member that entered the new passphrase): key present -> ciphertext.
 		FrameCrypto key = FrameCrypto.fromPassphrase("secret", "team");
-		byte[] out = WalkieClient.outboundFrame(FRAME, key, key.keyCheck());
+		byte[] out = WalkieClient.outboundFrame(FRAME, key, key.keyCheck(), NAMED_CHANNEL);
 		assertNotNull(out);
 		assertFalse(Arrays.equals(FRAME, out));
 		assertEquals(E2EE_SCHEME, out[0]);
@@ -72,9 +106,13 @@ class WalkieClientTest {
 	// --- rekeyAction: the announced-passphrase-change decision (never adopt a non-matching key) --------
 
 	@Test
-	void rekeyDisablesWhenTheAnnouncedKeyCheckIsNull() {
-		// The owner turned encryption off — drop the key regardless of what we derived.
-		assertEquals(WalkieClient.RekeyAction.DISABLE, WalkieClient.rekeyAction(null, null));
+	void rekeyRefusesADowngradeWhenNoKeyCheckIsAnnounced() throws GeneralSecurityException {
+		// This used to assert RekeyAction.DISABLE — "the owner turned encryption off, drop the key". That is gone
+		// in both directions: the server refuses a clearing rotation with PASSPHRASE_REQUIRED, and obeying such an
+		// announcement would be a downgrade (with the key dropped, outboundFrame sends in the clear). KEEP is the
+		// fail-closed answer, and it must hold whatever we derived — including nothing.
+		assertEquals(WalkieClient.RekeyAction.KEEP, WalkieClient.rekeyAction(null, null));
+		assertEquals(WalkieClient.RekeyAction.KEEP, WalkieClient.rekeyAction(null, FrameCrypto.fromPassphrase("secret", "team")));
 	}
 
 	@Test

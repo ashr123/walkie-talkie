@@ -9,6 +9,7 @@ import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
 import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.server.TestKeyChecks;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
@@ -37,6 +38,12 @@ import static org.junit.jupiter.api.Assertions.*;
 /// monitors. The bar: no operation throws, the run finishes (no deadlock — see [Timeout]), and once every
 /// session has closed, no channel is leaked.
 class ConcurrencyStressTest {
+
+	/// The key-checks both the joins and the passphrase rotations below draw from. They must come from ONE set: a
+	/// rotation to a value no join ever presents starves every later join with `PASSPHRASE_MISMATCH`, leaving the
+	/// storm hammering channels nobody can enter — which is not a failure, just a test that stops testing. Four
+	/// values over 48,000 operations means they agree constantly while rotations still genuinely change the value.
+	private static final String[] KEY_CHECKS = {"kcv-0", "kcv-1", "kcv-2", "kcv-3"};
 
 	private static final MessageBroadcaster BROADCASTER =
 			new MessageBroadcaster(new MessageCodec(JsonMapper.shared()));
@@ -69,20 +76,23 @@ class ConcurrencyStressTest {
 		String[] channels = {"alpha", "beta", "gamma", "delta"};   // few channels, many sessions -> high contention
 		byte[] frame = {1, 2, 3};
 		Collection<Throwable> errors = new ConcurrentLinkedQueue<>();
+		Collection<FakeClientSession> sessions = new ConcurrentLinkedQueue<>();
 		CountDownLatch start = new CountDownLatch(1);
 		Collection<Thread> threads = new ArrayList<>();
 
 		for (int w = 0; w < workers; w++) {
 			int seed = w;
 			threads.add(Thread.ofVirtual().unstarted(() -> {
-				ClientSession me = new FakeClientSession("s-" + seed, Transport.AUDIO_RELAY, "n-" + seed);
+				FakeClientSession me = new FakeClientSession("s-" + seed, Transport.AUDIO_RELAY, "n-" + seed);
+				sessions.add(me);
 				Random rnd = new Random(seed);
 				try {
 					start.await();
 					for (int i = 0; i < opsPerWorker; i++) {
 						switch (rnd.nextInt(8)) {
 							case 0 -> service.onMessage(me, new ClientMessage.Join(
-									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, "n-" + seed, null));
+									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, "n-" + seed,
+									KEY_CHECKS[rnd.nextInt(KEY_CHECKS.length)]));
 							case 1 -> service.onMessage(me, new ClientMessage.RequestFloor());
 							case 2 -> service.onMessage(me, new ClientMessage.ReleaseFloor());
 							case 3 -> service.onMessage(me, new ClientMessage.Rename("n-" + seed + "-" + i % 40));
@@ -90,10 +100,15 @@ class ConcurrencyStressTest {
 							case 5 -> service.onMessage(me, new ClientMessage.Leave());
 							// Passphrase rotation races joins/leaves on the SAME channel: only the channel's current
 							// owner succeeds (others get NOT_OWNER, no throw), so the registry's key-check write must
-							// stay serialized with join validation under the channel-name bin lock. A null key-check
-							// flips the channel back to unencrypted, keeping joins (which present null) succeeding.
+							// stay serialized with join validation under the channel-name bin lock.
+							//
+							// Rotations draw from the same [#KEY_CHECKS] set case 0's joins present, so the two agree
+							// often enough for joins to keep landing. This used to rely on rotating to null, which
+							// made the channel plaintext and matched joins presenting null; that is refused now.
+							// `null` is still requested one time in three deliberately — it IS refused, and that
+							// refusal has to be harmless under contention too.
 							case 6 -> service.onMessage(me, new ClientMessage.ChangePassphrase(
-									rnd.nextInt(3) == 0 ? null : "kcv-" + i % 4, null));
+									rnd.nextInt(3) == 0 ? null : KEY_CHECKS[i % KEY_CHECKS.length], null));
 							// Ownership transfer races the auto-election a concurrent leave performs AND the case-6
 							// rotation (both write under the same channel-name bin lock). Half the time target SELF —
 							// guaranteed a current member, so when this worker currently owns its channel the OK
@@ -125,6 +140,13 @@ class ConcurrencyStressTest {
 		assertTrue(errors.isEmpty(),
 				() -> "concurrent operations threw " + errors.size() + " error(s): "
 						+ errors.stream().map(Throwable::toString).distinct().collect(Collectors.joining("; ")));
+		// A POSITIVE assertion, because the two above are both satisfied by a registry nothing ever entered: if every
+		// join were refused, "no errors" and "no channels left" would still hold and this test would report success
+		// while exercising nothing. Not hypothetical — making a passphrase mandatory did exactly that on the first
+		// attempt, taking the peak live-channel count from 4 to 0 with the whole suite still green.
+		assertTrue(sessions.stream().flatMap(session -> session.sent.stream())
+						.anyMatch(ServerMessage.Joined.class::isInstance),
+				"no join was ever accepted — the storm ran against an empty registry and asserted nothing");
 		assertEquals(0, registry.channelCount(),
 				"every channel is dropped once empty — no channel is leaked after all sessions close");
 	}
@@ -263,6 +285,7 @@ class ConcurrencyStressTest {
 		String[] channels = {"alpha", "beta"};   // fewer channels, many sessions -> heavy queue contention
 		byte[] frame = {1, 2, 3};
 		Collection<Throwable> errors = new ConcurrentLinkedQueue<>();
+		Collection<FakeClientSession> sessions = new ConcurrentLinkedQueue<>();
 		CountDownLatch start = new CountDownLatch(1);
 		CountDownLatch done = new CountDownLatch(workers);
 		Collection<Thread> threads = new ArrayList<>();
@@ -270,14 +293,16 @@ class ConcurrencyStressTest {
 		for (int w = 0; w < workers; w++) {
 			int seed = w;
 			threads.add(Thread.ofVirtual().unstarted(() -> {
-				ClientSession me = new FakeClientSession("s-" + seed, Transport.AUDIO_RELAY, "n-" + seed);
+				FakeClientSession me = new FakeClientSession("s-" + seed, Transport.AUDIO_RELAY, "n-" + seed);
+				sessions.add(me);
 				Random rnd = new Random(seed);
 				try {
 					start.await();
 					for (int i = 0; i < opsPerWorker; i++) {
 						switch (rnd.nextInt(7)) {
 							case 0 -> service.onMessage(me, new ClientMessage.Join(
-									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, "n-" + seed, null));
+									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, "n-" + seed,
+									KEY_CHECKS[0]));   // one value: nothing rotates here, so joins must all agree
 							// Request interpreted by state: grab a free floor, claim a reserved turn, or enqueue behind
 							// a busy one — all under the channel monitor with the holder swap.
 							case 1, 2 -> service.onMessage(me, new ClientMessage.RequestFloor());
@@ -321,6 +346,13 @@ class ConcurrencyStressTest {
 		assertTrue(errors.isEmpty(),
 				() -> "concurrent queue operations under the sweep threw " + errors.size() + " error(s): "
 						+ errors.stream().map(Throwable::toString).distinct().collect(Collectors.joining("; ")));
+		// A POSITIVE assertion, because the two above are both satisfied by a registry nothing ever entered: if every
+		// join were refused, "no errors" and "no channels left" would still hold and this test would report success
+		// while exercising nothing. Not hypothetical — making a passphrase mandatory did exactly that on the first
+		// attempt, taking the peak live-channel count from 4 to 0 with the whole suite still green.
+		assertTrue(sessions.stream().flatMap(session -> session.sent.stream())
+						.anyMatch(ServerMessage.Joined.class::isInstance),
+				"no join was ever accepted — the storm ran against an empty registry and asserted nothing");
 		assertEquals(0, registry.channelCount(),
 				"every channel is dropped once empty — no channel (nor its floor/queue/reservation state) is leaked");
 	}

@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.integration;
 
+import io.github.ashr123.walkietalkie.server.TestKeyChecks;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
@@ -19,9 +20,9 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	private String[] joinPair(String channel, ChannelMode mode,
 	                          WebSocketSession sa, CollectingHandler a,
 	                          WebSocketSession sb, CollectingHandler b) throws Exception {
-		send(sa, new ClientMessage.Join(channel, mode, "Alice", null));
+		send(sa, new ClientMessage.Join(channel, mode, "Alice", TestKeyChecks.keyCheckFor(mode)));
 		ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
-		send(sb, new ClientMessage.Join(channel, mode, "Bob", null));
+		send(sb, new ClientMessage.Join(channel, mode, "Bob", TestKeyChecks.keyCheckFor(mode)));
 		ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 		awaitType(a.messages, ServerMessage.MemberJoined.class);
 		// Every real join now seeds the joiner with an authoritative FloorStatus snapshot (toOne). Drain Bob's here
@@ -178,7 +179,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			assertEquals(ChannelMode.FULL_DUPLEX, awaitType(b.messages, ServerMessage.ModeChanged.class).mode());
 
 			// A member who joins afterwards is not the owner and cannot.
-			send(sc, new ClientMessage.Join("reelect", ChannelMode.FULL_DUPLEX, "Carol", null));
+			send(sc, new ClientMessage.Join("reelect", ChannelMode.FULL_DUPLEX, "Carol", TestKeyChecks.ENCRYPTED));
 			awaitType(c.messages, ServerMessage.Joined.class);
 			send(sc, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
 			assertEquals(ErrorCode.NOT_OWNER, awaitType(c.messages, ServerMessage.ErrorMessage.class).code());
@@ -196,15 +197,21 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
 			String[] ids = joinPair("rotate-wire", ChannelMode.MULTI_CHANNEL_PTT, sa, a, sb, b);
 
-			// Enable encryption with a non-null key-check — both peers receive PassphraseChanged carrying it.
+			// Rotate to a new key-check — both peers receive PassphraseChanged carrying it. (Not an "enable": the
+			// channel was created encrypted, since a join with no key-check is refused.)
 			send(sa, new ClientMessage.ChangePassphrase("kcv-hex-1", null));
 			assertEquals("kcv-hex-1", awaitType(a.messages, ServerMessage.PassphraseChanged.class).keyCheck());
 			assertEquals("kcv-hex-1", awaitType(b.messages, ServerMessage.PassphraseChanged.class).keyCheck());
 
-			// Disable — the NULL key-check must survive the JSON round-trip (a Jackson null regression shows only here).
-			send(sa, new ClientMessage.ChangePassphrase(null, null));
-			assertNull(awaitType(a.messages, ServerMessage.PassphraseChanged.class).keyCheck());
-			assertNull(awaitType(b.messages, ServerMessage.PassphraseChanged.class).keyCheck());
+			// Rotate again WITHOUT a wrapped key (the owner opted out of auto-distribution): a null `wrappedKey`
+			// must survive the JSON round-trip. This is what keeps the Jackson-null regression covered now that a
+			// null KEY-CHECK is refused — the coverage that mattered here was "a null-valued protocol field arrives
+			// as null over the wire", and wrappedKey is the field that can still legitimately be one.
+			send(sa, new ClientMessage.ChangePassphrase("kcv-hex-2", null));
+			ServerMessage.PassphraseChanged rotatedA = awaitType(a.messages, ServerMessage.PassphraseChanged.class);
+			assertEquals("kcv-hex-2", rotatedA.keyCheck());
+			assertNull(rotatedA.wrappedKey(), "opting out of sharing must arrive as a null wrappedKey");
+			assertNull(awaitType(b.messages, ServerMessage.PassphraseChanged.class).wrappedKey());
 
 			// Explicit ownership transfer — both peers receive OwnerChanged naming Bob.
 			send(sa, new ClientMessage.TransferOwnership(ids[1]));

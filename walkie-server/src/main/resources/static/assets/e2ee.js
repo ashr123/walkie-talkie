@@ -141,28 +141,53 @@ export async function unwrapPassphrase(wrapped, key) {
 
 /**
  * The pure outbound transmit-gate decision, given the key-check of the key we currently HOLD and the channel's
- * announced key-check. Returns 'plaintext' (unencrypted channel — send as-is), 'encrypt' (our key matches the
- * channel's announced one — send ciphertext), or 'drop' (the channel announces encryption but our key-check
- * doesn't match — stay SILENT). 'drop' covers BOTH a member with no key (the plaintext→encrypted enable, never
- * leak plaintext) AND a member holding a STALE key after a rotation it hasn't adopted (don't emit undecodable
- * audio; a straggler is muted until it adopts). Mirrors the Java client's WalkieClient.outboundFrame.
+ * announced key-check. Returns 'plaintext' (send as-is), 'encrypt' (our key matches the channel's announced one
+ * — send ciphertext), or 'drop' (stay SILENT).
+ *
+ * `plaintextAllowed` is the whole point of this function's shape, and it is the CALLER's own knowledge — true only
+ * for the server-managed `global` room, the one channel that is plaintext by design. It exists because the gate
+ * used to infer "this channel is unencrypted" from `channelKeyCheck == null`, and that value comes from the
+ * SERVER: a single forged `passphraseChanged { keyCheck: null }` therefore flipped a whole encrypted channel to
+ * sending in the clear. Deciding on a fact the client owns instead means no value the server sends can produce a
+ * plaintext frame in a named channel — the worst it can do is get us dropped, which is silence, not a leak.
+ *
+ * The `heldKeyCheck == null` term beside it closes the remaining trust: `plaintextAllowed` is derived from the
+ * MODE, and the mode arrives in the `Joined` snapshot, so a server that lied about it could otherwise still ask a
+ * member of a named channel to talk in the clear. But whether we hold a key is a fact the client owns outright —
+ * we derived it from a passphrase the user typed — and holding one means encryption was intended, full stop. So
+ * plaintext requires BOTH that the channel is allowed to be plaintext AND that we never derived a key for it.
+ *
+ * Outside that, the answer is 'encrypt' only when we hold a key whose key-check equals the announced one, and
+ * 'drop' for every other combination. That deliberately includes BOTH nulls: a named channel with nothing
+ * announced and nothing held used to be 'plaintext' and is now fail-closed.
+ *
+ * 'drop' has two ordinary triggers, neither of them an attack: a member holding a STALE key after a rotation it
+ * has not adopted (don't emit undecodable audio — a straggler is muted until it adopts), and the round trip of
+ * switching between channels, where the announced key-check briefly belongs to the channel we are leaving.
+ * Mirrors the Java client's WalkieClient.outboundFrame.
  */
-export function frameDisposition(heldKeyCheck, channelKeyCheck) {
-	return channelKeyCheck == null ? 'plaintext' : heldKeyCheck === channelKeyCheck ? 'encrypt' : 'drop';
+export function frameDisposition(heldKeyCheck, channelKeyCheck, plaintextAllowed) {
+	if (plaintextAllowed && heldKeyCheck == null) {
+		return 'plaintext';
+	}
+	return heldKeyCheck != null && heldKeyCheck === channelKeyCheck ? 'encrypt' : 'drop';
 }
 
 /**
  * The pure decision for an announced passphrase change, given the channel's announced key-check and the
- * key-check the client derived from the passphrase it holds (or null if none was derived). 'disable' = the owner
- * turned encryption off (drop the key); 'apply' = the derived key matches, adopt it; 'keep' = hold the current
- * key (we don't have the new passphrase yet, or it mismatched — never adopt a non-matching key). The caller
- * must pass the LIVE announced key-check (re-read AFTER any await) so two rapid rotations can't apply a key that
- * only matched a stale value. Mirrors the Java client's WalkieClient.rekeyAction.
+ * key-check the client derived from the passphrase it holds (or null if none was derived). 'apply' = the derived
+ * key matches, adopt it; 'keep' = hold the current key (we don't have the new passphrase yet, or it mismatched —
+ * never adopt a non-matching key). The caller must pass the LIVE announced key-check (re-read AFTER any await) so
+ * two rapid rotations can't apply a key that only matched a stale value.
+ *
+ * A null announced key-check yields 'keep', not a third 'disable' that dropped the key. It used to mean "the owner
+ * turned encryption off"; no conformant server sends it now (a clearing rotation is refused with
+ * PASSPHRASE_REQUIRED), and obeying it would have turned a feature into a DOWNGRADE — with the key dropped,
+ * frameDisposition returns 'plaintext', so one forged or buggy broadcast would put a whole encrypted channel on
+ * the air in the clear. Keeping the key we hold fails closed. Mirrors the Java client's WalkieClient.rekeyAction.
  */
 export function rekeyAction(announcedKeyCheck, derivedKeyCheck) {
-	return announcedKeyCheck == null ?
-		'disable' :
-		derivedKeyCheck != null && derivedKeyCheck === announcedKeyCheck ?
-			'apply' :
-			'keep';
+	return announcedKeyCheck != null && derivedKeyCheck != null && derivedKeyCheck === announcedKeyCheck ?
+		'apply' :
+		'keep';
 }

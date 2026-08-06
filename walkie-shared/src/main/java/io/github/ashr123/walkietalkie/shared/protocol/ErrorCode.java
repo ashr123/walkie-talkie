@@ -25,6 +25,12 @@ public enum ErrorCode {
 	RESERVED_CHANNEL,
 	/// A global-push-to-talk `join` carrying a key-check — the global room is always unencrypted.
 	ENCRYPTION_NOT_ALLOWED,
+	/// The exact inverse of [#ENCRYPTION_NOT_ALLOWED]: a `join` to any channel OTHER than the global room
+	/// carrying no key-check, or an owner trying to clear a channel's passphrase. Every ordinary channel is
+	/// end-to-end encrypted — there is no such thing as a plaintext one — so a client must derive a key from a
+	/// passphrase and send its key-check before it can be admitted. Not transient: retrying without a passphrase
+	/// will fail identically. The server-managed `global` room is the sole exception and is unencrypted by design.
+	PASSPHRASE_REQUIRED,
 	/// An in-channel request (floor, mode, passphrase, transfer, mute, lock…) sent before joining a channel.
 	NOT_IN_CHANNEL,
 	/// An owner-only request (mode, passphrase, transfer, mute, lock) from a member that isn't the owner.

@@ -253,6 +253,30 @@ public class ConnectionService {
 					"The global channel can't be end-to-end encrypted — clear the passphrase to join it.");
 			return;
 		}
+		// ...and the exact inverse: every OTHER channel is end-to-end encrypted, so a join must bring a key-check.
+		// There are no plaintext channels any more; `global` above is the single exception.
+		//
+		// Discriminated on the MODE, not the channel name, for the same reason as the check above: `requested` was
+		// rewritten to GLOBAL_CHANNEL for GLOBAL_PTT at the top of this method, so a name test would exempt any
+		// channel a client happened to call "global".
+		//
+		// Placed here, after the display-name and channel-name checks, so those still report their own specific
+		// reason for a join that is malformed in more than one way — a client that sent a bad name AND no
+		// passphrase is better told about the name it can see than about a key it never derived. Placed BEFORE the
+		// atomic join for the reason the block below documents: nothing has been given up yet, so a refusal costs
+		// the session neither its channel nor its floor.
+		//
+		// Transport-independent by design. A WebRTC session's media never reaches the server and is already
+		// encrypted (DTLS-SRTP), so its key-check buys no media confidentiality — but requiring it keeps ONE
+		// invariant ("every non-global channel has a passphrase"), makes the passphrase a membership credential on
+		// that path, and is what lets a relay member and a WebRTC member finally share a channel: their
+		// key-checks now agree instead of one being null and failing PASSPHRASE_MISMATCH.
+		if (join.mode() != ChannelMode.GLOBAL_PTT && join.keyCheck() == null) {
+			sendError(session, ErrorCode.PASSPHRASE_REQUIRED,
+					"'" + requested + "' needs an end-to-end-encryption passphrase — every channel but '"
+							+ GLOBAL_CHANNEL + "' is encrypted.");
+			return;
+		}
 		// Channel-affinity (multi-instance): this socket may only serve a channel THIS instance owns — the channel
 		// it was routed to at the handshake, or one it already hosts (a live local Channel proves that channel
 		// routes here, by the affinity invariant). A switch to a channel owned by another instance is refused so
@@ -1131,12 +1155,15 @@ public class ConnectionService {
 	}
 
 	/// Rotates the current channel's end-to-end-encryption passphrase, but only for its owner. The server never
-	/// learns the passphrase — the request carries only the key-check derived from the new one (or `null` to make
-	/// the channel unencrypted) — so all it does is record the new key-check and broadcast a `PassphraseChanged`
-	/// to every member (including the owner) so each client re-derives its key from the new passphrase, obtained
-	/// out-of-band exactly as the original was. A non-owner gets `NOT_OWNER`; a request before joining gets
-	/// `NOT_IN_CHANNEL`. The server-managed `global` room has the sentinel owner, so a rotation there is refused
-	/// as `NOT_OWNER` — it stays the unencrypted broadcast room.
+	/// learns the passphrase — the request carries only the key-check derived from the new one — so all it does is
+	/// record the new key-check and broadcast a `PassphraseChanged` to every member (including the owner) so each
+	/// client re-derives its key from the new passphrase, obtained out-of-band exactly as the original was.
+	///
+	/// A rotation can only ever replace one key with another. Clearing it (`keyCheck: null`) used to turn the
+	/// channel plaintext and is now refused with `PASSPHRASE_REQUIRED`, since there are no plaintext channels.
+	/// A non-owner gets `NOT_OWNER`; a request before joining gets `NOT_IN_CHANNEL`. The server-managed `global`
+	/// room has the sentinel owner, so a rotation there is refused as `NOT_OWNER` — it stays the unencrypted
+	/// broadcast room, and never reaches the clearing rule at all.
 	///
 	/// Concurrency: the key-check write happens inside the registry's channel-name `computeIfPresent` span (see
 	/// [ChannelRegistry#changePassphrase]), serializing it with every join's key-check validation. The broadcast
@@ -1158,6 +1185,8 @@ public class ConnectionService {
 			case ChannelRegistry.RekeyResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
 			case ChannelRegistry.RekeyResult.NotOwner _ ->
 					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can change the passphrase");
+			case ChannelRegistry.RekeyResult.EncryptionRequired _ -> sendError(session, ErrorCode.PASSPHRASE_REQUIRED,
+					"Encryption can't be turned off — rotate to a new passphrase instead.");
 			case ChannelRegistry.RekeyResult.Ok(Channel channel) -> {
 				synchronized (channel) {
 					// Broadcast the LIVE key-check (convergence) plus this request's wrappedKey relayed verbatim —
@@ -1166,8 +1195,10 @@ public class ConnectionService {
 					// blob just falls back to a manual re-entry).
 					broadcaster.toAll(channel, new ServerMessage.PassphraseChanged(channel.keyCheck(), wrappedKey));
 				}
-				// Log the encrypted/plaintext STATUS only — never the key-check token or the wrapped blob.
-				log.info("changed passphrase (now {})", keyCheck == null ? "unencrypted" : "encrypted");
+				// The fact of a rotation only — never the key-check token or the wrapped blob. There is no longer an
+				// encrypted/plaintext status to report: reaching here means the channel is encrypted, and a clear
+				// was refused above.
+				log.info("rotated the channel passphrase");
 			}
 		}
 	}

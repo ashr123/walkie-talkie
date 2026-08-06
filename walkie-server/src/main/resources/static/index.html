@@ -535,6 +535,35 @@
             font-size: 12px;
             margin-top: 6px;
         }
+
+        /* A required field that is not yet satisfied. Added/removed at runtime by app.js (classList) on the INPUT,
+           so it never appears in the static HTML. Deliberately not :invalid — these fields carry no `required` or
+           `pattern` attribute, because the rules live in assets/connect-form.js where they can be unit-tested and
+           kept identical to the server's; letting the browser own a second, slightly different copy of them is
+           exactly the drift this repo avoids elsewhere. */
+        /*noinspection CssUnusedSymbol*/
+        input.needed {
+            border-color: var(--accent);
+        }
+
+        /* The message under a field that still needs something — same size as .hint but in the warning colour, so
+           "what is missing" reads differently from "here is how this works". Populated and shown/hidden by app.js;
+           aria-live so a screen reader hears the change without the field having to be re-focused. */
+        /*noinspection CssUnusedSymbol*/
+        .needs {
+            color: var(--accent);
+            font-size: 12px;
+            margin-top: 6px;
+        }
+
+        /* The one-line summary sitting directly above the Connect button, naming every field still outstanding, so
+           the reason the button is dead is visible without hunting up the form for warning text. */
+        #connectSummary {
+            color: var(--accent);
+            font-size: 12px;
+            margin-top: 12px;
+            text-align: center;
+        }
 	</style>
 </head>
 <body>
@@ -546,7 +575,8 @@
 	<section class="panel" id="setup">
 		<h2>Connect</h2>
 		<label for="display">Display name</label>
-		<input autocomplete="off" id="display" placeholder="1-32 letters, digits or spaces (any language), _ . -" value="Alice">
+		<input aria-describedby="displayNeeds" autocomplete="off" id="display" placeholder="1-32 letters, digits or spaces (any language), _ . -">
+		<div aria-live="polite" class="needs" hidden id="displayNeeds"></div>
 		<div class="hint">Shown to others. Your identity in a channel is a per-connection id; if two people
 			share a display name, each is shown with a short <code>#id</code> to tell them apart.
 		</div>
@@ -556,7 +586,8 @@
 		     editable (changing the channel name = switching to a different room, so a non-owner can pick its
 		     properties; staying on the current channel, only the owner can). -->
 		<label for="channel">Channel</label>
-		<input autocomplete="off" id="channel" value="lobby">
+		<input aria-describedby="channelNeeds" autocomplete="off" id="channel" placeholder="1-64 letters, digits, _ or -">
+		<div aria-live="polite" class="needs" hidden id="channelNeeds"></div>
 		<div class="hint" hidden id="channelHint">Global push-to-talk uses one shared channel for everyone — the name is fixed to <code>global</code>. Switch the Channel mode away from global to join a different channel.</div>
 		<label for="transport">Transport</label>
 		<select id="transport">
@@ -579,10 +610,12 @@
 		<label id="startMutedRow" style="display:none; align-items:center; gap:8px; margin-top:10px;">
 			<input id="startMuted" style="width:auto;" type="checkbox"> Connect muted
 		</label>
-		<label for="passphrase" id="passphraseLabel">Encryption passphrase (optional, relay)</label>
-		<input autocomplete="off" id="passphrase" placeholder="shared secret — leave blank for none" type="password">
+		<label for="passphrase" id="passphraseLabel">Encryption passphrase</label>
+		<input aria-describedby="passphraseNeeds" autocomplete="off" id="passphrase" placeholder="shared secret — everyone in the channel uses the same one" type="password">
+		<div aria-live="polite" class="needs" hidden id="passphraseNeeds"></div>
 		<div class="hint" hidden id="passphraseHint">The global channel is the server's unencrypted broadcast room — encryption isn't available there.</div>
-		<button id="connectBtn">Connect</button>
+		<div aria-live="polite" hidden id="connectSummary"></div>
+		<button disabled id="connectBtn">Connect</button>
 		<button class="secondary" hidden id="disconnectBtn" style="width:100%; margin-top:8px;">Disconnect</button>
 		<label for="ownerSelect" hidden id="ownerLabel" style="margin-top:8px;">Channel owner</label>
 		<select hidden id="ownerSelect"></select>
@@ -593,8 +626,8 @@
 			pending changes.</span><span id="applyHintInChannel">Change the transport, mode, channel, passphrase, or
 			owner above, then Apply — or Reset to discard the pending changes. A new channel name switches rooms
 			(carrying the chosen properties); otherwise the change applies to the current channel — mode, passphrase
-			and ownership are owner-only, and changing the transport reconnects. Clear the passphrase and Apply to turn
-			encryption off.</span></div>
+			and ownership are owner-only, and changing the transport reconnects. A passphrase can be rotated but not
+			removed — every channel except the global room is end-to-end encrypted.</span></div>
 		<label hidden id="shareRekeyRow" style="align-items:center; gap:8px; margin-top:8px;">
 			<input checked id="shareRekey" style="width:auto;" type="checkbox"> <span id="shareRekeyText">Share new passphrase with current members (uncheck to require everyone to re-enter it)</span>
 		</label>

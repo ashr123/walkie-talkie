@@ -77,20 +77,32 @@ test('decrypt rejects a plaintext peer frame (no scheme byte), even with the rig
 
 // --- the transmit-gate invariant: only put on the wire what the channel's current key-check matches ------
 
-test('a genuinely unencrypted channel sends in the clear', () => {
-	assert.equal(frameDisposition(null, null), 'plaintext');
+test('frameDisposition: the complete truth table — plaintext ONLY in the global room', () => {
+	// Exhaustive over (held, announced) x plaintextAllowed, because this is the function that decides whether
+	// cleartext audio reaches the relay and the interesting cases are precisely the combinations nobody pictures.
+	// `plaintextAllowed` is the caller's OWN mode (true only for global), never anything the server said.
+	const GLOBAL = true, NAMED = false;
+	[
+		// held,      announced,   plaintextAllowed, expected, why
+		[null,        null,        GLOBAL, 'plaintext', 'the global room: no key either side, plaintext by design'],
+		['kcv-X',     null,        GLOBAL, 'drop',      'holding a key means encryption was intended — even if the mode claims global'],
+		['kcv-X',     'kcv-X',     NAMED,  'encrypt',   'our key matches the channel'],
+		['kcv-OLD',   'kcv-NEW',   NAMED,  'drop',      'stale key after a rotation we have not adopted'],
+		[null,        'kcv-X',     NAMED,  'drop',      'we hold NO key for an encrypted channel'],
+		['kcv-X',     null,        NAMED,  'drop',      'THE DOWNGRADE: a named channel announcing no key-check'],
+		[null,        null,        NAMED,  'drop',      'a named channel with nothing announced and nothing held'],
+		[undefined,   'kcv-X',     NAMED,  'drop',      'an unset held key-check is not a match either'],
+	].forEach(([held, announced, allowed, expected, why]) =>
+			assert.equal(frameDisposition(held, announced, allowed), expected, why));
 });
 
-test('ENABLE transition: a member with no key into an announced-encrypted channel is DROPPED', () => {
-	// The leak case the round-1 review caught: no key held (channel was plaintext) but the owner just announced a
-	// non-null key-check. Must NOT fall back to plaintext.
-	assert.equal(frameDisposition(null, 'non-null-kcv'), 'drop');
-});
-
-test('frameDisposition: a matching held key-check encrypts; a stale one is muted', () => {
-	assert.equal(frameDisposition('kcv-X', 'kcv-X'), 'encrypt');     // our key matches the channel -> send ciphertext
-	assert.equal(frameDisposition('kcv-OLD', 'kcv-NEW'), 'drop');    // stale key after a rotation we haven't adopted -> muted
-	assert.equal(frameDisposition('kcv-X', null), 'plaintext');      // channel is unencrypted
+test('frameDisposition refuses the downgrade a forged rotation would attempt', () => {
+	// The specific hole this shape closes. The gate used to read "the channel is unencrypted" off the
+	// SERVER-supplied announced key-check, so one forged `passphraseChanged { keyCheck: null }` turned every
+	// member of an encrypted channel into a cleartext transmitter. Deciding plaintext from the client's own mode
+	// means the worst a forged value can now do is get us DROPPED — silence, not a leak.
+	assert.equal(frameDisposition('kcv-X', null, false), 'drop');
+	assert.notEqual(frameDisposition('kcv-X', null, false), 'plaintext');
 });
 
 test('wrapPassphrase round-trips under the same key, and only that key can unwrap', async () => {
@@ -124,9 +136,14 @@ test('decryptFrame rejects a frame shorter than scheme+IV+tag (29 bytes)', async
 
 // --- rekeyAction: the announced-passphrase-change decision (must stay in lock-step with WalkieClient.rekeyAction)
 
-test('rekeyAction: disable when nothing is announced', () => {
-	assert.equal(rekeyAction(null, 'whatever'), 'disable');
-	assert.equal(rekeyAction(null, null), 'disable');
+test('rekeyAction REFUSES a downgrade: an announcement of no key-check keeps the key we hold', () => {
+	// This used to return a third action, 'disable', which dropped the key — that was the owner turning encryption
+	// off. Encryption cannot be turned off any more (the server refuses a clearing rotation with
+	// PASSPHRASE_REQUIRED), so obeying such an announcement would have flipped from feature to DOWNGRADE: with the
+	// key dropped, frameDisposition returns 'plaintext', and one forged or buggy broadcast would put every member
+	// of an encrypted channel on the air in the clear. Failing closed is the whole point.
+	assert.equal(rekeyAction(null, 'whatever'), 'keep');
+	assert.equal(rekeyAction(null, null), 'keep');
 });
 
 test('rekeyAction: apply only on a matching derived key-check', () => {

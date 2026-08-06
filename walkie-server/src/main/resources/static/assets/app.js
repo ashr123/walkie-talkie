@@ -20,6 +20,7 @@ import {
 } from './e2ee.js';
 import {CHANNEL_FLAGS, flagDisplay} from './channel-flags.js';
 import {canonicalDisplayName, isValidDisplayName} from './names.js';
+import {canConnect, CHANNEL_NAME, connectProblems, readinessSummary} from './connect-form.js';
 import {micErrorMessage, NO_CAPTURE_API_MESSAGE} from './mic-errors.js';
 import {
 	FLOOR_IN_LINE,
@@ -51,7 +52,6 @@ const STEREO_BITRATE = 128000;   // stereo needs ~2x for equivalent quality
 const CODEC_OPUS = 1;
 const CODEC_PCM = 2;
 const OPUS_SUPPORTED = typeof AudioEncoder !== 'undefined' && typeof AudioDecoder !== 'undefined';
-const CHANNEL_NAME = /^[A-Za-z0-9_-]{1,64}$/;    // must match the server's CHANNEL_NAME validation (no '.', unlike display names)
 const SERVER_OWNER = 'server';   // ownerId the server stamps on the server-managed "global" room (matches ConnectionService.GLOBAL_CHANNEL_OWNER); no participant owns it
 const MAX_ACTIVE_DECODERS = 8;   // cap on per-sender decoders we mix at once (O(N^2) fan-out guard); evict longest-silent
 const SILENCE_TTL_MS = 4000;     // close a per-sender lane after this much silence (survives speech gaps + jitter)
@@ -177,18 +177,25 @@ function ownsChannel() {
 // --- connection -----------------------------------------------------------------------------------
 
 /**
- * Derive (or clear) the relay E2EE key + key-check for a (transport, passphrase, mode, channel) and store them
- * in state. WebRTC media is already peer-to-peer encrypted, so it never uses a relay key. Shared by connect()
- * and applyOrSwitch() so re-keying on a channel switch matches the initial-connect derivation exactly.
+ * Derive (or clear) the E2EE key + key-check for a (passphrase, mode, channel) and store them in state. Shared by
+ * connect() and applyOrSwitch() so re-keying on a channel switch matches the initial-connect derivation exactly.
+ *
+ * Derived on BOTH transports, deliberately, even though only the relay path ever encrypts a frame with the key
+ * (WebRTC media is already peer-to-peer encrypted via DTLS-SRTP, and the server never sees it). The key-check is
+ * what the server matches a joiner against, so a WebRTC join that carried none could only ever enter a channel
+ * whose key-check is also null — which no longer exists outside `global`. Deriving on both keeps one invariant,
+ * makes the passphrase a membership credential on the WebRTC path, and is what finally lets a relay member and a
+ * WebRTC member share a channel: previously their key-checks could never agree.
+ *
  */
-async function deriveJoinKey(transport, passphrase, mode, channel) {
+async function deriveJoinKey(passphrase, mode, channel) {
 	/**
 	 * Global is the server-managed, always-unencrypted room — the server rejects an encrypted global join
 	 * (ENCRYPTION_NOT_ALLOWED). So drop the key for GLOBAL_PTT regardless of any passphrase still sitting in the
 	 * field (e.g. when switching INTO global from an encrypted channel), mirroring the Java client's deriveCrypto;
 	 * otherwise the join would carry a non-null keyCheck and be refused, silently failing the switch.
 	 */
-	const derived = transport === 'relay' && passphrase && mode !== 'GLOBAL_PTT'
+	const derived = passphrase && mode !== 'GLOBAL_PTT'
 		? await deriveKey(passphrase, channel)
 		: null;
 	// Remember what this (optimistic) key change overwrites. The server keeps us in our current channel unless the
@@ -198,6 +205,65 @@ async function deriveJoinKey(transport, passphrase, mode, channel) {
 	state.cryptoKey = derived ? derived.key : null;
 	state.keyCheck = derived ? derived.keyCheck : null;
 	state.passphrase = derived ? passphrase : '';   // remember what backs the current key, for the adaptive button
+}
+
+/**
+ * The Connect form as the plain object connect-form.js's rules take. One reader for the whole form, so the gate
+ * that disables the button and the gate inside connect()/applyOrSwitch() are looking at the same thing.
+ *
+ * `secureContext` is resolved here rather than inside the rules because the rules are DOM-free and unit-tested
+ * under Node, where `window` does not exist. `crypto.subtle` is the thing actually needed (it is undefined outside
+ * a secure context), so test for it rather than trusting isSecureContext alone.
+ */
+function formValues() {
+	return {
+		displayName: byId('display').value,
+		channel: byId('channel').value,
+		mode: byId('mode').value,
+		passphrase: byId('passphrase').value,
+		secureContext: Boolean(window.isSecureContext && window.crypto && crypto.subtle),
+	};
+}
+
+/** The per-field message element for a field id, by convention `<field>Needs`. */
+const NEEDS_FIELDS = ['display', 'channel', 'passphrase'];
+
+/**
+ * Show what the form still needs, and keep Connect disabled until it needs nothing. Runs on every keystroke and on
+ * every mode change, and once at startup — the page now loads with the display name, channel and passphrase all
+ * empty (no pre-filled "Alice"/"lobby"), so "not ready yet" is the state the user first meets and it has to
+ * explain itself rather than just presenting a dead button.
+ *
+ * Three levels of telling, because a single one is never enough: the offending input is outlined, the message under
+ * it says what that field needs, and a summary above the button names every outstanding field so the reason the
+ * button is dead is visible right where the user is clicking. All three come from one call to connectProblems, so
+ * they cannot contradict each other.
+ *
+ * Only the pre-connect Connect button is gated here. The connected form's adaptive Apply/Switch button has its own
+ * enablement rules (updateApplyControls) and its own reasons to be disabled, and applyOrSwitch re-checks these
+ * same rules when it acts.
+ */
+function updateConnectReadiness() {
+	const problems = connectProblems(formValues());
+	const byField = new Map(problems.map(problem => [problem.field, problem.message]));
+	NEEDS_FIELDS.forEach(field => {
+		const message = byField.get(field);
+		const input = byId(field);
+		const slot = byId(`${field}Needs`);
+		// A hidden field (the passphrase and channel in global mode) must not be outlined or explained: it is not
+		// something the user can act on, and connectProblems does not report it in that mode anyway.
+		input.classList.toggle('needed', Boolean(message) && !input.hidden);
+		slot.textContent = message ?? '';
+		slot.hidden = !message || input.hidden;
+	});
+	const summary = byId('connectSummary');
+	const text = readinessSummary(formValues());
+	summary.textContent = text;
+	summary.hidden = text === '';
+	const connectBtn = byId('connectBtn');
+	connectBtn.disabled = !canConnect(formValues());
+	// Say WHY on hover too, for a pointer user who has not scrolled the fields into view.
+	connectBtn.title = connectBtn.disabled ? text : '';
 }
 
 async function connect() {
@@ -215,24 +281,15 @@ async function connect() {
 	const channel = byId('channel').value.trim();
 	const passphrase = byId('passphrase').value;   // read once; used only on the relay path (E2EE)
 
-	if (!isValidDisplayName(display)) {
-		log('Display name must be 1-32 letters, digits or spaces (any language), _ . or - — no invisible characters.');
-		return;
-	}
-	// A channel name is required (no silent default) — except in global mode, where the field is hidden and the
-	// server forces the channel to "global".
-	if (state.mode !== 'GLOBAL_PTT' && !CHANNEL_NAME.test(channel)) {
-		log('Channel name must be 1-64 chars of letters, digits, _ or - (no spaces).');
-		return;
-	}
-
-	// crypto.subtle is only exposed in a secure context (HTTPS or localhost). A second device reaching
-	// this server over http://<LAN-IP> has no crypto.subtle, so catch that here — before we acquire the
-	// mic — and explain it, rather than throwing a cryptic TypeError mid-connect.
-	if (state.transport === 'relay' && passphrase
-		&& !(window.isSecureContext && window.crypto && crypto.subtle)) {
-		log('End-to-end encryption needs a secure context (HTTPS or localhost). '
-			+ 'Clear the passphrase to connect without it, or serve the page over HTTPS.');
+	// The same verdict the Connect button is disabled by (connect-form.js), re-checked here rather than trusted:
+	// the button can be bypassed by pressing Enter in the form, and a rule that is enforced in only one of those
+	// two places is a rule that will eventually disagree with itself. Covers all three required fields AND the
+	// secure-context requirement — crypto.subtle is absent over plain HTTP to a LAN address, so a passphrase could
+	// not be turned into a key there, and there is no longer an unencrypted way to connect to fall back on.
+	const problems = connectProblems(formValues());
+	if (problems.length > 0) {
+		problems.forEach(problem => log(problem.message));
+		updateConnectReadiness();   // make the fields say it too, in case Enter got here past a disabled button
 		return;
 	}
 
@@ -263,7 +320,7 @@ async function connect() {
 
 		// End-to-end encryption applies to the relay path only (WebRTC media is already peer-to-peer). The E2EE
 		// status is logged once, uniformly, in onJoined (covering this initial join and any later switch).
-		await deriveJoinKey(state.transport, passphrase, state.mode, channel);
+		await deriveJoinKey(passphrase, state.mode, channel);
 		state.txChain = Promise.resolve();
 		state.warnedDecrypt = false;
 
@@ -356,16 +413,15 @@ async function applyOrSwitch() {
 	if (effectiveChannel !== state.channel) {
 		// Different channel: switch (re-Join), carrying the chosen mode + passphrase. A channel name is required
 		// (no silent default) — global is exempt (channel forced to "global" server-side; the field is hidden).
-		if (mode !== 'GLOBAL_PTT' && !CHANNEL_NAME.test(channel)) {
-			log('Channel name must be 1-64 chars of letters, digits, _ or - (no spaces).');
+		// A switch is a fresh Join, so it must satisfy exactly what a connect does — including the passphrase the
+		// target channel now certainly has. Same function as the button's gate, so the two cannot drift.
+		const switchProblems = connectProblems(formValues());
+		if (switchProblems.length > 0) {
+			switchProblems.forEach(problem => log(problem.message));
+			updateConnectReadiness();
 			return;
 		}
-		if (transport === 'relay' && passphrase
-			&& !(window.isSecureContext && window.crypto && crypto.subtle)) {
-			log('End-to-end encryption needs a secure context (HTTPS or localhost). Clear the passphrase to switch.');
-			return;
-		}
-		await deriveJoinKey(transport, passphrase, mode, channel);
+		await deriveJoinKey(passphrase, mode, channel);
 		sendCtrl({type: 'join', channel, mode, displayName: display, keyCheck: state.keyCheck});
 		if (state.channel === null) {
 			// A CHANNEL-LESS join commits the name outright: the server keeps whatever the Join carried, even if the
@@ -399,10 +455,12 @@ async function applyOrSwitch() {
 				? 'Applied the channel passphrase — you can be heard again.'
 				: 'That passphrase does not match the channel — get the owner’s new passphrase and try again.');
 		} else {
-			// Non-owner on an unencrypted channel: only the owner can turn encryption on. Clear the field so the
-			// button settles instead of looping on a silent no-op.
-			log('Only the channel owner can change the passphrase.');
-			byId('passphrase').value = '';
+			// A non-owner with nothing announced to adopt — reachable before any rotation has been broadcast to
+			// this channel. Only the owner rotates a channel's passphrase (a member who wants a different one
+			// switches channel), so restore the field rather than leave the button looping on a silent no-op.
+			// "Turn encryption on" is not among the options any more: it is already on.
+			log('Only the channel owner can rotate this channel’s passphrase — switch channel to use a different one.');
+			byId('passphrase').value = state.passphrase || '';
 		}
 		acted = true;
 	}
@@ -516,27 +574,21 @@ function updateApplyControls() {
 		byId('passphrase').disabled = lockedForMember && !state.rekeyPending;
 	}
 
-	// The "share new passphrase" control is shown to the OWNER setting a NEW, non-empty passphrase on the CURRENT
-	// relay channel (a name change is a switch, not a rotation; clearing the field disables encryption — nothing
-	// to share). Two cases:
-	//  - encrypted→encrypted ROTATION (we hold an OLD key): the box is ENABLED — leave it checked to wrap the new
-	//    passphrase under the old key so members auto-adopt, or uncheck for a revocation-style re-key;
-	//  - plaintext→encrypted ENABLE (no old key to wrap under): auto-distribution is impossible, so the box is
-	//    DISABLED + unchecked and the label tells the owner every member must enter the new passphrase themselves.
+	// The "share new passphrase" control is shown to the OWNER typing a NEW passphrase for the CURRENT relay
+	// channel (a name change is a switch, not a rotation; a blank field is refused — encryption cannot be turned
+	// off). Every rotation is now encrypted→encrypted, so an OLD key always exists to wrap the new passphrase
+	// under and the box is always usable: checked wraps it so members auto-adopt, unchecked withholds it for a
+	// revocation-style re-key. (It used to also cover a plaintext→encrypted ENABLE, which had no old key to wrap
+	// under and so disabled the box; that transition no longer exists.)
 	const settingNewPassphrase = iAmOwner && !channelChanged && passphraseChanged && passphraseValue !== ''
 		&& transport === 'relay' && mode !== 'GLOBAL_PTT';
-	const canAutoShare = state.cryptoKey != null;   // need an OLD key to wrap the new passphrase under
 	byId('shareRekeyRow').hidden = !settingNewPassphrase;
-	byId('shareRekey').disabled = !canAutoShare;
-	byId('shareRekeyText').textContent = canAutoShare
-		? 'Share new passphrase with current members (uncheck to require everyone to re-enter it)'
-		: 'No existing key to share under — every member must enter the new passphrase themselves';
+	byId('shareRekeyText').textContent =
+		'Share new passphrase with current members (uncheck to require everyone to re-enter it)';
 	if (!settingNewPassphrase) {
 		byId('shareRekey').checked = true;    // hidden → back to the auto-share default for the next rotation
-	} else if (!canAutoShare) {
-		byId('shareRekey').checked = false;   // enable: can't auto-share, so reflect "members must re-enter"
 	}
-	// (rotation + canAutoShare: leave .checked alone, so a manual uncheck isn't undone on the next keystroke)
+	// (while shown: leave .checked alone, so a manual uncheck isn't undone on the next keystroke)
 }
 
 /**
@@ -583,7 +635,8 @@ function sendCtrl(obj) {
 
 /**
  * Owner action (invoked by Apply changes): derive the key-check from the passphrase field for the CURRENT
- * channel and ask the server to rotate it for everyone (a blank field clears encryption → a null key-check).
+ * channel and ask the server to rotate it for everyone. A blank field is refused here rather than sent: it used
+ * to clear encryption, which no channel permits any more.
  * We do NOT swap our own key here — we apply it when the server echoes passphraseChanged, so a rejected request
  * changes nothing.
  */
@@ -592,26 +645,33 @@ async function initiatePassphraseChange() {
 		return;
 	}
 	const passphrase = byId('passphrase').value;
-	if (passphrase && !(window.isSecureContext && window.crypto && crypto.subtle)) {
-		log('End-to-end encryption needs a secure context (HTTPS or localhost). Clear the passphrase to turn it off.');
+	// A blank field used to mean "make this channel plaintext". It cannot any more — the server refuses a cleared
+	// key-check with PASSPHRASE_REQUIRED — so stop the request here, where the reason can be stated plainly,
+	// rather than sending a rotation that comes back as an error. Reachable without the user intending it: a
+	// promoted member who never typed the passphrase (their field is empty) is one Apply click from this.
+	if (!passphrase) {
+		log('Encryption can\u2019t be turned off — type the new passphrase to rotate it, or leave it unchanged.');
+		updateConnectReadiness();
+		return;
+	}
+	if (!(window.isSecureContext && window.crypto && crypto.subtle)) {
+		log('End-to-end encryption needs a secure context (HTTPS or localhost) — open this page over HTTPS.');
 		return;
 	}
 	const effectiveChannel = state.mode === 'GLOBAL_PTT' ? 'global' : state.channel;
-	const derived = passphrase ? await deriveKey(passphrase, effectiveChannel) : null;
-	// Auto-distribution: when the owner opted in (the "Share with current members" box) AND we currently hold a
-	// key (so this is a rotation, not the plaintext→encrypted enable) AND we're setting a new passphrase, wrap the
-	// new passphrase under the OLD key so connected members adopt it automatically. The server relays the blob
-	// without ever seeing the passphrase. Opting out (or no old key / disabling) sends no wrap, so members must
-	// re-enter it out-of-band — use that for a revocation-style rotation that locks out the old key.
-	const wrappedKey = derived && state.cryptoKey && byId('shareRekey').checked
+	const derived = await deriveKey(passphrase, effectiveChannel);
+	// Auto-distribution: when the owner opted in (the "Share with current members" box), wrap the new passphrase
+	// under the OLD key so connected members adopt it automatically. The server relays the blob without ever seeing
+	// the passphrase. Opting out sends no wrap, so members must re-enter it out-of-band — use that for a
+	// revocation-style rotation that locks out the old key. The `state.cryptoKey` term is now belt-and-braces: an
+	// owner rotating a channel always holds its current key, since no channel is ever plaintext.
+	const wrappedKey = state.cryptoKey && byId('shareRekey').checked
 		? await wrapPassphrase(passphrase, state.cryptoKey)
 		: null;
-	sendCtrl({type: 'changePassphrase', keyCheck: derived ? derived.keyCheck : null, wrappedKey});
-	log(passphrase
-		? wrappedKey
-			? 'Requested a re-key — connected members will adopt it automatically…'
-			: 'Requested a re-key for everyone (members must enter the new passphrase out-of-band)…'
-		: 'Requested encryption OFF for everyone…');
+	sendCtrl({type: 'changePassphrase', keyCheck: derived.keyCheck, wrappedKey});
+	log(wrappedKey
+		? 'Requested a re-key — connected members will adopt it automatically…'
+		: 'Requested a re-key for everyone (members must enter the new passphrase out-of-band)…');
 }
 
 /**
@@ -662,19 +722,20 @@ async function applyAnnouncedPassphrase() {
  * pre-entered the new secret), a clear prompt for everyone else.
  */
 async function onPassphraseChanged(keyCheck, wrappedKey) {
+	// REFUSE A DOWNGRADE. A null key-check used to mean "the owner turned encryption off", and this handler
+	// dropped our key in response. No conformant server sends that any more — a clearing rotation is refused with
+	// PASSPHRASE_REQUIRED — and honouring it would now be a downgrade attack rather than a feature: dropping the
+	// key sets state.channelKeyCheck to null, which makes frameDisposition return 'plaintext', so ONE forged or
+	// buggy broadcast would put every member of an encrypted channel on the air in the clear. Keep the key we
+	// hold, say so, and change nothing.
+	if (keyCheck == null) {
+		log('Ignored a passphrase change that would have turned encryption off — this channel stays encrypted.');
+		return;
+	}
 	state.channelKeyCheck = keyCheck;
 	// A new key era — re-arm the one-shot "could not decrypt" notice so a member who misses THIS rotation gets a
 	// fresh cue (the flag is otherwise set on the first failure and never cleared until reconnect).
 	state.warnedDecrypt = false;
-	if (keyCheck == null) {
-		state.cryptoKey = null;
-		state.keyCheck = null;
-		state.passphrase = '';
-		state.rekeyPending = false;
-		updateApplyControls();
-		log('The owner turned end-to-end encryption OFF for this channel.');
-		return;
-	}
 	// Auto-adopt: if the owner shared the new passphrase wrapped under the OLD key (which we still hold), unwrap
 	// it, confirm it derives the announced key-check, and adopt silently — seamless for everyone who held the old
 	// key (including the owner echoing their own rotation). Compare against the LIVE state.channelKeyCheck read
@@ -892,11 +953,12 @@ function onJoined(msg) {
 		: ownsChannel()
 			? 'You own this channel — change mode/passphrase and click Apply, or pick a new owner.'
 			: `Owner: ${memberLabel(state.ownerId)}`);
-	// Report the channel's E2EE status on every confirmed room entry — initial join AND in-place switch, whether
-	// we created the channel or joined an existing one — reflecting the key we actually hold for it. (The global
-	// room already states "no encryption" in the owner line above, so skip the redundant line there.)
+	// Confirm E2EE on every room entry — initial join AND in-place switch. There is no "off" to report outside the
+	// global room any more (a join carrying no key-check is refused with PASSPHRASE_REQUIRED), and the global room
+	// states "no encryption" in the owner line above, so it is skipped. Relay only: on WebRTC we derive a key as
+	// the membership credential, but DTLS-SRTP is what protects that media, so naming AES here would misdescribe it.
 	if (state.transport === 'relay' && state.ownerId !== SERVER_OWNER) {
-		log(state.cryptoKey ? 'End-to-end encryption: ON (AES-256-GCM)' : 'End-to-end encryption: off');
+		log('End-to-end encryption: ON (AES-256-GCM)');
 	}
 	// Report the queue setting on JOIN, not only when the owner toggles it (onFloorQueueChanged). Whoever was already
 	// in the channel heard that toggle; whoever joins afterwards heard nothing — and since the queue defaults OFF,
@@ -1272,6 +1334,10 @@ function updateGlobalModeLocks() {
 	// showing it greyed-out). Toggle display directly rather than the `hidden` attribute: this row's inline
 	// `display:flex` would override the UA `[hidden]{display:none}` rule.
 	byId('startMutedRow').style.display = !isOpen() && mode === 'FULL_DUPLEX' ? 'flex' : 'none';
+	// Which fields are REQUIRED depends on the mode — global asks for neither a channel name nor a passphrase — and
+	// this function is the single funnel for a mode change, pre- and post-connect, as well as the thing that blanks
+	// the passphrase on the way into global. So recompute readiness here rather than at each of its callers.
+	updateConnectReadiness();
 }
 
 /**
@@ -1755,14 +1821,19 @@ function sendTagged(tag, payloadBytes) {
 
 /// Ships one already-tagged frame (`[codec tag][payload]`), applying the transmit-gate decision and E2EE.
 function sendFrame(out) {
-	if (!isOpen()) {
+	// No channel, no audio. The server would drop it anyway (a frame outside a channel is routed nowhere), but the
+	// local stop is what matters: the channel-less state also nulls state.channelKeyCheck (see onJoinRefused), and
+	// resetChannelState does not clear state.transmitting, so without this the only thing standing between "a
+	// refused join" and a cleartext frame is the Talk button happening to be disabled.
+	if (!isOpen() || state.channel === null) {
 		return;
 	}
-	// One pure decision (see e2ee.frameDisposition): 'drop' = the channel announces encryption but we hold no
-	// matching key (e.g. the owner just turned encryption ON and we haven't applied the new passphrase) — stay
-	// SILENT rather than leak cleartext to the relay; 'plaintext' = a genuinely unencrypted channel; 'encrypt' =
-	// we hold a key.
-	const disposition = frameDisposition(state.keyCheck, state.channelKeyCheck);
+	// One pure decision (see e2ee.frameDisposition): 'encrypt' = we hold a key matching the channel's announced
+	// one; 'plaintext' = the global room, the only channel that is plaintext by design; 'drop' = anything else,
+	// which is the fail-closed answer for a rotation we have not adopted yet AND for any announced value that
+	// would otherwise talk us into sending in the clear. The plaintext decision is made from OUR mode, never from
+	// the server-supplied key-check.
+	const disposition = frameDisposition(state.keyCheck, state.channelKeyCheck, state.mode === 'GLOBAL_PTT');
 	if (disposition === 'drop') {
 		return;
 	}
@@ -2538,6 +2609,7 @@ function cleanup() {
 	updateTalkButton();   // "Connect first", disabled, with the live / your-turn highlights cleared
 	byId('connectBtn').hidden = false;
 	byId('disconnectBtn').hidden = true;
+	updateConnectReadiness();   // Connect is visible again — gate it on what the form currently holds
 	byId('renameBtn').hidden = true;
 	byId('renameHint').hidden = true;
 	byId('applyBtn').hidden = true;
@@ -2598,6 +2670,9 @@ window.addEventListener('DOMContentLoaded', () => {
 	// Re-evaluate the adaptive Switch/Apply button as the form fields change (mode is handled in its own listener).
 	byId('channel').addEventListener('input', updateApplyControls);
 	byId('passphrase').addEventListener('input', updateApplyControls);
+	// Readiness is recomputed on every keystroke in each required field, so the button and the messages track what
+	// the user has actually typed rather than waiting for a submit to tell them.
+	NEEDS_FIELDS.forEach(field => byId(field).addEventListener('input', updateConnectReadiness));
 	byId('transport').addEventListener('change', updateApplyControls);
 	// Enable Rename only once the Display name field differs from the current name.
 	byId('display').addEventListener('input', updateRenameButton);

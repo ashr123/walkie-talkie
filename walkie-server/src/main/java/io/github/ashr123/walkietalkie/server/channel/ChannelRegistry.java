@@ -230,7 +230,8 @@ public class ChannelRegistry {
 	/// the caller broadcasts over **that** object, never a fresh `find()`-by-name, which could resolve a
 	/// dropped-and-recreated same-named channel and misroute the notice (the same-object discipline [#leave] uses).
 	/// `NotOwner` = the requester doesn't own the channel; `NotFound` = no such channel (e.g. it emptied and was
-	/// dropped). A sealed hierarchy so the caller's `switch` is exhaustive and the `Channel` is present only on the
+	/// dropped); `EncryptionRequired` = the rotation asked to CLEAR the passphrase, which no channel permits any
+	/// more. A sealed hierarchy so the caller's `switch` is exhaustive and the `Channel` is present only on the
 	/// success variant (never a null field).
 	public sealed interface RekeyResult {
 		record Ok(Channel channel) implements RekeyResult {}
@@ -238,9 +239,15 @@ public class ChannelRegistry {
 		record NotOwner() implements RekeyResult {}
 
 		record NotFound() implements RekeyResult {}
+
+		/// The owner asked to turn encryption off. Refused, so the channel keeps the passphrase it had — a
+		/// distinct variant rather than a caller-side pre-check because the rule has to be evaluated under the
+		/// same bin lock as the write it is refusing (see [#changePassphrase]).
+		record EncryptionRequired() implements RekeyResult {}
 	}
 
-	/// Rotates (sets/clears) a channel's key-check on the owner's request. The owner check and the key-check
+	/// Rotates a channel's key-check on the owner's request. It can only ever be rotated to another key, never
+	/// cleared: there are no plaintext channels (`global` is server-owned, so it never reaches here at all). The owner check and the key-check
 	/// write happen **inside** `channels.computeIfPresent(name, …)`, i.e. under the same `ConcurrentHashMap` bin
 	/// lock that [#joinOrCreate]'s `channels.compute` validates a joiner's key-check under — so a rotation is
 	/// atomic with respect to every concurrent join (a joiner either validates against the old value and is then
@@ -252,11 +259,17 @@ public class ChannelRegistry {
 	public RekeyResult changePassphrase(String name, String requesterId, String newKeyCheck) {
 		AtomicReference<RekeyResult> result = new AtomicReference<>(new RekeyResult.NotFound());
 		channels.computeIfPresent(name, (_, channel) -> {
-			if (requesterId.equals(channel.ownerId())) {
+			if (!requesterId.equals(channel.ownerId())) {
+				result.set(new RekeyResult.NotOwner());
+			} else if (newKeyCheck == null) {
+				// Clearing the passphrase would make this channel plaintext, which no channel may be. Refused HERE,
+				// inside the lock and before the write, so the channel is never even momentarily unencrypted for a
+				// concurrent joiner to slip into — a caller-side pre-check could not promise that. Ordered after the
+				// owner check so a non-owner still hears NOT_OWNER, which is the truer answer for them.
+				result.set(new RekeyResult.EncryptionRequired());
+			} else {
 				channel.setKeyCheck(newKeyCheck);
 				result.set(new RekeyResult.Ok(channel));
-			} else {
-				result.set(new RekeyResult.NotOwner());
 			}
 			return channel;
 		});

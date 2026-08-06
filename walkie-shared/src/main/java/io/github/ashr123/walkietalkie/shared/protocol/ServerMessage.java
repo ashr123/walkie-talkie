@@ -174,15 +174,17 @@ public sealed interface ServerMessage {
 	record OwnerChanged(String ownerId) implements ServerMessage {
 	}
 
-	/// The channel owner changed the end-to-end-encryption passphrase. `keyCheck` is the new key-check value, or
-	/// `null` if the channel is now unencrypted. Every member — including the owner who initiated it — adopts the
-	/// new key and verifies its derived key-check against this one. The passphrase itself is never sent in clear;
-	/// the server never sees it.
+	/// The channel owner rotated the end-to-end-encryption passphrase. `keyCheck` is the new key-check value and is
+	/// always **non-null** — a clearing rotation is refused with `PASSPHRASE_REQUIRED`, so this message never
+	/// announces "now unencrypted". (Both reference clients treat a null one as a downgrade attempt and keep the key
+	/// they hold rather than obeying it.) Every member — including the owner who initiated it — adopts the new key
+	/// and verifies its derived key-check against this one. The passphrase itself is never sent in clear; the server
+	/// never sees it.
 	///
 	/// `wrappedKey` (relayed verbatim from [ClientMessage.ChangePassphrase#wrappedKey()], or `null`) is the new
 	/// passphrase encrypted under the channel's OLD key: a member that still holds the old key decrypts it and
 	/// adopts the new passphrase **automatically**, verifying the result against `keyCheck`. When it is absent (the
-	/// owner opted out, an enable transition, or a tampered/undecryptable blob) the member must obtain the new
+	/// owner opted out, or a tampered/undecryptable blob) the member must obtain the new
 	/// passphrase out-of-band and apply it. Until a member holds a key matching `keyCheck` it is muted — it neither
 	/// transmits (no plaintext, no stale-key audio) nor can decode others.
 	@JsonTypeName("passphraseChanged")

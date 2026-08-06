@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.integration;
 
+import io.github.ashr123.walkietalkie.server.TestKeyChecks;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
@@ -73,7 +74,7 @@ class AuthBoundaryIntegrationTest extends WebSocketIntegrationTestSupport {
 	void aValidQueryTokenOpensAUsableAudioSession() throws Exception {
 		CollectingHandler handler = new CollectingHandler();
 		try (WebSocketSession session = connect(AUDIO, handler, login())) {
-			send(session, new ClientMessage.Join("auth-usable", ChannelMode.MULTI_CHANNEL_PTT, "Alice", null));
+			send(session, new ClientMessage.Join("auth-usable", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joined = awaitType(handler.messages, ServerMessage.Joined.class);
 			assertEquals("auth-usable", joined.channel(), "the authenticated session can join and is fully usable");
 		}
