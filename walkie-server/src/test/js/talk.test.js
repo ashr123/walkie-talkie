@@ -17,16 +17,17 @@ import {
 	FLOOR_IN_LINE,
 	FLOOR_LIVE,
 	FLOOR_MY_TURN,
-	TOO_QUICK_TO_TALK,
 	floorActionFor,
 	floorIsFree,
 	floorNarration,
 	floorStateFor,
 	grantOpensMic,
 	holdInProgress,
+	micTrackEnabled,
 	shouldAutoOpenMic,
 	spaceDrivesFloor,
-	talkDecision
+	talkDecision,
+	TOO_QUICK_TO_TALK,
 } from '../../main/resources/static/assets/talk.js';
 
 const SELF = 'self-session-id';
@@ -728,4 +729,36 @@ test('the FLOOR_* values are the Java client\'s FloorState enum names', () => {
 	assert.equal(FLOOR_MY_TURN, 'MY_TURN');
 	assert.equal(FLOOR_IN_LINE, 'IN_LINE');
 	assert.equal(FLOOR_IDLE, 'IDLE');
+});
+
+// --- micTrackEnabled: the local microphone track follows the FLOOR, and nothing else --------------------
+
+test('micTrackEnabled is exactly "am I transmitting?" — no transport term, no mode term', () => {
+	// The property, stated as the invariant rather than as a table: a track is a capture device, so where its
+	// samples go cannot change whether the floor says the mic is open. This replaced
+	// `transport === 'webrtc' ? on : true`, which forced a relay client's track ENABLED at every disable site —
+	// including endTransmit and the owner-muted branch of beginTransmit. Combined with a relay client answering any
+	// WebRTC offer it was handed, that left a microphone streaming to a peer outside the server's floor and
+	// owner-mute enforcement and outside the passphrase E2EE, with both UIs showing a free floor.
+	assert.equal(micTrackEnabled(true), true);
+	assert.equal(micTrackEnabled(false), false);
+});
+
+test('micTrackEnabled fails closed on anything that is not a definite yes', () => {
+	// Same discipline as grantOpensMic: an absent or non-boolean value must never open a microphone. `createPeer`
+	// calls this with state.transmitting, which is undefined for the window before the first join completes.
+	[undefined, null, 0, 1, '', 'true', 'yes', {}, []].forEach(value =>
+			assert.equal(micTrackEnabled(value), false, `${JSON.stringify(value) ?? String(value)} must not open the mic`));
+});
+
+test('micTrackEnabled agrees with shouldAutoOpenMic on the full-duplex auto-open', () => {
+	// createPeer used to carry its own `mode === 'FULL_DUPLEX' ||` disjunct, which ignored "Connect muted" and
+	// owner-mute. The two functions now have distinct jobs and must not be conflated: shouldAutoOpenMic decides
+	// whether to START transmitting (weighing mode, --muted and owner-mute), and micTrackEnabled reflects whether we
+	// ARE. Full-duplex therefore still opens the mic — via beginTransmit, one step later — but only when
+	// shouldAutoOpenMic agrees.
+	assert.equal(micTrackEnabled(shouldAutoOpenMic('FULL_DUPLEX', false, false)), true);
+	assert.equal(micTrackEnabled(shouldAutoOpenMic('FULL_DUPLEX', true, false)), false, '--muted must stay muted');
+	assert.equal(micTrackEnabled(shouldAutoOpenMic('FULL_DUPLEX', false, true)), false, 'owner-muted must stay muted');
+	assert.equal(micTrackEnabled(shouldAutoOpenMic('MULTI_CHANNEL_PTT', false, false)), false, 'PTT never auto-opens');
 });

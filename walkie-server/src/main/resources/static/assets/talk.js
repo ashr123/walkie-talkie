@@ -67,6 +67,33 @@ export function shouldAutoOpenMic(mode, startMuted, selfMuted) {
 }
 
 /**
+ * Whether the local microphone TRACK should be sending — the ONE answer both places that write
+ * `MediaStreamTrack.enabled` must use. It is exactly "am I transmitting?", with no transport term and no mode
+ * term: a track is a capture device, not a transport, so where its samples end up — the relay's capture worklet,
+ * an `RTCRtpSender`, or both at once — cannot change whether the floor says the mic is open.
+ *
+ * Deleting the transport term is the whole point. `enableLocalTracks` used to write
+ * `transport === 'webrtc' ? on : true`, reasoning that a relay client gates at the SEND site instead
+ * (`onCapturedFrame` drops a frame while the floor is not held). That is true of the relay pipeline and false the
+ * moment the SAME track is handed to a peer connection — which a relay client did whenever a WebRTC member
+ * offered to it, because inbound offers were answered without consulting our own transport. Every disable site
+ * was therefore an ENABLE site: one Talk press-and-release left the microphone streaming to that peer, outside
+ * the server's floor and owner-mute enforcement and outside the passphrase E2EE, with both UIs showing a free
+ * floor.
+ *
+ * Deleting the mode term matters too, and is a separate bug: `createPeer` used
+ * `mode === 'FULL_DUPLEX' || transmitting`, which opened the mic on the first inbound offer regardless of
+ * "Connect muted" or an owner mute. [#shouldAutoOpenMic] already weighs all three terms — `createPeer` simply
+ * never asked it. Full-duplex still auto-opens, one step later and through that function, which is where the
+ * decision belongs.
+ *
+ * `=== true` for [#grantOpensMic]'s reason: a value that is not a definite yes must not open a microphone.
+ */
+export function micTrackEnabled(transmitting) {
+	return transmitting === true;
+}
+
+/**
  * Whether an arriving `FloorGranted` should OPEN THE MIC — the other half of the "should the mic open by itself?"
  * question above, for the push-to-talk path where the mic follows the floor.
  *

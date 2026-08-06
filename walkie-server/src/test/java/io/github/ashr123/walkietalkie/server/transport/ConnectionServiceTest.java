@@ -886,6 +886,59 @@ class ConnectionServiceTest {
 	}
 
 	@Test
+	void webRtcSignalingIsNotRelayedToAMemberOnTheAudioTransport() {
+		// The audio path is transport-gated in both directions; signaling was gated in neither, so a relay member
+		// could be HANDED an offer — and the browser answered it, attaching its microphone to a peer connection
+		// whose media takes neither the floor/owner-mute enforcement nor the passphrase E2EE. Dropped silently,
+		// like a signaling session's audio frames: a client sending these on the wrong transport is confused, not
+		// owed a reply, and an error per ICE candidate would be a flood.
+		FakeClientSession webrtc = signaling("webrtc");
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession relay = session("relay");
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		relay.sent.clear();
+		webrtc.sent.clear();
+
+		service.onMessage(webrtc, new ClientMessage.Offer("relay", "sdp-offer"));
+
+		assertTrue(relay.sent.stream().noneMatch(ServerMessage.SignalOffer.class::isInstance),
+				"a relay member must not be handed an offer it would answer with its microphone");
+		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.ErrorMessage.class::isInstance),
+				"...and the sender gets no error: dropped silently, like audio on the wrong transport");
+	}
+
+	@Test
+	void signalingFromAMemberOnTheAudioTransportIsAlsoDropped() {
+		// The other direction, for symmetry: a relay member that sends signaling (an older client, or one confused
+		// about its own transport) must not reach a WebRTC member either.
+		FakeClientSession relay = session("relay");
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession webrtc = signaling("webrtc");
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		webrtc.sent.clear();
+
+		service.onMessage(relay, new ClientMessage.Answer("webrtc", "sdp-answer"));
+		service.onMessage(relay, new ClientMessage.IceCandidate("webrtc", "cand", "0", 0));
+
+		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.SignalAnswer.class::isInstance));
+		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.SignalIce.class::isInstance));
+	}
+
+	@Test
+	void signalingStillFlowsBetweenTwoWebRtcMembers() {
+		// The gate must not break the transport it exists for: both ends signaling, so the offer is relayed.
+		FakeClientSession alice = signaling("alice");
+		service.onMessage(alice, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		FakeClientSession bob = signaling("bob");
+		service.onMessage(bob, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.Offer("bob", "sdp-offer"));
+
+		assertEquals("sdp-offer", firstOf(bob, ServerMessage.SignalOffer.class).sdp());
+	}
+
+	@Test
 	void aJoinWithANullChannelNameIsRejectedAsInvalidChannel() {
 		FakeClientSession s = session("s1");
 		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));

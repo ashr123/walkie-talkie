@@ -597,6 +597,18 @@ six:
 - `static/assets/talk.js` — the floor rules (`floorStateFor`/`floorActionFor`/`floorIsFree`), the full-duplex
   mic auto-open policy (`shouldAutoOpenMic`, whose three terms are mode / "Connect muted" / owner-mute),
   `grantOpensMic` (a grant that outlived its hold must NOT open the mic — see the hold-vs-tap note below),
+  `micTrackEnabled` (whether the local `MediaStreamTrack.enabled` should be on — exactly "am I transmitting?",
+  with NO transport term and NO mode term, and the single rule for both writers: `enableLocalTracks` and
+  `createPeer`. It replaced `transport === 'webrtc' ? on : true`, which forced a relay client's track ENABLED at
+  every disable site. That was safe only while a relay client could never hold a peer connection — but inbound
+  WebRTC offers were answered without consulting our own transport, so a relay member handed an offer attached
+  this microphone to a peer, and one Talk press-and-release then left it streaming outside the server's floor and
+  owner-mute enforcement AND outside the passphrase E2EE, with both UIs showing a free floor. `createPeer` also
+  carried its own `mode === 'FULL_DUPLEX' ||` disjunct, which ignored "Connect muted" and owner-mute; full-duplex
+  still auto-opens, via `shouldAutoOpenMic`, which weighs all three terms. Both clients now discard signaling on
+  the relay transport and `ClientSession#supportsSignaling` is the server-side belt — the audio path was gated in
+  both directions and signaling in neither. Residual, stated honestly: the RULE is pinned in `talk.test.js`, but
+  the two `app.js` call sites are not, because `app.js` is not importable under Node),
   `holdInProgress` (whether an interruption — lost focus, a hidden tab, a cancelled touch, or a Space up-edge after
   focus drifted — has a hold to end), `spaceDrivesFloor` (an ALLOW-list: Space drives the floor only when nothing
   owns it — nothing focused, the document body, or the Talk button — so a focused `<select>` keeps the key that

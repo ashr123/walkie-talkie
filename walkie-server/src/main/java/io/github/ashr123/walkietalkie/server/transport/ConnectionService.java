@@ -1118,11 +1118,24 @@ public class ConnectionService {
 		if (!(requireChannel(session) instanceof Some(Channel channel))) {
 			return;
 		}
-		if (channel.member(targetId) instanceof Some(ClientSession target))
+		if (channel.member(targetId) instanceof Some(ClientSession target)) {
+			// Both ends must be on the signaling transport. Dropped SILENTLY, mirroring how a signaling session's
+			// audio frames are dropped on arrival rather than answered with an error — a client that sends these on
+			// the wrong transport is confused, not owed a reply, and a per-ICE-candidate error would be a flood.
+			//
+			// Why it matters on the RECEIVING side: handed an offer, a relay client would attach its microphone to a
+			// peer connection, and peer-to-peer media takes neither the floor/owner-mute enforcement below nor the
+			// passphrase E2EE — both of which only exist on the relay frame path. See ClientSession#supportsSignaling.
+			if (!session.supportsSignaling() || !target.supportsSignaling()) {
+				log.debug("Dropped {} between transports ({} -> {})",
+						message.getClass().getSimpleName(), session.transport(), target.transport());
+				return;
+			}
 			broadcaster.toOne(target, message);
-		else
+		} else {
 			sendError(session, ErrorCode.UNKNOWN_TARGET,
 					"No member '" + targetId + "' in this channel");
+		}
 	}
 
 	private Option<Channel> requireChannel(ClientSession session) {

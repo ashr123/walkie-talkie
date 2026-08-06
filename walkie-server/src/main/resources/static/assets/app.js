@@ -31,6 +31,7 @@ import {
 	floorStateFor,
 	grantOpensMic,
 	holdInProgress,
+	micTrackEnabled,
 	shouldAutoOpenMic,
 	spaceDrivesFloor,
 	talkDecision
@@ -107,6 +108,7 @@ const state = {
 	txChain: null,          // serializes async frame encryption (send side) so it can't reorder our Opus stream
 	warnedDecrypt: false,
 	warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
+	warnedSignaling: false,       // warn once if WebRTC signaling arrives while we are on the relay transport
 	peers: new Map(),       // remoteId -> RTCPeerConnection (WebRTC)
 	members: new Map(),     // id -> displayName
 	// The authoritative owner-mute snapshot (ServerMessage.MuteStatus): the whole set of muted ids, REPLACED
@@ -879,13 +881,19 @@ function onWsMessage(ev) {
 			onPassphraseChanged(msg.keyCheck, msg.wrappedKey).catch(err => log(`Passphrase change error: ${err.message}`));
 			break;
 		case 'signalOffer':
-			onOffer(msg.from, msg.sdp).catch(err => log(`Offer error: ${err.message}`));
+			if (!ignoreSignaling(msg.type)) {
+				onOffer(msg.from, msg.sdp).catch(err => log(`Offer error: ${err.message}`));
+			}
 			break;
 		case 'signalAnswer':
-			onAnswer(msg.from, msg.sdp).catch(err => log(`Answer error: ${err.message}`));
+			if (!ignoreSignaling(msg.type)) {
+				onAnswer(msg.from, msg.sdp).catch(err => log(`Answer error: ${err.message}`));
+			}
 			break;
 		case 'signalIce':
-			onIce(msg.from, msg.candidate, msg.sdpMid, msg.sdpMLineIndex).catch(err => log(`ICE error: ${err.message}`));
+			if (!ignoreSignaling(msg.type)) {
+				onIce(msg.from, msg.candidate, msg.sdpMid, msg.sdpMLineIndex).catch(err => log(`ICE error: ${err.message}`));
+			}
 			break;
 		case 'error':
 			log(`Server error [${msg.code}]: ${msg.message}`);
@@ -1683,9 +1691,11 @@ function endTransmit() {
 }
 
 function enableLocalTracks(on) {
-	// WebRTC: gate the outgoing track. Relay: gating happens where frames are sent.
+	// Transport-INDEPENDENT — see talk.js's micTrackEnabled. This used to force `true` on the relay path, on the
+	// reasoning that a relay client gates where frames are sent; that stopped being true once a relay client could
+	// hold a peer connection it never asked for, and turned every disable site into an enable site.
 	if (state.micStream) {
-		state.micStream.getAudioTracks().forEach(t => t.enabled = state.transport === 'webrtc' ? on : true);
+		state.micStream.getAudioTracks().forEach(t => t.enabled = micTrackEnabled(on));
 	}
 }
 
@@ -2114,7 +2124,10 @@ function sweepLanes() {
 function createPeer(remoteId) {
 	const pc = new RTCPeerConnection(STUN);
 	state.micStream.getAudioTracks().forEach(track => {
-		track.enabled = state.mode === 'FULL_DUPLEX' || state.transmitting;
+		// The same rule as enableLocalTracks, with no `mode === 'FULL_DUPLEX'` disjunct: that opened the mic on the
+		// first inbound offer regardless of "Connect muted" or an owner mute. Full-duplex still auto-opens a moment
+		// later, through micAutoOpens/shouldAutoOpenMic below, which weighs all three terms.
+		track.enabled = micTrackEnabled(state.transmitting);
 		pc.addTrack(track, state.micStream);
 	});
 	pc.onicecandidate = e => {
@@ -2139,6 +2152,27 @@ async function offerTo(remoteId) {
 	await pc.setLocalDescription({type: offer.type, sdp: tuneOpusSdp(offer.sdp)});
 	sendCtrl({type: 'offer', target: remoteId, sdp: pc.localDescription.sdp});
 	setSenderBitrate(pc, MONO_BITRATE);
+}
+
+/**
+ * Whether an inbound WebRTC signaling message must be DISCARDED because we are not on the WebRTC transport. The
+ * SEND side was already gated (offerTo runs only from onJoined when the transport is webrtc) but the receive side
+ * was not, so a relay client answered any offer it was handed and attached this microphone to a peer connection —
+ * media that takes neither the server's floor/owner-mute enforcement nor the passphrase E2EE, both of which live
+ * on the relay frame path. Mirrors the Java client, which has always discarded the three signaling messages.
+ *
+ * Warned once per session (like state.warnedDecrypt): a peer can send these as fast as the control rate limiter
+ * allows, and a log line per ICE candidate would bury everything else.
+ */
+function ignoreSignaling(type) {
+	if (state.transport === 'webrtc') {
+		return false;
+	}
+	if (!state.warnedSignaling) {
+		state.warnedSignaling = true;
+		log(`Ignored a WebRTC ${type} — this client is on the relay transport, so it has no peer connections.`);
+	}
+	return true;
 }
 
 async function onOffer(from, sdp) {

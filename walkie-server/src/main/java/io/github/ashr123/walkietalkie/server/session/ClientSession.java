@@ -43,6 +43,21 @@ public interface ClientSession {
 
 	boolean supportsAudioRelay();
 
+	/// Whether this session takes part in WebRTC signaling — the counterpart of [#supportsAudioRelay].
+	///
+	/// It exists to close an asymmetry: the AUDIO path is transport-gated in both directions (a signaling session's
+	/// frames are dropped on arrival, and the fan-out skips signaling members), while the signaling path was gated
+	/// in NEITHER. A relay member could therefore be handed an `offer`, and the browser answered it and attached
+	/// its microphone to a peer connection — media outside the floor, owner-mute and passphrase-E2EE gates that all
+	/// live on the relay frame path. Both clients now refuse such a message; this is the server-side belt so a
+	/// misbehaving or older client cannot be put in that position at all.
+	///
+	/// A `default` method rather than an abstract one: it is derivable from [#transport], so no implementation —
+	/// including the test doubles — needs to answer it separately.
+	default boolean supportsSignaling() {
+		return transport() == Transport.SIGNALING;
+	}
+
 	/// Whether this session has been torn down (its socket gone). Unlike [#channelName] (which is also null before
 	/// the first join), this is a lifecycle-wide signal, so a control-path caller can drop a late frame from an
 	/// already-closed session before it resurrects per-session state (e.g. a [SessionRateLimiter] bucket after
