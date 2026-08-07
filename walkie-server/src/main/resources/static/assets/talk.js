@@ -67,6 +67,51 @@ export function shouldAutoOpenMic(mode, startMuted, selfMuted) {
 }
 
 /**
+ * Full-duplex voice-activity gate: true when a PCM buffer's RMS — after dividing by `scale` to normalise to
+ * [-1, 1] — exceeds [#VAD_RMS_THRESHOLD]. `scale` is 32768 for captured Int16 and 1 for already-normalised
+ * Float32 (a decoded relay lane, or an AnalyserNode's time-domain data).
+ *
+ * It lives here, beside the other talk rules, because it is what decides whether a member's row is highlighted as
+ * "talking" in full-duplex — where every mic is open, so merely being unmuted means nothing. It has four callers
+ * across both transports (the relay capture path, the relay decode lanes, and the WebRTC meter for self and for
+ * each peer), and one rule with one threshold is the point: two transports that disagreed about what counts as
+ * talking would highlight the same person differently depending on how their audio arrived.
+ */
+export function isVoiceActive(samples, scale) {
+	let sum = 0;
+	for (const item of samples) {
+		sum += (item / scale) ** 2;
+	}
+	return samples.length > 0 && Math.sqrt(sum / samples.length) > VAD_RMS_THRESHOLD;
+}
+
+/**
+ * The RMS a normalised buffer must exceed to count as speech. Rough on purpose — it separates "someone is
+ * talking" from room tone and mic hiss, not speech from noise. Tune per mic/AGC if a quiet talker never lights up.
+ */
+export const VAD_RMS_THRESHOLD = 0.02;
+
+/**
+ * Whether this (transport, mode) pair needs a voice-activity METER to drive the roster highlight, rather than
+ * getting it from somewhere else.
+ *
+ * Three drivers exist and each covers a different case: the relay decode lanes highlight a remote sender per
+ * frame, the relay capture path highlights you, and `onFloorStatus` highlights the floor holder on WebRTC. The
+ * combination they all miss is WebRTC + FULL_DUPLEX — there are no relay frames on either side to key off, and
+ * full-duplex has no floor holder to name. Measured before the fix: a WebRTC full-duplex channel never lit a
+ * single row, for anyone, while every other combination did.
+ *
+ * The `FULL_DUPLEX` term is load-bearing, not a tidy restriction. In a PTT mode on WebRTC the highlight is STICKY
+ * — `onFloorStatus` sets it and leaves it until the floor moves — whereas a meter drives `markSpeaking`, which
+ * arms a short silence timer. Running the meter in PTT would let the first pause longer than that timer clear the
+ * holder's row, with nothing to re-light it until the floor next changed. So the meter must cover exactly the gap
+ * and no more.
+ */
+export function needsVoiceMeter(transport, mode) {
+	return transport === 'webrtc' && mode === 'FULL_DUPLEX';
+}
+
+/**
  * Whether the local microphone TRACK should be sending — the ONE answer both places that write
  * `MediaStreamTrack.enabled` must use. It is exactly "am I transmitting?", with no transport term and no mode
  * term: a track is a capture device, not a transport, so where its samples end up — the relay's capture worklet,

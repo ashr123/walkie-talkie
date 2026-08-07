@@ -31,7 +31,9 @@ import {
 	floorStateFor,
 	grantOpensMic,
 	holdInProgress,
+	isVoiceActive,
 	micTrackEnabled,
+	needsVoiceMeter,
 	shouldAutoOpenMic,
 	spaceDrivesFloor,
 	talkDecision
@@ -57,8 +59,9 @@ const SERVER_OWNER = 'server';   // ownerId the server stamps on the server-mana
 const MAX_ACTIVE_DECODERS = 8;   // cap on per-sender decoders we mix at once (O(N^2) fan-out guard); evict longest-silent
 const SILENCE_TTL_MS = 4000;     // close a per-sender lane after this much silence (survives speech gaps + jitter)
 
+const VOICE_METER_MS = 100;     // how often the WebRTC full-duplex meter samples; well under SPEAK_SILENCE_MS so a talker's row never flickers
+const VOICE_METER_FFT = 2048;   // samples per look (~43 ms at 48 kHz) — see addVoiceMeter for why a small window under-reports
 const SPEAK_SILENCE_MS = 250;   // a relay speaker stays highlighted until this long passes with no frame (a few 20 ms frames of grace)
-const VAD_RMS_THRESHOLD = 0.02; // full-duplex voice-activity gate: highlight a member only when their PCM RMS (normalized 0..1) exceeds this — a rough "actually talking" level (every mic is open in full-duplex). Tune per mic/AGC.
 
 // "Your turn" attention cues (grant-to-talk floor queue): a short beep + a tab-title flash, the browser analogue
 // of the Java client's terminal BEL — they grab an inattentive user the instant the floor is reserved for them.
@@ -124,6 +127,8 @@ const state = {
 	streamOf: new Map(),     // member id -> stream id
 	memberOfStream: new Map(), // stream id -> member id
 	laneSweep: null,         // interval id for the silent-lane age-out sweep
+	voiceMeters: new Map(),  // id -> AnalyserNode, the WebRTC full-duplex speaking detector (see needsVoiceMeter)
+	voiceSweep: null,        // interval id polling those analysers
 	speaking: new Set(),     // ids currently highlighted as "speaking" in the roster
 	memberLis: new Map(),    // id -> roster <li>, so speaking/owner state toggles without a full re-render
 	speakTimers: new Map(),  // id -> timeout that clears a relay speaker after a short silence
@@ -1013,6 +1018,8 @@ function onJoined(msg) {
 			.filter(m => m.id !== state.selfId)
 			.forEach(m => offerTo(m.id).catch(err => log(`Offer error: ${err.message}`)));
 	}
+	// Now that the mode and our own id are known, start (or stop) the WebRTC full-duplex speaking meter.
+	syncVoiceMeter();
 
 	// Runs AFTER the roster is seeded above, so micAutoOpens sees our own owner-mute: a muted member re-joining its
 	// current channel keeps its mic closed.
@@ -1036,6 +1043,8 @@ function onJoined(msg) {
 
 function onModeChanged(mode) {
 	state.mode = mode;
+	// The mode is half of needsVoiceMeter, so a change can start or stop the meter.
+	setTimeout(syncVoiceMeter, 0);
 	state.transmitting = false;
 	enableLocalTracks(false);
 	if (micAutoOpens()) {
@@ -2274,6 +2283,7 @@ function attachRemoteAudio(remoteId, stream) {
 }
 
 function closePeer(remoteId) {
+	removeVoiceMeter(remoteId);
 	const pc = state.peers.get(remoteId);
 	if (pc) {
 		pc.close();
@@ -2374,6 +2384,71 @@ function setSpeaking(id, speaking) {
 }
 
 /**
+ * Watch one audio stream for speech and highlight `id` while it lasts — the driver WebRTC full-duplex was missing
+ * entirely (see needsVoiceMeter in talk.js). Relay gets this from the frames themselves; peer-to-peer media never
+ * passes through us, so the only way to know someone is talking is to listen to it.
+ *
+ * An AnalyserNode rather than the RTCRtpReceiver's `audioLevel`: that depends on an RFC 6464 header extension
+ * being negotiated and is not implemented everywhere, whereas this works off the stream we already have. Safe for
+ * a remote stream because attachRemoteAudio keeps the `<audio>` element alive — a remote stream consumed ONLY by
+ * Web Audio is the case that historically went silent in Chrome.
+ */
+function addVoiceMeter(id, stream) {
+	if (!state.audioContext || state.voiceMeters.has(id) || !stream) {
+		return;
+	}
+	const analyser = state.audioContext.createAnalyser();
+	// ~43 ms at 48 kHz. The window has to be a decent fraction of the polling interval, not a token sample: an
+	// earlier 512 (~11 ms, and read 256 at a time) meant each poll looked at ~5 % of the elapsed time, so a talker
+	// with any gap in their speech was missed far more often than caught — measured as an intermittent,
+	// seemingly-random highlight. Still trivial to compute at 10 Hz.
+	analyser.fftSize = VOICE_METER_FFT;
+	state.audioContext.createMediaStreamSource(stream).connect(analyser);
+	state.voiceMeters.set(id, analyser);
+}
+
+/** Stop metering one stream — its peer left, or the channel/session is going away. */
+function removeVoiceMeter(id) {
+	state.voiceMeters.delete(id);
+}
+
+/**
+ * Poll every metered stream and mark whoever is talking. Runs only while needsVoiceMeter holds; markSpeaking's own
+ * silence timer clears a row once someone stops, so this only ever has to say "still talking".
+ */
+function sweepVoiceMeters() {
+	// RECONCILE first, then poll. The streams appear asynchronously and at different moments for each side — your
+	// own mic exists at join, but a peer's arrives on `ontrack`, a whole offer/answer/ICE round trip later, and the
+	// side that OFFERS reaches it at a different time from the side that answers. A one-shot setup at join
+	// therefore metered whoever happened to exist by then and silently missed the rest: measured, the answering
+	// client saw the other row light up and the offering client saw nothing at all. Re-adding every tick is
+	// idempotent (addVoiceMeter returns early when a meter exists) and costs a Map lookup per member.
+	addVoiceMeter(state.selfId, state.micStream);
+	state.peers.forEach((_, id) => addVoiceMeter(id, document.getElementById(`audio-${id}`)?.srcObject));
+
+	const samples = new Float32Array(VOICE_METER_FFT);
+	state.voiceMeters.forEach((analyser, id) => {
+		analyser.getFloatTimeDomainData(samples);
+		if (isVoiceActive(samples, 1)) {   // already normalised to [-1, 1], like a decoded relay lane
+			markSpeaking(id);
+		}
+	});
+}
+
+/** Start or stop the meter to match the current transport and mode. Idempotent; safe to call on every change. */
+function syncVoiceMeter() {
+	const wanted = needsVoiceMeter(state.transport, state.mode);
+	if (wanted && state.voiceSweep === null) {
+		state.voiceSweep = setInterval(sweepVoiceMeters, VOICE_METER_MS);
+	} else if (!wanted && state.voiceSweep !== null) {
+		clearInterval(state.voiceSweep);
+		state.voiceSweep = null;
+		state.voiceMeters.clear();
+	}
+}
+
+
+/**
  * A relay audio frame just arrived from `id`: highlight them and (re)arm a short silence timer that clears it.
  * This keys off actual audio frames, so it works in every mode on the relay path (PTT, global, full-duplex).
  */
@@ -2387,19 +2462,6 @@ function markSpeaking(id) {
 		state.speakTimers.delete(id);
 		setSpeaking(id, false);
 	}, SPEAK_SILENCE_MS));
-}
-
-/**
- * Rough voice-activity gate: true when a PCM frame's RMS (after dividing by `scale` to normalize to [-1, 1])
- * exceeds VAD_RMS_THRESHOLD. `scale` is 32768 for captured Int16, 1 for already-normalized decoded Float32.
- */
-function isVoiceActive(samples, scale) {
-	let sum = 0;
-	for (let i = 0; i < samples.length; i++) {
-		const v = samples[i] / scale;
-		sum += v * v;
-	}
-	return samples.length > 0 && Math.sqrt(sum / samples.length) > VAD_RMS_THRESHOLD;
 }
 
 /**
@@ -2617,6 +2679,11 @@ function resetChannelState() {
 	state.streamOf.clear();
 	state.speakTimers.forEach(clearTimeout);
 	state.speakTimers.clear();
+	if (state.voiceSweep !== null) {
+		clearInterval(state.voiceSweep);
+		state.voiceSweep = null;
+	}
+	state.voiceMeters.clear();
 	state.speaking.clear();
 	state.floorSpeaker = null;
 	state.floorHolder = null;

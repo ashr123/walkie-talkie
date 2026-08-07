@@ -643,6 +643,20 @@ six:
   the relay transport and `ClientSession#supportsSignaling` is the server-side belt — the audio path was gated in
   both directions and signaling in neither. Residual, stated honestly: the RULE is pinned in `talk.test.js`, but
   the two `app.js` call sites are not, because `app.js` is not importable under Node),
+  `isVoiceActive` + `VAD_RMS_THRESHOLD` (the full-duplex "actually talking" gate, moved here from app.js when it
+  went from two call sites to four — one rule and one threshold, or the two transports would disagree about what
+  counts as talking for the same person),
+  `needsVoiceMeter` (which (transport, mode) pair needs a voice-activity METER to drive the roster highlight.
+  Exactly one does: WebRTC + FULL_DUPLEX. The other three drivers are the relay decode lanes, the relay capture
+  path and `onFloorStatus`'s floor holder — and that combination has none of them, so measured with two real
+  browser clients it never lit a single row, for anyone, on either side. The `FULL_DUPLEX` term is load-bearing,
+  not tidiness: on WebRTC in a PTT mode the highlight is STICKY until the floor moves, whereas a meter drives
+  `markSpeaking`'s silence timer, so metering there would let the first pause longer than that timer clear the
+  holder's row with nothing to re-light it. Two implementation notes worth not rediscovering — the analyser window
+  must be a real fraction of the poll interval, since a 5 ms look every 100 ms caught a talker only
+  intermittently; and the sweep RECONCILES its meters every tick rather than being set up once at join, because a
+  peer's stream arrives on `ontrack` a full round trip later and at a different moment for the offering and
+  answering sides, which showed up as one client highlighting and the other never doing so),
   `holdInProgress` (whether an interruption — lost focus, a hidden tab, a cancelled touch, or a Space up-edge after
   focus drifted — has a hold to end), `spaceDrivesFloor` (an ALLOW-list: Space drives the floor only when nothing
   owns it — nothing focused, the document body, or the Talk button — so a focused `<select>` keeps the key that

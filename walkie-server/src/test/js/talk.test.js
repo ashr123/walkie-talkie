@@ -23,11 +23,14 @@ import {
 	floorStateFor,
 	grantOpensMic,
 	holdInProgress,
+	isVoiceActive,
 	micTrackEnabled,
+	needsVoiceMeter,
 	shouldAutoOpenMic,
 	spaceDrivesFloor,
 	talkDecision,
 	TOO_QUICK_TO_TALK,
+	VAD_RMS_THRESHOLD,
 } from '../../main/resources/static/assets/talk.js';
 
 const SELF = 'self-session-id';
@@ -761,4 +764,45 @@ test('micTrackEnabled agrees with shouldAutoOpenMic on the full-duplex auto-open
 	assert.equal(micTrackEnabled(shouldAutoOpenMic('FULL_DUPLEX', true, false)), false, '--muted must stay muted');
 	assert.equal(micTrackEnabled(shouldAutoOpenMic('FULL_DUPLEX', false, true)), false, 'owner-muted must stay muted');
 	assert.equal(micTrackEnabled(shouldAutoOpenMic('MULTI_CHANNEL_PTT', false, false)), false, 'PTT never auto-opens');
+});
+
+// --- the roster "who is talking" highlight: which driver covers which (transport, mode) -------------------
+
+test('needsVoiceMeter covers exactly the combination that had NO highlight driver', () => {
+	// Measured before the fix, with two real browser clients per combination: WebRTC + FULL_DUPLEX never lit a
+	// single row for anyone, while every other pairing did. The relay decode lanes highlight a remote sender and
+	// the relay capture path highlights you; onFloorStatus highlights the floor holder on WebRTC. Full-duplex has
+	// no floor holder and WebRTC has no relay frames, so that one cell had nothing.
+	assert.equal(needsVoiceMeter('webrtc', 'FULL_DUPLEX'), true);
+	// ...and nothing else, which is the load-bearing half. On WebRTC in a PTT mode the highlight is STICKY
+	// (onFloorStatus sets it until the floor moves) while a meter drives markSpeaking, which arms a silence timer —
+	// so running the meter there would let the first pause clear the holder's row with nothing to re-light it.
+	['MULTI_CHANNEL_PTT', 'GLOBAL_PTT'].forEach(mode =>
+			assert.equal(needsVoiceMeter('webrtc', mode), false, `webrtc/${mode} is driven by the floor`));
+	// The relay transport has its own per-frame drivers in every mode.
+	['FULL_DUPLEX', 'MULTI_CHANNEL_PTT', 'GLOBAL_PTT'].forEach(mode =>
+			assert.equal(needsVoiceMeter('relay', mode), false, `relay/${mode} is driven by frames`));
+});
+
+test('isVoiceActive separates speech from room tone, at either scale', () => {
+	// One rule for both transports and both sample formats: `scale` normalises to [-1, 1] — 32768 for captured
+	// Int16, 1 for a decoded relay lane or an AnalyserNode's time-domain data. Two transports that disagreed about
+	// what counts as talking would highlight the same person differently depending on how their audio arrived.
+	assert.ok(isVoiceActive(new Float32Array(128).fill(0.5), 1), 'a loud float buffer is speech');
+	assert.ok(!isVoiceActive(new Float32Array(128).fill(0.001), 1), 'room tone is not');
+	assert.ok(isVoiceActive(new Int16Array(128).fill(16000), 32768), 'the same level as Int16 agrees');
+	assert.ok(!isVoiceActive(new Int16Array(128).fill(32), 32768), '...and so does the quiet case');
+});
+
+test('isVoiceActive is false for an empty buffer rather than NaN', () => {
+	// Math.sqrt(0/0) is NaN, and NaN > threshold is false — but only by accident, so pin it: the meter polls on a
+	// timer and can sample before any audio has arrived.
+	assert.equal(isVoiceActive(new Float32Array(0), 1), false);
+});
+
+test('the threshold sits between room tone and speech', () => {
+	// Pinned so a future tweak is a deliberate decision rather than a drifting constant.
+	assert.ok(VAD_RMS_THRESHOLD > 0.001 && VAD_RMS_THRESHOLD < 0.1, VAD_RMS_THRESHOLD);
+	const atThreshold = new Float32Array(64).fill(VAD_RMS_THRESHOLD);
+	assert.ok(!isVoiceActive(atThreshold, 1), 'exactly at the threshold is not yet speech (strict >)');
 });
