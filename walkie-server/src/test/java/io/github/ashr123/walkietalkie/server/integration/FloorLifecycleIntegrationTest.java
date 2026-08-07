@@ -39,9 +39,9 @@ class FloorLifecycleIntegrationTest extends WebSocketIntegrationTestSupport {
 	private String[] joinPair(String channel, ChannelMode mode,
 	                          WebSocketSession sa, CollectingHandler a,
 	                          WebSocketSession sb, CollectingHandler b) throws Exception {
-		send(sa, new ClientMessage.Join(channel, mode, "Alice", TestKeyChecks.keyCheckFor(mode)));
+		send(sa, new ClientMessage.Join(channel, mode, null, "Alice", TestKeyChecks.keyCheckFor(mode)));
 		ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
-		send(sb, new ClientMessage.Join(channel, mode, "Bob", TestKeyChecks.keyCheckFor(mode)));
+		send(sb, new ClientMessage.Join(channel, mode, null, "Bob", TestKeyChecks.keyCheckFor(mode)));
 		ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 		awaitType(a.messages, ServerMessage.MemberJoined.class);
 		awaitType(b.messages, ServerMessage.FloorStatus.class);

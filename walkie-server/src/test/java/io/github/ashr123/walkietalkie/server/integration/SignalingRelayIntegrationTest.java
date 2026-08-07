@@ -23,9 +23,9 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 	private String[] joinPair(String channel,
 	                          WebSocketSession sa, CollectingHandler a,
 	                          WebSocketSession sb, CollectingHandler b) throws Exception {
-		send(sa, new ClientMessage.Join(channel, ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+		send(sa, new ClientMessage.Join(channel, ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 		ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
-		send(sb, new ClientMessage.Join(channel, ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
+		send(sb, new ClientMessage.Join(channel, ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
 		ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 		awaitType(a.messages, ServerMessage.MemberJoined.class);
 		return new String[]{joinedA.selfId(), joinedB.selfId()};
@@ -63,7 +63,7 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 	void signalingToAnUnknownTargetReturnsUnknownTargetToTheSender() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(SIGNAL, a, login())) {
-			send(sa, new ClientMessage.Join("rtc-unknown", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("rtc-unknown", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			awaitType(a.messages, ServerMessage.Joined.class);
 			send(sa, new ClientMessage.Offer("ghost", "sdp"));
 			assertEquals(ErrorCode.UNKNOWN_TARGET, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
@@ -76,9 +76,9 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(SIGNAL, a, login());
 		     WebSocketSession sb = connect(SIGNAL, b, login())) {
-			send(sa, new ClientMessage.Join("rtc-x", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("rtc-x", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			awaitType(a.messages, ServerMessage.Joined.class);
-			send(sb, new ClientMessage.Join("rtc-y", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sb, new ClientMessage.Join("rtc-y", ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
 			String bob = awaitType(b.messages, ServerMessage.Joined.class).selfId();
 
 			send(sa, new ClientMessage.Offer(bob, "sdp"));   // Bob is real, but not in Alice's channel
@@ -99,7 +99,7 @@ class SignalingRelayIntegrationTest extends WebSocketIntegrationTestSupport {
 	void signalingToYourOwnSessionIdIsRelayedBackToYou() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(SIGNAL, a, login())) {
-			send(sa, new ClientMessage.Join("rtc-self", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("rtc-self", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			String alice = awaitType(a.messages, ServerMessage.Joined.class).selfId();
 			send(sa, new ClientMessage.Offer(alice, "sdp-self"));
 			ServerMessage.SignalOffer offer = awaitType(a.messages, ServerMessage.SignalOffer.class);

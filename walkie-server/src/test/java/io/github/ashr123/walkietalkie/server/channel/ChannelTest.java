@@ -7,7 +7,7 @@ import io.github.ashr123.option.Some;
 import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.FakeClientSession;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.JoinRequestInfo;
 import org.junit.jupiter.api.Test;
@@ -29,7 +29,7 @@ class ChannelTest {
 
 	@Test
 	void grantsTheFloorToTheFirstAcquirerAndDeniesTheSecond() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 		channel.add(session("alice"));
 		channel.add(session("bob"));
 
@@ -42,7 +42,7 @@ class ChannelTest {
 
 	@Test
 	void releaseLetsTheNextAcquirerIn() {
-		Channel channel = new Channel("c", ChannelMode.GLOBAL_PTT, "alice", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("c", ChannelMode.GLOBAL_PTT, "alice", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 
 		assertTrue(channel.tryAcquireFloor("alice", Instant.EPOCH));
 		assertTrue(channel.releaseFloor("alice"), "the holder releases");
@@ -52,7 +52,7 @@ class ChannelTest {
 
 	@Test
 	void releaseByANonHolderIsRejected() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 
 		channel.tryAcquireFloor("alice", Instant.EPOCH);
 		assertFalse(channel.releaseFloor("bob"), "a non-holder cannot release the floor");
@@ -61,7 +61,7 @@ class ChannelTest {
 
 	@Test
 	void fullDuplexAlwaysGrantsTheFloorAndTracksNoHolder() {
-		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "owner", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "owner", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 
 		assertTrue(channel.tryAcquireFloor("alice", Instant.EPOCH));
 		assertTrue(channel.tryAcquireFloor("bob", Instant.EPOCH), "full-duplex never contends for the floor");
@@ -71,7 +71,7 @@ class ChannelTest {
 
 	@Test
 	void setMutedReportsWhetherItChangedAndIsMutedReflectsIt() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 		channel.add(session("bob"));
 
 		assertFalse(channel.isMuted("bob"), "a member starts unmuted");
@@ -85,7 +85,7 @@ class ChannelTest {
 
 	@Test
 	void setMutedForAllExceptSkipsTheOwnerAndReturnsOnlyTheChangedIds() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 		channel.add(session("alice"));
 		channel.add(session("bob"));
 		channel.add(session("carol"));
@@ -100,7 +100,7 @@ class ChannelTest {
 
 	@Test
 	void removeClearsAMembersMuteState() {
-		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 		channel.add(session("bob"));
 		channel.setMuted("bob", true);
 
@@ -110,7 +110,7 @@ class ChannelTest {
 
 	@Test
 	void streamIndexOfIsNoneForAnUnknownSessionAndRequireFailsFast() {
-		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "alice", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("c", ChannelMode.FULL_DUPLEX, "alice", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 		channel.add(session("alice"));
 
 		assertInstanceOf(SomeInt.class, channel.streamIndexOf("alice"), "a current member has an index");
@@ -125,7 +125,7 @@ class ChannelTest {
 	// --- floor queue primitives (the "raise hand" model — see docs/CLIENT_PROTOCOL.md §3b) ------------------
 
 	private static Channel queueChannel() {
-		return new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, new Channel.Defaults(true, 0));
+		return new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null,Transport.AUDIO_RELAY,  new Channel.Defaults(true, 0));
 	}
 
 	@Test
@@ -310,12 +310,12 @@ class ChannelTest {
 
 	/// A channel that parks up to two newcomers, so the cap is reachable in a test without twelve sessions.
 	private static Channel knockChannel() {
-		return new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, new Channel.Defaults(false, 2));
+		return new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null,Transport.AUDIO_RELAY,  new Channel.Defaults(false, 2));
 	}
 
 	@Test
 	void parkingIsDisabledWhenTheCapIsZero() {
-		assertFalse(new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null, Channel.Defaults.NONE)
+		assertFalse(new Channel("c", ChannelMode.MULTI_CHANNEL_PTT, "alice", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE)
 						.acceptsJoinRequests(),
 				"cap 0 means a locked channel refuses newcomers outright instead of parking them");
 		assertTrue(knockChannel().acceptsJoinRequests());

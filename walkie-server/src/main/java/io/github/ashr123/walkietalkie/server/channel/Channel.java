@@ -5,11 +5,8 @@ import io.github.ashr123.option.Option;
 import io.github.ashr123.option.OptionInt;
 import io.github.ashr123.option.SomeInt;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.*;
 import io.github.ashr123.walkietalkie.server.transport.ConnectionService;
-import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
-import io.github.ashr123.walkietalkie.shared.protocol.JoinRequestInfo;
-import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 
 import java.time.Instant;
 import java.util.*;
@@ -50,6 +47,16 @@ public final class Channel {
 	private volatile String floorHolder;
 	private volatile ChannelMode mode;
 	private volatile String ownerId;
+
+	/// The media plane every member of this channel uses. Relay audio and WebRTC media never meet — the fan-out
+	/// skips a signaling member and a signaling sender's frames are dropped on arrival — so a channel carrying both
+	/// would be a full roster with working floor control and no audio at all, which looks exactly like working.
+	///
+	/// STORED rather than derived from the roster. An earlier version derived it from any member, on the reasoning
+	/// that a field would be a second answer to a question the roster already answers. That stopped being true the
+	/// moment the owner could CHANGE it: the change moves the channel and every member together, so for the instant
+	/// between deciding and applying, the channel is the only thing that knows the answer.
+	private volatile Transport transport;
 	/// The key-check value every member must present to join (a short value derived from the E2EE
 	/// passphrase, or `null` for an unencrypted channel), set by the creator and changed by the owner on a
 	/// passphrase rotation. The server compares it to reject a mismatched passphrase; it is not the key and
@@ -147,7 +154,8 @@ public final class Channel {
 		public static final Defaults NONE = new Defaults(false, 0);
 	}
 
-	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck, Defaults defaults) {
+	public Channel(String name, ChannelMode mode, String ownerId, String keyCheck, Transport transport, Defaults defaults) {
+		this.transport = transport;
 		this.name = name;
 		this.mode = mode;
 		this.ownerId = ownerId;
@@ -192,6 +200,33 @@ public final class Channel {
 	/// field's concurrency note).
 	public void setLocked(boolean locked) {
 		this.locked = locked;
+	}
+
+	/// The media plane this channel uses; every member is on it. See the field for why it is stored, not derived.
+	public Transport transport() {
+		return transport;
+	}
+
+	/// Moves the channel to the other media plane, returning whether it actually moved (false when it is already
+	/// there, so the caller can skip a pointless broadcast). Call **only** from [ChannelRegistry#changeTransport],
+	/// i.e. inside the bin lock, so it is serialized with every concurrent join's transport read.
+	///
+	/// Only this one write is needed, and that is the point of storing the transport HERE rather than on each
+	/// member's session. An earlier draft mirrored it onto every member and had to keep the copies in step; but a
+	/// session switching channels is a member of its old channel and its new one at once (the departure happens
+	/// only after the join succeeds, so no refusal can strand a switcher), and the two channels sit under
+	/// different bin locks — so the old channel's move could land on a session the new channel had just claimed,
+	/// leaving that member permanently on the wrong plane with nothing to correct it. One field, read through the
+	/// channel every caller already holds, cannot disagree with itself.
+	///
+	/// Nothing else moves. The stream index, the floor, the roster and ownership are all keyed on the session id,
+	/// which does not change — that is the whole reason this is a live change and not a reconnect.
+	public boolean setTransport(Transport transport) {
+		if (this.transport == transport) {
+			return false;
+		}
+		this.transport = transport;
+		return true;
 	}
 
 	public String ownerId() {
@@ -268,25 +303,6 @@ public final class Channel {
 
 	public int size() {
 		return members.size();
-	}
-
-	/// The transport every member of this channel uses — absent only for a memberless channel, which the registry
-	/// never publishes (a channel is dropped the instant its last member leaves).
-	///
-	/// DERIVED from a member rather than stored, so it cannot drift from who is actually here. The invariant is
-	/// "every member of a channel shares one transport" (enforced in [ChannelRegistry#joinOrCreate]); a field would
-	/// be a second answer to a question the roster already answers, and would have to be maintained on every add
-	/// and remove. Any member will do, precisely because they agree.
-	///
-	/// Why the invariant exists: relay audio and WebRTC media never meet. The fan-out skips a signaling member and
-	/// a signaling sender's frames are dropped on arrival, so a mixed channel is a full roster with working floor
-	/// control and NO audio path in either direction — it looks like it works.
-	///
-	/// Concurrency: read inside the registry's `channels.compute(name, …)` span, which is where every add and
-	/// remove for this name runs, so it cannot change under the join being validated against it.
-	public Option<Transport> firstMemberTransport() {
-		// Option.of(Optional) + map — the same idiom as member() and anyMember() just below.
-		return Option.of(members.values().stream().findAny()).map(member -> member.session().transport());
 	}
 
 	public Option<ClientSession> member(String sessionId) {

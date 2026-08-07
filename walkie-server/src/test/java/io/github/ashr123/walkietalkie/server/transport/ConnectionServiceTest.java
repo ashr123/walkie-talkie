@@ -8,7 +8,7 @@ import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import io.github.ashr123.walkietalkie.server.TestKeyChecks;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
@@ -110,7 +110,7 @@ class ConnectionServiceTest {
 
 	private FakeClientSession join(String id, String channelName, ChannelMode mode) {
 		FakeClientSession session = session(id);
-		service.onMessage(session, new ClientMessage.Join(channelName, mode, id, TestKeyChecks.keyCheckFor(mode)));
+		service.onMessage(session, new ClientMessage.Join(channelName, mode, null, id, TestKeyChecks.keyCheckFor(mode)));
 		return session;
 	}
 
@@ -134,7 +134,7 @@ class ConnectionServiceTest {
 		ConnectionService svc = affinityService();
 		FakeClientSession alice = session("alice");
 		alice.setHandshakeChannel("team1");   // the router pinned this socket to team1
-		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		assertEquals("team1", alice.channelName());
 		assertFalse(received(alice, ErrorCode.CHANNEL_ROUTING_MISMATCH));
 	}
@@ -144,11 +144,11 @@ class ConnectionServiceTest {
 		ConnectionService svc = affinityService();
 		FakeClientSession bob = session("bob");
 		bob.setHandshakeChannel("team2");
-		svc.onMessage(bob, new ClientMessage.Join("team2", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));   // team2 now hosted here
+		svc.onMessage(bob, new ClientMessage.Join("team2", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));   // team2 now hosted here
 		FakeClientSession alice = session("alice");
 		alice.setHandshakeChannel("team1");
-		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(alice, new ClientMessage.Join("team2", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));   // co-located switch
+		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team2", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));   // co-located switch
 		assertEquals("team2", alice.channelName());
 		assertFalse(received(alice, ErrorCode.CHANNEL_ROUTING_MISMATCH));
 	}
@@ -158,9 +158,9 @@ class ConnectionServiceTest {
 		ConnectionService svc = affinityService();
 		FakeClientSession alice = session("alice");
 		alice.setHandshakeChannel("team1");
-		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team1", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		// team9 is neither the handshake channel nor hosted here → this socket can't serve it.
-		svc.onMessage(alice, new ClientMessage.Join("team9", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team9", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		assertTrue(received(alice, ErrorCode.CHANNEL_ROUTING_MISMATCH));
 		assertEquals("team1", alice.channelName(), "the rejected switch must not drop the client from its channel");
 		assertFalse(channelExists("team9"), "the wrong-instance channel must not be created here");
@@ -170,7 +170,7 @@ class ConnectionServiceTest {
 	void withoutChannelAffinityASwitchToAnyChannelIsAllowed() {
 		// The default `service` has affinity OFF: switching to a brand-new channel is fine (single instance).
 		FakeClientSession alice = join("alice", "team1", ChannelMode.MULTI_CHANNEL_PTT);
-		service.onMessage(alice, new ClientMessage.Join("team9", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(alice, new ClientMessage.Join("team9", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		assertEquals("team9", alice.channelName());
 		assertFalse(received(alice, ErrorCode.CHANNEL_ROUTING_MISMATCH));
 	}
@@ -265,7 +265,7 @@ class ConnectionServiceTest {
 		// The pattern alone accepts a lone space (it is in the class, and {1,32} is satisfied) — only stripping BEFORE
 		// the match rejects it, by leaving an empty string. Reversing that order looks harmless, hence this test.
 		FakeClientSession session = session("blank");
-		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "   ", TestKeyChecks.ENCRYPTED));
+		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "   ", TestKeyChecks.ENCRYPTED));
 
 		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(session, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("team"), "the channel is not created for a blank name");
@@ -287,7 +287,7 @@ class ConnectionServiceTest {
 		};
 		for (String name : invisible) {
 			FakeClientSession session = session("inv-" + name.hashCode());
-			service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, name, TestKeyChecks.ENCRYPTED));
+			service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, name, TestKeyChecks.ENCRYPTED));
 			assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(session, ServerMessage.ErrorMessage.class).code(),
 					"rejected: " + name.replaceAll("\\p{C}", "?"));
 		}
@@ -300,7 +300,7 @@ class ConnectionServiceTest {
 		assertEquals("\uD835\uDD04".repeat(32), joinWithName("astral", "\uD835\uDD04".repeat(32)).displayName());
 
 		FakeClientSession tooLong = session("too-long");
-		service.onMessage(tooLong, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "a".repeat(33), TestKeyChecks.ENCRYPTED));
+		service.onMessage(tooLong, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "a".repeat(33), TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(tooLong, ServerMessage.ErrorMessage.class).code());
 	}
 
@@ -308,7 +308,7 @@ class ConnectionServiceTest {
 	/// on (its canonical form) rather than on what was sent.
 	private FakeClientSession joinWithName(String channel, String name) {
 		FakeClientSession session = session("s-" + channel);
-		service.onMessage(session, new ClientMessage.Join(channel, ChannelMode.MULTI_CHANNEL_PTT, name, TestKeyChecks.ENCRYPTED));
+		service.onMessage(session, new ClientMessage.Join(channel, ChannelMode.MULTI_CHANNEL_PTT, null, name, TestKeyChecks.ENCRYPTED));
 		return session;
 	}
 
@@ -375,7 +375,7 @@ class ConnectionServiceTest {
 		bob.sent.clear();
 
 		// Alice re-sends Join for the channel she is already in (a duplicate / retry).
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("team", firstOf(alice, ServerMessage.Joined.class).channel(),
 				"a duplicate join re-sends the snapshot so the client re-syncs");
@@ -389,7 +389,7 @@ class ConnectionServiceTest {
 		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		alice.sent.clear();
 
-		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("other", firstOf(alice, ServerMessage.Joined.class).channel(), "joining a different channel switches");
 		assertFalse(channelExists("team"), "the previous channel is left (and dropped once empty)");
@@ -402,7 +402,7 @@ class ConnectionServiceTest {
 		alice.sent.clear();
 
 		// Bad target channel name: validated BEFORE leaving, so the switch is refused without dropping alice.
-		service.onMessage(alice, new ClientMessage.Join("bad name!", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(alice, new ClientMessage.Join("bad name!", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("team", alice.channelName(), "an invalid switch target must not drop the client from its channel");
@@ -450,7 +450,7 @@ class ConnectionServiceTest {
 	@Test
 	void aJoinWithAnInvalidDisplayNameIsRejected() {
 		FakeClientSession session = session("sess-1");
-		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "has/slash", TestKeyChecks.ENCRYPTED));
+		service.onMessage(session, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "has/slash", TestKeyChecks.ENCRYPTED));
 
 		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(session, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("team"), "the channel is not created when the join is rejected");
@@ -463,7 +463,7 @@ class ConnectionServiceTest {
 		List.of("\u05E9\u05DC\u05D5\u05DD", "\u674E\u96F7", "\u0395\u03BB\u03AD\u03BD\u03B7", "\u05E6\u05D5\u05D5\u05EA-1")
 				.forEach(name -> {
 					FakeClientSession session = session("s-" + name);
-					service.onMessage(session, new ClientMessage.Join(name, ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+					service.onMessage(session, new ClientMessage.Join(name, ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 					assertEquals(name, firstOf(session, ServerMessage.Joined.class).channel(), name);
 				});
 	}
@@ -474,13 +474,13 @@ class ConnectionServiceTest {
 		// client's PBKDF2 salt, so two members typing what looks like the same room must land in one room with one
 		// key. NBSP, the ideographic space, a tab and a double space all collapse to a single plain space.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("my room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("my room", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		assertEquals("my room", firstOf(alice, ServerMessage.Joined.class).channel());
 
 		List.of("my\u00A0room", "my\u3000room", "my\troom", "my   room", "  my room  ")
 				.forEach(spelling -> {
 					FakeClientSession peer = session("peer-" + spelling.hashCode());
-					service.onMessage(peer, new ClientMessage.Join(spelling, ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+					service.onMessage(peer, new ClientMessage.Join(spelling, ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 					assertEquals("my room", firstOf(peer, ServerMessage.Joined.class).channel(),
 							() -> "should be the same room: " + spelling);
 				});
@@ -492,7 +492,7 @@ class ConnectionServiceTest {
 		// Collapse-then-strip reduces it to the empty string, which the pattern refuses — the same discipline
 		// canonicalDisplayName follows, so a name cannot be minted out of invisible padding.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join(" \u00A0\t ", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join(" \u00A0\t ", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 	}
 
@@ -504,7 +504,7 @@ class ConnectionServiceTest {
 		List.of("team.one", "bad\u200bname", "team\u202e", "a/b")
 				.forEach(name -> {
 					FakeClientSession session = session("bad-" + name.hashCode());
-					service.onMessage(session, new ClientMessage.Join(name, ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+					service.onMessage(session, new ClientMessage.Join(name, ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 					assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(session, ServerMessage.ErrorMessage.class).code(),
 							() -> "should reject " + name);
 				});
@@ -523,9 +523,9 @@ class ConnectionServiceTest {
 		assertNotEquals(precomposed, decomposed, "the two spellings really are different strings");
 
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join(precomposed, ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join(precomposed, ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join(decomposed, ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(bob, new ClientMessage.Join(decomposed, ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 
 		String joined = firstOf(alice, ServerMessage.Joined.class).channel();
 		assertEquals(decomposed, joined, "the canonical (NFC) form is what the server stores and echoes");
@@ -537,7 +537,7 @@ class ConnectionServiceTest {
 	@Test
 	void aChannelNameIsStrippedSoACopyPastedSpaceIsTheSameRoom() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("  team-1  ", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("  team-1  ", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		assertEquals("team-1", firstOf(alice, ServerMessage.Joined.class).channel());
 	}
 
@@ -547,7 +547,7 @@ class ConnectionServiceTest {
 		// PASSPHRASE_MISMATCH, which is about DISAGREEING with a channel's key — this fires before any channel
 		// exists, on a creation attempt, which is the case that used to quietly produce a plaintext channel.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", null));
 
 		assertEquals(ErrorCode.PASSPHRASE_REQUIRED, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("team"), "a refused join must not have created the channel");
@@ -557,7 +557,7 @@ class ConnectionServiceTest {
 	void everyModeButGlobalRequiresAKeyCheck() {
 		// Full-duplex is not a special case: the rule is about the MODE being global, not about push-to-talk.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("duplex", ChannelMode.FULL_DUPLEX, "alice", null));
+		service.onMessage(alice, new ClientMessage.Join("duplex", ChannelMode.FULL_DUPLEX, null, "alice", null));
 		assertEquals(ErrorCode.PASSPHRASE_REQUIRED, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 	}
 
@@ -568,7 +568,7 @@ class ConnectionServiceTest {
 		FakeClientSession alice = join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		alice.sent.clear();
 
-		service.onMessage(alice, new ClientMessage.Join("elsewhere", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		service.onMessage(alice, new ClientMessage.Join("elsewhere", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", null));
 
 		assertEquals(ErrorCode.PASSPHRASE_REQUIRED, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("team", alice.channelName(), "the refused switch left us where we were");
@@ -581,11 +581,11 @@ class ConnectionServiceTest {
 		// passphrase check sits after the name checks for exactly this reason, and putting it earlier was measured
 		// to break four name-validation tests.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("bad.name", ChannelMode.MULTI_CHANNEL_PTT, "alice", null));
+		service.onMessage(alice, new ClientMessage.Join("bad.name", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", null));
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 
 		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "x".repeat(33), null));
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "x".repeat(33), null));
 		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 	}
 
@@ -595,7 +595,7 @@ class ConnectionServiceTest {
 		// not the plaintext-vs-encrypted case it used to be — there are no plaintext channels to contrast with.
 		join("alice", "team", ChannelMode.MULTI_CHANNEL_PTT);
 		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-X"));
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-X"));
 
 		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertEquals(1, channel("team").size(), "the mismatched joiner is not added");
@@ -615,9 +615,9 @@ class ConnectionServiceTest {
 	@Test
 	void theOwnerCanChangeThePassphraseAndEveryoneIsNotified() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 		alice.sent.clear();
 		bob.sent.clear();
 
@@ -631,9 +631,9 @@ class ConnectionServiceTest {
 	@Test
 	void aNonOwnerCannotChangeThePassphrase() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 		bob.sent.clear();
 
 		service.onMessage(bob, new ClientMessage.ChangePassphrase("kcv-B", null));
@@ -652,17 +652,17 @@ class ConnectionServiceTest {
 	@Test
 	void afterARekeyANewJoinerMustPresentTheNewKeyCheck() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 
 		// The old passphrase no longer works...
 		FakeClientSession stale = session("stale");
-		service.onMessage(stale, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "stale", "kcv-A"));
+		service.onMessage(stale, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "stale", "kcv-A"));
 		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(stale, ServerMessage.ErrorMessage.class).code());
 
 		// ...but the new one does.
 		FakeClientSession fresh = session("fresh");
-		service.onMessage(fresh, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "fresh", "kcv-B"));
+		service.onMessage(fresh, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "fresh", "kcv-B"));
 		assertEquals("team", firstOf(fresh, ServerMessage.Joined.class).channel());
 		assertEquals(2, channel("team").size(), "alice + the joiner using the new key");
 	}
@@ -673,7 +673,7 @@ class ConnectionServiceTest {
 		// its effects, because a refusal that half-applied would be worse than either outcome — the channel would be
 		// plaintext while its members still held keys.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		alice.sent.clear();
 
 		service.onMessage(alice, new ClientMessage.ChangePassphrase(null, null));   // "make this channel plaintext"
@@ -686,7 +686,7 @@ class ConnectionServiceTest {
 		// would only re-test the join guard, which cannot distinguish "the clear was refused" from "the clear
 		// worked and this channel is now plaintext" (both refuse a null). So present kcv-A and expect to get in.
 		FakeClientSession holder = session("holder");
-		service.onMessage(holder, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "holder", "kcv-A"));
+		service.onMessage(holder, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "holder", "kcv-A"));
 		assertEquals("team", firstOf(holder, ServerMessage.Joined.class).channel(),
 				"a holder of the retained passphrase is still admitted");
 	}
@@ -694,7 +694,7 @@ class ConnectionServiceTest {
 	@Test
 	void rotatingThePassphraseOnTheGlobalRoomIsRefused() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("global", ChannelMode.GLOBAL_PTT, "alice", null));
+		service.onMessage(alice, new ClientMessage.Join("global", ChannelMode.GLOBAL_PTT, null, "alice", null));
 		alice.sent.clear();
 
 		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
@@ -712,23 +712,23 @@ class ConnectionServiceTest {
 		// regardless of whether the clear had worked. A refusal has to be inert, not merely overwritten, so assert
 		// the state between the two calls rather than only at the end.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		service.onMessage(alice, new ClientMessage.ChangePassphrase(null, null));      // refused
 		assertEquals("kcv-A", channel("team").keyCheck(), "the refused clear left the key-check alone");
 		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));   // a real rotation still works
 		assertEquals("kcv-B", channel("team").keyCheck());
 		FakeClientSession stale = session("stale");
-		service.onMessage(stale, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "stale", "kcv-A"));
+		service.onMessage(stale, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "stale", "kcv-A"));
 		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(stale, ServerMessage.ErrorMessage.class).code());
 		FakeClientSession fresh = session("fresh");
-		service.onMessage(fresh, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "fresh", "kcv-B"));
+		service.onMessage(fresh, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "fresh", "kcv-B"));
 		assertEquals("team", firstOf(fresh, ServerMessage.Joined.class).channel());
 	}
 
 	@Test
 	void aSecondRotationReplacesTheKeyCheckAgain() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-C", null));
 		assertEquals("kcv-C", channel("team").keyCheck(), "the latest rotation wins");
@@ -786,9 +786,9 @@ class ConnectionServiceTest {
 	@Test
 	void theNewOwnerCanRotateAndTheOldOwnerCannot() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
 		alice.sent.clear();
 		bob.sent.clear();
@@ -809,9 +809,9 @@ class ConnectionServiceTest {
 	@Test
 	void aRotationFollowedByATransferKeepsBothMutations() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 
 		service.onMessage(alice, new ClientMessage.ChangePassphrase("kcv-B", null));
 		service.onMessage(alice, new ClientMessage.TransferOwnership("bob"));
@@ -843,14 +843,14 @@ class ConnectionServiceTest {
 	void aSwitchToAChannelWithAWrongPassphraseLeavesTheSwitcherWhereItWas() {
 		// alice owns encrypted "team"; "other" already exists with a DIFFERENT key-check.
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession bootstrap = session("bootstrap");
-		service.onMessage(bootstrap, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bootstrap", "kcv-OTHER"));
+		service.onMessage(bootstrap, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "bootstrap", "kcv-OTHER"));
 		alice.sent.clear();
 
 		// In-place switch to "other" with the WRONG key-check. The mismatch is only knowable inside the atomic join,
 		// so this used to drop the switcher from BOTH channels; the join now departs the old channel only on success.
-		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-WRONG"));
+		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-WRONG"));
 
 		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(alice, ServerMessage.ErrorMessage.class).code());
 		assertEquals("team", alice.channelName(), "a failed switch no longer costs the switcher its channel");
@@ -861,16 +861,16 @@ class ConnectionServiceTest {
 	@Test
 	void aFailedSwitchAlsoUndoesTheDisplayNameItCarried() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession bootstrap = session("bootstrap");
-		service.onMessage(bootstrap, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bootstrap", "kcv-OTHER"));
+		service.onMessage(bootstrap, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "bootstrap", "kcv-OTHER"));
 		FakeClientSession bob = session("bob");
-		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 		bob.sent.clear();
 
 		// Join carries a display name as well as a channel, so a rejected switch must not apply half of it: staying in
 		// "team" under a new name nobody there was told about would leave that roster wrong forever.
-		service.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bob-renamed", "kcv-WRONG"));
+		service.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "bob-renamed", "kcv-WRONG"));
 
 		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(bob, ServerMessage.ErrorMessage.class).code());
 		assertEquals("bob", bob.displayName(), "the name the failed Join carried is rolled back");
@@ -882,9 +882,9 @@ class ConnectionServiceTest {
 	@Test
 	void aSuccessfulSwitchDoesApplyTheDisplayNameItCarried() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 
-		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "alice-renamed", TestKeyChecks.ENCRYPTED));
+		service.onMessage(alice, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "alice-renamed", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("alice-renamed", alice.displayName(), "on success the Join's name takes effect");
 		assertEquals("other", alice.channelName());
@@ -893,10 +893,10 @@ class ConnectionServiceTest {
 	@Test
 	void anUninvolvedMemberAlsoHearsTheOwnerAndPassphraseChanges() {
 		FakeClientSession alice = session("alice");
-		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
-		service.onMessage(session("bob"), new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
+		service.onMessage(session("bob"), new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 		FakeClientSession carol = session("carol");   // neither owner nor the transfer target — a pure bystander
-		service.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", "kcv-A"));
+		service.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", "kcv-A"));
 		carol.sent.clear();
 
 		// Both broadcasts fan out to the WHOLE channel (forEach), so the bystander must receive them.
@@ -914,164 +914,266 @@ class ConnectionServiceTest {
 		return new FakeClientSession(id, Transport.SIGNALING, id);
 	}
 
-	/// Builds the mixed-transport channel the join path now REFUSES, by adding the second member to the channel
-	/// directly instead of through `Join`.
-	///
-	/// That is deliberate, and it is the right shape for a defence-in-depth gate: the signaling gate below is the
-	/// server-side BELT, so its test must construct the state the invariant forbids and assert the backstop still
-	/// holds. Routing through `Join` would make these tests pass vacuously — the join is refused, so the member is
-	/// never there to be signalled at — which is exactly what happened to an earlier version of them.
-	private FakeClientSession forceIntoChannel(String channelName, FakeClientSession session) {
-		channel(channelName).add(session);
-		session.joinedChannel(channelName);
-		return session;
+	// --- changeTransport: the owner moves the whole channel, and nobody reconnects ---------------------
+
+	@Test
+	void theOwnerMovesTheWholeChannelAndEverySessionKeepsItsPlace() {
+		// The bug this replaced: changing transport meant a new socket, hence a new session id — and ownership, the
+		// floor and the roster position are all keyed on that. An owner could not move their own channel without
+		// ceasing to own it, and a leave-election would hand it to someone else mid-move.
+		FakeClientSession alice = join("alice", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.RequestFloor());
+		alice.sent.clear();
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.ChangeTransport(Transport.SIGNALING));
+
+		assertEquals(Transport.SIGNALING, channel("room").transport());
+		assertEquals(Transport.SIGNALING, firstOf(alice, ServerMessage.TransportChanged.class).transport(),
+				"the asker is told too — it is a channel-wide fact, not an acknowledgement");
+		assertEquals(Transport.SIGNALING, firstOf(bob, ServerMessage.TransportChanged.class).transport());
+		assertEquals("alice", channel("room").ownerId(), "the owner is still the owner");
+		assertEquals("alice", channel("room").floorHolder() instanceof Some(String holder) ? holder : null,
+				"and still holds the floor it took");
+		assertEquals(2, channel("room").size(), "nobody was removed to do it");
 	}
 
 	@Test
-	void webRtcSignalingIsNotRelayedToAMemberOnTheAudioTransport() {
-		// The audio path is transport-gated in both directions; signaling was gated in neither, so a relay member
-		// could be HANDED an offer — and the browser answered it, attaching its microphone to a peer connection
-		// whose media takes neither the floor/owner-mute enforcement nor the passphrase E2EE. Dropped silently,
-		// like a signaling session's audio frames: a client sending these on the wrong transport is confused, not
-		// owed a reply, and an error per ICE candidate would be a flood.
-		FakeClientSession webrtc = signaling("webrtc");
-		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
-		FakeClientSession relay = forceIntoChannel("room", session("relay"));
-		relay.sent.clear();
-		webrtc.sent.clear();
+	void aNonOwnerCannotMoveTheChannel() {
+		join("alice", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "room", ChannelMode.MULTI_CHANNEL_PTT);
 
-		service.onMessage(webrtc, new ClientMessage.Offer("relay", "sdp-offer"));
+		service.onMessage(bob, new ClientMessage.ChangeTransport(Transport.SIGNALING));
 
-		assertTrue(relay.sent.stream().noneMatch(ServerMessage.SignalOffer.class::isInstance),
-				"a relay member must not be handed an offer it would answer with its microphone");
-		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.ErrorMessage.class::isInstance),
-				"...and the sender gets no error: dropped silently, like audio on the wrong transport");
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(bob, ServerMessage.ErrorMessage.class).code());
+		assertEquals(Transport.AUDIO_RELAY, channel("room").transport(), "and the channel did not move");
 	}
 
 	@Test
-	void signalingFromAMemberOnTheAudioTransportIsAlsoDropped() {
-		// The other direction, for symmetry: a relay member that sends signaling (an older client, or one confused
-		// about its own transport) must not reach a WebRTC member either.
-		FakeClientSession webrtc = signaling("webrtc");
-		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
-		FakeClientSession relay = forceIntoChannel("room", session("relay"));
-		webrtc.sent.clear();
+	void movingToThePlaneTheChannelIsAlreadyOnSaysNothingToAnyone() {
+		// Accepted, not refused: a client re-sending its own state (or two owners' clicks crossing) is not an
+		// error. But it must not BROADCAST, or every member would tear down and rebuild a working audio pipeline
+		// for nothing — the one cost this whole design exists to avoid.
+		FakeClientSession alice = join("alice", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		alice.sent.clear();
+		bob.sent.clear();
 
-		service.onMessage(relay, new ClientMessage.Answer("webrtc", "sdp-answer"));
-		service.onMessage(relay, new ClientMessage.IceCandidate("webrtc", "cand", "0", 0));
+		service.onMessage(alice, new ClientMessage.ChangeTransport(Transport.AUDIO_RELAY));
 
-		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.SignalAnswer.class::isInstance));
-		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.SignalIce.class::isInstance));
+		assertTrue(alice.sent.isEmpty(), "no acknowledgement for a no-op");
+		assertTrue(bob.sent.isEmpty(), "and certainly no rebuild instruction");
 	}
 
 	@Test
-	void aJoinerOnTheOtherTransportIsRefusedAndTheChannelIsUndisturbed() {
-		// The structural fix: one transport per channel, decided by whoever joined first. A mixed channel is a full
-		// roster with working floor control and NO audio path in either direction — it looks like it works, which is
-		// why it is refused rather than merely warned about.
+	void movingTheChannelBeforeJoiningOneIsNotInChannel() {
+		FakeClientSession stray = session("stray");
+		service.onMessage(stray, new ClientMessage.ChangeTransport(Transport.SIGNALING));
+		assertEquals(ErrorCode.NOT_IN_CHANNEL, firstOf(stray, ServerMessage.ErrorMessage.class).code());
+	}
+
+	@Test
+	void theGlobalRoomCannotBeMoved() {
+		// It has the sentinel owner, which no session id can equal, so every owner-only action there is NOT_OWNER —
+		// including this one. Worth pinning: the global room is the one channel a user cannot leave by switching
+		// away from a plane they cannot speak, so moving it would strand people.
+		FakeClientSession alice = join("alice", "global", ChannelMode.GLOBAL_PTT);
+		alice.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.ChangeTransport(Transport.SIGNALING));
+
+		assertEquals(ErrorCode.NOT_OWNER, firstOf(alice, ServerMessage.ErrorMessage.class).code());
+		assertEquals(Transport.AUDIO_RELAY, channel("global").transport());
+	}
+
+	@Test
+	void aMemberJoiningAfterAMoveGetsTheChannelsCurrentPlane() {
+		// The move and the join are serialized on the same bin lock, so a joiner is measured against one plane or
+		// the other and never against a channel halfway between. Observable as: whoever arrives next is told where
+		// the channel actually is, with no second message to correct it.
+		FakeClientSession alice = join("alice", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.ChangeTransport(Transport.SIGNALING));
+
+		FakeClientSession bob = join("bob", "room", ChannelMode.MULTI_CHANNEL_PTT);
+
+		assertEquals(Transport.SIGNALING, firstOf(bob, ServerMessage.Joined.class).transport());
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.TransportChanged.class::isInstance),
+				"the Joined snapshot already said so — a correction afterwards would be a second answer");
+	}
+
+	@Test
+	void signalingIsNotRelayedInsideARelayChannel() {
+		// The audio path is transport-gated in both directions; signaling was gated in neither, so a member on the
+		// relay plane could be HANDED an offer — and the browser answered it, attaching its microphone to a peer
+		// connection whose media takes neither the floor/owner-mute enforcement nor the passphrase E2EE. Dropped
+		// silently, like a relay frame in a WebRTC channel: a client sending these in the wrong channel is confused,
+		// not owed a reply, and an error per ICE candidate would be a flood.
+		//
+		// The gate is on the CHANNEL now, so this covers both directions at once — sender and target are members of
+		// the same channel, and a channel has one plane. It used to take two tests and a helper that spliced a
+		// member into a channel behind the join path's back, because a mixed channel could not be built any other
+		// way; it now cannot be built at all, which is what made the helper unnecessary rather than merely unused.
+		FakeClientSession alice = join("alice", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		alice.sent.clear();
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.Offer("bob", "sdp-offer"));
+		service.onMessage(bob, new ClientMessage.Answer("alice", "sdp-answer"));
+		service.onMessage(bob, new ClientMessage.IceCandidate("alice", "cand", "0", 0));
+
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.SignalOffer.class::isInstance),
+				"a relay-plane member must not be handed an offer it would answer with its microphone");
+		assertTrue(alice.sent.stream().noneMatch(ServerMessage.SignalAnswer.class::isInstance));
+		assertTrue(alice.sent.stream().noneMatch(ServerMessage.SignalIce.class::isInstance));
+		assertTrue(alice.sent.stream().noneMatch(ServerMessage.ErrorMessage.class::isInstance),
+				"...and no sender gets an error: dropped silently, like audio in the wrong channel");
+		assertTrue(bob.sent.stream().noneMatch(ServerMessage.ErrorMessage.class::isInstance));
+	}
+
+	@Test
+	void signalingResumesInTheSameChannelOnceItsOwnerMovesItToWebRtc() {
+		// The gate is the channel's plane and nothing else, so the very same pair that was dropped above gets
+		// through after a `changeTransport` — on the same sockets, in the same channel, with the same session ids.
+		FakeClientSession alice = join("alice", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		FakeClientSession bob = join("bob", "room", ChannelMode.MULTI_CHANNEL_PTT);
+		service.onMessage(alice, new ClientMessage.ChangeTransport(Transport.SIGNALING));
+		bob.sent.clear();
+
+		service.onMessage(alice, new ClientMessage.Offer("bob", "sdp-offer"));
+
+		assertEquals("alice", firstOf(bob, ServerMessage.SignalOffer.class).from());
+	}
+
+	@Test
+	void aJoinerAdoptsTheChannelsTransportRatherThanBeingRefused() {
+		// The structural rule: one transport per channel, and the joiner does not get a vote. It used to be refused
+		// with TRANSPORT_MISMATCH and told to reconnect on the other endpoint; adopting is strictly better, because
+		// the two endpoints speak the identical control protocol so the socket never needed redialling. What must
+		// NOT happen is a mixed channel — a full roster with working floor control and no audio path in either
+		// direction, which looks exactly like working.
 		FakeClientSession relay = session("relay");
-		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		relay.sent.clear();
 		FakeClientSession webrtc = signaling("webrtc");
 
-		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 
-		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(webrtc, ServerMessage.ErrorMessage.class).code());
-		assertEquals(1, channel("room").size(), "the refused joiner is not added");
-		assertTrue(relay.sent.stream().noneMatch(ServerMessage.MemberJoined.class::isInstance),
-				"and the incumbent is not told about a member that never joined");
+		assertEquals(Transport.AUDIO_RELAY, firstOf(webrtc, ServerMessage.Joined.class).transport(),
+				"the ack names the channel's plane, not the endpoint the joiner dialled");
+		assertEquals(2, channel("room").size(), "and it really is in the channel");
+		assertEquals(Transport.AUDIO_RELAY, channel("room").transport(), "the channel did not move to meet it");
+		assertTrue(relay.sent.stream().anyMatch(ServerMessage.MemberJoined.class::isInstance),
+				"and the incumbent is told about it, as about any other arrival");
 	}
 
 	@Test
-	void theMirrorImageIsRefusedToo() {
+	void theMirrorImageAdoptsToo() {
 		FakeClientSession webrtc = signaling("webrtc");
-		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession relay = session("relay");
-		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
-		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(relay, ServerMessage.ErrorMessage.class).code());
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
+		assertEquals(Transport.SIGNALING, firstOf(relay, ServerMessage.Joined.class).transport());
 	}
 
 	@Test
-	void theFirstMemberDecidesTheTransportAndAnEmptiedChannelDecidesAfresh() {
+	void theCreatorDecidesTheTransportAndAnEmptiedChannelDecidesAfresh() {
 		// The answer to "what about a channel that was left": there is no such thing to inherit from. A channel is
-		// dropped the instant its last member leaves, so the next creator decides. Deriving the transport from the
-		// roster (rather than storing it) is what makes that structural instead of something to remember.
+		// dropped the instant its last member leaves, so the next creator decides — including when the two creators
+		// disagree, which is the case a stored field could get wrong if it outlived its channel.
 		FakeClientSession relay = session("relay");
-		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		service.onClose(relay, "bye");
 		assertFalse(channelExists("room"), "the channel is dropped once empty");
 
 		FakeClientSession webrtc = signaling("webrtc");
-		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
-		assertEquals("room", firstOf(webrtc, ServerMessage.Joined.class).channel(),
-				"the new first member sets the transport, whatever the old one used");
+		service.onMessage(webrtc, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
+		assertEquals(Transport.SIGNALING, firstOf(webrtc, ServerMessage.Joined.class).transport(),
+				"the new creator sets the transport, whatever the old one used");
 
 		FakeClientSession late = session("late");
-		service.onMessage(late, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "carol", "kcv-A"));
-		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(late, ServerMessage.ErrorMessage.class).code(),
-				"...and now it is the relay transport that is refused");
+		service.onMessage(late, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", "kcv-A"));
+		assertEquals(Transport.SIGNALING, firstOf(late, ServerMessage.Joined.class).transport(),
+				"...and now it is a relay-dialled joiner that adopts WebRTC");
 	}
 
 	@Test
-	void aLockedChannelRefusesAWrongTransportKnockerWithoutTroublingTheOwner() {
-		// The gate exists in BOTH branches of joinOrCreate, and a mutation run showed the locked/parking one was
-		// uncovered. It sits BEFORE knock() on purpose — the same argument the LOCKED and key-check gates above it
-		// make: never ask an owner to approve someone who could not be admitted anyway.
+	void aJoinMayASKForATransportAndGetsItOnlyWhenItCreatesTheChannel() {
+		// Exactly the rule `mode` follows: the creator's request is honoured, a joiner's is ignored in favour of the
+		// channel's. Without the first half, an owner who picked WebRTC in the form would create a relay channel
+		// (their socket is /ws/audio) and immediately have to move it — a visible flicker for no reason.
+		FakeClientSession alice = session("alice");
+		service.onMessage(alice, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, Transport.SIGNALING, "alice", "kcv-A"));
+		assertEquals(Transport.SIGNALING, firstOf(alice, ServerMessage.Joined.class).transport(),
+				"the creator asked for WebRTC on a relay socket and got it");
+
+		FakeClientSession bob = session("bob");
+		service.onMessage(bob, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, Transport.AUDIO_RELAY, "bob", "kcv-A"));
+		assertEquals(Transport.SIGNALING, firstOf(bob, ServerMessage.Joined.class).transport(),
+				"a joiner's request loses to the channel's own plane");
+		assertEquals(Transport.SIGNALING, channel("room").transport(), "and cannot drag the channel with it");
+	}
+
+	@Test
+	void aLockedChannelParksAKnockerWhateverEndpointItDialled() {
+		// The transport gate used to sit in this branch too, refusing a wrong-transport knocker before knock(). With
+		// adoption there is nothing to refuse: the knocker will adopt the channel's plane if the owner admits it, so
+		// parking it is the same decision as for anyone else.
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		alice.sent.clear();
 		FakeClientSession webrtc = signaling("webrtc");
 
-		svc.onMessage(webrtc, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(webrtc, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
-		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(webrtc, ServerMessage.ErrorMessage.class).code());
-		assertTrue(webrtc.sent.stream().noneMatch(ServerMessage.JoinPending.class::isInstance),
-				"refused outright, not parked");
-		assertNull(webrtc.pendingChannel(), "and not left marked as waiting");
-		assertTrue(alice.sent.stream().noneMatch(ServerMessage.JoinRequests.class::isInstance),
-				"the owner is never shown a request it could not usefully approve");
+		assertTrue(webrtc.sent.stream().anyMatch(ServerMessage.JoinPending.class::isInstance), "parked, not refused");
+		assertEquals("team", webrtc.pendingChannel(), "and marked as waiting there");
+		assertTrue(alice.sent.stream().anyMatch(ServerMessage.JoinRequests.class::isInstance),
+				"the owner is shown a request it can usefully approve");
 	}
 
 	@Test
-	void aWrongPassphraseIsReportedAheadOfAWrongTransport() {
-		// Ordering: the passphrase is the membership credential, so it stays the FIRST gate. Someone who cannot
-		// present it must learn nothing about how the channel is configured.
+	void aWrongPassphraseIsStillReportedWhateverEndpointTheJoinerDialled() {
+		// The passphrase is the membership credential and stays the gate that matters. It used to be ordered ahead
+		// of a transport check so a stranger learned nothing about the channel's configuration; there is no longer
+		// a second gate to be ahead of, but the refusal itself must not have quietly gone with it.
 		FakeClientSession relay = session("relay");
-		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(relay, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession wrong = signaling("wrong");
 
-		service.onMessage(wrong, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-DIFFERENT"));
+		service.onMessage(wrong, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-DIFFERENT"));
 
 		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(wrong, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
-	void aRefusedTransportSwitchKeepsTheChannelAndRollsBackTheName() {
-		// A switch is a fresh Join, so the all-or-nothing guarantee has to hold for this refusal too: the refused
-		// switcher keeps its channel AND the display name it had, since handleJoin applies the new name before the
-		// atomic join and undoes it on refusal.
+	void switchingIntoAChannelOnTheOtherPlaneMovesTheSwitcherAndKeepsItsNewName() {
+		// A switch is a fresh Join, so it adopts like any other. The name it carried STICKS, because the join
+		// succeeded — the rollback path exists only for a refusal, and this used to be one.
 		FakeClientSession relay = session("relay");
-		service.onMessage(relay, new ClientMessage.Join("home", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(relay, new ClientMessage.Join("home", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession webrtc = signaling("webrtc");
-		service.onMessage(webrtc, new ClientMessage.Join("webrtc-room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(webrtc, new ClientMessage.Join("webrtc-room", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 		relay.sent.clear();
 
-		service.onMessage(relay, new ClientMessage.Join("webrtc-room", ChannelMode.MULTI_CHANNEL_PTT, "renamed", "kcv-A"));
+		service.onMessage(relay, new ClientMessage.Join("webrtc-room", ChannelMode.MULTI_CHANNEL_PTT, null, "renamed", "kcv-A"));
 
-		assertEquals(ErrorCode.TRANSPORT_MISMATCH, firstOf(relay, ServerMessage.ErrorMessage.class).code());
-		assertEquals("home", relay.channelName(), "the refused switch left us where we were");
-		assertEquals("alice", relay.displayName(), "and rolled the display name back");
+		assertEquals(Transport.SIGNALING, firstOf(relay, ServerMessage.Joined.class).transport());
+		assertEquals("webrtc-room", relay.channelName(), "the switch landed");
+		assertEquals("renamed", relay.displayName(), "and kept the name it carried");
+		assertFalse(channelExists("home"), "the channel it left emptied and was dropped");
 	}
 
 	@Test
 	void signalingStillFlowsBetweenTwoWebRtcMembers() {
 		// The gate must not break the transport it exists for: both ends signaling, so the offer is relayed.
 		FakeClientSession alice = signaling("alice");
-		service.onMessage(alice, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		service.onMessage(alice, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		FakeClientSession bob = signaling("bob");
-		service.onMessage(bob, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-A"));
+		service.onMessage(bob, new ClientMessage.Join("room", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-A"));
 		bob.sent.clear();
 
 		service.onMessage(alice, new ClientMessage.Offer("bob", "sdp-offer"));
@@ -1082,28 +1184,28 @@ class ConnectionServiceTest {
 	@Test
 	void aJoinWithANullChannelNameIsRejectedAsInvalidChannel() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void aJoinWithAnEmptyChannelNameIsRejectedAsInvalidChannel() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join("", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join("", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void aJoinWithAnOverlongChannelNameIsRejectedAsInvalidChannel() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join("x".repeat(65), ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join("x".repeat(65), ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void channelNameValidationHappensBeforeDisplayNameValidation() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join("bad.name", ChannelMode.MULTI_CHANNEL_PTT, "also bad!!", TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join("bad.name", ChannelMode.MULTI_CHANNEL_PTT, null, "also bad!!", TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.INVALID_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code(),
 				"the channel name is validated before the display name");
 	}
@@ -1111,21 +1213,21 @@ class ConnectionServiceTest {
 	@Test
 	void aJoinWithANullDisplayNameIsRejectedAsInvalidDisplayName() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, null, TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void aJoinWithAnOverlongDisplayNameIsRejected() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "x".repeat(33), TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "x".repeat(33), TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.INVALID_DISPLAY_NAME, firstOf(s, ServerMessage.ErrorMessage.class).code());
 	}
 
 	@Test
 	void globalPttWithANullChannelNameStillJoinsTheGlobalChannel() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.GLOBAL_PTT, "alice", null));
+		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.GLOBAL_PTT, null, "alice", null));
 		assertEquals("global", firstOf(s, ServerMessage.Joined.class).channel(),
 				"GLOBAL_PTT forces the name to 'global' before the null-channel check");
 	}
@@ -1135,7 +1237,7 @@ class ConnectionServiceTest {
 	@Test
 	void joiningTheGlobalNameInMultiChannelModeIsReservedRejected() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.RESERVED_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("global"), "the global channel is not created by a reserved-name rejection");
 	}
@@ -1143,7 +1245,7 @@ class ConnectionServiceTest {
 	@Test
 	void joiningTheGlobalNameInFullDuplexIsReservedRejected() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.FULL_DUPLEX, "alice", TestKeyChecks.ENCRYPTED));
+		service.onMessage(s, new ClientMessage.Join("global", ChannelMode.FULL_DUPLEX, null, "alice", TestKeyChecks.ENCRYPTED));
 		assertEquals(ErrorCode.RESERVED_CHANNEL, firstOf(s, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("global"));
 	}
@@ -1151,7 +1253,7 @@ class ConnectionServiceTest {
 	@Test
 	void anEncryptedGlobalPttJoinIsRejected() {
 		FakeClientSession s = session("s1");
-		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.GLOBAL_PTT, "alice", "kcv-X"));
+		service.onMessage(s, new ClientMessage.Join(null, ChannelMode.GLOBAL_PTT, null, "alice", "kcv-X"));
 		assertEquals(ErrorCode.ENCRYPTION_NOT_ALLOWED, firstOf(s, ServerMessage.ErrorMessage.class).code());
 		assertFalse(channelExists("global"), "an encrypted join never creates the global channel");
 	}
@@ -1222,18 +1324,24 @@ class ConnectionServiceTest {
 
 	@Test
 	void audioFromASignalingSenderIsDroppedAndSignalingMembersAreSkipped() {
+		// A member's plane is its CHANNEL's, so "a signaling member in a relay channel" is not a state to test —
+		// it cannot exist. What can: a relay frame arriving in a channel that is on the WebRTC plane, from a client
+		// that has not yet acted on its transportChanged. It is dropped, and every member is skipped by the
+		// fan-out, because in that channel the audio is supposed to be flowing peer-to-peer.
 		FakeClientSession alice = join("alice", "room", ChannelMode.FULL_DUPLEX);
 		FakeClientSession bob = join("bob", "room", ChannelMode.FULL_DUPLEX);
 		FakeClientSession carol = signaling("carol");
-		service.onMessage(carol, new ClientMessage.Join("room", ChannelMode.FULL_DUPLEX, "carol", TestKeyChecks.ENCRYPTED));
+		service.onMessage(carol, new ClientMessage.Join("room", ChannelMode.FULL_DUPLEX, null, "carol", TestKeyChecks.ENCRYPTED));
 
 		byte[] frame = {1, 2, 3};
 		service.onAudio(alice, ByteBuffer.wrap(frame));
-		assertEquals(1, bob.audio.size(), "an audio-relay member receives the frame");
-		assertEquals(0, carol.audio.size(), "a signaling member is skipped");
+		assertEquals(1, bob.audio.size(), "every member of a relay channel receives the frame");
+		assertEquals(1, carol.audio.size(), "including one that dialled /ws/signal and adopted the relay plane");
 
-		service.onAudio(carol, ByteBuffer.wrap(frame));   // a signaling sender cannot relay audio
-		assertEquals(1, bob.audio.size(), "audio from a signaling sender is dropped");
+		service.onMessage(alice, new ClientMessage.ChangeTransport(Transport.SIGNALING));
+		service.onAudio(alice, ByteBuffer.wrap(frame));
+		assertEquals(1, bob.audio.size(), "a relay frame in a WebRTC channel is dropped on arrival");
+		assertEquals(1, carol.audio.size());
 	}
 
 	@Test
@@ -1247,7 +1355,7 @@ class ConnectionServiceTest {
 		FakeClientSession alice = join("alice", "relayfail", ChannelMode.FULL_DUPLEX);
 		FakeClientSession good = join("good", "relayfail", ChannelMode.FULL_DUPLEX);
 		ClientSession bad = new ThrowingSession("bad");
-		service.onMessage(bad, new ClientMessage.Join("relayfail", ChannelMode.FULL_DUPLEX, "bad", TestKeyChecks.ENCRYPTED));
+		service.onMessage(bad, new ClientMessage.Join("relayfail", ChannelMode.FULL_DUPLEX, null, "bad", TestKeyChecks.ENCRYPTED));
 
 		byte[] frame = {4, 5, 6};
 		assertDoesNotThrow(() -> service.onAudio(alice, ByteBuffer.wrap(frame)));
@@ -1364,8 +1472,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle-release 5 s, max-hold off
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("ptt", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("ptt", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("ptt", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("ptt", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice takes the floor at t=0
 		assertTrue(channel("ptt").holdsFloor("alice"));
@@ -1399,9 +1507,9 @@ class ConnectionServiceTest {
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 		FakeClientSession carol = session("carol");
-		svc.onMessage(alice, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(carol, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("ptt3", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds at t=0, then goes silent
 
 		clock.advance(Duration.ofSeconds(6));
@@ -1421,8 +1529,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 0, 10);   // idle-release OFF, max-hold 10 s
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("swept", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("swept", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("swept", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("swept", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds at t=0, then goes silent (no frames, no release)
 		assertTrue(channel("swept").holdsFloor("alice"));
 
@@ -1449,8 +1557,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 0, 10);   // idle-release off, max-hold 10 s
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("ptt2", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("ptt2", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("ptt2", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("ptt2", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds at t=0
 		bob.audio.clear();
 		alice.sent.clear();
@@ -1478,8 +1586,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle-release 5 s, max-hold off
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("ptt-active", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("ptt-active", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("ptt-active", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("ptt-active", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice acquires at t=0
 		assertTrue(channel("ptt-active").holdsFloor("alice"));
 
@@ -1515,8 +1623,8 @@ class ConnectionServiceTest {
 		);
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("flood", ChannelMode.FULL_DUPLEX, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		byte[] frame = {1, 2, 3};
 		svc.onAudio(alice, ByteBuffer.wrap(frame));
@@ -1546,8 +1654,8 @@ class ConnectionServiceTest {
 		);
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		byte[] frame = {1, 2, 3};
 		svc.onAudio(alice, ByteBuffer.wrap(frame));
@@ -1555,7 +1663,7 @@ class ConnectionServiceTest {
 		assertEquals(1, bob.audio.size(), "the second frame is over the cap and dropped");
 
 		svc.onClose(alice, "test close");          // must evict alice's bucket
-		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, "alice", TestKeyChecks.ENCRYPTED));   // same id reconnects
+		svc.onMessage(alice, new ClientMessage.Join("recon", ChannelMode.FULL_DUPLEX, null, "alice", TestKeyChecks.ENCRYPTED));   // same id reconnects
 		bob.audio.clear();
 		svc.onAudio(alice, ByteBuffer.wrap(frame));
 		assertEquals(1, bob.audio.size(), "after onClose evicts the bucket, the reconnecting id starts from a full bucket");
@@ -1584,7 +1692,7 @@ class ConnectionServiceTest {
 		);
 		FakeClientSession alice = session("alice");
 
-		svc.onMessage(alice, new ClientMessage.Join("flood-ctl", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));   // token 1
+		svc.onMessage(alice, new ClientMessage.Join("flood-ctl", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));   // token 1
 		svc.onMessage(alice, new ClientMessage.Rename("renamed-once"));    // token 2 -> applied
 		svc.onMessage(alice, new ClientMessage.Rename("renamed-twice"));   // over the rate -> dropped
 
@@ -1735,9 +1843,9 @@ class ConnectionServiceTest {
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 		FakeClientSession carol = session("carol");
-		svc.onMessage(alice, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(carol, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("q3", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
 
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
@@ -1783,9 +1891,9 @@ class ConnectionServiceTest {
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
 		FakeClientSession carol = session("carol");
-		svc.onMessage(alice, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(carol, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("q5", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
 
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
@@ -1813,8 +1921,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 0, 0);   // idle/max-hold off; reservation window = 10 s
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("q5b", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("q5b", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("q5b", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("q5b", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
 
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
@@ -1949,8 +2057,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle 5 s, max-hold off
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("qC", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("qC", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("qC", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("qC", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice (relay) holds, then goes silent
 		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
@@ -1973,8 +2081,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 5, 0);   // idle 5 s
 		FakeClientSession alice = signaling("alice");   // WebRTC (non-relay) holder — no server-side activity signal
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("qD", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("qD", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("qD", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("qD", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // WebRTC alice holds
 		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
@@ -1995,8 +2103,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 0, 10);   // idle off, max-hold 10 s
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("qE", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("qE", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("qE", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("qE", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
 		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
@@ -2016,8 +2124,8 @@ class ConnectionServiceTest {
 		ConnectionService svc = serviceWithClock(clock, 0, 10);   // idle off, max-hold 10 s
 		FakeClientSession alice = session("alice");
 		FakeClientSession bob = session("bob");
-		svc.onMessage(alice, new ClientMessage.Join("qF", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("qF", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("qF", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("qF", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetFloorQueue(true));
 		svc.onMessage(alice, new ClientMessage.RequestFloor());   // alice holds
 		svc.onMessage(bob, new ClientMessage.RequestFloor());     // bob queues
@@ -2489,7 +2597,7 @@ class ConnectionServiceTest {
 		assertFalse(channel("entry-rejoin").isMuted("bob"));
 
 		bob.sent.clear();
-		service.onMessage(bob, new ClientMessage.Join("entry-rejoin", ChannelMode.FULL_DUPLEX, "bob", TestKeyChecks.ENCRYPTED));
+		service.onMessage(bob, new ClientMessage.Join("entry-rejoin", ChannelMode.FULL_DUPLEX, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertFalse(channel("entry-rejoin").isMuted("bob"), "an idempotent re-join must not re-apply the entry mute");
 		assertFalse(firstOf(bob, ServerMessage.Joined.class).members().stream()
@@ -2504,15 +2612,15 @@ class ConnectionServiceTest {
 		// The shared `service` has parking disabled (max-join-requests 0), so a locked channel would refuse outright.
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetMuteNewMembers(true));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, null, "bob", TestKeyChecks.ENCRYPTED));
 		assertTrue(bob.sent.stream().anyMatch(ServerMessage.JoinPending.class::isInstance), "bob is parked");
 		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", true));
-		svc.onMessage(bob, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("entry-knock", ChannelMode.FULL_DUPLEX, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("entry-knock", bob.channelName(), "its own re-Join completed the join");
 		assertTrue(channel("entry-knock").isMuted("bob"), "an admitted newcomer is a newcomer");
@@ -2619,7 +2727,7 @@ class ConnectionServiceTest {
 
 		bob.sent.clear();
 		// bob re-sends Join for its CURRENT channel — an idempotent re-snapshot, allowed despite the lock.
-		service.onMessage(bob, new ClientMessage.Join("relock-snap", ChannelMode.FULL_DUPLEX, "bob", TestKeyChecks.ENCRYPTED));
+		service.onMessage(bob, new ClientMessage.Join("relock-snap", ChannelMode.FULL_DUPLEX, null, "bob", TestKeyChecks.ENCRYPTED));
 		ServerMessage.Joined snap = firstOf(bob, ServerMessage.Joined.class);
 		assertTrue(snap.locked(), "the re-snapshot carries the locked state");
 		assertFalse(bob.sent.stream().anyMatch(ServerMessage.ErrorMessage.class::isInstance),
@@ -2703,11 +2811,11 @@ class ConnectionServiceTest {
 	void aNewcomerAtALockedChannelIsParkedAndTheOwnerIsTold() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("team", firstOf(bob, ServerMessage.JoinPending.class).channel(),
 				"the newcomer is told it is waiting, NOT refused");
@@ -2726,11 +2834,11 @@ class ConnectionServiceTest {
 	void aParkedNewcomerKeepsTheNameItsJoinCarried() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = new FakeClientSession("bob-id", Transport.AUDIO_RELAY, "");   // no name until it joins
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("bob", bob.displayName(), "the name its Join carried survives being parked");
 		assertEquals(
@@ -2747,10 +2855,10 @@ class ConnectionServiceTest {
 	void renamingWhileWaitingRefreshesTheOwnersList() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		svc.onMessage(bob, new ClientMessage.Rename("bob-renamed"));
 
@@ -2768,12 +2876,12 @@ class ConnectionServiceTest {
 	void reJoiningWithANewNameWhileWaitingRefreshesTheOwnersList() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob2", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob2", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("bob2", bob.displayName(), "a parked newcomer keeps the name its latest Join carried");
 		assertEquals(
@@ -2790,14 +2898,14 @@ class ConnectionServiceTest {
 	void reJoiningWithTheSameNameDoesNotReNotifyTheOwner() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		long afterFirstKnock = alice.sent.stream().filter(ServerMessage.JoinRequests.class::isInstance).count();
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(bob, new ClientMessage.Rename("bob"));   // a no-op rename is also not a change
 
 		assertEquals(
@@ -2813,12 +2921,12 @@ class ConnectionServiceTest {
 	void aParkedSwitcherKeepsTheNameItsOwnChannelKnowsItBy() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob-renamed", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob-renamed", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("bob", bob.displayName(), "the rename is rolled back with the rest of the refused switch");
 		assertEquals(
@@ -2832,14 +2940,14 @@ class ConnectionServiceTest {
 	void aParkedNewcomerCannotLetItselfIn() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		// Re-sending Join is exactly what an APPROVED newcomer does to claim its place, so an unapproved one
 		// re-sending it must NOT get in — otherwise the lock means nothing.
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertTrue(bob.sent.stream().noneMatch(ServerMessage.Joined.class::isInstance),
 				"a re-Join without an approval does not admit the newcomer");
@@ -2854,12 +2962,12 @@ class ConnectionServiceTest {
 	void aMemberSwitchingIntoALockedChannelIsParkedAndKeepsItsOldChannel() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("other", bob.channelName(), "waiting does not cost the switcher the channel it already had");
 		assertEquals("team", bob.pendingChannel(), "and it is now waiting at the locked channel's door");
@@ -2871,10 +2979,10 @@ class ConnectionServiceTest {
 	void aWaitingNewcomerThatDisconnectsIsScrubbedFromTheOwnersList() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		svc.onClose(bob, "normal close");
 
@@ -2887,15 +2995,15 @@ class ConnectionServiceTest {
 	void knockingAtASecondDoorWithdrawsTheFirstRequest() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession dave = session("dave");
-		svc.onMessage(dave, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "dave", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(dave, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "dave", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(dave, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
-		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("other", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("other", bob.pendingChannel(), "a session waits at exactly one door");
 		assertTrue(lastOf(alice, ServerMessage.JoinRequests.class).requests().isEmpty(),
@@ -2908,11 +3016,11 @@ class ConnectionServiceTest {
 	void withTheCapAtZeroALockedChannelStillRefusesOutright() {
 		ConnectionService svc = serviceParking(0);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertEquals(ErrorCode.CHANNEL_LOCKED, firstOf(bob, ServerMessage.ErrorMessage.class).code(),
 				"cap 0 keeps the pre-feature behaviour, so CHANNEL_LOCKED stays reachable");
@@ -2923,11 +3031,11 @@ class ConnectionServiceTest {
 	void aWrongPassphraseIsRefusedRatherThanParked() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", "kcv-A"));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", "kcv-A"));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", "kcv-B"));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", "kcv-B"));
 
 		assertEquals(ErrorCode.PASSPHRASE_MISMATCH, firstOf(bob, ServerMessage.ErrorMessage.class).code(),
 				"the key-check is validated BEFORE parking, so the owner is never asked to approve someone who "
@@ -2939,13 +3047,13 @@ class ConnectionServiceTest {
 	void theWaitingListIsRefusedOnceFull() {
 		ConnectionService svc = serviceParking(1);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		FakeClientSession carol = session("carol");
 
-		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 
 		assertEquals(ErrorCode.TOO_MANY_JOIN_REQUESTS, firstOf(carol, ServerMessage.ErrorMessage.class).code());
 		assertNull(carol.pendingChannel());
@@ -2961,17 +3069,17 @@ class ConnectionServiceTest {
 	void anAdmittedNewcomerJoinsByReSendingItsJoin() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", true));
 
 		assertEquals("team", firstOf(bob, ServerMessage.JoinApproved.class).channel(), "the newcomer is told to claim");
 		assertNull(bob.channelName(), "an approval alone does not make it a member");
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("team", bob.channelName(), "its own re-Join completes the join");
 		assertEquals(2, channel("team").size());
@@ -2984,17 +3092,17 @@ class ConnectionServiceTest {
 	void aGrantIsOneShotSoAReJoinCannotBeReplayed() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", true));
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		// bob is in. It leaves, then tries to walk back in on the strength of the approval it already spent.
 		svc.onMessage(bob, new ClientMessage.Leave());
 		bob.sent.clear();
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertNull(bob.channelName(), "the spent grant does not let it back in");
 		assertEquals("team", firstOf(bob, ServerMessage.JoinPending.class).channel(), "it has to ask again");
@@ -3004,10 +3112,10 @@ class ConnectionServiceTest {
 	void aDeniedNewcomerIsToldAndDroppedFromTheList() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", false));
 
@@ -3021,17 +3129,17 @@ class ConnectionServiceTest {
 	void anUnclaimedApprovalCanStillBeRevoked() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", true));
 		// bob's client never comes back to claim it — which is why a granted request stays on the owner's list.
 		assertEquals(List.of("bob"),
 				lastOf(alice, ServerMessage.JoinRequests.class).requests().stream().map(JoinRequestInfo::id).toList());
 
 		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("bob", false));
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertNull(bob.channelName(), "the revoked approval no longer admits it");
 		// Its claim arrives to find no grant, so it counts as asking again — which is what bob is in fact doing.
@@ -3045,10 +3153,10 @@ class ConnectionServiceTest {
 	void aWithdrawnRequestLeavesTheOwnersList() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		svc.onMessage(bob, new ClientMessage.WithdrawJoinRequest());
 
@@ -3060,12 +3168,12 @@ class ConnectionServiceTest {
 	void unlockingAdmitsEveryoneWhoWasWaiting() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
 		FakeClientSession carol = session("carol");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 
 		svc.onMessage(alice, new ClientMessage.SetLocked(false));
 
@@ -3076,7 +3184,7 @@ class ConnectionServiceTest {
 		assertTrue(lastOf(alice, ServerMessage.JoinRequests.class).requests().isEmpty(),
 				"the list is drained, not left full of approvals no unlocked channel would ever consume");
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		assertEquals("team", bob.channelName(), "and they join normally, the lock being gone");
 	}
 
@@ -3087,10 +3195,10 @@ class ConnectionServiceTest {
 	void theLastMemberLeavingALockedChannelReleasesEveryoneWaiting() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		svc.onClose(alice, "normal close");
 
@@ -3099,7 +3207,7 @@ class ConnectionServiceTest {
 				"the lock died with the channel, so the waiting newcomer is cleared to join");
 		assertNull(bob.pendingChannel());
 
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		assertEquals("team", bob.channelName(), "its re-Join RECREATES the channel");
 		assertEquals("bob", channel("team").ownerId(), "and whoever was waiting at an abandoned door now owns it");
@@ -3110,12 +3218,12 @@ class ConnectionServiceTest {
 	void aNewlyElectedOwnerInheritsTheWaitingList() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		FakeClientSession carol = session("carol");
-		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 		carol.sent.clear();
 
 		svc.onClose(alice, "normal close");   // ownership auto-elects to carol
@@ -3132,12 +3240,12 @@ class ConnectionServiceTest {
 	void onlyTheOwnerCanResolveAJoinRequest() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		FakeClientSession carol = session("carol");
-		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
 
 		svc.onMessage(carol, new ClientMessage.ResolveJoinRequest("bob", true));
 
@@ -3150,7 +3258,7 @@ class ConnectionServiceTest {
 	void resolvingAnUnknownRequestIsReportedRatherThanIgnored() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 
 		svc.onMessage(alice, new ClientMessage.ResolveJoinRequest("ghost", true));
@@ -3162,23 +3270,23 @@ class ConnectionServiceTest {
 	void admitAllAdmitsEveryWaitingNewcomerAndDenyAllTurnsThemAway() {
 		ConnectionService svc = serviceParking(16);
 		FakeClientSession alice = session("alice");
-		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "alice", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(alice, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "alice", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.SetLocked(true));
 		FakeClientSession bob = session("bob");
 		FakeClientSession carol = session("carol");
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 
 		svc.onMessage(alice, new ClientMessage.ResolveAllJoinRequests(true));
 
 		// Admit-all keeps the channel LOCKED, so each newcomer still needs its grant to pass the lock.
-		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "bob", TestKeyChecks.ENCRYPTED));
-		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "carol", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(bob, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "bob", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(carol, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "carol", TestKeyChecks.ENCRYPTED));
 		assertEquals(3, channel("team").size());
 		assertTrue(channel("team").isLocked(), "admit-all is not an unlock");
 
 		FakeClientSession dave = session("dave");
-		svc.onMessage(dave, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "dave", TestKeyChecks.ENCRYPTED));
+		svc.onMessage(dave, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "dave", TestKeyChecks.ENCRYPTED));
 		svc.onMessage(alice, new ClientMessage.ResolveAllJoinRequests(false));
 
 		assertEquals(ErrorCode.JOIN_REQUEST_DENIED, firstOf(dave, ServerMessage.ErrorMessage.class).code());
@@ -3284,11 +3392,6 @@ class ConnectionServiceTest {
 
 		@Override
 		public void pendingCleared() {
-		}
-
-		@Override
-		public boolean supportsAudioRelay() {
-			return true;
 		}
 
 		@Override

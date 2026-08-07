@@ -8,7 +8,7 @@ import io.github.ashr123.walkietalkie.server.channel.ChannelRegistry;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import io.github.ashr123.walkietalkie.server.TestKeyChecks;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
@@ -32,7 +32,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.*;
 
 /// Adversarial concurrency stress: many sessions hammer a small set of shared channels with interleaved
-/// join / leave / floor / rename / audio / passphrase-rotation / ownership-transfer, to flush out races and deadlocks under contention (the integration
+/// join / leave / floor / rename / audio / passphrase-rotation / ownership-transfer / transport-move, to flush out races and deadlocks under contention (the integration
 /// tests are otherwise sequential). Each worker owns ONE session — so a single session is never touched by two
 /// threads (a real connection isn't) — and contention is concentrated on the channel registry and the per-channel
 /// monitors. The bar: no operation throws, the run finishes (no deadlock — see [Timeout]), and once every
@@ -89,9 +89,9 @@ class ConcurrencyStressTest {
 				try {
 					start.await();
 					for (int i = 0; i < opsPerWorker; i++) {
-						switch (rnd.nextInt(8)) {
+						switch (rnd.nextInt(9)) {
 							case 0 -> service.onMessage(me, new ClientMessage.Join(
-									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, "n-" + seed,
+									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, null, "n-" + seed,
 									KEY_CHECKS[rnd.nextInt(KEY_CHECKS.length)]));
 							case 1 -> service.onMessage(me, new ClientMessage.RequestFloor());
 							case 2 -> service.onMessage(me, new ClientMessage.ReleaseFloor());
@@ -116,6 +116,16 @@ class ConcurrencyStressTest {
 							// target a random id to exercise the NOT_OWNER / UNKNOWN_TARGET paths. None may throw.
 							case 7 -> service.onMessage(me, new ClientMessage.TransferOwnership(
 									rnd.nextBoolean() ? me.id() : "s-" + rnd.nextInt(workers)));
+							// A channel-wide media-plane move races the case-0 joins on the SAME bin lock: the move
+							// writes the channel's transport while a join reads it to seed a Joined snapshot, so a
+							// joiner must be measured against one plane or the other and never a channel halfway
+							// between. Like cases 6 and 7 it succeeds only for the current owner.
+							//
+							// Biased 3:1 toward the relay, deliberately: a channel on the WebRTC plane drops case-4's
+							// audio on arrival, so an even split would quietly retire half of this storm's audio
+							// contention while still passing.
+							case 8 -> service.onMessage(me, new ClientMessage.ChangeTransport(
+									rnd.nextInt(4) == 0 ? Transport.SIGNALING : Transport.AUDIO_RELAY));
 						}
 					}
 				} catch (Throwable ex) {
@@ -151,16 +161,17 @@ class ConcurrencyStressTest {
 				"every channel is dropped once empty — no channel is leaked after all sessions close");
 	}
 
-	/// Convergence under contention: many threads concurrently rotate the passphrase and transfer ownership on
-	/// ONE channel that nobody leaves (so every OwnerChanged/PassphraseChanged a member receives is for that
-	/// channel). Owner-only ops succeed only from whichever thread currently owns, so rotation broadcasts race
+	/// Convergence under contention: many threads concurrently rotate the passphrase, transfer ownership and move
+	/// the media plane of ONE channel that nobody leaves (so every OwnerChanged/PassphraseChanged/TransportChanged
+	/// a member receives is for that channel). Owner-only ops succeed only from whichever thread currently owns, so rotation broadcasts race
 	/// transfer broadcasts. The invariant the bar checks beyond no-throw: the LAST OwnerChanged / PassphraseChanged
-	/// each member received must equal the channel's FINAL ownerId / keyCheck. A broadcast that fans out a stale
-	/// captured value (instead of the channel's live field under the monitor) lets a member's last-seen value
-	/// disagree with the field — the exact ghost-owner / stale-key-check-gate desync this guards.
+	/// each member received must equal the channel's FINAL ownerId / keyCheck / transport. A broadcast that fans out
+	/// a stale captured value (instead of the channel's live field under the monitor) lets a member's last-seen
+	/// value disagree with the field — the exact ghost-owner / stale-key-check-gate / wrong-plane desync this
+	/// guards.
 	@Test
 	@Timeout(60)
-	void concurrentRotationsAndTransfersConvergeOnTheFinalOwnerAndKeyCheck() throws Exception {
+	void concurrentRotationsTransfersAndMovesConvergeOnTheChannelsFinalState() throws Exception {
 		ChannelRegistry registry = new ChannelRegistry();
 		ConnectionService service = new ConnectionService(
 				registry,
@@ -185,7 +196,7 @@ class ConcurrencyStressTest {
 		// All members join ONE encrypted channel and STAY — the first creates it, the rest match its key-check.
 		for (int i = 0; i < members; i++) {
 			FakeClientSession s = new FakeClientSession("m-" + i, Transport.AUDIO_RELAY, "m-" + i);
-			service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, "m-" + i, "kcv-seed"));
+			service.onMessage(s, new ClientMessage.Join("team", ChannelMode.MULTI_CHANNEL_PTT, null, "m-" + i, "kcv-seed"));
 			sessions.add(s);
 		}
 
@@ -202,10 +213,16 @@ class ConcurrencyStressTest {
 					for (int i = 0; i < opsPerWorker; i++) {
 						// Owner-only ops: each succeeds only while THIS member is the owner, so the owner and the
 						// key-check change from whichever thread currently owns — concurrent broadcasts race.
-						if (rnd.nextBoolean()) {
-							service.onMessage(me, new ClientMessage.ChangePassphrase("kcv-" + seed + "-" + i, null));
-						} else {
-							service.onMessage(me, new ClientMessage.TransferOwnership("m-" + rnd.nextInt(members)));
+						switch (rnd.nextInt(3)) {
+							case 0 -> service.onMessage(me, new ClientMessage.ChangePassphrase("kcv-" + seed + "-" + i, null));
+							case 1 -> service.onMessage(me, new ClientMessage.TransferOwnership("m-" + rnd.nextInt(members)));
+							// The media-plane move broadcasts under exactly the same discipline (read the channel's
+							// LIVE value under the monitor, never the request's captured one), and gets the same
+							// convergence check below. It is the one where divergence is worst: a member left
+							// believing the channel is on the plane it just left has rebuilt its audio for a path
+							// that carries nothing, and no later message would correct it.
+							default -> service.onMessage(me, new ClientMessage.ChangeTransport(
+									rnd.nextBoolean() ? Transport.SIGNALING : Transport.AUDIO_RELAY));
 						}
 					}
 				} catch (Throwable ex) {
@@ -225,6 +242,7 @@ class ConcurrencyStressTest {
 		assertNotNull(team, "the channel survives — nobody left");
 		String finalOwner = team.ownerId();
 		String finalKeyCheck = team.keyCheck();
+		Transport finalTransport = team.transport();
 		for (FakeClientSession s : sessions) {
 			s.sent.stream().filter(ServerMessage.OwnerChanged.class::isInstance).map(ServerMessage.OwnerChanged.class::cast)
 					.reduce((_, b) -> b).ifPresent(last -> assertEquals(finalOwner, last.ownerId(),
@@ -232,6 +250,9 @@ class ConcurrencyStressTest {
 			s.sent.stream().filter(ServerMessage.PassphraseChanged.class::isInstance).map(ServerMessage.PassphraseChanged.class::cast)
 					.reduce((_, b) -> b).ifPresent(last -> assertEquals(finalKeyCheck, last.keyCheck(),
 							"member " + s.id() + "'s last PassphraseChanged must converge on the channel's final key-check"));
+			s.sent.stream().filter(ServerMessage.TransportChanged.class::isInstance).map(ServerMessage.TransportChanged.class::cast)
+					.reduce((_, b) -> b).ifPresent(last -> assertEquals(finalTransport, last.transport(),
+							"member " + s.id() + "'s last TransportChanged must converge on the channel's final transport"));
 		}
 	}
 
@@ -301,7 +322,7 @@ class ConcurrencyStressTest {
 					for (int i = 0; i < opsPerWorker; i++) {
 						switch (rnd.nextInt(7)) {
 							case 0 -> service.onMessage(me, new ClientMessage.Join(
-									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, "n-" + seed,
+									channels[rnd.nextInt(channels.length)], ChannelMode.MULTI_CHANNEL_PTT, null, "n-" + seed,
 									KEY_CHECKS[0]));   // one value: nothing rotates here, so joins must all agree
 							// Request interpreted by state: grab a free floor, claim a reserved turn, or enqueue behind
 							// a busy one — all under the channel monitor with the holder swap.

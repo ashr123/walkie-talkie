@@ -23,8 +23,6 @@ import {canonicalChannelName, canonicalDisplayName, CHANNEL_NAME, isValidDisplay
 import {canConnect, connectProblems, readinessSummary} from './connect-form.js';
 import {micErrorMessage, NO_CAPTURE_API_MESSAGE} from './mic-errors.js';
 import {
-	FLOOR_IN_LINE,
-	FLOOR_LIVE,
 	FLOOR_MY_TURN,
 	TOO_QUICK_TO_TALK,
 	floorNarration,
@@ -95,7 +93,7 @@ const state = {
 	transmitting: false,
 	connecting: false,      // true while a connect() flow is in flight — guards against double-clicking Connect
 	channel: null,          // the channel currently joined (server-confirmed), so a Switch can tell same vs new
-	pendingReconnect: false, // set when a transport change requires tearing down + reconnecting (a new session)
+	pendingReconnect: false, // set when reaching the target needs a NEW session (channel affinity); ws.onclose reconnects
 	opusEncoder: null,
 	captureTs: 0,
 	warnedNoOpus: false,
@@ -112,7 +110,6 @@ const state = {
 	warnedDecrypt: false,
 	warnedEncryptedNoKey: false,  // warn once if encrypted frames arrive while no passphrase is set
 	warnedSignaling: false,       // warn once if WebRTC signaling arrives while we are on the relay transport
-	followedTransport: false,     // a TRANSPORT_MISMATCH auto-follow already happened; don't ping-pong (cleared on a successful join)
 	peers: new Map(),       // remoteId -> RTCPeerConnection (WebRTC)
 	members: new Map(),     // id -> displayName
 	// The authoritative owner-mute snapshot (ServerMessage.MuteStatus): the whole set of muted ids, REPLACED
@@ -346,7 +343,7 @@ async function connect() {
 		ws.onopen = () => {
 			state.connecting = false;   // connect flow completed — now connected
 			log(`WebSocket open (${state.transport})`);
-			sendCtrl({type: 'join', channel, mode: state.mode, displayName: display, keyCheck: state.keyCheck});
+			sendCtrl({type: 'join', channel, mode: state.mode, transport: wireTransport(state.transport), displayName: display, keyCheck: state.keyCheck});
 			setStatus(true, `Connected — ${state.transport}`);
 			// Rename is a SESSION property: the server accepts it with or without a channel ("no roster to keep
 			// consistent"), and someone waiting to be admitted to a locked channel has a real reason to use it —
@@ -396,8 +393,8 @@ function disconnect() {
  * transport) in one click when it hasn't — think of mode+passphrase+transport as the channel's properties.
  * A switch is a fresh Join on the same socket ("leave old, join new"), so the session id (and the mic,
  * AudioContext and socket) survive and the new Joined snapshot resets per-channel state (resetChannelState in
- * onJoined). Changing the TRANSPORT can't be done in place (different socket endpoint + audio pipeline), so it
- * reconnects as a new session; connect() re-reads the form, carrying any other pending change into the join.
+ * onJoined). Changing the TRANSPORT is a channel-wide, owner-only move (`changeTransport`) that every member
+ * follows in place — it used to reconnect, back when the media plane was pinned to the socket.
  */
 async function applyOrSwitch() {
 	if (state.connecting || !isOpen()) {
@@ -414,13 +411,9 @@ async function applyOrSwitch() {
 	}
 	const effectiveChannel = mode === 'GLOBAL_PTT' ? 'global' : channel;
 
-	if (transport !== state.transport) {
-		log('Transport changed — reconnecting as a new session…');
-		state.pendingReconnect = true;
-		disconnect();   // ws.onclose -> cleanup -> connect() with the current form values
-		return;
-	}
-
+	// Checked BEFORE the transport move below, because a switch already carries the transport pick in its Join
+	// (honoured if it creates the target, adopted from the target otherwise). Moving the channel we are LEAVING —
+	// which is what the other order would do — is never what changing both fields at once means.
 	if (effectiveChannel !== state.channel) {
 		// Different channel: switch (re-Join), carrying the chosen mode + passphrase. A channel name is required
 		// (no silent default) — global is exempt (channel forced to "global" server-side; the field is hidden).
@@ -433,7 +426,7 @@ async function applyOrSwitch() {
 			return;
 		}
 		await deriveJoinKey(passphrase, mode, channel);
-		sendCtrl({type: 'join', channel, mode, displayName: display, keyCheck: state.keyCheck});
+		sendCtrl({type: 'join', channel, mode, transport: wireTransport(transport), displayName: display, keyCheck: state.keyCheck});
 		if (state.channel === null) {
 			// A CHANNEL-LESS join commits the name outright: the server keeps whatever the Join carried, even if the
 			// join only lands us on a waiting list, and nothing comes back to confirm it. Record it, or Rename stays
@@ -444,6 +437,18 @@ async function applyOrSwitch() {
 			updateRenameButton();
 		}
 		log(`Switching to "${effectiveChannel}" (${mode})…`);   // E2EE status follows in onJoined once confirmed
+		updateApplyControls();
+		return;
+	}
+
+	if (transport !== state.transport) {
+		// A CHANNEL-WIDE move, not a personal one: the server flips the channel and tells every member, and each
+		// rebuilds its own audio in place. This used to reconnect — the transport was pinned to the socket, so
+		// changing it meant a new socket, hence a new session id, and ownership, the floor and the roster position
+		// are all keyed on that. The owner literally could not move their own channel without ceasing to own it,
+		// which is the bug this replaced. Only the owner may ask; the selector is disabled for everyone else.
+		sendCtrl({type: 'changeTransport', transport: wireTransport(transport)});
+		log(`Moving this channel to ${transport === 'webrtc' ? 'WebRTC' : 'the WebSocket relay'} for everyone…`);
 		updateApplyControls();
 		return;
 	}
@@ -877,6 +882,9 @@ function onWsMessage(ev) {
 		case 'muteNewMembersChanged':
 			onMuteNewMembersChanged(msg.enabled);
 			break;
+		case 'transportChanged':
+			onTransportChanged(msg.transport);
+			break;
 		case 'modeChanged':
 			onModeChanged(msg.mode);
 			break;
@@ -915,31 +923,6 @@ function onWsMessage(ev) {
 				onJoinRefused('The owner declined your request to join.');
 			} else if (msg.code === 'TOO_MANY_JOIN_REQUESTS') {
 				onJoinRefused('Too many people are already waiting to join this channel — try again shortly.');
-			} else if (msg.code === 'TRANSPORT_MISMATCH') {
-				// Every member of the target channel is on the other transport, and a mixed channel carries no audio
-				// at all, so follow them: flip the selector and reconnect through the transport-change path
-				// (pendingReconnect → disconnect → ws.onclose → connect), which re-reads the form.
-				//
-				// ONCE per Connect. A channel's transport is not stable — it is whoever joined first, and the channel
-				// is dropped when it empties — so an unbounded follow could ping-pong, and each lap costs a fresh
-				// getUserMedia + AudioContext. The flag clears when a join succeeds (onJoined).
-				//
-				// The two directions are NOT equally safe, which is why the second attempt only advises. Following
-				// TOWARD the relay is reliable: it is one TLS connection to the server, the one already carrying
-				// control. Following toward WebRTC depends on ICE, and with STUN-only config (no TURN) two devices on
-				// different networks may fail to connect at all — silently, since a failed negotiation looks exactly
-				// like this bug: full roster, working floor, no audio.
-				if (state.followedTransport) {
-					log(`${msg.message} Switch the Transport selector yourself and press Connect.`);
-					onJoinRefused('That channel uses the other transport.');
-				} else {
-					state.followedTransport = true;
-					const target = state.transport === 'webrtc' ? 'relay' : 'webrtc';
-					byId('transport').value = target;
-					log(`${msg.message} Reconnecting on ${target === 'webrtc' ? 'WebRTC' : 'the WebSocket relay'}…`);
-					state.pendingReconnect = true;
-					disconnect();
-				}
 			} else if (msg.code === 'CHANNEL_ROUTING_MISMATCH') {
 				// Channel affinity (multi-instance): the channel we tried to switch to lives on another instance, so
 				// an in-place switch can't reach it. Reconnect as a NEW session — reusing the transport-change path
@@ -972,7 +955,6 @@ function onJoined(msg) {
 	state.selfId = msg.selfId;
 	state.ownerId = msg.ownerId;
 	state.mode = msg.mode;
-	state.followedTransport = false;   // this join landed, so a future mismatch may follow once again
 	state.channel = msg.channel;
 	state.locked = msg.locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join too)
 	// The join landed, so what the switch overwrote is now the truth; a stale rollback here would let a LATER
@@ -987,6 +969,13 @@ function onJoined(msg) {
 		// leaving us mis-keyed with no recovery.
 		state.channelKeyCheck = state.keyCheck;
 		state.rekeyPending = false;
+	}
+	// The endpoint we dialled was only an opening bid: the CHANNEL decides its media plane and a joiner adopts it
+	// (see ServerMessage.Joined). Done before the roster render and the offer loop below, so both act on the plane
+	// we are actually going to use. This is what replaced the old TRANSPORT_MISMATCH refusal-and-reconnect: the
+	// control connection never needed redialling, so nothing is thrown away to change planes.
+	if (applyTransport(uiTransport(msg.transport))) {
+		log(`This channel is on the ${state.transport === 'webrtc' ? 'WebRTC' : 'WebSocket relay'} transport — switched to it.`);
 	}
 	msg.members.forEach(addMember);
 	renderMembers();
@@ -1039,6 +1028,37 @@ function onJoined(msg) {
 	updateRenameButton();   // starts disabled — the field matches our just-joined name
 	updateApplyControls();
 	renderOwnerSelect();
+}
+
+/**
+ * The owner moved this channel to the other media plane. Rebuild our own audio for it and, on WebRTC, offer to
+ * everyone already here — a mid-session move has no `joined` snapshot to offer against, so it uses the roster we
+ * are already holding.
+ *
+ * Nothing else is touched, and that is the whole point: we keep this socket, this session id, our place in the
+ * roster and the floor. Only the path the audio takes changed.
+ */
+function onTransportChanged(transport) {
+	if (!applyTransport(uiTransport(transport))) {
+		return;   // already there (a re-broadcast, or our own request echoed back after we had followed it)
+	}
+	log(`The owner moved this channel to ${state.transport === 'webrtc' ? 'WebRTC' : 'the WebSocket relay'}.`);
+	if (state.transport === 'webrtc') {
+		// Offer only to members whose id sorts BELOW ours, so exactly one side of each pair offers.
+		//
+		// A tie-break is needed here and nowhere else. Every other negotiation starts from a `joined` snapshot,
+		// where the asymmetry is free — the joiner offers to the roster it was handed and the incumbents wait. A
+		// transport move has no joiner: the same broadcast reaches everyone at once, so "offer to everyone" makes
+		// both ends of every pair offer, and the second answer arrives at a connection already in `stable`
+		// ("Failed to set remote answer sdp: Called in wrong state"). Measured, not theorised: two real browsers
+		// moved to WebRTC together and neither could hear the other. The comparison is arbitrary; that both sides
+		// compute the same answer from ids they both already know is the whole requirement.
+		state.members.forEach((_, id) => {
+			if (id < state.selfId) {
+				offerTo(id).catch(err => log(`Offer error: ${err.message}`));
+			}
+		});
+	}
 }
 
 function onModeChanged(mode) {
@@ -1781,24 +1801,120 @@ async function setupAudio() {
 	log(`Audio ready — context ${ctx.state} @ ${ctx.sampleRate} Hz, ${state.channels === 2 ? 'stereo' : 'mono'}, transport ${state.transport}`);
 
 	if (state.transport === 'relay') {
-		setupRelayCodec();
-		// One decode/playback lane PER sender is created lazily in getLane; ctx.destination mixes them all.
-		// Sweep idle lanes so a sender that has fallen silent has its decoder released.
-		state.laneSweep = setInterval(sweepLanes, 1000);
-		const source = ctx.createMediaStreamSource(state.micStream);
-		// 'explicit' + 'speakers' so the worklet always gets exactly `channels` channels; if the source
-		// turns out mono, 'speakers' duplicates it into both (no hard-left/dead-right) rather than
-		// padding the second channel with silence the way 'discrete' would.
-		const capture = new AudioWorkletNode(ctx, 'capture-processor', {
-			channelCount: state.channels,
-			channelCountMode: 'explicit',
-			channelInterpretation: 'speakers',
-			processorOptions: {channels: state.channels},
-		});
-		source.connect(capture);
-		capture.port.onmessage = e => onCapturedFrame(e.data);
-		state.captureNode = capture;
+		startRelayAudio();
 	}
+}
+
+/**
+ * Builds the relay audio pipeline — encoder, the idle-lane sweep, and the capture worklet feeding
+ * onCapturedFrame — on the AudioContext and mic setupAudio already acquired. Idempotent-ish by way of its one
+ * caller pair: setupAudio on connect, and applyTransport when a channel moves onto the relay plane.
+ *
+ * Split out of setupAudio precisely so the second caller can exist. A transport change used to mean a reconnect,
+ * so "build the relay pipeline" only ever happened once, inline; now the channel can move under a live session
+ * and the pipeline has to be built without re-acquiring the mic, the AudioContext or the socket — none of which
+ * a media-plane change touches.
+ */
+function startRelayAudio() {
+	const ctx = state.audioContext;
+	setupRelayCodec();
+	// One decode/playback lane PER sender is created lazily in getLane; ctx.destination mixes them all.
+	// Sweep idle lanes so a sender that has fallen silent has its decoder released.
+	state.laneSweep = setInterval(sweepLanes, 1000);
+	const source = ctx.createMediaStreamSource(state.micStream);
+	// 'explicit' + 'speakers' so the worklet always gets exactly `channels` channels; if the source
+	// turns out mono, 'speakers' duplicates it into both (no hard-left/dead-right) rather than
+	// padding the second channel with silence the way 'discrete' would.
+	const capture = new AudioWorkletNode(ctx, 'capture-processor', {
+		channelCount: state.channels,
+		channelCountMode: 'explicit',
+		channelInterpretation: 'speakers',
+		processorOptions: {channels: state.channels},
+	});
+	source.connect(capture);
+	capture.port.onmessage = e => onCapturedFrame(e.data);
+	state.captureNode = capture;
+}
+
+/**
+ * Tears the relay audio pipeline down again — the inverse of [startRelayAudio], leaving the mic, AudioContext and
+ * socket untouched. Called when a channel moves onto the WebRTC plane, where relay frames are dropped on arrival
+ * and the encoder would just burn CPU producing them.
+ *
+ * Disconnecting the capture node matters more than closing the encoder: a still-connected worklet keeps calling
+ * onCapturedFrame, and each call would encode and enqueue a frame the server now discards.
+ */
+function stopRelayAudio() {
+	if (state.laneSweep) {
+		clearInterval(state.laneSweep);
+		state.laneSweep = null;
+	}
+	closeAllLanes();
+	if (state.captureNode) {
+		state.captureNode.port.onmessage = null;
+		state.captureNode.disconnect();
+		state.captureNode = null;
+	}
+	closeCodec(state.opusEncoder);
+	state.opusEncoder = null;
+	state.captureTs = 0;
+}
+
+/**
+ * Moves this client onto `transport` ('relay' | 'webrtc') IN PLACE: swap the local audio pipeline, leave
+ * everything else — the socket, the session id, the mic, the AudioContext, the roster, the floor — exactly as it
+ * is. Returns whether anything changed, so a caller can skip the log line when it was already there.
+ *
+ * This is the client half of a change the server makes channel-wide; both entry points (a `transportChanged`
+ * broadcast, and a `joined` snapshot naming a plane other than the one we dialled) land here, so there is one
+ * implementation of "become a WebRTC client" / "become a relay client" rather than two that can drift.
+ *
+ * It deliberately does NOT create peer connections. Who to offer to depends on which entry point you came
+ * through — a fresh join offers to the roster it was just handed, a mid-session move offers to the members it
+ * already knows — so each caller does its own offering against the roster it trusts.
+ */
+/**
+ * The wire spelling of a transport: the server's `Transport` enum, not our UI value. Kept as a pair of one-line
+ * functions rather than inlined ternaries because the mapping appears on both the send and the receive side of
+ * three different messages, and a single inverted ternary among them is the kind of bug that shows up as silence
+ * rather than as an error.
+ */
+function wireTransport(transport) {
+	return transport === 'webrtc' ? 'SIGNALING' : 'AUDIO_RELAY';
+}
+
+/** The inverse of [wireTransport]: the UI value for a `Transport` off the wire. */
+function uiTransport(wire) {
+	return wire === 'SIGNALING' ? 'webrtc' : 'relay';
+}
+
+function applyTransport(transport) {
+	if (transport === state.transport) {
+		return false;
+	}
+	state.transport = transport;
+	byId('transport').value = transport;   // the selector shows the channel's live plane, not a stale pick
+	if (transport === 'relay') {
+		// Peer connections carry media that no longer has anywhere to go; closing them also stops their tracks
+		// arriving as "speaking" and leaving stuck highlights behind.
+		state.peers.forEach((_, id) => closePeer(id));
+		state.peers.clear();
+		startRelayAudio();
+	} else {
+		stopRelayAudio();
+	}
+	// The meter runs only on WebRTC full-duplex, so both directions of this change can start or stop it.
+	syncVoiceMeter();
+	// Our mic's enabled-ness is expressed differently on each plane (a track flag vs. whether frames are sent), so
+	// re-derive it from the mode rather than carrying the previous plane's answer across.
+	state.transmitting = false;
+	enableLocalTracks(false);
+	if (micAutoOpens()) {
+		beginTransmit();
+	}
+	updateTalkButton();
+	updateApplyControls();
+	return true;
 }
 
 function setupRelayCodec() {
@@ -2276,6 +2392,14 @@ function attachRemoteAudio(remoteId, stream) {
 		el.autoplay = true;
 		document.body.appendChild(el);
 	}
+	if (el.srcObject !== stream) {
+		// The meter is an AnalyserNode wired to the OLD stream, and nothing would ever rewire it: addVoiceMeter is
+		// idempotent by id, so it would see a meter already present and leave the dead one in place. Dropping it
+		// here lets the next sweep rebuild it against the stream this element now actually plays. Renegotiation
+		// makes this reachable — `ontrack` fires again with a fresh stream — which a channel that can change its
+		// media plane mid-session does far more often than one that only ever negotiates at join.
+		removeVoiceMeter(remoteId);
+	}
 	el.srcObject = stream;
 	// autoplay should start it, but call play() explicitly so a blocked autoplay surfaces a hint
 	// instead of failing silently.
@@ -2700,17 +2824,11 @@ function resetChannelState() {
 
 function cleanup() {
 	resetChannelState();
-	if (state.laneSweep) {
-		clearInterval(state.laneSweep);
-		state.laneSweep = null;
-	}
+	stopRelayAudio();   // no-op on the WebRTC plane, where there is no relay pipeline to take down
 	renderMembers();
 	state.channel = null;
 	state.transmitting = false;
 	state.connecting = false;
-	closeCodec(state.opusEncoder);
-	state.opusEncoder = null;
-	state.captureTs = 0;
 	state.warnedNoOpus = false;
 	state.warnedChannels = false;
 	state.cryptoKey = null;
@@ -2728,7 +2846,6 @@ function cleanup() {
 		state.audioContext.close();
 		state.audioContext = null;
 	}
-	state.captureNode = null;
 	state.ws = null;
 	state.token = null;
 	state.ownerId = null;

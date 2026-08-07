@@ -2,7 +2,7 @@ package io.github.ashr123.walkietalkie.server.support;
 
 import io.github.ashr123.walkietalkie.server.FakeClientSession;
 import io.github.ashr123.walkietalkie.server.channel.Channel;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import org.junit.jupiter.api.Test;
 import org.slf4j.MDC;
@@ -121,7 +121,7 @@ class RequestContextTest {
 
 	@Test
 	void channelScopeTagsOnlyTheChannelAndLeavesTheSessionUnset() {
-		Channel channel = new Channel("room-9", ChannelMode.MULTI_CHANNEL_PTT, "owner", null, Channel.Defaults.NONE);
+		Channel channel = new Channel("room-9", ChannelMode.MULTI_CHANNEL_PTT, "owner", null,Transport.AUDIO_RELAY,  Channel.Defaults.NONE);
 		try (RequestContext.Scope _ = RequestContext.channelScope(channel)) {
 			assertEquals("room-9", MDC.get(RequestContext.MDC_CHANNEL_KEY), "channelScope tags the channel from Channel.name()");
 			assertNull(MDC.get(RequestContext.MDC_SESSION_KEY), "channelScope binds no session — the pattern shows its 'system' default");

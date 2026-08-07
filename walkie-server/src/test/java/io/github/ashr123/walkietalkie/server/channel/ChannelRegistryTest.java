@@ -3,7 +3,7 @@ package io.github.ashr123.walkietalkie.server.channel;
 import io.github.ashr123.option.None;
 import io.github.ashr123.option.Option;
 import io.github.ashr123.walkietalkie.server.FakeClientSession;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import org.junit.jupiter.api.Test;
@@ -149,6 +149,69 @@ class ChannelRegistryTest {
 		// NotOwner carries no channel by construction (sealed), so there's nothing to null-check.
 		assertInstanceOf(ChannelRegistry.RekeyResult.NotOwner.class, registry.changePassphrase("team", "b", "kcv-B"));
 		assertEquals("kcv-A", created.keyCheck(), "a refused rotation leaves the key-check unchanged");
+	}
+
+	@Test
+	void changeTransportMovesTheChannelForTheOwnerAndReportsThatItMoved() {
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"))).channel();
+		assertEquals(Transport.AUDIO_RELAY, created.transport(), "created on the plane its creator dialled");
+
+		ChannelRegistry.TransportResult.Ok result = assertInstanceOf(ChannelRegistry.TransportResult.Ok.class,
+				registry.changeTransport("team", "a", Transport.SIGNALING));
+
+		assertSame(created, result.channel(), "Ok carries the exact mutated channel instance (not a fresh find())");
+		assertTrue(result.changed());
+		assertEquals(Transport.SIGNALING, created.transport());
+	}
+
+	@Test
+	void changeTransportToThePlaneItIsAlreadyOnIsOkButReportsNoChange() {
+		// Not an error — a client re-sending its own state is not wrong — but the caller must be able to tell, so it
+		// can skip a broadcast that would have every member rebuild a working audio pipeline for nothing.
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"))).channel();
+		ChannelRegistry.TransportResult.Ok result = assertInstanceOf(ChannelRegistry.TransportResult.Ok.class,
+				registry.changeTransport("team", "a", Transport.AUDIO_RELAY));
+		assertFalse(result.changed());
+		assertEquals(Transport.AUDIO_RELAY, created.transport());
+	}
+
+	@Test
+	void changeTransportRefusesANonOwnerAndLeavesThePlane() {
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"))).channel();
+		registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("b"));
+		assertInstanceOf(ChannelRegistry.TransportResult.NotOwner.class,
+				registry.changeTransport("team", "b", Transport.SIGNALING));
+		assertEquals(Transport.AUDIO_RELAY, created.transport(), "a refused move leaves the channel where it was");
+	}
+
+	@Test
+	void changeTransportOnAMissingChannelIsNotFound() {
+		assertInstanceOf(ChannelRegistry.TransportResult.NotFound.class,
+				registry.changeTransport("ghost", "a", Transport.SIGNALING));
+	}
+
+	@Test
+	void aJoinerOnTheOtherPlaneIsAdmittedAndTheChannelDoesNotMove() {
+		// The rule that replaced TRANSPORT_MISMATCH: a joiner adopts, it does not negotiate. The second half
+		// matters as much as the first — a joiner that could drag the channel onto its own plane would silently
+		// reconfigure everyone already there.
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A", session("a"))).channel();
+
+		Channel joined = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A",
+				new FakeClientSession("b", Transport.SIGNALING, "b"))).channel();
+
+		assertSame(created, joined);
+		assertEquals(Transport.AUDIO_RELAY, created.transport());
+		assertEquals(2, created.size(), "and it really was admitted, not quietly dropped");
+	}
+
+	@Test
+	void aCreatorMayAskForAPlaneOtherThanTheOneItDialled() {
+		// What ClientMessage.Join.transport buys: the browser's selector can create a WebRTC channel over the
+		// /ws/audio socket it is already holding, instead of creating a relay channel and immediately moving it.
+		Channel created = admitted(registry.joinOrCreate("team", ChannelMode.MULTI_CHANNEL_PTT, "kcv-A",
+				session("a"), Transport.SIGNALING, Channel.Defaults.NONE, _ -> {})).channel();
+		assertEquals(Transport.SIGNALING, created.transport());
 	}
 
 	@Test

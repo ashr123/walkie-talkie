@@ -204,6 +204,7 @@ public class ConnectionService {
 			case ClientMessage.RequestFloor _ -> handleRequestFloor(session);
 			case ClientMessage.ReleaseFloor _ -> handleReleaseFloor(session);
 			case ClientMessage.ChangeMode(ChannelMode mode) -> handleChangeMode(session, mode);
+			case ClientMessage.ChangeTransport(Transport transport) -> handleChangeTransport(session, transport);
 			case ClientMessage.ChangePassphrase(String keyCheck, String wrappedKey) ->
 					handleChangePassphrase(session, keyCheck, wrappedKey);
 			case ClientMessage.TransferOwnership(String newOwnerId) -> handleTransferOwnership(session, newOwnerId);
@@ -254,6 +255,7 @@ public class ConnectionService {
 								session.id(),
 								current.name(),
 								current.mode(),
+								current.transport(),
 								current.ownerId(),
 								current.isLocked(),
 								current.isFloorQueueEnabled(),
@@ -363,6 +365,7 @@ public class ConnectionService {
 							session.id(),
 							joinedChannel.name(),
 							joinedChannel.mode(),
+							joinedChannel.transport(),
 							joinedChannel.ownerId(),
 							joinedChannel.isLocked(),
 							joinedChannel.isFloorQueueEnabled(),
@@ -373,14 +376,19 @@ public class ConnectionService {
 			broadcaster.toOne(session, floorStatusOf(joinedChannel));
 		};
 
+		// The media plane this join asks for, used ONLY if the join creates the channel (an existing one keeps its
+		// own and the joiner adopts it — same rule as the mode). A client that never offers the choice sends null
+		// and gets the endpoint it dialled, which is the only answer it could act on anyway.
+		Transport wanted = join.transport() == null ? session.transport() : join.transport();
+
 		// Global is server-owned (sentinel owner) and forced unencrypted (null key-check); every other channel
 		// is owned by its creator and adopts the joiner's key-check. Only a NON-global newly created channel adopts
 		// the server-wide floor-queue default — the sentinel-owned global room is created with the queue OFF (false)
 		// and can never be toggled on (its floor-queue toggle is NOT_OWNER), since it is unbounded and a large queue
 		// would mean heavy position-broadcast churn.
 		ChannelRegistry.JoinOutcome outcome = join.mode() == ChannelMode.GLOBAL_PTT
-				? channelRegistry.joinOrCreate(requested, join.mode(), null, session, GLOBAL_CHANNEL_OWNER, Channel.Defaults.NONE, emitInitialState)
-				: channelRegistry.joinOrCreate(requested, join.mode(), join.keyCheck(), session, channelDefaults, emitInitialState);
+				? channelRegistry.joinOrCreate(requested, join.mode(), null, session, GLOBAL_CHANNEL_OWNER, wanted, Channel.Defaults.NONE, emitInitialState)
+				: channelRegistry.joinOrCreate(requested, join.mode(), join.keyCheck(), session, wanted, channelDefaults, emitInitialState);
 		// The atomic join carries its own verdict, decided under the registry bin lock, so a refusal names its EXACT
 		// reason — no re-reading the channel afterwards to guess which of the three rules rejected us (a re-read
 		// could report a reason that only became true in the instant after the failed join).
@@ -550,7 +558,7 @@ public class ConnectionService {
 		withdrawPendingElsewhere(session, null);
 	}
 
-	/// The channel this session owns, or [io.github.ashr123.option.None] after replying with the reason it isn't
+	/// The channel this session owns, or [None] after replying with the reason it isn't
 	/// eligible — `NOT_IN_CHANNEL` before joining, `NOT_OWNER` otherwise. The sentinel-owned `global` room can never
 	/// be locked, so it never has waiting newcomers; its owner check refuses there anyway.
 	private Option<Channel> requireOwnedChannel(ClientSession session) {
@@ -582,18 +590,6 @@ public class ConnectionService {
 					session,
 					ErrorCode.PASSPHRASE_MISMATCH,
 					"This channel is using a different encryption passphrase (or none) — you can't join it."
-			);
-			// There are exactly two transports, so the joiner's OWN transport names the other by elimination — this
-			// refusal exists precisely because they differ. The switch is exhaustive on purpose: adding a third
-			// transport stops this compiling, which is the moment the required one must be carried ON the refusal
-			// rather than derived here.
-			case TRANSPORT_MISMATCH -> sendError(
-					session,
-					ErrorCode.TRANSPORT_MISMATCH,
-					"Every member of this channel is on the " + switch (session.transport()) {
-						case AUDIO_RELAY -> "WebRTC";
-						case SIGNALING -> "WebSocket relay";
-					} + " transport — switch to it to join them."
 			);
 			case WAITING_LIST_FULL -> sendError(
 					session,
@@ -808,8 +804,8 @@ public class ConnectionService {
 		return !floorIdleRelease.isZero()
 				&& currentHolderId != null
 				&& !currentHolderId.equals(requester.id())
-				&& channel.member(currentHolderId) instanceof Some(ClientSession holder)
-				&& holder.supportsAudioRelay()
+				&& channel.transport() == Transport.AUDIO_RELAY
+				&& channel.member(currentHolderId) instanceof Some<ClientSession>
 				&& channel.preemptFloorIfIdle(currentHolderId, requester.id(), now, now.minus(floorIdleRelease));
 	}
 
@@ -971,8 +967,8 @@ public class ConnectionService {
 							&& channel.isFloorQueueEnabled()
 							&& !channel.isFloorQueueEmpty()
 							&& channel.floorHolder() instanceof Some(String holderId)
-							&& channel.member(holderId) instanceof Some(ClientSession holder)
-							&& holder.supportsAudioRelay()) {
+							&& channel.transport() == Transport.AUDIO_RELAY
+							&& channel.member(holderId) instanceof Some(ClientSession holder)) {
 						String released = channel.releaseIfIdle(now.minus(floorIdleRelease));
 						if (released != null) {
 							freed = true;
@@ -1031,11 +1027,15 @@ public class ConnectionService {
 		// into find(null) → ConcurrentHashMap.get(null) → NPE, thrown on the per-frame audio hot path with no
 		// try/catch above it (handleBinaryMessage doesn't catch). One read also keeps the whole gate consistent.
 		String channelName = session.channelName();
-		if (!session.supportsAudioRelay()
-				|| !audio.hasRemaining()
+		if (!audio.hasRemaining()
 				|| audio.remaining() > properties.maxAudioFrameBytes()
 				|| channelName == null
 				|| !(channelRegistry.find(channelName) instanceof Some(Channel channel))
+				// Relay frames from a channel that is on the WebRTC plane are dropped on arrival: its media goes
+				// peer-to-peer and never passes here, so anything that does arrive is a client that has not yet
+				// acted on its `TransportChanged`/`Joined`. Read off the CHANNEL, not the sender's session — the
+				// session only records which endpoint it dialled, which a channel move leaves behind.
+				|| channel.transport() != Transport.AUDIO_RELAY
 				|| !channel.holdsFloor(session.id())
 				// Owner-enforced mute: drop the frame server-side so a muted member (PTT holder or any
 				// full-duplex talker) can't route audio around a client that ignores its own mute. This is a
@@ -1097,13 +1097,14 @@ public class ConnectionService {
 		// stamp a bogus index and misroute it into another member's decode lane.
 		if (channel.streamIndexOf(session.id()) instanceof SomeInt(int index)) {
 			byte[] prefixed = prefixedFrame(index, audio);
+			// No per-member transport filter: the channel is on ONE plane (checked above), so every member of it is
+			// too. The filter this replaced existed when each session carried its own transport and a channel could
+			// hold a mix; that mix is now impossible by construction rather than skipped per frame.
 			channel.forEachOther(session.id(), other -> {
-				if (other.supportsAudioRelay()) {
-					try {
-						other.sendAudio(prefixed);
-					} catch (RuntimeException e) {
-						log.debug("Audio relay to {} ({}) failed: {}", other.id(), other.displayName(), e.getMessage());
-					}
+				try {
+					other.sendAudio(prefixed);
+				} catch (RuntimeException e) {
+					log.debug("Audio relay to {} ({}) failed: {}", other.id(), other.displayName(), e.getMessage());
 				}
 			});
 		}
@@ -1148,16 +1149,19 @@ public class ConnectionService {
 			return;
 		}
 		if (channel.member(targetId) instanceof Some(ClientSession target)) {
-			// Both ends must be on the signaling transport. Dropped SILENTLY, mirroring how a signaling session's
-			// audio frames are dropped on arrival rather than answered with an error — a client that sends these on
-			// the wrong transport is confused, not owed a reply, and a per-ICE-candidate error would be a flood.
+			// Signaling only travels inside a channel that is ON the WebRTC plane. Dropped SILENTLY, mirroring how
+			// a relay frame arriving at a WebRTC channel is dropped rather than answered with an error — a client
+			// that sends these before acting on its `TransportChanged` is behind, not owed a reply, and a
+			// per-ICE-candidate error would be a flood.
 			//
 			// Why it matters on the RECEIVING side: handed an offer, a relay client would attach its microphone to a
 			// peer connection, and peer-to-peer media takes neither the floor/owner-mute enforcement below nor the
-			// passphrase E2EE — both of which only exist on the relay frame path. See ClientSession#supportsSignaling.
-			if (!session.supportsSignaling() || !target.supportsSignaling()) {
-				log.debug("Dropped {} between transports ({} -> {})",
-						message.getClass().getSimpleName(), session.transport(), target.transport());
+			// passphrase E2EE — both of which only exist on the relay frame path.
+			//
+			// ONE check covers both ends, because sender and target are members of the same channel and a channel
+			// has a single transport. Two per-session checks were needed only while a channel could hold a mix.
+			if (channel.transport() != Transport.SIGNALING) {
+				log.debug("Dropped {} in a {} channel", message.getClass().getSimpleName(), channel.transport());
 				return;
 			}
 			broadcaster.toOne(target, message);
@@ -1217,6 +1221,49 @@ public class ConnectionService {
 			broadcaster.toAll(channel, new ServerMessage.ModeChanged(mode), floorStatusOf(channel));
 		}
 		log.info("changed mode to {}", mode);
+	}
+
+	/// Moves the current channel to the other media plane, but only for its owner: relay audio (binary frames
+	/// through the server) ⇄ WebRTC (peer-to-peer media, the server only carrying signaling). Every member's
+	/// session moves with the channel and each is told by a `TransportChanged`, so nobody reconnects and nobody
+	/// loses their place — see [ClientMessage.ChangeTransport] for
+	/// why keeping the control connection is the entire point.
+	///
+	/// A non-owner gets `NOT_OWNER`; a request before joining gets `NOT_IN_CHANNEL`; naming the plane the channel
+	/// is already on succeeds silently (no broadcast), so a client that re-sends its state is not punished for it.
+	/// The `global` room's sentinel owner means a move there is refused as `NOT_OWNER`.
+	///
+	/// Concurrency: the owner check, the channel write and every member-session write are one atomic step inside
+	/// the registry's `computeIfPresent` span (see [ChannelRegistry#changeTransport]), serializing the move against
+	/// every concurrent join's transport check. The broadcast then runs **under the channel monitor**, the same
+	/// discipline [#handleChangePassphrase] uses, reading the channel's LIVE transport rather than the requested
+	/// one so two moves that cross each other CONVERGE: a delayed broadcast carries where the channel actually is,
+	/// never a plane it has already left. Getting that wrong is not cosmetic here — a member that rebuilt its audio
+	/// for a stale answer is silent until something else corrects it, and nothing else would.
+	///
+	/// The floor is deliberately NOT cleared. Unlike a mode change, which redefines what holding the floor means,
+	/// this changes only how audio travels; the holder keeps talking, and the few frames in flight across the
+	/// switch are lost the same way a passphrase rotation loses a few GCM-failing frames.
+	private void handleChangeTransport(ClientSession session, Transport transport) {
+		String channelName = session.channelName();   // snapshot once: a concurrent leave nulling it would NPE below
+		if (channelName == null) {
+			sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
+			return;
+		}
+		switch (channelRegistry.changeTransport(channelName, session.id(), transport)) {
+			case ChannelRegistry.TransportResult.NotFound _ -> sendError(session, ErrorCode.NOT_IN_CHANNEL, "Join a channel first");
+			case ChannelRegistry.TransportResult.NotOwner _ ->
+					sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can change the transport");
+			case ChannelRegistry.TransportResult.Ok(Channel channel, boolean changed) -> {
+				if (!changed) {
+					return;   // already on that plane: nothing moved, so there is nothing to tell anyone
+				}
+				synchronized (channel) {
+					broadcaster.toAll(channel, new ServerMessage.TransportChanged(channel.transport()));
+				}
+				log.info("changed transport to {}", channel.transport());
+			}
+		}
 	}
 
 	/// Rotates the current channel's end-to-end-encryption passphrase, but only for its owner. The server never

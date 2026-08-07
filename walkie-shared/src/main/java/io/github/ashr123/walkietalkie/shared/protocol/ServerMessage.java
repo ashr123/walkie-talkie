@@ -17,11 +17,19 @@ public sealed interface ServerMessage {
 	/// owner-toggleable push-to-talk floor queue is on (see [FloorStatus]); carried here for the same reason.
 	/// `muteNewMembers` is whether the owner has armed the standing "mute every arrival" rule
 	/// ([ClientMessage.SetMuteNewMembers]); ditto. Your OWN mute — including one that rule applied as you were
-	/// added — is in your entry of `members` ([MemberInfo#muted]), not a separate field.
+	/// added — is in your entry of `members` ([MemberInfo#muted()]), not a separate field.
+	///
+	/// `transport` is the channel's media plane, and like `mode` the joiner ADOPTS it — the endpoint you dialled
+	/// (`/ws/audio` or `/ws/signal`) is only your opening bid. If it differs from what you dialled, build the audio
+	/// pipeline this field names, not the one you came for, and stay on the socket you already have: the two
+	/// endpoints speak the identical control protocol, so nothing about your session needs to be redone. A joiner
+	/// that ignored this would sit in the channel with a full roster and no audio in either direction, which is why
+	/// it is stated on the acknowledgement itself rather than left to be inferred from which URL you opened.
 	@JsonTypeName("joined")
 	record Joined(String selfId,
 	              String channel,
 	              ChannelMode mode,
+	              Transport transport,
 	              String ownerId,
 	              boolean locked,
 	              boolean floorQueueEnabled,
@@ -51,7 +59,7 @@ public sealed interface ServerMessage {
 	/// bounded per-recipient control queue whose overflow disconnects the client.
 	///
 	/// Being a snapshot, it also converges: a client that somehow missed one is corrected by the next, with no
-	/// incremental state to drift. The initial value is seeded from [MemberInfo#muted] in the [Joined] roster, so
+	/// incremental state to drift. The initial value is seeded from [MemberInfo#muted()] in the [Joined] roster, so
 	/// this message is only ever sent for a CHANGE — the same shape as `locked` / `floorQueueEnabled`, which ride
 	/// in [Joined] and then have [ChannelLocked] / [FloorQueueChanged] for changes.
 	///
@@ -187,6 +195,18 @@ public sealed interface ServerMessage {
 	/// owner opted out, or a tampered/undecryptable blob) the member must obtain the new
 	/// passphrase out-of-band and apply it. Until a member holds a key matching `keyCheck` it is muted — it neither
 	/// transmits (no plaintext, no stale-key audio) nor can decode others.
+	/// The channel moved to the other media plane, by its owner's [ClientMessage.ChangeTransport]. Every member
+	/// receives it, including the owner who asked.
+	///
+	/// Act on it by rebuilding your LOCAL audio pipeline only — tear down peer connections and start sending binary
+	/// frames, or the reverse — and do NOT reconnect: your session, your place in the roster, your stream index and
+	/// the floor all survive, because the two endpoints speak the same control protocol and only the media plane
+	/// differs. A client that cannot speak the new transport (the reference Java client has no WebRTC stack) should
+	/// say so and leave the channel rather than sit in one whose audio it can neither send nor receive.
+	@JsonTypeName("transportChanged")
+	record TransportChanged(Transport transport) implements ServerMessage {
+	}
+
 	@JsonTypeName("passphraseChanged")
 	record PassphraseChanged(String keyCheck, String wrappedKey) implements ServerMessage {
 	}

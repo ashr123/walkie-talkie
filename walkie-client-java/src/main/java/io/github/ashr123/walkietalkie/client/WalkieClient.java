@@ -509,6 +509,7 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.Joined(String selfId,
 									  String channel,
 									  ChannelMode mode,
+									  Transport transport,
 									  String ownerId,
 									  boolean locked,
 									  boolean floorQueueEnabled,
@@ -526,6 +527,13 @@ public final class WalkieClient implements AutoCloseable {
 				this.switchRollback = null;
 				this.floorQueueEnabled = floorQueueEnabled;   // adopt the channel's queue setting (authoritative on every Joined)
 				this.muteNewMembers = muteNewMembers;         // ditto for the standing "mute every arrival" rule
+				// We dialled /ws/audio, but the channel — not the endpoint — decides the media plane, and a joiner
+				// adopts it. If it is WebRTC we are in a channel whose audio we can neither send nor receive, so
+				// leave at once rather than sit in it looking connected. Handled before the roster/mute seeding
+				// below only for clarity; leaveBecauseWebRtc's own Leave frame is what actually ends it.
+				if (transport == Transport.SIGNALING && leaveBecauseWebRtc()) {
+					return;
+				}
 				if (channelChanged) {
 					// Baseline the channel's announced key-check from the key we joined with — only on an ACTUAL
 					// channel change (a switch). switchTo deliberately doesn't advance it, so the transmit gate keeps
@@ -653,6 +661,17 @@ public final class WalkieClient implements AutoCloseable {
 					handlePassphraseChanged(keyCheck, wrappedKey);
 			case ServerMessage.SignalOffer _, ServerMessage.SignalAnswer _,
 			     ServerMessage.SignalIce _ -> { /* WebRTC: not used by the relay client */ }
+			// The owner moved the whole channel between media planes, without disconnecting anyone. A browser
+			// rebuilds its audio pipeline in place; this client can only do relay, so a move to WebRTC is the one
+			// case it cannot follow — it leaves instead. A move back to relay needs nothing: our capture and
+			// playback loops never stopped, and the server is once again forwarding the frames they produce.
+			case ServerMessage.TransportChanged(Transport transport) -> {
+				if (transport != Transport.SIGNALING) {
+					log("[transport] this channel is back on the WebSocket relay — audio resumes.");
+				} else {
+					leaveBecauseWebRtc();
+				}
+			}
 			case ServerMessage.ErrorMessage(ErrorCode code, String message) -> {
 				log("[error] " + code + ": " + message);
 				switch (code) {
@@ -670,11 +689,6 @@ public final class WalkieClient implements AutoCloseable {
 					// another. They used to exit the process, which threw away a healthy connection and left the user
 					// nothing to do but restart.
 					case PASSPHRASE_MISMATCH -> joinRefused("this channel needs a different --key.");
-					// This client is relay-only — there is no mature pure-Java WebRTC stack (see the README's known
-					// constraints), so unlike the browser it cannot follow the channel onto the other transport.
-					// Say so plainly instead of leaving the user with a bare [error] line and no way forward.
-					case TRANSPORT_MISMATCH -> joinRefused("this channel is on the WebRTC transport, and the console "
-							+ "client speaks only the WebSocket relay — join it from a browser instead.");
 					case CHANNEL_LOCKED -> joinRefused("this channel is locked by its owner.");
 					case CHANNEL_FULL -> joinRefused("this channel is full — it has reached its member limit.");
 					// The target channel lives on another instance (channel affinity): an in-place switch can't reach
@@ -909,6 +923,16 @@ public final class WalkieClient implements AutoCloseable {
 		}
 		// Nothing was joined in the first place (an initial connect), so there is nothing to keep: settle into the
 		// connected-but-channel-less state and let the user pick another channel.
+		forgetChannelState();
+		log("[refused] " + reason + " Use 'c <channel> [mode]' to try another.");
+	}
+
+	/// Drops every piece of per-channel state, settling into the connected-but-channel-less state that both ways
+	/// out of a channel end in — a refused initial join ([#joinRefused]) and a deliberate departure
+	/// ([#leaveBecauseWebRtc]). The typed `--key` (`crypto`) is deliberately KEPT, since it is the user's own
+	/// passphrase and reusable for the next attempt; `currentChannelKeyCheck` is the CHANNEL's announced value and
+	/// describes a channel we are no longer in, so it goes.
+	private void forgetChannelState() {
 		ownerId = null;
 		channelLocked = false;
 		muteNewMembers = false;
@@ -918,8 +942,33 @@ public final class WalkieClient implements AutoCloseable {
 		floorSnapshot = FloorSnapshot.IDLE;
 		awaitingClaim = false;
 		audio.setTransmitting(false);
-		log("[refused] " + reason + " Use 'c <channel> [mode]' to try another.");
 	}
+
+	/// Leaves the current channel because it is on the WebRTC media plane, which this client cannot speak, and
+	/// returns whether it actually left (false when we are somehow not in a channel, so the caller carries on).
+	///
+	/// There is no mature pure-Java WebRTC stack (see the README's known constraints), so unlike the browser this
+	/// client cannot rebuild its audio onto the other plane — and staying would be the worst outcome available: a
+	/// full roster, a working floor, a mic that appears live, and not one byte of audio in either direction. It
+	/// leaves deliberately, with the `leave` frame rather than by dropping the socket, so the channel runs its
+	/// normal departure (a `MemberLeft` for everyone, and an owner election if we owned it) instead of waiting on
+	/// a timeout — and so the console stays connected and `c <channel>` can pick another.
+	private boolean leaveBecauseWebRtc() {
+		if (currentChannel == null) {
+			return false;
+		}
+		String left = currentChannel;
+		enqueue(new ClientMessage.Leave());
+		log("[left] \"" + left + "\" is on the WebRTC transport and the console client speaks only the WebSocket "
+				+ "relay — join it from a browser instead. Still connected: use 'c <channel>' for another.");
+		// Drop the per-channel state ourselves rather than waiting for anything back: `leave` draws no reply, so
+		// this is the only place that can reconcile us to being out of it.
+		currentChannel = null;
+		switchRollback = null;
+		forgetChannelState();
+		return true;
+	}
+
 
 	/// Handles [ServerMessage.JoinRequests]: the authoritative list of newcomers waiting at this locked channel's
 	/// door, sent only while we own it. A terminal has no badge to glance at, so an ARRIVAL is announced as a log
@@ -1357,7 +1406,7 @@ public final class WalkieClient implements AutoCloseable {
 			// one, keeping the old (non-null) key-check makes the transmit gate (outboundFrame) keep dropping
 			// frames instead of leaking cleartext into the channel we're leaving.
 			String display = memberNames.getOrDefault(selfId, options.display());
-			enqueue(new ClientMessage.Join(channel, mode, display, next == null ? null : next.keyCheck()));
+			enqueue(new ClientMessage.Join(channel, mode, null, display, next == null ? null : next.keyCheck()));
 			log("[switch] joining \"" + channel + "\" (" + mode + ")...");
 		} catch (GeneralSecurityException e) {
 			log("[switch] key derivation failed: " + e.getMessage());
@@ -1624,6 +1673,9 @@ public final class WalkieClient implements AutoCloseable {
 		enqueue(new ClientMessage.Join(
 				target.channel(),
 				target.mode(),
+				// null = "whichever endpoint I dialled". This client only ever dials /ws/audio and offers no
+				// transport choice, so asking for one would only be a way to disagree with itself.
+				null,
 				memberNames.getOrDefault(selfId, options.display()),
 				crypto == null ? null : crypto.keyCheck()
 		));

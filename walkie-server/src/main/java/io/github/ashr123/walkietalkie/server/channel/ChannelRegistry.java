@@ -3,7 +3,8 @@ package io.github.ashr123.walkietalkie.server.channel;
 import io.github.ashr123.option.Option;
 import io.github.ashr123.option.Some;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ChannelMode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import org.springframework.stereotype.Component;
@@ -64,10 +65,7 @@ public class ChannelRegistry {
 			LOCKED,
 			FULL,
 			PASSPHRASE_MISMATCH,
-			WAITING_LIST_FULL,
-			/// The joiner's transport disagrees with the one every current member uses. Relay audio and WebRTC media
-			/// never meet, so a mixed channel is a full roster with working floor control and no audio path at all.
-			TRANSPORT_MISMATCH
+			WAITING_LIST_FULL
 		}
 	}
 
@@ -78,20 +76,28 @@ public class ChannelRegistry {
 	/// channel's. The whole check-add-and-snapshot happens inside the atomic map update, so it cannot race with a
 	/// concurrent create or [#leave].
 	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session) {
-		return joinOrCreate(name, mode, keyCheck, session, session.id(), Channel.Defaults.NONE, NO_OP);
+		return joinOrCreate(name, mode, keyCheck, session, session.id(), session.transport(), Channel.Defaults.NONE, NO_OP);
 	}
 
 	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], but stamps a newly-created channel with
 	/// an explicit `ownerId` instead of the joiner's session id — used to give the server-managed "global"
 	/// channel a sentinel owner that no participant can match. An existing channel keeps its own owner.
 	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId) {
-		return joinOrCreate(name, mode, keyCheck, session, ownerId, Channel.Defaults.NONE, NO_OP);
+		return joinOrCreate(name, mode, keyCheck, session, ownerId, session.transport(), Channel.Defaults.NONE, NO_OP);
 	}
 
 	/// As [#joinOrCreate(String, ChannelMode, String, ClientSession)], plus the [Channel.Defaults] a newly-created
 	/// channel adopts and a hook run on a successful add. See the full form for what `onJoinUnderLock` guarantees.
 	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, Channel.Defaults defaults, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
-		return joinOrCreate(name, mode, keyCheck, session, session.id(), defaults, onJoinUnderLock);
+		return joinOrCreate(name, mode, keyCheck, session, session.id(), session.transport(), defaults, onJoinUnderLock);
+	}
+
+	/// As the full form, but seeding a newly-created channel with `transport` — the media plane the joiner ASKED
+	/// for ([ClientMessage.Join#transport()]) — instead of the
+	/// endpoint it happens to be dialled on. The shorter overloads pass the dialled endpoint, which is the right
+	/// answer for a client that never offers the choice.
+	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, Transport transport, Channel.Defaults defaults, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
+		return joinOrCreate(name, mode, keyCheck, session, session.id(), transport, defaults, onJoinUnderLock);
 	}
 
 	/// Full form. `defaults` seeds a **newly created** channel (an existing channel keeps its own state, like its
@@ -103,10 +109,15 @@ public class ChannelRegistry {
 	/// leave the hint naming a stale holder. The hook MUST be short and non-blocking — it runs under the registry
 	/// bin lock and the channel monitor, and must NOT call back into the registry (that would invert the
 	/// bin→monitor order). It is skipped entirely on a refusal.
-	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, Channel.Defaults defaults, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
+	public JoinOutcome joinOrCreate(String name, ChannelMode mode, String keyCheck, ClientSession session, String ownerId, Transport transport, Channel.Defaults defaults, Consumer<? super JoinOutcome.Admitted> onJoinUnderLock) {
 		AtomicReference<JoinOutcome> outcome = new AtomicReference<>();
 		channels.compute(name, (key, existing) -> {
-			Channel channel = existing == null ? new Channel(key, mode, ownerId, keyCheck, defaults) : existing;
+			// A new channel takes the media plane its CREATOR asked for; an existing one keeps its own and the
+			// joiner adopts it, exactly as with the mode. Nothing below re-checks it — there is no mismatch to
+			// refuse any more, because a joiner cannot disagree with a channel it does not get a vote on.
+			Channel channel = existing == null
+					? new Channel(key, mode, ownerId, keyCheck, transport, defaults)
+					: existing;
 			// Each refusal below records its OWN reason while still under the bin lock, so the caller never has to
 			// re-read the channel to work out which rule rejected the joiner.
 			//
@@ -136,12 +147,6 @@ public class ChannelRegistry {
 						outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.PASSPHRASE_MISMATCH));
 						return channel;
 					}
-					if (transportMismatch(channel, session)) {
-						// Before knocking, not after: never ask an owner to approve someone who could not be
-						// admitted anyway — the same argument the LOCKED/key-check gates above already make.
-						outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.TRANSPORT_MISMATCH));
-						return channel;
-					}
 					outcome.set(switch (channel.knock(session)) {
 						case REGISTERED -> new JoinOutcome.Pending(channel, false);
 						case ALREADY_WAITING -> new JoinOutcome.Pending(channel, true);
@@ -158,16 +163,7 @@ public class ChannelRegistry {
 				outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.FULL));
 				return channel;
 			}
-			// One transport per channel — see Channel#firstMemberTransport for why a mixed one carries no audio.
-			// Evaluated under the same bin lock as the key-check, so the verdict cannot race a concurrent join or
-			// the channel's last member leaving. A freshly created channel matches by construction: it was created
-			// BY this session, which is exactly how the FIRST member comes to decide.
-			//
-			// AFTER the key-check on purpose: the passphrase is the membership credential, so someone who cannot
-			// present it learns nothing about how this channel is configured.
-			if (Objects.equals(channel.keyCheck(), keyCheck) && transportMismatch(channel, session)) {
-				outcome.set(new JoinOutcome.Refused(JoinOutcome.Reason.TRANSPORT_MISMATCH));
-			} else if (Objects.equals(channel.keyCheck(), keyCheck)) {
+			if (Objects.equals(channel.keyCheck(), keyCheck)) {
 				// Add the joiner, snapshot its view, AND let the caller emit that view to it — all ATOMICALLY under
 				// the channel monitor (bin→monitor, the established lock order — never the reverse). Doing the
 				// add (which makes the joiner broadcast-eligible), the snapshot, and the joiner's initial-state
@@ -189,12 +185,6 @@ public class ChannelRegistry {
 			return channel;   // keep the channel even on a key-check mismatch (don't drop it)
 		});
 		return outcome.get();
-	}
-
-	/// Whether `session` may not join `channel` because its transport disagrees with the members already there.
-	/// False for a memberless channel — the joiner is about to become the first member and therefore decides.
-	private static boolean transportMismatch(Channel channel, ClientSession session) {
-		return channel.firstMemberTransport() instanceof Some(Transport theirs) && theirs != session.transport();
 	}
 
 	public Option<Channel> find(String name) {
@@ -333,6 +323,40 @@ public class ChannelRegistry {
 			} else {
 				result.set(new TransferResult.NotAMember());
 			}
+			return channel;
+		});
+		return result.get();
+	}
+
+	/// The result of a [#changeTransport] attempt. `Ok` carries the `Channel` that moved — the caller broadcasts
+	/// over that exact instance (see [RekeyResult] for why a fresh `find()` would be unsafe) — and `changed` says
+	/// whether the transport was actually different, so a request naming the plane the channel is already on is a
+	/// success that broadcasts nothing rather than an error. `NotOwner` = the requester doesn't own the channel;
+	/// `NotFound` = no such channel. Sealed, so the caller's `switch` is exhaustive.
+	public sealed interface TransportResult {
+		record Ok(Channel channel, boolean changed) implements TransportResult {}
+
+		record NotOwner() implements TransportResult {}
+
+		record NotFound() implements TransportResult {}
+	}
+
+	/// Moves a channel and every one of its members to the other media plane, on the owner's request. The owner
+	/// check and both writes happen **inside** `channels.computeIfPresent(name, …)` — the same bin lock
+	/// [#joinOrCreate] compares a joiner's transport under — so the move is atomic with respect to every concurrent
+	/// join: a joiner is measured against either the old transport or the new one, never against a channel that has
+	/// moved but whose members have not. Without that, a `SIGNALING` joiner could be admitted to a channel mid-move
+	/// and find half the roster unable to hear it.
+	///
+	/// Nobody is disconnected and nobody is removed: see
+	/// [io.github.ashr123.walkietalkie.shared.protocol.ClientMessage.ChangeTransport] for why the control plane
+	/// survives a media-plane change, and why it has to.
+	public TransportResult changeTransport(String name, String requesterId, Transport transport) {
+		AtomicReference<TransportResult> result = new AtomicReference<>(new TransportResult.NotFound());
+		channels.computeIfPresent(name, (_, channel) -> {
+			result.set(requesterId.equals(channel.ownerId())
+					? new TransportResult.Ok(channel, channel.setTransport(transport))
+					: new TransportResult.NotOwner());
 			return channel;
 		});
 		return result.get();

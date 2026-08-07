@@ -6,6 +6,7 @@ import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.MemberInfo;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -26,11 +27,11 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			send(sa, new ClientMessage.Join("snap", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("snap", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
 
 			// Bob asks for FULL_DUPLEX but must adopt the existing channel's MULTI_CHANNEL_PTT and its owner.
-			send(sb, new ClientMessage.Join("snap", ChannelMode.FULL_DUPLEX, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sb, new ClientMessage.Join("snap", ChannelMode.FULL_DUPLEX, null, "Bob", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 
 			assertEquals(ChannelMode.MULTI_CHANNEL_PTT, joinedB.mode(), "the existing channel's mode wins");
@@ -48,9 +49,9 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			send(sa, new ClientMessage.Join("rename-room", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("rename-room", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
-			send(sb, new ClientMessage.Join("rename-room", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sb, new ClientMessage.Join("rename-room", ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
 			awaitType(b.messages, ServerMessage.Joined.class);
 			awaitType(a.messages, ServerMessage.MemberJoined.class);
 
@@ -69,9 +70,9 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			send(sa, new ClientMessage.Join("fanout", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("fanout", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			awaitType(a.messages, ServerMessage.Joined.class);
-			send(sb, new ClientMessage.Join("fanout", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sb, new ClientMessage.Join("fanout", ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 
 			ServerMessage.MemberJoined notice = awaitType(a.messages, ServerMessage.MemberJoined.class);
@@ -89,9 +90,9 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			send(sa, new ClientMessage.Join("names", ChannelMode.MULTI_CHANNEL_PTT, "Al.ice-1_2", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("names", ChannelMode.MULTI_CHANNEL_PTT, null, "Al.ice-1_2", TestKeyChecks.ENCRYPTED));
 			awaitType(a.messages, ServerMessage.Joined.class);
-			send(sb, new ClientMessage.Join("names", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sb, new ClientMessage.Join("names", ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 
 			assertTrue(joinedB.members().stream().anyMatch(m -> "Al.ice-1_2".equals(m.displayName())),
@@ -106,12 +107,12 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			send(sa, new ClientMessage.Join("held", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("held", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
 			send(sa, new ClientMessage.RequestFloor());
 			awaitType(a.messages, ServerMessage.FloorGranted.class);
 
-			send(sb, new ClientMessage.Join("held", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sb, new ClientMessage.Join("held", ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
 			awaitType(b.messages, ServerMessage.Joined.class);
 			// The newcomer's own initial FloorStatus snapshot (seeded on join) already shows the current holder.
 			ServerMessage.FloorStatus taken = awaitType(b.messages, ServerMessage.FloorStatus.class);
@@ -125,11 +126,11 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			send(sa, new ClientMessage.Join("alpha", ChannelMode.GLOBAL_PTT, "Alice", null));
+			send(sa, new ClientMessage.Join("alpha", ChannelMode.GLOBAL_PTT, null, "Alice", null));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
 			assertEquals("global", joinedA.channel(), "GLOBAL_PTT forces the channel name to 'global'");
 
-			send(sb, new ClientMessage.Join("bravo", ChannelMode.GLOBAL_PTT, "Bob", null));
+			send(sb, new ClientMessage.Join("bravo", ChannelMode.GLOBAL_PTT, null, "Bob", null));
 			ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 			assertEquals("global", joinedB.channel());
 
@@ -142,7 +143,7 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void aJoinWithAnIllegalChannelNameIsRejectedAsInvalidChannel() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login())) {
-			send(sa, new ClientMessage.Join("bad name!", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("bad name!", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			ServerMessage.ErrorMessage error = awaitType(a.messages, ServerMessage.ErrorMessage.class);
 			assertEquals(ErrorCode.INVALID_CHANNEL, error.code());
 			assertNotReceived(a.messages, ServerMessage.Joined.class);
@@ -157,30 +158,65 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			assertEquals(ErrorCode.BAD_MESSAGE, awaitType(a.messages, ServerMessage.ErrorMessage.class).code());
 
 			// The connection survives a bad frame: a subsequent valid join still works.
-			send(sa, new ClientMessage.Join("recover", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("recover", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			assertNotNull(awaitType(a.messages, ServerMessage.Joined.class));
 		}
 	}
 
 	@Test
 	void aChannelIsSINGLETransportAcrossRealSockets() throws Exception {
-		// The inverse of what this test used to assert. Membership WAS transport-agnostic, and that turned out to be
-		// the bug rather than the feature: relay audio and WebRTC media never meet (the fan-out skips a signaling
-		// member, and a signaling sender's frames are dropped on arrival), so a mixed channel was a full roster with
-		// working floor control and no audio path in either direction — indistinguishable from working.
+		// Membership was once transport-agnostic, and that turned out to be a bug rather than a feature: relay audio
+		// and WebRTC media never meet, so a mixed channel was a full roster with working floor control and no audio
+		// path in either direction — indistinguishable from working. The channel is now single-transport, but the
+		// way that is enforced is ADOPTION, not refusal: dialling /ws/signal is a request, and the channel answers.
+		//
+		// Worth asserting across REAL sockets specifically, because the two endpoints are the thing being claimed to
+		// be interchangeable for control — /ws/audio is /ws/signal plus a binary handler — and a unit test with fakes
+		// could not tell a genuinely working /ws/signal control path from one that happens not to be exercised.
 		CollectingHandler audioPeer = new CollectingHandler();
 		CollectingHandler signalPeer = new CollectingHandler();
 		try (WebSocketSession sAudio = connect(AUDIO, audioPeer, login());
 		     WebSocketSession sSignal = connect(SIGNAL, signalPeer, login())) {
-			send(sAudio, new ClientMessage.Join("mix", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sAudio, new ClientMessage.Join("mix", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			awaitType(audioPeer.messages, ServerMessage.Joined.class);
 
-			send(sSignal, new ClientMessage.Join("mix", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sSignal, new ClientMessage.Join("mix", ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
 
-			assertEquals(ErrorCode.TRANSPORT_MISMATCH,
-					awaitType(signalPeer.messages, ServerMessage.ErrorMessage.class).code());
-			assertTrue(signalPeer.messages.stream().noneMatch(ServerMessage.Joined.class::isInstance),
-					"the refused joiner never gets a Joined snapshot");
+			assertEquals(Transport.AUDIO_RELAY, awaitType(signalPeer.messages, ServerMessage.Joined.class).transport(),
+					"the /ws/signal joiner is admitted and told to build a RELAY pipeline");
+			assertTrue(signalPeer.messages.stream().noneMatch(ServerMessage.ErrorMessage.class::isInstance),
+					"and nothing is refused");
+		}
+	}
+
+	@Test
+	void theOwnerMovesTheWholeChannelAcrossRealSocketsWithoutAnyoneReconnecting() throws Exception {
+		// The point of the whole design: a media-plane change costs nobody their session. Asserted end-to-end over
+		// real sockets because the claim is about the SOCKETS — that the one you are on keeps working after the
+		// move, so the owner stays the owner and the roster does not churn.
+		CollectingHandler ownerPeer = new CollectingHandler();
+		CollectingHandler memberPeer = new CollectingHandler();
+		try (WebSocketSession sOwner = connect(AUDIO, ownerPeer, login());
+		     WebSocketSession sMember = connect(AUDIO, memberPeer, login())) {
+			send(sOwner, new ClientMessage.Join("movers", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
+			String ownerId = awaitType(ownerPeer.messages, ServerMessage.Joined.class).selfId();
+			send(sMember, new ClientMessage.Join("movers", ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
+			awaitType(memberPeer.messages, ServerMessage.Joined.class);
+
+			send(sOwner, new ClientMessage.ChangeTransport(Transport.SIGNALING));
+
+			assertEquals(Transport.SIGNALING, awaitType(ownerPeer.messages, ServerMessage.TransportChanged.class).transport());
+			assertEquals(Transport.SIGNALING, awaitType(memberPeer.messages, ServerMessage.TransportChanged.class).transport(),
+					"every member is told, not just the one who asked");
+			assertTrue(sOwner.isOpen() && sMember.isOpen(), "and nobody was disconnected to do it");
+
+			// The proof that the session survived: the owner is STILL the owner. Ownership is keyed on the session
+			// id, so a reconnect — which the old design required — would have minted a new id and handed the channel
+			// to whoever the election picked. An owner-only action landing (rather than NOT_OWNER) is what says so.
+			ownerPeer.messages.clear();
+			send(sOwner, new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
+			assertEquals(ChannelMode.FULL_DUPLEX, awaitType(ownerPeer.messages, ServerMessage.ModeChanged.class).mode(),
+					"the owner (session " + ownerId + ") can still act as one after the move");
 		}
 	}
 
@@ -190,9 +226,9 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			send(sa, new ClientMessage.Join("old", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("old", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
-			send(sb, new ClientMessage.Join("old", ChannelMode.MULTI_CHANNEL_PTT, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sb, new ClientMessage.Join("old", ChannelMode.MULTI_CHANNEL_PTT, null, "Bob", TestKeyChecks.ENCRYPTED));
 			awaitType(b.messages, ServerMessage.Joined.class);
 			awaitType(a.messages, ServerMessage.MemberJoined.class);   // drains Alice's join FloorStatus snapshot
 			awaitType(b.messages, ServerMessage.FloorStatus.class);    // drain Bob's join FloorStatus snapshot
@@ -202,7 +238,7 @@ class JoinMembershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			awaitType(b.messages, ServerMessage.FloorStatus.class);    // Bob sees Alice hold
 
 			// Alice re-joins a different channel; the server leaves "old" first.
-			send(sa, new ClientMessage.Join("new", ChannelMode.MULTI_CHANNEL_PTT, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("new", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
 
 			// Post-removal emission to the survivor is MemberLeft -> OwnerChanged (Bob is re-elected owner of "old")
 			// -> FloorStatus(null): the member is removed first (clearing the held floor), then survivors hear it.

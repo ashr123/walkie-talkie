@@ -1,7 +1,7 @@
 package io.github.ashr123.walkietalkie.server;
 
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -96,11 +96,6 @@ public final class FakeClientSession implements ClientSession {
 	@Override
 	public void pendingCleared() {
 		this.pendingChannel = null;
-	}
-
-	@Override
-	public boolean supportsAudioRelay() {
-		return transport == Transport.AUDIO_RELAY;
 	}
 
 	@Override

@@ -25,9 +25,9 @@ class RelayFramingIntegrationTest extends WebSocketIntegrationTestSupport {
 		CollectingHandler b = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login());
 		     WebSocketSession sb = connect(AUDIO, b, login())) {
-			send(sa, new ClientMessage.Join("fd-sid", ChannelMode.FULL_DUPLEX, "Alice", TestKeyChecks.ENCRYPTED));
+			send(sa, new ClientMessage.Join("fd-sid", ChannelMode.FULL_DUPLEX, null, "Alice", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
-			send(sb, new ClientMessage.Join("fd-sid", ChannelMode.FULL_DUPLEX, "Bob", TestKeyChecks.ENCRYPTED));
+			send(sb, new ClientMessage.Join("fd-sid", ChannelMode.FULL_DUPLEX, null, "Bob", TestKeyChecks.ENCRYPTED));
 			ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 
 			// Bob learns Alice's stream index from his snapshot.

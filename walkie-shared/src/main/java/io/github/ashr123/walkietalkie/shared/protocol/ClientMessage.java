@@ -20,8 +20,14 @@ public sealed interface ClientMessage {
 	/// key derivation), or `null` when the member is unencrypted. The server compares it against the
 	/// channel's established value to reject a member whose passphrase doesn't match — without ever
 	/// learning the passphrase itself. It is *not* the key and cannot decrypt anything.
+	///
+	/// `transport` is the media plane you want, and — exactly like `mode` — it is honoured only when this join
+	/// CREATES the channel; joining an existing one adopts whatever that channel already uses, whether or not it
+	/// is what you asked for. Either way the answer comes back on [ServerMessage.Joined], and it is that value,
+	/// not this one, that says which audio pipeline to build. `null` means "whichever endpoint I dialled", which
+	/// is what a client that never offers the choice should send.
 	@JsonTypeName("join")
-	record Join(String channel, ChannelMode mode, String displayName, String keyCheck) implements ClientMessage {
+	record Join(String channel, ChannelMode mode, Transport transport, String displayName, String keyCheck) implements ClientMessage {
 	}
 
 	/// Leave the current channel without closing the connection.
@@ -71,6 +77,21 @@ public sealed interface ClientMessage {
 	/// relays the blob opaquely, exactly like the audio it forwards). It is `null` when the owner opts out (a
 	/// revocation-style rotation that forces out-of-band re-entry, since anyone holding the old key could unwrap
 	/// it). There is always an old key to wrap under, since every rotation is now encrypted→encrypted.
+	/// Owner-only: move the whole channel to the other media plane (`AUDIO_RELAY` ⇄ `SIGNALING`). Every member's
+	/// session moves with it and each is told by a [ServerMessage.TransportChanged], so nobody reconnects.
+	///
+	/// That last part is the reason this message exists. The two endpoints (`/ws/audio` and `/ws/signal`) speak the
+	/// identical control protocol, so the media plane never needed to be pinned to the socket — and pinning it
+	/// meant changing it required a new socket, hence a new session id, and ownership, the floor and the roster
+	/// position are all keyed on that. An owner could not change their own channel's transport without ceasing to
+	/// be its owner.
+	///
+	/// A non-owner gets `NOT_OWNER`; sending it before joining gets `NOT_IN_CHANNEL`; naming the transport the
+	/// channel already uses is accepted and changes nothing.
+	@JsonTypeName("changeTransport")
+	record ChangeTransport(Transport transport) implements ClientMessage {
+	}
+
 	@JsonTypeName("changePassphrase")
 	record ChangePassphrase(String keyCheck, String wrappedKey) implements ClientMessage {
 	}
@@ -127,7 +148,7 @@ public sealed interface ClientMessage {
 	/// this ON does not touch anyone already in the channel (which would otherwise cut off whoever is mid-sentence,
 	/// with no way to arm the rule without doing so).
 	///
-	/// A joiner is muted as it is added, so it learns of its own mute from [MemberInfo#muted] in its own
+	/// A joiner is muted as it is added, so it learns of its own mute from [MemberInfo#muted()] in its own
 	/// [ServerMessage.Joined] roster, and the other members learn of it from [ServerMessage.MemberJoined] — no
 	/// separate mute message is involved. The channel OWNER is never muted by it (an owner cannot unmute itself, so
 	/// that would lock the channel's only moderator out). On success the server broadcasts a

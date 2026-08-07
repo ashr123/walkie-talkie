@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.session;
 
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.PingMessage;
@@ -274,10 +275,11 @@ class WebSocketClientSessionTest {
 	}
 
 	@Test
-	void supportsAudioRelayReflectsTheTransport() {
+	void reportsTheEndpointItWasDialledOn() {
 		WebSocketSession ws = mock(WebSocketSession.class);
-		assertTrue(new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null, NO_KEEPALIVE).supportsAudioRelay());
-		assertFalse(new WebSocketClientSession(ws, Transport.SIGNALING, null, NO_KEEPALIVE).supportsAudioRelay(),
-				"a signaling session does not relay audio");
+		// The dialled endpoint, and nothing more: it seeds a channel this session CREATES, while a member's actual
+		// media plane is the CHANNEL's (Channel#transport), which a join adopts and an owner can move.
+		assertEquals(Transport.AUDIO_RELAY, new WebSocketClientSession(ws, Transport.AUDIO_RELAY, null, NO_KEEPALIVE).transport());
+		assertEquals(Transport.SIGNALING, new WebSocketClientSession(ws, Transport.SIGNALING, null, NO_KEEPALIVE).transport());
 	}
 }

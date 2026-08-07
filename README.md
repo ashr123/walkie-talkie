@@ -6,12 +6,12 @@ two reference clients, and three channel modes.
 
 ## What it does
 
-| Choice           | Options                                                                                                                                                                                                                                             |
-|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Transport**    | **WebSocket relay** — the server forwards raw audio frames between members · **WebRTC** — the server relays signaling only, audio flows peer-to-peer. **One per channel**: whoever joins first decides, and everyone else must match                |
-| **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared, server-managed, always-unencrypted room) · **Full-duplex** (everyone talks at once)                                                                                  |
-| **Clients**      | A zero-install **browser** client · a **Java 25 desktop** client                                                                                                                                                                                    |
-| **Encryption**   | **End-to-end encryption is mandatory** — every channel except the server-managed global room needs a shared passphrase (AES-256-GCM on the relay path; on WebRTC the media is already end-to-end via DTLS-SRTP and the passphrase gates membership) |
+| Choice           | Options                                                                                                                                                                                                                                                                                           |
+|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Transport**    | **WebSocket relay** — the server forwards raw audio frames between members · **WebRTC** — the server relays signaling only, audio flows peer-to-peer. **One per channel**: its creator picks, joiners adopt it, and the owner can move the whole channel between the two live — nobody reconnects |
+| **Channel mode** | **Multi-channel PTT** (named rooms, half-duplex) · **Global PTT** (one shared, server-managed, always-unencrypted room) · **Full-duplex** (everyone talks at once)                                                                                                                                |
+| **Clients**      | A zero-install **browser** client · a **Java 25 desktop** client                                                                                                                                                                                                                                  |
+| **Encryption**   | **End-to-end encryption is mandatory** — every channel except the server-managed global room needs a shared passphrase (AES-256-GCM on the relay path; on WebRTC the media is already end-to-end via DTLS-SRTP and the passphrase gates membership)                                               |
 
 ## Architecture
 
@@ -256,8 +256,9 @@ connected). Change any of them and click the single adaptive button:
   by the channel owner** on the current channel; for a non-owner the Transport and Mode selectors are disabled
   and the Encryption passphrase field is read-only. They all re-enable the moment you change the **channel name**
   (you're switching to a different room, so you pick its properties like a fresh connect), and the passphrase
-  field also re-enables to adopt an owner's announced re-key. Changing the **transport** can't be done in place
-  (a different endpoint + audio pipeline), so it reconnects transparently as a new session.
+  field also re-enables to adopt an owner's announced re-key. Changing the **transport** moves the **whole
+  channel** — every member rebuilds their audio pipeline in place and nobody is disconnected, so the owner stays
+  the owner and whoever holds the floor keeps it.
 - It's **disabled** when nothing has changed.
 
 The owner rotating the **passphrase** never reaches the server as a
@@ -527,7 +528,8 @@ classpath — tests have no generated context there and must stay reflective.
 ## Known constraints (by design)
 
 - **WebRTC is browser-to-browser.** There is no mature pure-Java WebRTC stack, so the Java desktop
-  client uses the relay transport. WebRTC group calls here use a peer-to-peer **mesh** (fine for small
+  client uses the relay transport — and it is the one client that cannot follow a channel onto WebRTC: it says
+  so and leaves the channel rather than sitting in one whose audio it can neither send nor receive. WebRTC group calls here use a peer-to-peer **mesh** (fine for small
   PTT groups); a large conference would need an SFU.
 - **The relay mixes on the client, not the server.** Simultaneous talkers (full-duplex) work on the relay
   path: the server prefixes each fanned-out frame with the sender's 1-byte stream index, and the receiver

@@ -20,9 +20,9 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	private String[] joinPair(String channel, ChannelMode mode,
 	                          WebSocketSession sa, CollectingHandler a,
 	                          WebSocketSession sb, CollectingHandler b) throws Exception {
-		send(sa, new ClientMessage.Join(channel, mode, "Alice", TestKeyChecks.keyCheckFor(mode)));
+		send(sa, new ClientMessage.Join(channel, mode, null, "Alice", TestKeyChecks.keyCheckFor(mode)));
 		ServerMessage.Joined joinedA = awaitType(a.messages, ServerMessage.Joined.class);
-		send(sb, new ClientMessage.Join(channel, mode, "Bob", TestKeyChecks.keyCheckFor(mode)));
+		send(sb, new ClientMessage.Join(channel, mode, null, "Bob", TestKeyChecks.keyCheckFor(mode)));
 		ServerMessage.Joined joinedB = awaitType(b.messages, ServerMessage.Joined.class);
 		awaitType(a.messages, ServerMessage.MemberJoined.class);
 		// Every real join now seeds the joiner with an authoritative FloorStatus snapshot (toOne). Drain Bob's here
@@ -90,7 +90,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 	void theGlobalChannelIsServerManagedAndItsModeCannotBeChanged() throws Exception {
 		CollectingHandler a = new CollectingHandler();
 		try (WebSocketSession sa = connect(AUDIO, a, login())) {
-			send(sa, new ClientMessage.Join("anything", ChannelMode.GLOBAL_PTT, "Alice", null));
+			send(sa, new ClientMessage.Join("anything", ChannelMode.GLOBAL_PTT, null, "Alice", null));
 			ServerMessage.Joined joined = awaitType(a.messages, ServerMessage.Joined.class);
 			assertEquals("global", joined.channel());
 			assertEquals("server", joined.ownerId(), "the global channel is server-owned, not owned by the joiner");
@@ -179,7 +179,7 @@ class ModeOwnershipIntegrationTest extends WebSocketIntegrationTestSupport {
 			assertEquals(ChannelMode.FULL_DUPLEX, awaitType(b.messages, ServerMessage.ModeChanged.class).mode());
 
 			// A member who joins afterwards is not the owner and cannot.
-			send(sc, new ClientMessage.Join("reelect", ChannelMode.FULL_DUPLEX, "Carol", TestKeyChecks.ENCRYPTED));
+			send(sc, new ClientMessage.Join("reelect", ChannelMode.FULL_DUPLEX, null, "Carol", TestKeyChecks.ENCRYPTED));
 			awaitType(c.messages, ServerMessage.Joined.class);
 			send(sc, new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
 			assertEquals(ErrorCode.NOT_OWNER, awaitType(c.messages, ServerMessage.ErrorMessage.class).code());

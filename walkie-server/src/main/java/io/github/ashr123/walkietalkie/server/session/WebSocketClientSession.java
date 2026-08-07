@@ -1,5 +1,6 @@
 package io.github.ashr123.walkietalkie.server.session;
 
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.socket.*;
@@ -50,6 +51,11 @@ public final class WebSocketClientSession implements ClientSession {
 	private static final int CONTROL_CAPACITY = 1024;
 
 	private final WebSocketSession session;
+	/// The endpoint this socket was dialled on — an opening bid, not a verdict. It seeds a channel this session
+	/// CREATES; once it is in a channel, the channel's own transport is the answer, and this may differ from it
+	/// (see [io.github.ashr123.walkietalkie.shared.protocol.ServerMessage.Joined]). Immutable, because the two
+	/// endpoints speak the identical control protocol — `/ws/audio` is `/ws/signal` plus a binary handler — so a
+	/// channel moving between media planes never needs this socket to be redialled.
 	private final Transport transport;
 	/// The `channel` query param captured at the handshake (see [ClientSession#handshakeChannel]); may be null.
 	private final String handshakeChannel;
@@ -225,11 +231,6 @@ public final class WebSocketClientSession implements ClientSession {
 	@Override
 	public void pendingCleared() {
 		this.pendingChannel = null;
-	}
-
-	@Override
-	public boolean supportsAudioRelay() {
-		return transport == Transport.AUDIO_RELAY;
 	}
 
 	@Override

@@ -3,7 +3,7 @@ package io.github.ashr123.walkietalkie.server.transport;
 import io.github.ashr123.walkietalkie.server.config.WalkieProperties;
 import io.github.ashr123.walkietalkie.server.protocol.MessageCodec;
 import io.github.ashr123.walkietalkie.server.session.ClientSession;
-import io.github.ashr123.walkietalkie.server.session.Transport;
+import io.github.ashr123.walkietalkie.shared.protocol.Transport;
 import io.github.ashr123.walkietalkie.server.session.WebSocketClientSession;
 import io.github.ashr123.walkietalkie.server.support.RequestContext;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
