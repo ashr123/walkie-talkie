@@ -727,7 +727,11 @@ public final class WalkieClient implements AutoCloseable {
 		FloorState state = floorStateFor(self, holderId, waiting);
 		// What is worth SAYING about this snapshot, and whether it repeats what was already said. FloorStatus is
 		// re-sent on plenty of occasions that do not move the floor (a member leaving, a mute change, a re-join), so
-		// an unchanged situation stays silent — mirrors floorNarration in the browser's talk.js, key for key.
+		// an unchanged situation stays silent — mirrors floorNarration in the browser's talk.js, key for key, with
+		// ONE deliberate exception in the OTHER direction: the browser now draws the queue as a list and therefore
+		// falls silent on IN_LINE and OFFERED, which would only repeat what its panel already shows. A terminal has
+		// no panel, so here these two lines ARE the queue display and both stay. Do not "restore parity" by dropping
+		// them; that would leave this client unable to report the queue at all.
 		FloorNarration narration = floorNarration(self, holderId, waiting, released, awaitingClaim, floorQueueEnabled);
 		if (narration != null && !narration.key().equals(lastFloorNarration)) {
 			switch (narration.kind()) {
@@ -752,7 +756,12 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	/// What a floor snapshot is worth saying, if anything — the Java mirror of `floorNarration` in the browser's
-	/// talk.js, key for key, so the two clients fall silent on exactly the same snapshots. `null` means say nothing.
+	/// talk.js, key for key. `null` means say nothing.
+	///
+	/// The two clients no longer fall silent on exactly the same snapshots, and that is deliberate: the browser
+	/// draws the queue as a list, so it suppresses `IN_LINE` and `OFFERED` while that panel is up. A terminal has no
+	/// panel, so here those two lines ARE the queue display and both stay. Every other kind and key still matches;
+	/// see the note at the call site.
 	///
 	/// `key` identifies the SITUATION; the caller logs only when it differs from the last one it logged. LIVE and
 	/// MY_TURN say nothing at all here: FloorGranted and FloorReserved are the imperative triggers that announce

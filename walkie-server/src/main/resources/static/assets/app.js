@@ -24,7 +24,6 @@ import {canConnect, connectProblems, readinessSummary} from './connect-form.js';
 import {micErrorMessage, NO_CAPTURE_API_MESSAGE} from './mic-errors.js';
 import {
 	FLOOR_MY_TURN,
-	TOO_QUICK_TO_TALK,
 	floorNarration,
 	floorStateFor,
 	grantOpensMic,
@@ -32,9 +31,11 @@ import {
 	isVoiceActive,
 	micTrackEnabled,
 	needsVoiceMeter,
+	queueView,
 	shouldAutoOpenMic,
 	spaceDrivesFloor,
-	talkDecision
+	talkDecision,
+	TOO_QUICK_TO_TALK,
 } from './talk.js';
 
 /**
@@ -1074,6 +1075,7 @@ function onModeChanged(mode) {
 	updateModeControl();
 	updateGlobalModeLocks();
 	updateChannelSettings();   // the queue row and badge drop out in full-duplex (no floor)
+	renderQueue();            // ...and so does the queue panel: mode is queueView's second gate term
 	updateApplyControls();   // the live mode now matches the selector again → the Apply button settles
 	log(`Mode changed to ${mode}`);
 }
@@ -1534,6 +1536,132 @@ function clearTurnAlert() {
 }
 
 /**
+ * The floor snapshot as talk.js wants it — the shape both [floorNarration] and [queueView] take. One builder, so
+ * the panel, the roster chips and the log line are all reading the same snapshot: the narration's silence on
+ * `in-line`/`offered` is conditional on the panel showing them, and that only holds if the two are handed
+ * identical inputs. (`released` and `awaitingClaim` are transition fields only the narration reads; queueView
+ * ignores them, which is why they are optional here.)
+ */
+function floorView(extra) {
+	return {
+		selfId: state.selfId,
+		holderId: state.floorHolder,
+		waiting: state.floorWaiting,
+		floorQueueEnabled: state.floorQueueEnabled,
+		mode: state.mode,
+		...extra,
+	};
+}
+
+/**
+ * Updates the roster's ✋N chips IN PLACE on the cached `<li>`s, adding, moving and removing them to match the
+ * queue — the same treatment `setSpeaking` gives the speaking highlight, and for the same reason: `renderMembers`
+ * replaces every row, and replacing the row the user is interacting with destroys focus.
+ *
+ * That is a correctness problem here, not a nicety. Focus falling back to `<body>` is precisely the state
+ * `spaceDrivesFloor` reads as "Space should drive the floor", so rebuilding the roster on every floor transition
+ * turned a queued member's tap — which moves the queue for everyone — into "the next Space press opens some
+ * bystander's microphone" if that bystander happened to have a roster button focused. Chips churn with every raise
+ * and lower of a hand, so this is the busiest roster update there is; the speaking highlight took the same decision
+ * for the same shape of reason.
+ *
+ * `renderMembers` still builds the chips itself when it draws a fresh roster — a new row needs one from the start —
+ * from its own call on the same pure derivation. Both paths must produce the same DOM, which is why the chip is
+ * anchored after `.member-name` in each.
+ */
+function syncQueueChips() {
+	const queued = new Map(queueView(floorView()).entries.map(entry => [entry.memberId, entry]));
+	state.memberLis.forEach((li, id) => {
+		const entry = queued.get(id);
+		const existing = li.querySelector('.queue-badge');
+		if (entry === undefined) {
+			if (existing !== null) {
+				existing.remove();
+			}
+			return;
+		}
+		const chip = existing ?? li.querySelector('.member-name').insertAdjacentElement('afterend', queueChip());
+		describeQueueChip(chip, entry);
+	});
+}
+
+/** An empty chip node; [#describeQueueChip] fills in what it says. Shared by both drawing paths. */
+function queueChip() {
+	const chip = document.createElement('span');
+	chip.className = 'queue-badge';
+	return chip;
+}
+
+/** Writes a queue entry onto a chip node — the single place the chip's text, class and tooltip are decided. */
+function describeQueueChip(chip, entry) {
+	chip.classList.toggle('offered', entry.isOffered);
+	chip.textContent = `✋${entry.position}`;
+	chip.title = entry.isOffered
+		? 'Being offered the floor now — their claim window is ticking'
+		: `#${entry.position} in line to talk`;
+}
+
+/**
+ * Draws the floor queue. This is the ONE call site to reach for whenever a queueView input changes: it draws the
+ * panel and syncs the roster chips, so a caller only has to remember one name.
+ *
+ * The chips are NOT drawn from this function's own [queueView] call — [#syncQueueChips] and [#renderMembers] each
+ * make their own call on the same pure derivation, reading the same state in the same task. That is what makes the
+ * two surfaces agree: not a shared call, but a pure function over one snapshot. It also means they agree only if
+ * both actually run, which is what this function guarantees. Forgetting the second call is exactly how a rename
+ * left the panel showing a queued member's old name while the row beside it showed the new one.
+ */
+function renderQueue() {
+	const view = queueView(floorView());
+	const panel = byId('queuePanel');
+	const list = byId('floorQueue');
+	panel.hidden = !view.shown;
+	list.replaceChildren();
+	syncQueueChips();
+	if (!view.shown) {
+		return;
+	}
+	// The heading carries the SIZE, so the total is readable even when the list is truncated below.
+	byId('queueTitle').textContent = `In line to talk (${view.size})`;
+	view.visible.forEach(entry => {
+		const li = document.createElement('li');
+		if (entry.isOffered) {
+			li.classList.add('offered');
+			li.title = 'Being offered the floor now — their claim window is ticking';
+		}
+		const position = document.createElement('span');
+		position.className = 'queue-position';
+		position.textContent = `${entry.position}.`;
+		li.appendChild(position);
+		const name = document.createElement('span');
+		if (entry.isSelf) {
+			name.className = 'self';
+		}
+		// textContent, never innerHTML: a display name is user-supplied and must not be able to inject markup —
+		// the same rule renderMembers states for the roster.
+		name.textContent = queueLabel(entry.memberId) + (entry.isSelf ? ' (you)' : '');
+		li.appendChild(name);
+		if (entry.isOffered) {
+			// In WORDS, not only in the border colour. Being offered the floor is the one state in this panel that
+			// changes what someone should DO, the log line that used to say it is now deliberately suppressed, and a
+			// blue outline against a blue self-highlight is not a distinction everybody can see.
+			const note = document.createElement('span');
+			note.className = 'queue-note';
+			note.textContent = entry.isSelf ? '— your turn' : '— being offered the floor';
+			li.appendChild(note);
+		}
+		list.appendChild(li);
+	});
+	if (view.hiddenCount > 0) {
+		// Never silently truncate: say how many were cut. Your own position is on the Talk button regardless.
+		const more = document.createElement('li');
+		more.className = 'more';
+		more.textContent = `+${view.hiddenCount} more waiting`;
+		list.appendChild(more);
+	}
+}
+
+/**
  * Applies the authoritative FloorStatus snapshot: records the holder + queue, drives the WebRTC speaker highlight,
  * reconciles our transmit state ("if the floor is no longer mine, I was released — stop the mic"), logs a concise
  * status, and re-renders the Talk button. This is now the SINGLE source of the "you were released" truth — the
@@ -1574,15 +1702,12 @@ function onFloorStatus(holderId, waiting) {
 	// plenty of occasions that do not move the floor (a member leaving, a mute change, a re-join), so narrate only
 	// when the SITUATION changed: floorNarration returns a key, and an unchanged key stays silent. Without this a
 	// queue toggle logged "Floor is free" into a floor that was already free.
-	const narration = floorNarration({
-		selfId: self,
-		holderId: state.floorHolder,
-		waiting: state.floorWaiting,
-		released,
-		awaitingClaim: prevAwaiting,
-		floorQueueEnabled: state.floorQueueEnabled
-	});
-	if (narration !== null && narration.key !== state.lastFloorNarration) {
+	const narration = floorNarration(floorView({released, awaitingClaim: prevAwaiting}));
+	// Three answers, not two: a spoken kind, `null` (say nothing and FORGET what was last said), and 'silent' (say
+	// nothing and REMEMBER it) — see floorNarration. Without the third, raising and lowering a hand reprinted the
+	// unchanged "Talking: X" every time, which is the noise the panel exists to remove.
+	const spoken = narration !== null && narration.kind !== 'silent';
+	if (spoken && narration.key !== state.lastFloorNarration) {
 		switch (narration.kind) {
 			case 'in-line':
 				log(`In line #${narration.position} of ${narration.size} — tap Talk to leave the queue`);
@@ -1607,10 +1732,14 @@ function onFloorStatus(holderId, waiting) {
 		}
 	}
 	// Remember it even when nothing was logged, so LIVE/MY_TURN (which narrate nothing) do not let the next IDLE
-	// snapshot repeat the line that preceded them.
-	state.lastFloorNarration = narration === null ? null : narration.key;
+	// snapshot repeat the line that preceded them. A 'silent' snapshot is skipped entirely: it is the one answer
+	// that must not disturb the last SPOKEN key.
+	if (narration === null || spoken) {
+		state.lastFloorNarration = spoken ? narration.key : null;
+	}
 	state.awaitingClaim = floorState === FLOOR_MY_TURN;   // so a later snapshot that drops us can log "your turn passed"
 	updateTalkButton();
+	renderQueue();
 }
 
 /**
@@ -1667,6 +1796,10 @@ function onFloorQueueChanged(enabled) {
 		: 'Floor queue disabled — a busy floor now refuses new requests until it frees.');
 	updateChannelSettings();
 	updateTalkButton();
+	// The flag is one of queueView's three gate terms, so a toggle both ways changes what is drawn. Disabling also
+	// DRAINS the queue server-side, but the emptied FloorStatus is a separate message: redrawing here is what makes
+	// the panel go the instant the flag does, rather than lingering until that snapshot lands.
+	renderQueue();
 }
 
 // --- talk control ---------------------------------------------------------------------------------
@@ -2463,6 +2596,10 @@ function renameMember(id, name) {
 		state.displayName = name;   // confirmed by the server, so Rename settles
 	}
 	renderMembers();
+	// The queue panel draws NAMES, and a rename is the one member change with no FloorStatus behind it (the comment
+	// below says so for the talk control's sake) — so without this the panel keeps the old name while the row beside
+	// it shows the new one, for as long as the queue sits unchanged.
+	renderQueue();
 	updateRenameButton();   // if this was our own rename, the field now matches the new name → Rename re-disables
 	// A rename is the one member change that arrives with no FloorStatus behind it, so the talk control has to be
 	// told: with the queue off it names the floor holder ("Floor held by X"), which would otherwise keep the old name.
@@ -2603,6 +2740,16 @@ function idTag(id) {
  * A member's display name followed by its id tag — the standard way to name a member in a log line, so a name is
  * always attributable to a session id (mirrors the Java client's name()).
  */
+/**
+ * A queued member's label. Falls back to the short id alone when the roster does not know the name, which is
+ * reachable by ordering: `MemberLeft` deletes the member locally, and the FloorStatus that drops them from the
+ * queue is a separate message — so for one message the panel may hold an id it can no longer name. "undefined
+ * (#0b57)" would be the one rendering worse than saying nothing.
+ */
+function queueLabel(id) {
+	return state.members.has(id) ? memberLabel(id) : `#${id.slice(0, ID_PREFIX_LENGTH)}`;
+}
+
 function memberLabel(id) {
 	return `${state.members.get(id)}${idTag(id)}`;
 }
@@ -2614,6 +2761,11 @@ function renderMembers() {
 	// Only the channel owner sees the moderation controls (per-member Mute/Unmute + "Mute all"); the server
 	// enforces the same rule, so this is UI convenience, not the security boundary. Never for the ownerless global room.
 	const iAmOwner = ownsChannel();
+	// The queue chips, from the SAME derivation the queue panel draws — one call, indexed by id, so a member's
+	// position cannot read one way in the list and another on their row. Built from `entries` (the whole queue)
+	// rather than `visible`, because a chip belongs on a member's row even when their position is past the cut the
+	// panel makes. Empty map when the queue is off, in full-duplex, or when nobody is waiting.
+	const queued = new Map(queueView(floorView()).entries.map(entry => [entry.memberId, entry]));
 	// Always append a short session-id prefix after the display name (the session id is the real identity —
 	// names aren't unique); the full id is on hover. Lexicographic (case-insensitive) by name, then by id.
 	[...state.members.entries()]
@@ -2636,12 +2788,19 @@ function renderMembers() {
 				li.appendChild(crown);
 			}
 			const nameSpan = document.createElement('span');
-			if (id === state.selfId) {
-				nameSpan.className = 'self';
-			}
+			// A stable hook so syncQueueChips can anchor the chip in the SAME position this path puts it in.
+			nameSpan.className = id === state.selfId ? 'member-name self' : 'member-name';
 			// textContent (not innerHTML) so a crafted display name can't inject markup.
 			nameSpan.textContent = label;
 			li.appendChild(nameSpan);
+			// The queue chip reads as part of the person's label ("Alice ✋3"), so it goes straight after the name
+			// rather than right-aligned like the mute badge — that one is a moderation state, this is a position.
+			const queueEntry = queued.get(id);
+			if (queueEntry !== undefined) {
+				const chip = queueChip();
+				describeQueueChip(chip, queueEntry);
+				li.appendChild(chip);
+			}
 			// Muted members are dimmed and flagged with a speaker-off marker, so everyone (not just the owner) can
 			// see who the owner has silenced. The badge's margin-left:auto right-aligns it (and the button after it).
 			const muted = state.mutedMembers.has(id);
@@ -2820,6 +2979,9 @@ function resetChannelState() {
 	state.mutedMembers.clear();
 	state.locked = false;   // onJoined re-seeds from the snapshot; this keeps a clean baseline for the disconnect path
 	state.muteNewMembers = false;   // ditto — a stale badge must not outlive the channel
+	// The fields above are its inputs, so this empties the panel and strips every chip — a stale queue must not
+	// outlive the channel either (cleanup and every in-place switch both land here).
+	renderQueue();
 }
 
 function cleanup() {

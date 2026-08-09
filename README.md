@@ -231,7 +231,10 @@ probe; everything else under `/actuator` is not.
 3. **Push-to-talk** modes: hold the big button (or hold **Space**). If the owner has enabled the channel's
    **floor queue** (a "raise hand" line — owner-only **Enable queue**/**Disable queue** control) and the floor
    is busy, the button flips to **tap to raise your hand**: you join the line, see your place, and tap again to
-   leave. When your turn comes the button pulses **YOUR TURN — hold to talk** with a countdown (grant-to-claim);
+   leave. While anyone is queued, an **In line to talk** list appears above the roster showing the whole line in
+   order (long lines are cut with a "+N more waiting" tail), and each queued member's roster row gets a `✋N` chip;
+   the person whose claim window is ticking is highlighted in both. Your own position is always on the button too,
+   so it stays visible however long the line gets. When your turn comes the button pulses **YOUR TURN — hold to talk** with a countdown (grant-to-claim);
    hold it in time to go live or the turn passes to the next person. **Full-duplex**: click to toggle your
    mic — or tick **Connect muted** before connecting to join with the mic off (it stays muted until you
    click Talk). That checkbox shows only in full-duplex mode and locks once connected.
@@ -435,7 +438,9 @@ otherwise mono — and interoperates with relay-mode browser clients.
   server; max-hold is a pure time cap and bounds every holder, including WebRTC.
 - **Push-to-talk floor queue ("raise hand").** A channel owner can turn on a per-channel floor queue (default
   **off** — a busy floor is simply not granted, as before). With it on, asking for a busy floor puts you **in
-  line** (FIFO) and everyone sees their place; when the floor frees it passes to the head of the line. It is
+  line** (FIFO); when the floor frees it passes to the head of the line. The whole line is **visible to everyone**
+  — browser clients draw it as an ordered list above the roster and mark each queued member's row with a `✋N`
+  chip, so you can see who is ahead of you and who is being offered the floor right now, not just your own number. It is
   **grant-to-claim, never a hot mic**: when your turn arrives the floor is *reserved* for you for
   `walkie.floor-reservation` (default `10s`) and you must take the normal talk action to go live — miss the
   window and you're dropped and the floor moves to the next in line. The owner toggles it with `SetFloorQueue`;

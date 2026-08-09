@@ -26,6 +26,9 @@ import {
 	isVoiceActive,
 	micTrackEnabled,
 	needsVoiceMeter,
+	QUEUE_ROWS_SHOWN,
+	queueView,
+	SILENT,
 	shouldAutoOpenMic,
 	spaceDrivesFloor,
 	talkDecision,
@@ -805,4 +808,168 @@ test('the threshold sits between room tone and speech', () => {
 	assert.ok(VAD_RMS_THRESHOLD > 0.001 && VAD_RMS_THRESHOLD < 0.1, VAD_RMS_THRESHOLD);
 	const atThreshold = new Float32Array(64).fill(VAD_RMS_THRESHOLD);
 	assert.ok(!isVoiceActive(atThreshold, 1), 'exactly at the threshold is not yet speech (strict >)');
+});
+
+// --- the floor queue as two rendered surfaces (queueView) -------------------------------------------
+//
+// The panel and the roster chips are drawn from ONE call, so these assert the derivation once and both surfaces
+// inherit it. The limit is read from QUEUE_ROWS_SHOWN rather than hard-coded, so re-tuning the constant does not
+// silently turn the truncation tests into assertions about nothing.
+
+const QUEUE_VIEW = {selfId: SELF, holderId: HOLDER, waiting: [], floorQueueEnabled: true, mode: 'MULTI_CHANNEL_PTT'};
+
+test('queueView: an ordered queue numbers from 1 and marks us', () => {
+	const view = queueView({...QUEUE_VIEW, waiting: [OTHER, SELF]});
+	assert.equal(view.shown, true);
+	assert.equal(view.size, 2);
+	assert.deepEqual(view.entries.map(entry => entry.position), [1, 2]);
+	assert.deepEqual(view.entries.map(entry => entry.memberId), [OTHER, SELF]);
+	assert.deepEqual(view.entries.map(entry => entry.isSelf), [false, true]);
+	assert.deepEqual(view.visible, view.entries, 'a short queue is drawn whole');
+	// A queue shorter than the cut must report ZERO hidden, not a negative. "-6 were hidden" is nonsense, and a
+	// caller testing `hiddenCount !== 0` instead of `> 0` would render "+-6 more waiting" off the back of it.
+	assert.equal(view.hiddenCount, 0);
+});
+
+test('queueView: nothing is drawn when the owner has the queue switched off', () => {
+	// The FLAG is the gate, not the contents: the server drains the queue on a disable, and the FloorQueueChanged
+	// that says so lands before the emptied snapshot, so a non-empty list under an off flag is a stale in-flight
+	// state that must not be drawn.
+	const view = queueView({...QUEUE_VIEW, floorQueueEnabled: false, waiting: [OTHER, SELF]});
+	assert.equal(view.shown, false);
+	assert.deepEqual(view.entries, [], 'and no roster chips either — both surfaces go together');
+	assert.equal(view.size, 0);
+});
+
+test('queueView: full-duplex draws nothing even with the flag on and people listed', () => {
+	// There is no floor in full-duplex, so there is nothing to be in line for. Mode is a gate term in its own
+	// right; without it a channel switched to full-duplex would keep rendering the queue it can no longer use.
+	const view = queueView({...QUEUE_VIEW, mode: 'FULL_DUPLEX', waiting: [OTHER, SELF]});
+	assert.equal(view.shown, false);
+	assert.deepEqual(view.entries, []);
+});
+
+test('queueView: an empty queue is hidden rather than drawn as an empty box', () => {
+	assert.equal(queueView(QUEUE_VIEW).shown, false);
+	assert.equal(queueView({...QUEUE_VIEW, holderId: null}).shown, false, 'a free floor with nobody waiting too');
+});
+
+test('queueView: the head of a FREE floor is marked as offered — and nobody else ever is', () => {
+	const free = queueView({...QUEUE_VIEW, holderId: null, waiting: [OTHER, SELF]});
+	assert.deepEqual(free.entries.map(entry => entry.isOffered), [true, false]);
+	const busy = queueView({...QUEUE_VIEW, waiting: [OTHER, SELF]});
+	assert.deepEqual(busy.entries.map(entry => entry.isOffered), [false, false],
+			'a queue behind a live holder has no claim window running');
+});
+
+test('queueView: a snapshot that omits the holder reads as a free floor, not one held by undefined', () => {
+	// The same loose `== null` floorStateFor documents. Tightening it to === would leave the head unmarked.
+	const view = queueView({...QUEUE_VIEW, holderId: undefined, waiting: [OTHER]});
+	assert.equal(view.entries[0].isOffered, true);
+});
+
+test('queueView: the offered mark agrees with floorStateFor for our own id', () => {
+	// The anti-drift test. isOffered and FLOOR_MY_TURN are the same rule stated in two places — one for drawing
+	// someone else's row, one for driving our own button — so they must never disagree about US.
+	const cases = [
+		{holderId: null, waiting: [SELF, OTHER]},
+		{holderId: null, waiting: [OTHER, SELF]},
+		{holderId: HOLDER, waiting: [SELF]},
+		{holderId: null, waiting: [SELF]},
+	];
+	cases.forEach(snapshot => {
+		const mine = queueView({...QUEUE_VIEW, ...snapshot}).entries.find(entry => entry.isSelf);
+		const myTurn = floorStateFor(SELF, snapshot.holderId, snapshot.waiting) === FLOOR_MY_TURN;
+		assert.equal(mine.isOffered, myTurn, JSON.stringify(snapshot));
+	});
+});
+
+test('queueView: a queue longer than the visible limit truncates and SAYS how many it cut', () => {
+	// Silent truncation would read as "that is the whole queue". The count is what makes the cut honest.
+	const waiting = Array.from({length: QUEUE_ROWS_SHOWN + 3}, (_, i) => `m-${i}`);
+	const view = queueView({...QUEUE_VIEW, waiting});
+	assert.equal(view.size, QUEUE_ROWS_SHOWN + 3, 'size is the WHOLE queue, for the heading');
+	assert.equal(view.visible.length, QUEUE_ROWS_SHOWN);
+	assert.equal(view.hiddenCount, 3);
+	assert.equal(view.entries.length, QUEUE_ROWS_SHOWN + 3,
+			'entries stays complete: a roster chip belongs on a member past the cut too');
+	assert.equal(view.entries.at(-1).position, QUEUE_ROWS_SHOWN + 3, 'and their position is still their real one');
+});
+
+test('queueView: a queue exactly at the limit is not reported as truncated', () => {
+	const waiting = Array.from({length: QUEUE_ROWS_SHOWN}, (_, i) => `m-${i}`);
+	const view = queueView({...QUEUE_VIEW, waiting});
+	assert.equal(view.visible.length, QUEUE_ROWS_SHOWN);
+	assert.equal(view.hiddenCount, 0, 'off by one here would print "+0 more waiting"');
+});
+
+test('queueView: visible is a prefix of entries, so the two surfaces cannot contradict each other', () => {
+	const waiting = Array.from({length: QUEUE_ROWS_SHOWN + 5}, (_, i) => `m-${i}`);
+	const view = queueView({...QUEUE_VIEW, waiting});
+	view.visible.forEach((entry, index) => assert.deepEqual(entry, view.entries[index],
+			'a row in the panel must be the same entry as the chip on that member'));
+});
+
+test('floorNarration: the two lines the panel duplicates fall silent while it is on screen', () => {
+	// The point of the panel. With five in line, every arrival and departure renumbered everyone and wrote a line
+	// per member, burying the things only the log can report (a rotation, a rename, a mute).
+	const shown = {...IDLE_VIEW, floorQueueEnabled: true, mode: 'MULTI_CHANNEL_PTT'};
+	assert.equal(floorNarration({...shown, holderId: HOLDER, waiting: [OTHER, SELF]}).kind, 'silent', 'in-line');
+	assert.equal(floorNarration({...shown, waiting: [OTHER]}).kind, 'silent', 'offered');
+});
+
+test('floorNarration: with no panel to read, both lines are said as before', () => {
+	// The queue flag off is the ordinary case, and the Java console client — which has no panel at all — depends on
+	// this branch staying intact.
+	assert.equal(floorNarration({...IDLE_VIEW, holderId: HOLDER, waiting: [OTHER, SELF]}).kind, 'in-line');
+	assert.equal(floorNarration({...IDLE_VIEW, waiting: [OTHER]}).kind, 'offered');
+	// ...and in full-duplex, where the panel is gated off by mode rather than by the flag.
+	const duplex = {...IDLE_VIEW, floorQueueEnabled: true, mode: 'FULL_DUPLEX'};
+	assert.equal(floorNarration({...duplex, waiting: [OTHER]}).kind, 'offered');
+});
+
+test('floorNarration: a silenced offer does not fall through to "Floor is free"', () => {
+	// The floor is RESERVED for the head, not free. Returning the wrong kind here would be worse than saying
+	// nothing, which is why the silenced branch returns explicitly instead of dropping out of the chain.
+	const shown = {...IDLE_VIEW, floorQueueEnabled: true, mode: 'MULTI_CHANNEL_PTT', waiting: [OTHER]};
+	assert.equal(floorNarration(shown).kind, 'silent');
+	assert.notEqual(floorNarration(shown).kind, 'free', 'the one wrong thing to say about a reserved floor');
+});
+
+test('floorNarration: silencing the queue lines leaves every other kind intact', () => {
+	// A blanket "say nothing while the panel is up" would have swallowed these — they are not in the panel.
+	//
+	// The fixture must genuinely put the panel UP: an earlier version of this test left `waiting` empty, so every
+	// assertion ran with shown === false and passed without exercising the suppression at all. `waiting` therefore
+	// holds a THIRD party — not us, so we are not IN_LINE, and the panel is up because somebody is queued.
+	const shown = {...IDLE_VIEW, floorQueueEnabled: true, mode: 'MULTI_CHANNEL_PTT', waiting: [OTHER]};
+	assert.equal(queueView(shown).shown, true, 'guard: the fixture really does put the panel up');
+	assert.equal(floorNarration({...shown, holderId: HOLDER}).kind, 'talking',
+			'who is talking is not something the queue panel shows');
+	assert.equal(floorNarration({...shown, released: true}).kind, 'released');
+	assert.equal(floorNarration({...shown, awaitingClaim: true}).kind, 'turn-passed');
+	// 'free' cannot coexist with a non-empty queue — an unheld floor with somebody queued is RESERVED for the head
+	// — so it is asserted with the panel down, which is the only state it occurs in.
+	assert.equal(floorNarration({...IDLE_VIEW, floorQueueEnabled: true, mode: 'MULTI_CHANNEL_PTT'}).kind, 'free');
+});
+
+test('floorNarration: a suppressed snapshot says nothing WITHOUT forgetting what was last said', () => {
+	// The distinction 'silent' exists for. `null` tells the caller to clear its last-logged key; 'silent' must not.
+	// Conflating them reprinted the unchanged "Talking: X" on every raise/lower cycle — the exact noise the panel
+	// was added to remove.
+	const shown = {...IDLE_VIEW, floorQueueEnabled: true, mode: 'MULTI_CHANNEL_PTT'};
+	const inLine = floorNarration({...shown, holderId: HOLDER, waiting: [OTHER, SELF]});
+	assert.equal(inLine.kind, 'silent');
+	assert.equal(inLine.key, undefined, 'a silent answer carries no key, so a caller cannot mistake it for a situation');
+	assert.equal(floorNarration({...shown, waiting: [OTHER]}).kind, 'silent', 'and the offered line likewise');
+	// LIVE and MY_TURN stay null — they are announced by FloorGranted/FloorReserved, and after them the next IDLE
+	// snapshot SHOULD speak, which is what clearing the memory buys.
+	assert.equal(floorNarration({...shown, holderId: SELF}), null, 'LIVE is still a hard null');
+	assert.equal(floorNarration({...shown, waiting: [SELF]}), null, 'MY_TURN too');
+});
+
+test('floorNarration: the silent answer is a shared frozen value, so it cannot be mutated by a caller', () => {
+	const shown = {...IDLE_VIEW, floorQueueEnabled: true, mode: 'MULTI_CHANNEL_PTT'};
+	assert.equal(floorNarration({...shown, waiting: [OTHER]}), SILENT, 'the exported constant, not a fresh object');
+	assert.equal(Object.isFrozen(SILENT), true);
 });

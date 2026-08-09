@@ -3,6 +3,11 @@
 // npm dependencies) from src/test/js/talk.test.js. Nothing here touches the DOM or any browser global: it maps a
 // plain snapshot of client state to what the Talk button should SAY and DO, and app.js renders that.
 //
+// floorNarration is mirrored by the Java client's own floorNarration, kind for kind and key for key, with ONE
+// deliberate exception: this one falls silent on `in-line` and `offered` while the browser's queue panel is
+// showing them (see queueView), and the console client — which has no panel — keeps both. That is the only
+// intended difference; anything else is drift.
+//
 // floorStateFor, floorActionFor and shouldAutoOpenMic are the SAME pure rules the Java client applies —
 // WalkieClient.floorStateFor / floorActionFor / shouldAutoOpenMic, pinned by WalkieClientTest — and the FLOOR_*
 // values are that client's FloorState enum names, so the two must stay in lock-step. They take the same positional
@@ -230,6 +235,68 @@ export function spaceDrivesFloor(mode, focus) {
 }
 
 /**
+ * How many entries the visible queue list draws before collapsing the rest into a "+N more" tail.
+ *
+ * A cut is needed because the queue is UNBOUNDED server-side — `Channel.floorQueue` is a plain `LinkedHashSet`,
+ * unlike the join-request list, which has `walkie.max-join-requests` — and a channel holds up to 255 members, so
+ * an untruncated list could stand taller than the page it sits on. Eight makes the ordinary case (a handful of
+ * raised hands) fully visible while never letting the list outgrow the roster beside it.
+ *
+ * Nothing actionable is lost at the cut: your OWN position is on the Talk button in every case ("In line #12 of
+ * 30 — tap to leave"), which is the one number that still means something from deep in the line. That is also why
+ * the truncation is a plain head-of-list slice rather than a window that follows you around — the surface that
+ * answers "where am I" is the button, and this list answers "who else, and in what order".
+ */
+export const QUEUE_ROWS_SHOWN = 8;
+
+/**
+ * The floor queue as something to RENDER: both the ordered list panel and the per-member roster chip, derived
+ * together so the two surfaces cannot disagree about who is in line or in what position.
+ *
+ * `entries` is the WHOLE queue and drives the roster chips — a chip belongs on a member's row whatever their
+ * position, including past the visible cut. `visible` is the slice the list panel draws, with `hiddenCount` for
+ * its tail. Same data, two surfaces, ONE derivation: the alternative is a list built from `waiting` and a chip
+ * built from `waiting.indexOf(...)` at the call site, which is two copies of one rule. The mute badge alongside it
+ * exists because that pattern was already regretted once — see `updateChannelSettings`, "the badge everyone sees
+ * and the owner's tick alike, so the two cannot disagree".
+ *
+ * `shown` is the single gate, and it takes THREE terms rather than just the feature flag:
+ *   - `floorQueueEnabled`, the owner's per-channel toggle, which can flip mid-session.
+ *   - the mode: FULL_DUPLEX has no floor at all, so there is nothing to queue for — the same mode term
+ *     `needsVoiceMeter` carries. The ownerless `global` room needs no case of its own, because its queue can never
+ *     be enabled (its toggle answers `NOT_OWNER`), so the flag term already answers for it.
+ *   - a non-empty queue, since an empty list is noise and the "✋ Queue on" badge already says the queue exists.
+ *
+ * Gating on the FLAG rather than on the queue's contents is what makes a disable clean. The server drains the
+ * queue when the owner turns it off, and the `FloorQueueChanged` saying so arrives just before the emptied
+ * snapshot — so reading the flag hides the panel a beat early instead of briefly showing a queue that is about to
+ * vanish, which is the more honest of the two failures.
+ *
+ * `isOffered` marks the member whose claim window is ticking: exactly `waiting[0]` of a FREE floor, the rule
+ * `ServerMessage.FloorStatus` documents and `floorStateFor` already applies for our own id. The `== null` on the
+ * holder is loose for the same reason it is loose there — a snapshot that omits the field means a free floor, not
+ * one held by `undefined`.
+ */
+export function queueView(view) {
+	if (!view.floorQueueEnabled || view.mode === 'FULL_DUPLEX' || view.waiting.length === 0) {
+		return {shown: false, size: 0, entries: [], visible: [], hiddenCount: 0};
+	}
+	const entries = view.waiting.map((memberId, index) => ({
+		memberId,
+		position: index + 1,
+		isSelf: memberId === view.selfId,
+		isOffered: view.holderId == null && index === 0,
+	}));
+	return {
+		shown: true,
+		size: entries.length,
+		entries,
+		visible: entries.slice(0, QUEUE_ROWS_SHOWN),
+		hiddenCount: Math.max(0, entries.length - QUEUE_ROWS_SHOWN),
+	};
+}
+
+/**
  * What a floor snapshot is worth SAYING, if anything — `null` when it should pass in silence.
  *
  * Returns `{kind, key}`: `kind` selects the wording (each client phrases it its own way), and `key` identifies the
@@ -242,16 +309,45 @@ export function spaceDrivesFloor(mode, focus) {
  * LIVE and MY_TURN say nothing here on purpose: FloorGranted and FloorReserved are the imperative triggers that
  * announce those, and repeating them on every queue churn would talk over the alert.
  *
+ * `in-line` and `offered` return the `silent` kind WHENEVER THE QUEUE PANEL IS ON SCREEN ([#queueView]'s `shown`),
+ * which is why this needs the `mode` field. Both lines only repeat what the reader can already see in the panel, and
+ * they repeat it on every churn: with five people in line, each arrival and departure moved everyone's number and
+ * wrote a line per member, so the log filled with position updates and scrolled the things only the log can say
+ * (a rotation, a rename, a mute) out of view. The gate is [#queueView]'s own, called here rather than passed in as
+ * a flag, so "the panel is showing it" and "do not also say it" cannot come apart.
+ *
+ * `silent` is a THIRD answer, distinct from both a spoken kind and `null`, and the difference is load-bearing:
+ * `null` means "forget what was last said" (the caller clears its key), whereas `silent` means "say nothing AND
+ * leave the memory alone". Conflating them costs exactly what this suppression was meant to save: log "Talking: X",
+ * raise your hand (suppressed), lower it again — with the key cleared, the unchanged "Talking: X" counts as new and
+ * is printed again, so every raise/lower cycle reprints it even though the floor never moved.
+ *
+ * This is the ONE place the browser and the Java console client deliberately diverge (see the module header): the
+ * console has no panel to look at, so there the narration IS the display and both kinds stay. Keep that asymmetry
+ * in mind before "fixing" either side to match the other.
+ *
  * `released` and `turnPassed` are transitions rather than states, and both are self-clearing (the client stops
  * transmitting / drops its awaiting-claim flag as it handles them), so they cannot repeat back-to-back — they are
  * keyed anyway so an intervening situation lets them be said again.
  */
+/**
+ * The answer for a snapshot the queue panel is already showing: say nothing, and leave the caller's "last thing I
+ * said" memory untouched. Frozen and shared because it carries no per-snapshot data — a caller must branch on the
+ * KIND, never compare identity.
+ */
+export const SILENT = Object.freeze({kind: 'silent'});
+
 export function floorNarration(view) {
 	const floorState = floorStateFor(view.selfId, view.holderId, view.waiting);
 	if (floorState === FLOOR_LIVE || floorState === FLOOR_MY_TURN) {
 		return null;
 	}
+	// Computed once and consulted by the two kinds the panel duplicates.
+	const queueOnScreen = queueView(view).shown;
 	if (floorState === FLOOR_IN_LINE) {
+		if (queueOnScreen) {
+			return SILENT;
+		}
 		const position = view.waiting.indexOf(view.selfId) + 1;
 		return {kind: 'in-line', position, size: view.waiting.length, key: `in-line:${position}/${view.waiting.length}`};
 	}
@@ -265,7 +361,9 @@ export function floorNarration(view) {
 		return {kind: 'talking', memberId: view.holderId, key: `talking:${view.holderId}`};
 	}
 	if (view.waiting.length > 0) {
-		return {kind: 'offered', memberId: view.waiting[0], key: `offered:${view.waiting[0]}`};
+		// Returning rather than falling through: the floor is RESERVED for the head, not free, so "Floor is free"
+		// would be the one wrong thing to say here.
+		return queueOnScreen ? SILENT : {kind: 'offered', memberId: view.waiting[0], key: `offered:${view.waiting[0]}`};
 	}
 	return {kind: 'free', key: 'free'};
 }
