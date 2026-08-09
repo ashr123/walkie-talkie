@@ -1554,111 +1554,98 @@ function floorView(extra) {
 }
 
 /**
- * Updates the roster's ✋N chips IN PLACE on the cached `<li>`s, adding, moving and removing them to match the
- * queue — the same treatment `setSpeaking` gives the speaking highlight, and for the same reason: `renderMembers`
- * replaces every row, and replacing the row the user is interacting with destroys focus.
+ * Places every roster row into its section and orders it: whoever is in line to talk first, in queue order, then
+ * everyone else by name. This is the ONE call to reach for whenever a [queueView] input changes, and the only place
+ * that decides where a row goes.
  *
- * That is a correctness problem here, not a nicety. Focus falling back to `<body>` is precisely the state
- * `spaceDrivesFloor` reads as "Space should drive the floor", so rebuilding the roster on every floor transition
- * turned a queued member's tap — which moves the queue for everyone — into "the next Space press opens some
- * bystander's microphone" if that bystander happened to have a roster button focused. Chips churn with every raise
- * and lower of a hand, so this is the busiest roster update there is; the speaking highlight took the same decision
- * for the same shape of reason.
+ * It moves as FEW rows as it can, and that is a correctness requirement rather than tuning. Relocating a node is a
+ * removal followed by an insertion, and removing the focused element drops focus to `<body>` — which is precisely the
+ * state `spaceDrivesFloor` reads as "Space should drive the floor". So a bystander with a roster button focused would
+ * have their next Space press open their microphone every time somebody else's hand went up. Hands go up and down
+ * constantly, making this the busiest roster update there is.
  *
- * `renderMembers` still builds the chips itself when it draws a fresh roster — a new row needs one from the start —
- * from its own call on the same pure derivation. Both paths must produce the same DOM, which is why the chip is
- * anchored after `.member-name` in each.
- */
-function syncQueueChips() {
-	const queued = new Map(queueView(floorView()).entries.map(entry => [entry.memberId, entry]));
-	state.memberLis.forEach((li, id) => {
-		const entry = queued.get(id);
-		const existing = li.querySelector('.queue-badge');
-		if (entry === undefined) {
-			if (existing !== null) {
-				existing.remove();
-			}
-			return;
-		}
-		const chip = existing ?? li.querySelector('.member-name').insertAdjacentElement('afterend', queueChip());
-		describeQueueChip(chip, entry);
-	});
-}
-
-/** An empty chip node; [#describeQueueChip] fills in what it says. Shared by both drawing paths. */
-function queueChip() {
-	const chip = document.createElement('span');
-	chip.className = 'queue-badge';
-	return chip;
-}
-
-/** Writes a queue entry onto a chip node — the single place the chip's text, class and tooltip are decided. */
-function describeQueueChip(chip, entry) {
-	chip.classList.toggle('offered', entry.isOffered);
-	chip.textContent = `✋${entry.position}`;
-	chip.title = entry.isOffered
-		? 'Being offered the floor now — their claim window is ticking'
-		: `#${entry.position} in line to talk`;
-}
-
-/**
- * Draws the floor queue. This is the ONE call site to reach for whenever a queueView input changes: it draws the
- * panel and syncs the roster chips, so a caller only has to remember one name.
- *
- * The chips are NOT drawn from this function's own [queueView] call — [#syncQueueChips] and [#renderMembers] each
- * make their own call on the same pure derivation, reading the same state in the same task. That is what makes the
- * two surfaces agree: not a shared call, but a pure function over one snapshot. It also means they agree only if
- * both actually run, which is what this function guarantees. Forgetting the second call is exactly how a rename
- * left the panel showing a queued member's old name while the row beside it showed the new one.
+ * An earlier version re-appended every row on the reasoning that it was idempotent and obviously correct. It was
+ * both, and it still destroyed focus on every snapshot, because appending a node that is already in the right place
+ * still removes and re-inserts it. Measured: focus was on a mute button, two floor transitions later it was on
+ * `<body>`. Hence the cursor walk below, which leaves an already-correct row untouched — and the restore afterwards,
+ * for the row that genuinely did move.
  */
 function renderQueue() {
 	const view = queueView(floorView());
-	const panel = byId('queuePanel');
-	const list = byId('floorQueue');
-	panel.hidden = !view.shown;
-	list.replaceChildren();
-	syncQueueChips();
-	if (!view.shown) {
+	byId('queuePanel').hidden = !view.shown;
+	if (view.shown) {
+		// The count belongs in the heading, not the rows: those are numbered by a CSS counter over document order,
+		// so nothing here counts anything.
+		byId('queueTitle').textContent = `In line to talk (${view.size})`;
+	}
+	// Whatever had focus, so a row that really did have to move can hand it back. Covers the case the cursor walk
+	// cannot: if the focused row is the one changing sections, it is removed and re-inserted by definition.
+	const focused = document.activeElement;
+	const queued = new Set(view.entries.map(entry => entry.memberId));
+	placeInOrder(byId('floorQueue'), view.entries.map(entry => entry.memberId));
+	placeInOrder(byId('members'), sortedMemberIds().filter(id => !queued.has(id)));
+	view.entries.forEach(entry => {
+		const li = state.memberLis.get(entry.memberId);
+		if (li !== undefined) {
+			markOffered(li, entry.isOffered, entry.isSelf);
+		}
+	});
+	sortedMemberIds()
+		.filter(id => !queued.has(id))
+		.forEach(id => markOffered(state.memberLis.get(id), false, false));
+	if (focused instanceof HTMLElement && focused.isConnected && document.activeElement !== focused
+			&& focused.closest('.member-list') !== null) {
+		focused.focus();
+	}
+}
+
+/**
+ * Reorders `list` to hold exactly `ids`, in that order, MOVING rows in from elsewhere as needed and leaving rows
+ * that are already in the right place completely alone — see [#renderQueue] for why "leaving alone" is the point.
+ *
+ * A row that belongs in the other list is not removed here: the other list's own pass claims it, because inserting a
+ * node into a new parent detaches it from the old one. So the two calls together partition every row, and a row that
+ * has left the queue is picked up by the pass over everyone else.
+ */
+function placeInOrder(list, ids) {
+	let cursor = list.firstElementChild;
+	ids.forEach(id => {
+		const li = state.memberLis.get(id);
+		if (li === undefined) {
+			// A queued id the roster does not (yet) know. Reachable by ordering: `memberLeft` deletes the member
+			// locally, and the floor snapshot dropping them from the queue is a separate message. There is no row to
+			// place and nothing invents one — which is also why the section can never render a name it cannot look
+			// up, the hazard the old separate panel had.
+			return;
+		}
+		if (li === cursor) {
+			cursor = cursor.nextElementSibling;   // already exactly where it should be: do not touch it
+			return;
+		}
+		list.insertBefore(li, cursor);
+	});
+}
+
+/**
+ * Marks (or unmarks) a row as the one being offered the floor — its claim window ticking. Stated in WORDS as well as
+ * colour: this is the only state in the list that changes what someone should DO, the log line that used to announce
+ * it is deliberately suppressed while the section is on screen, and the two blues involved (this and the
+ * self-highlight) are not a distinction everybody can see.
+ */
+function markOffered(li, isOffered, isSelf) {
+	li.classList.toggle('offered', isOffered);
+	const existing = li.querySelector('.queue-note');
+	if (!isOffered) {
+		if (existing !== null) {
+			existing.remove();
+		}
 		return;
 	}
-	// The heading carries the SIZE, so the total is readable even when the list is truncated below.
-	byId('queueTitle').textContent = `In line to talk (${view.size})`;
-	view.visible.forEach(entry => {
-		const li = document.createElement('li');
-		if (entry.isOffered) {
-			li.classList.add('offered');
-			li.title = 'Being offered the floor now — their claim window is ticking';
-		}
-		const position = document.createElement('span');
-		position.className = 'queue-position';
-		position.textContent = `${entry.position}.`;
-		li.appendChild(position);
-		const name = document.createElement('span');
-		if (entry.isSelf) {
-			name.className = 'self';
-		}
-		// textContent, never innerHTML: a display name is user-supplied and must not be able to inject markup —
-		// the same rule renderMembers states for the roster.
-		name.textContent = queueLabel(entry.memberId) + (entry.isSelf ? ' (you)' : '');
-		li.appendChild(name);
-		if (entry.isOffered) {
-			// In WORDS, not only in the border colour. Being offered the floor is the one state in this panel that
-			// changes what someone should DO, the log line that used to say it is now deliberately suppressed, and a
-			// blue outline against a blue self-highlight is not a distinction everybody can see.
-			const note = document.createElement('span');
-			note.className = 'queue-note';
-			note.textContent = entry.isSelf ? '— your turn' : '— being offered the floor';
-			li.appendChild(note);
-		}
-		list.appendChild(li);
-	});
-	if (view.hiddenCount > 0) {
-		// Never silently truncate: say how many were cut. Your own position is on the Talk button regardless.
-		const more = document.createElement('li');
-		more.className = 'more';
-		more.textContent = `+${view.hiddenCount} more waiting`;
-		list.appendChild(more);
-	}
+	// Appended LAST, not after the name: the note takes a whole line of its own (see the CSS), so anything after it
+	// in document order would be pushed onto a third line — including the owner's Mute button.
+	const note = existing ?? li.appendChild(document.createElement('span'));
+	note.className = 'queue-note';
+	note.textContent = isSelf ? '— your turn' : '— being offered the floor';
 }
 
 /**
@@ -2740,93 +2727,97 @@ function idTag(id) {
  * A member's display name followed by its id tag — the standard way to name a member in a log line, so a name is
  * always attributable to a session id (mirrors the Java client's name()).
  */
-/**
- * A queued member's label. Falls back to the short id alone when the roster does not know the name, which is
- * reachable by ordering: `MemberLeft` deletes the member locally, and the FloorStatus that drops them from the
- * queue is a separate message — so for one message the panel may hold an id it can no longer name. "undefined
- * (#0b57)" would be the one rendering worse than saying nothing.
- */
-function queueLabel(id) {
-	return state.members.has(id) ? memberLabel(id) : `#${id.slice(0, ID_PREFIX_LENGTH)}`;
-}
 
 function memberLabel(id) {
 	return `${state.members.get(id)}${idTag(id)}`;
 }
 
-function renderMembers() {
-	const ul = byId('members');
-	ul.replaceChildren();
-	state.memberLis.clear();
-	// Only the channel owner sees the moderation controls (per-member Mute/Unmute + "Mute all"); the server
-	// enforces the same rule, so this is UI convenience, not the security boundary. Never for the ownerless global room.
-	const iAmOwner = ownsChannel();
-	// The queue chips, from the SAME derivation the queue panel draws — one call, indexed by id, so a member's
-	// position cannot read one way in the list and another on their row. Built from `entries` (the whole queue)
-	// rather than `visible`, because a chip belongs on a member's row even when their position is past the cut the
-	// panel makes. Empty map when the queue is off, in full-duplex, or when nobody is waiting.
-	const queued = new Map(queueView(floorView()).entries.map(entry => [entry.memberId, entry]));
-	// Always append a short session-id prefix after the display name (the session id is the real identity —
-	// names aren't unique); the full id is on hover. Lexicographic (case-insensitive) by name, then by id.
-	[...state.members.entries()]
+/// Member ids in the roster's own order: by display name (case-insensitive), then by id so two people sharing a
+/// name have a stable order rather than swapping places on every render.
+function sortedMemberIds() {
+	return [...state.members.entries()]
 		.sort(([idA, nameA], [idB, nameB]) => nameA.localeCompare(nameB, undefined, {sensitivity: 'base'}) || (idA < idB ? -1 : idA > idB ? 1 : 0))
-		.forEach(([id, name]) => {
-			let label = `${name}${idTag(id)}`;
-			if (id === state.selfId) {
-				label += ' (you)';
-			}
-			const li = document.createElement('li');
-			li.title = id;
-			// The channel owner gets a crown so it's clear at a glance who owns the channel (no need to scan the
-			// log). The server-managed global room has no participant owner, so it gets no crown.
-			if (id === state.ownerId && state.ownerId !== SERVER_OWNER) {
-				li.classList.add('owner');
-				const crown = document.createElement('span');
-				crown.className = 'owner-badge';
-				crown.textContent = '👑';
-				crown.title = 'Channel owner';
-				li.appendChild(crown);
-			}
-			const nameSpan = document.createElement('span');
-			// A stable hook so syncQueueChips can anchor the chip in the SAME position this path puts it in.
-			nameSpan.className = id === state.selfId ? 'member-name self' : 'member-name';
-			// textContent (not innerHTML) so a crafted display name can't inject markup.
-			nameSpan.textContent = label;
-			li.appendChild(nameSpan);
-			// The queue chip reads as part of the person's label ("Alice ✋3"), so it goes straight after the name
-			// rather than right-aligned like the mute badge — that one is a moderation state, this is a position.
-			const queueEntry = queued.get(id);
-			if (queueEntry !== undefined) {
-				const chip = queueChip();
-				describeQueueChip(chip, queueEntry);
-				li.appendChild(chip);
-			}
-			// Muted members are dimmed and flagged with a speaker-off marker, so everyone (not just the owner) can
-			// see who the owner has silenced. The badge's margin-left:auto right-aligns it (and the button after it).
-			const muted = state.mutedMembers.has(id);
-			if (muted) {
-				li.classList.add('muted');
-				const badge = document.createElement('span');
-				badge.className = 'muted-badge';
-				badge.textContent = '🔇';
-				badge.title = 'Muted by the owner';
-				li.appendChild(badge);
-			}
-			// The owner gets a per-member Mute/Unmute toggle (never on its own row — the owner can't mute itself).
-			// It applies immediately, without the Apply/Reset flow the mode/passphrase/owner changes use.
-			if (iAmOwner && id !== state.selfId) {
-				const muteBtn = document.createElement('button');
-				muteBtn.type = 'button';
-				muteBtn.className = 'secondary member-mute';
-				muteBtn.textContent = muted ? 'Unmute' : 'Mute';
-				muteBtn.addEventListener('click', () => sendCtrl({type: 'muteMember', memberId: id, muted: !muted}));
-				li.appendChild(muteBtn);
-			}
-			// Re-apply the live speaking highlight (state.speaking is authoritative across re-renders).
-			li.classList.toggle('speaking', state.speaking.has(id));
-			state.memberLis.set(id, li);
-			ul.appendChild(li);
-		});
+		.map(([id]) => id);
+}
+
+/**
+ * Builds one member's roster row. The row is the whole of what a member IS on screen — crown, name, mute badge and
+ * the owner's Mute/Unmute button — and it is deliberately independent of WHICH list it ends up in, because it moves
+ * between the queue section and the rest as its member joins and leaves the line. That is what makes "one person,
+ * one row" possible: hiding a queued member from the roster instead would have taken the owner's only control over
+ * exactly the people about to be handed the floor, since the Mute button lives here.
+ */
+function memberRow(id, name, iAmOwner) {
+	const li = document.createElement('li');
+	li.title = id;
+	// The channel owner gets a crown so it's clear at a glance who owns the channel (no need to scan the log). The
+	// server-managed global room has no participant owner, so it gets no crown.
+	if (id === state.ownerId && state.ownerId !== SERVER_OWNER) {
+		li.classList.add('owner');
+		const crown = document.createElement('span');
+		crown.className = 'owner-badge';
+		crown.textContent = '👑';
+		crown.title = 'Channel owner';
+		li.appendChild(crown);
+	}
+	const nameSpan = document.createElement('span');
+	if (id === state.selfId) {
+		nameSpan.className = 'self';
+	}
+	// textContent (not innerHTML) so a crafted display name can't inject markup.
+	nameSpan.textContent = `${name}${idTag(id)}${id === state.selfId ? ' (you)' : ''}`;
+	li.appendChild(nameSpan);
+	// Muted members are dimmed and flagged with a speaker-off marker, so everyone (not just the owner) can see who
+	// the owner has silenced. The badge's margin-left:auto right-aligns it (and the button after it).
+	const muted = state.mutedMembers.has(id);
+	if (muted) {
+		li.classList.add('muted');
+		const badge = document.createElement('span');
+		badge.className = 'muted-badge';
+		badge.textContent = '🔇';
+		badge.title = 'Muted by the owner';
+		li.appendChild(badge);
+	}
+	// The owner gets a per-member Mute/Unmute toggle (never on its own row — the owner can't mute itself). It
+	// applies immediately, without the Apply/Reset flow the mode/passphrase/owner changes use.
+	if (iAmOwner && id !== state.selfId) {
+		const muteBtn = document.createElement('button');
+		muteBtn.type = 'button';
+		muteBtn.className = 'secondary member-mute';
+		muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+		muteBtn.addEventListener('click', () => sendCtrl({type: 'muteMember', memberId: id, muted: !muted}));
+		li.appendChild(muteBtn);
+	}
+	// Re-apply the live speaking highlight (state.speaking is authoritative across re-renders).
+	li.classList.toggle('speaking', state.speaking.has(id));
+	return li;
+}
+
+/**
+ * Rebuilds every roster row from scratch, then hands off to [#renderQueue] to place them. Splitting it that way
+ * means placement — which section a member's row belongs in, and in what order — is decided in exactly ONE
+ * function, so no caller can update the roster and leave the queue section describing the state before it. An
+ * earlier arrangement had two independent draw calls, and `renameMember` called only one of them: the queue kept a
+ * member's old display name while the row beside it showed the new one.
+ */
+function renderMembers() {
+	byId('members').replaceChildren();
+	byId('floorQueue').replaceChildren();
+	state.memberLis.clear();
+	// Only the channel owner sees the moderation controls (per-member Mute/Unmute + "Mute all"); the server enforces
+	// the same rule, so this is UI convenience, not the security boundary. Never for the ownerless global room.
+	const iAmOwner = ownsChannel();
+	if (state.members.size === 0) {
+		// Reachable while CONNECTED too — a refused join leaves you in no channel — so it does not mention
+		// connecting. A real element rather than a `:empty` rule: #members is legitimately empty whenever every
+		// member is in the queue, and a rule keyed on that would announce this to a channel full of raised hands.
+		const note = document.createElement('li');
+		note.className = 'empty-note';
+		note.textContent = 'Not in a channel yet.';
+		byId('members').appendChild(note);
+	}
+	sortedMemberIds().forEach(id => state.memberLis.set(id, memberRow(id, state.members.get(id), iAmOwner)));
+	renderQueue();         // puts every row in its section, and sets the queue heading
 	updateChannelSettings();   // badges for everyone + the owner's settings block (ownership and the roster may have changed)
 	renderOwnerSelect();   // keep the owner dropdown in sync with the roster
 	renderJoinRequests();  // ownership may have just moved to (or away from) us, and only the owner sees the list

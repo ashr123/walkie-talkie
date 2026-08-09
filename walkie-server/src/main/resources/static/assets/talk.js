@@ -235,42 +235,32 @@ export function spaceDrivesFloor(mode, focus) {
 }
 
 /**
- * How many entries the visible queue list draws before collapsing the rest into a "+N more" tail.
+ * The floor queue as something to RENDER: the roster rows that are in line, in line order.
  *
- * A cut is needed because the queue is UNBOUNDED server-side — `Channel.floorQueue` is a plain `LinkedHashSet`,
- * unlike the join-request list, which has `walkie.max-join-requests` — and a channel holds up to 255 members, so
- * an untruncated list could stand taller than the page it sits on. Eight makes the ordinary case (a handful of
- * raised hands) fully visible while never letting the list outgrow the roster beside it.
+ * `entries` is the queue in FIFO order and carries no position number, because the ORDER is the position — a
+ * numbered field would be the same fact written twice, and the visible numbering comes from a CSS counter over
+ * document order rather than from anything here. (Your OWN position, which is a different question and wanted as a
+ * number, is on the Talk button via `talkDecision`.)
  *
- * Nothing actionable is lost at the cut: your OWN position is on the Talk button in every case ("In line #12 of
- * 30 — tap to leave"), which is the one number that still means something from deep in the line. That is also why
- * the truncation is a plain head-of-list slice rather than a window that follows you around — the surface that
- * answers "where am I" is the button, and this list answers "who else, and in what order".
- */
-export const QUEUE_ROWS_SHOWN = 8;
-
-/**
- * The floor queue as something to RENDER: both the ordered list panel and the per-member roster chip, derived
- * together so the two surfaces cannot disagree about who is in line or in what position.
- *
- * `entries` is the WHOLE queue and drives the roster chips — a chip belongs on a member's row whatever their
- * position, including past the visible cut. `visible` is the slice the list panel draws, with `hiddenCount` for
- * its tail. Same data, two surfaces, ONE derivation: the alternative is a list built from `waiting` and a chip
- * built from `waiting.indexOf(...)` at the call site, which is two copies of one rule. The mute badge alongside it
- * exists because that pattern was already regretted once — see `updateChannelSettings`, "the badge everyone sees
- * and the owner's tick alike, so the two cannot disagree".
+ * There is no truncation either. The list used to cut at a limit and name the remainder, because the queue shared
+ * the panel's height with a full roster below it; now a queued member's row MOVES into this section instead of being
+ * repeated there, so the two lists together can never be longer than the roster alone. The server-side queue is
+ * still unbounded (`Channel.floorQueue` is a plain `LinkedHashSet`, unlike the join-request list with its
+ * `walkie.max-join-requests` cap) — but a channel holds at most 255 members and every one of them was already going
+ * to have a row.
  *
  * `shown` is the single gate, and it takes THREE terms rather than just the feature flag:
  *   - `floorQueueEnabled`, the owner's per-channel toggle, which can flip mid-session.
  *   - the mode: FULL_DUPLEX has no floor at all, so there is nothing to queue for — the same mode term
  *     `needsVoiceMeter` carries. The ownerless `global` room needs no case of its own, because its queue can never
  *     be enabled (its toggle answers `NOT_OWNER`), so the flag term already answers for it.
- *   - a non-empty queue, since an empty list is noise and the "✋ Queue on" badge already says the queue exists.
+ *   - a non-empty queue, since an empty section is a heading over nothing and the "✋ Queue on" badge already says
+ *     the queue exists.
  *
- * Gating on the FLAG rather than on the queue's contents is what makes a disable clean. The server drains the
- * queue when the owner turns it off, and the `FloorQueueChanged` saying so arrives just before the emptied
- * snapshot — so reading the flag hides the panel a beat early instead of briefly showing a queue that is about to
- * vanish, which is the more honest of the two failures.
+ * Gating on the FLAG rather than on the queue's contents is what makes a disable clean. The server drains the queue
+ * when the owner turns it off, and the `FloorQueueChanged` saying so arrives just before the emptied snapshot — so
+ * reading the flag collapses the section a beat early instead of briefly showing a queue that is about to vanish,
+ * which is the more honest of the two failures.
  *
  * `isOffered` marks the member whose claim window is ticking: exactly `waiting[0]` of a FREE floor, the rule
  * `ServerMessage.FloorStatus` documents and `floorStateFor` already applies for our own id. The `== null` on the
@@ -279,21 +269,14 @@ export const QUEUE_ROWS_SHOWN = 8;
  */
 export function queueView(view) {
 	if (!view.floorQueueEnabled || view.mode === 'FULL_DUPLEX' || view.waiting.length === 0) {
-		return {shown: false, size: 0, entries: [], visible: [], hiddenCount: 0};
+		return {shown: false, size: 0, entries: []};
 	}
 	const entries = view.waiting.map((memberId, index) => ({
 		memberId,
-		position: index + 1,
 		isSelf: memberId === view.selfId,
 		isOffered: view.holderId == null && index === 0,
 	}));
-	return {
-		shown: true,
-		size: entries.length,
-		entries,
-		visible: entries.slice(0, QUEUE_ROWS_SHOWN),
-		hiddenCount: Math.max(0, entries.length - QUEUE_ROWS_SHOWN),
-	};
+	return {shown: true, size: entries.length, entries};
 }
 
 /**

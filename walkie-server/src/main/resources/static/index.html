@@ -302,22 +302,25 @@
             background: var(--ok);
         }
 
-        ul#members {
+        /* Both roster sections — the queue and everyone else. Keyed on a CLASS, not on #members, because a row
+           MOVES between the two as its member joins and leaves the line, and a row that restyled itself on the way
+           across would make one person look like two. */
+        ul.member-list {
             list-style: none;
             padding: 0;
             margin: 8px 0 0;
         }
 
-        /* Empty states, via :empty rather than JS — there is no flag to set, nothing to keep in sync, and they
-           disappear the instant the first row or line arrives. Both are reachable while CONNECTED too (a refused
-           join leaves you in no channel), so neither mentions connecting. */
-        ul#members:empty::before {
-            content: 'Not in a channel yet.';
+        /* The empty-roster note is a real <li> from renderMembers, not the `:empty::before` rule it used to be:
+           #members is now legitimately empty whenever EVERY member is in the queue, and a rule keyed on that would
+           have announced "Not in a channel yet." to a channel full of people with their hands up. (#log keeps its
+           :empty rule — nothing moves rows out of the log.) */
+        li.empty-note {
             font-size: 13px;
             color: var(--muted);
         }
 
-        ul#members li {
+        ul.member-list li {
             /* Render a display name exactly as its owner typed it. HTML's default `normal` collapses runs of spaces
                and drops the edges, so "Roy  Ash" and "Roy Ash" came out the same pixel width when measured — while
                the Java client's terminal roster shows both spaces. pre-wrap makes the two clients agree, and the
@@ -336,38 +339,38 @@
 
         /* .self is added at runtime by app.js (the "you" marker on your own roster entry). */
         /*noinspection CssUnusedSymbol*/
-        ul#members li .self {
+        ul.member-list li .self {
             color: var(--accent);
         }
 
         /* The channel owner is flagged with a crown in the roster (so you don't have to scan the log). */
         /*noinspection CssUnusedSymbol*/
-        ul#members li .owner-badge {
+        ul.member-list li .owner-badge {
             margin-right: 4px;
             color: var(--accent);
         }
 
         /* A member is highlighted while transmitting, in any mode, until they go quiet. */
         /*noinspection CssUnusedSymbol*/
-        ul#members li.speaking {
+        ul.member-list li.speaking {
             background: #16321d;
             box-shadow: inset 3px 0 0 var(--ok);
         }
 
         /* A member the owner has muted: dim the row and show a speaker-off marker. Added at runtime by app.js. */
         /*noinspection CssUnusedSymbol*/
-        ul#members li.muted {
+        ul.member-list li.muted {
             opacity: 0.65;
         }
         /*noinspection CssUnusedSymbol*/
-        ul#members li .muted-badge {
+        ul.member-list li .muted-badge {
             color: var(--muted);
         }
 
         /* Owner-only moderation. The per-member mute/unmute toggle sits at the right edge of its roster row;
            the "Mute all" toggle lives in the Members panel header. Both are hidden for non-owners (app.js). */
         /*noinspection CssUnusedSymbol*/
-        ul#members li .member-mute {
+        ul.member-list li .member-mute {
             margin-left: auto;
             width: auto;
             padding: 3px 9px;
@@ -454,85 +457,56 @@
             border: 1px solid var(--accent);
             border-radius: 6px;
         }
-        /* Same shape as #requestsPanel, deliberately: both are short ordered lists above the roster. The border is
-           dimmed rather than accent-coloured because this one is channel STATE everyone watches, not an owner
-           action waiting on a decision — an accent border on a permanently-visible panel reads as "act on me". */
+        /* The queue is a SECTION of the roster, not a panel beside it: a heading over the rows that are in line, no
+           border and no box. Its rows are ordinary member rows, so nothing about how a member LOOKS is restated
+           here — that is the whole point of the arrangement. One person has one row, and it travels between the
+           sections carrying its crown, mute badge and owner-only mute button with it. */
         #queuePanel {
             margin: 8px 0 0;
-            padding: 8px;
-            border: 1px solid var(--line);
-            border-radius: 6px;
         }
         #queuePanel h3 {
             margin: 0 0 6px;
             font-size: 13px;
             color: var(--muted);
         }
+        /* Position numbers from a CSS counter over document order, so nothing in JS numbers anything: the order IS
+           the position, and a row that moves out of this list stops being numbered by the same token. A ::before
+           rather than a list marker because `display: flex` on the row stops it generating one — the pseudo-element
+           becomes a flex item instead. Fixed width so the names line up: the digits are proportional otherwise. */
         ul#floorQueue {
-            list-style: none;
-            padding: 0;
-            margin: 0;
+            counter-reset: queue-position;
         }
-        ul#floorQueue li {
-            padding: 4px 8px;
-            border-radius: 6px;
-            background: #0e151c;
-            margin-bottom: 4px;
-            font-size: 13px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            /* Display names may contain runs of spaces (see ul#members li) — keep them visible here too so the
-               same person reads identically in both lists. */
-            white-space: pre-wrap;
-        }
-        /* A fixed width for the number so the names line up in a column. Not about digit COUNT — the list cuts at
-           QUEUE_ROWS_SHOWN (8), so it never draws a two-digit position — but the glyphs are proportional, so "1."
-           and "4." are different widths and the names would otherwise sit a pixel or two apart per row. */
-        ul#floorQueue li .queue-position {
+        ul#floorQueue li::before {
+            counter-increment: queue-position;
+            content: counter(queue-position) '.';
             min-width: 1.6em;
             color: var(--muted);
             font-variant-numeric: tabular-nums;
         }
-        ul#floorQueue li .self {
-            color: var(--accent);
-            font-weight: 600;
-        }
         /* The head of a FREE floor: their claim window is ticking. Borrows the Talk button's YOUR TURN COLOUR
            (--accent-2) so the state is recognisable across surfaces — but deliberately NOT its pulse animation:
-           that button is the one person's call to act, whereas this row is on every bystander's screen, and eight
-           of these breathing at once would be the noisiest thing on the page. The words in .queue-note are what
-           actually carry the state; the colour is the redundant cue. */
+           that button is the one person's call to act, whereas this row is on every bystander's screen, and a
+           list of them breathing at once would be the noisiest thing on the page. An inset edge rather than a
+           border, matching how a speaking row is marked, so the row does not change size as it becomes offered.
+           The words in .queue-note are what actually carry the state; the colour is the redundant cue. */
         ul#floorQueue li.offered {
-            border: 1px solid var(--accent-2);
+            box-shadow: inset 3px 0 0 var(--accent-2);
         }
-        ul#floorQueue li.offered .queue-position {
+        ul#floorQueue li.offered::before {
             color: var(--accent-2);
         }
-        /* The offered state in words, beside the colour — see ul#floorQueue li.offered. */
+        /* The offered state in words, beside the colour — see ul#floorQueue li.offered. It takes a LINE OF ITS OWN
+           (flex-basis 100% against the row's wrap) rather than competing for width with the name: display names run
+           to 32 characters and the panel is narrow, so sharing the line broke names mid-token ("Bea" above
+           "(#f39e7a57)"). Indented to sit under the name rather than under the number. */
+        ul#floorQueue li.offered {
+            flex-wrap: wrap;
+        }
         ul#floorQueue li .queue-note {
+            flex: 0 0 100%;
+            padding-left: 1.6em;
             color: var(--accent-2);
             font-size: 12px;
-        }
-        ul#floorQueue li.more {
-            background: none;
-            color: var(--muted);
-            font-size: 12px;
-            padding: 2px 8px;
-        }
-        /* The roster's queue chip — the second surface. Sits straight after the name (not right-aligned like the
-           mute badge) so it reads as part of the person's label: "Alice ✋3". */
-        ul#members li .queue-badge {
-            font-size: 11px;
-            color: var(--muted);
-            border: 1px solid var(--line);
-            border-radius: 999px;
-            padding: 0 6px;
-            font-variant-numeric: tabular-nums;
-        }
-        ul#members li .queue-badge.offered {
-            color: var(--accent-2);
-            border-color: var(--accent-2);
         }
         #requestsPanel h3 {
             margin: 0 0 6px;
@@ -764,15 +738,16 @@
 						<button class="secondary" id="denyAllBtn" type="button">Deny all</button>
 					</div>
 				</div>
-				<!-- The floor queue, shown to EVERYONE while the owner's raise-hand queue is on and somebody is in
-				     line. Its own ordered list because a queue's whole point is ORDER, and the roster below is sorted
-				     by name — so queue order there is only readable by scanning for the ✋ chips. The two surfaces are
-				     derived together (queueView in talk.js) so they cannot disagree. Written by renderFloorQueue. -->
+				<!-- The roster, in two sections: whoever is in line to talk (in queue order), then everyone else (by
+				     name). A member has ONE row, which MOVES between the lists, so nobody is listed twice and the row
+				     keeps its crown, mute badge and owner-only mute button wherever it sits. Both lists carry
+				     .member-list so a row cannot restyle itself on the way across. renderMembers builds and places
+				     the rows; renderQueue moves them as the line changes. -->
 				<div hidden id="queuePanel">
 					<h3 id="queueTitle"></h3>
-					<ul id="floorQueue"></ul>
+					<ul class="member-list" id="floorQueue"></ul>
 				</div>
-				<ul id="members"></ul>
+				<ul class="member-list" id="members"></ul>
 			</div>
 			<div class="panel" id="logPanel">
 				<h2>Log</h2>

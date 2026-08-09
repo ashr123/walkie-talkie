@@ -94,58 +94,59 @@ The Java console client is the one client that cannot follow a move to WebRTC �
 no mature pure-Java WebRTC stack — so it says so and leaves the channel cleanly rather than sitting in one whose
 audio it can neither send nor receive.
 
-**The floor queue is drawn on two surfaces from ONE derivation.** `queueView` (talk.js) returns the whole queue
-plus the truncated slice; the ordered `#queuePanel` list and the `✋N` chips on the roster rows are both built from
-it. A list off `waiting` and a chip off `waiting.indexOf(...)` at each call site is the pattern
-`updateChannelSettings` already regrets out loud ("the badge everyone sees and the owner's tick alike, so the two
-cannot disagree"), so this one starts where that one ended up. `floorView()` is the single builder of the snapshot
-object, because `floorNarration` and `queueView` must be handed identical inputs for the next paragraph to hold.
+**The floor queue is a SECTION of the roster, not a second list beside it.** The Members panel holds two `<ul>`s —
+`#floorQueue` (whoever is in line, in queue order) and `#members` (everyone else, by name) — and a member has exactly
+ONE row, which MOVES between them. Nobody is listed twice, and the two lists together can never be longer than the
+roster alone, which is why nothing truncates.
 
-The two surfaces are drawn by two FUNCTIONS, though, and that distinction has already bitten once. `renderQueue`
-draws the panel; the chips are built inside `renderMembers`, which has to keep deriving them itself because it runs
-for plenty of roster reasons unrelated to the floor. What makes them agree is that `queueView` is pure and both read
-the same state in the same task — not a shared call — so they agree *only if both run*. `renderQueue` therefore
-calls `renderMembers` itself, and is the one name a caller has to remember. A review caught the original version
-without that: `renameMember` refreshed the roster and not the panel, and since a rename is the one member change
-with no `FloorStatus` behind it, the panel kept a queued member's OLD name for as long as the queue sat unchanged.
+It started as a panel plus a `✋N` chip on the roster row, i.e. the same person drawn twice. Hiding queued members
+from the roster would have been the obvious fix and is the wrong one: a row is not a name, it carries the crown, the
+mute badge, and the **owner's Mute/Unmute button**. Hiding it takes away the owner's only control over exactly the
+people about to be handed the floor — and muting is meaningful there, since `detachFromFloorIfMuted` DEQUEUES a muted
+member. Moving the row keeps all of it. (Muted-while-queued is therefore not a state to render; the server does not
+allow it.)
 
-`renderQueue` updates the chips IN PLACE (`syncQueueChips`) rather than re-rendering the roster — the same decision
-`setSpeaking` takes for the speaking highlight, and for the same shape of reason. `renderMembers` replaces every
-`<li>`, which destroys focus, and focus falling back to `<body>` is exactly what `spaceDrivesFloor` reads as "Space
-drives the floor": rebuilding on every floor transition meant one queued member's tap could turn some bystander's
-next Space press into an open microphone, if that bystander had a roster button focused. Chips churn on every raise
-and lower of a hand, which makes this the busiest roster update there is. An earlier attempt gated the rebuild on a
-signature of the queue; that only narrowed the window, since a real queue change still rebuilt — measured, focus
-still ended up on `<body>`. Both drawing paths anchor the chip after `.member-name` and share
-`queueChip`/`describeQueueChip`, so the fresh-roster path and the in-place path cannot produce different DOM.
+`renderMembers` BUILDS the rows, `renderQueue` PLACES them. Placement — which section, in what order — is decided in
+exactly one function, so no caller can update the roster and leave the queue describing the state before it. That is
+not hypothetical: an earlier arrangement had two independent draw calls, and `renameMember` called only one, so the
+queue kept a member's old display name while the row beside it showed the new one.
+
+`renderQueue` MOVES rows (`appendChild` relocates an element rather than recreating it) and never rebuilds them.
+`renderMembers` replaces every `<li>`, and focus falling back to `<body>` is exactly what `spaceDrivesFloor` reads as
+"Space drives the floor" — so rebuilding on every floor transition meant one queued member's tap could turn a
+bystander's next Space press into an open microphone. Hands go up and down constantly, making this the busiest roster
+update there is; the speaking highlight took the same decision for the same reason. Both lists carry `.member-list`
+so a row cannot restyle itself on the way across, and the position numbers come from a **CSS counter over document
+order** — so nothing in JS numbers anything, and a row that leaves the section stops being numbered by the same
+token. `queueView` deliberately exposes no position field: order is the position, and a second expression of it could
+disagree with the counter.
 
 `shown` takes THREE terms, not just the feature flag: the owner's `floorQueueEnabled`, the mode (FULL_DUPLEX has no
-floor, the same term `needsVoiceMeter` carries), and a non-empty queue. `global` needs no case of its own — its
-queue can never be enabled, so the flag answers for it. Gating on the FLAG rather than the contents is what makes a
-disable clean: the server drains the queue and the `FloorQueueChanged` arrives just BEFORE the emptied snapshot, so
-reading the flag hides the panel a beat early instead of briefly drawing a queue that is about to vanish.
+floor, the same term `needsVoiceMeter` carries), and a non-empty queue. `global` needs no case of its own — its queue
+can never be enabled, so the flag answers for it. Gating on the FLAG rather than the contents is what makes a disable
+clean: the server drains the queue and the `FloorQueueChanged` arrives just BEFORE the emptied snapshot, so reading
+the flag collapses the section a beat early instead of briefly drawing a queue about to vanish.
 
-Because the panel now shows them, `floorNarration` returns its `SILENT` kind for `in-line` and `offered` whenever
-the panel is up — otherwise five people in line meant every arrival and departure renumbered everyone AND wrote a
-line per member, scrolling the things only the log can say (a rotation, a rename, a mute) out of view. It calls
-`queueView` for that verdict rather than taking a flag, so "the panel is showing it" and "do not also say it" cannot
-come apart.
+The empty-roster note is a real `<li>` rather than the `:empty::before` rule it used to be: `#members` is
+legitimately empty whenever EVERY member is queued, and a rule keyed on that announced "Not in a channel yet." to a
+channel full of raised hands.
 
-`SILENT` is a THIRD answer, and the difference from `null` is load-bearing: `null` means "say nothing and FORGET
-what was last said" (the caller clears its suppression key), `SILENT` means "say nothing and LEAVE the memory
-alone". Collapsing them costs precisely what the suppression was for — log "Talking: X", raise a hand (suppressed),
-lower it, and the unchanged "Talking: X" counts as new and prints again, so every raise/lower cycle reprints it.
-Both halves are pinned by mutation tests, along with the case that caught the reviewer's eye in the test rather than
-the source: a fixture that meant to prove "everything else is still narrated" left `waiting` empty, so the panel was
-never actually up and a blanket silence would have passed it. **This
-is the one place the two clients deliberately differ**: the Java console client's `floorNarration` mirrors this one
-kind-for-kind and key-for-key everywhere else, but it has no panel, so there the two lines ARE the queue display
-and both stay. Both sides say so in a comment; anything else that differs is drift.
+Because the section shows them, `floorNarration` returns its `SILENT` kind for `in-line` and `offered` whenever it is
+up — otherwise five people in line meant every arrival and departure renumbered everyone AND wrote a line per member,
+scrolling the things only the log can say (a rotation, a rename, a mute) out of view. It calls `queueView` for that
+verdict rather than taking a flag, so "the section is showing it" and "do not also say it" cannot come apart.
 
-The queue is UNBOUNDED server-side (`Channel.floorQueue` is a plain `LinkedHashSet`, unlike the join-request list
-with `walkie.max-join-requests`) and a channel holds up to 255 members, so the list cuts at `QUEUE_ROWS_SHOWN` and
-names the remainder ("+N more waiting") rather than truncating silently. Your OWN position is on the Talk button in
-every case, which is why the cut is a plain head-of-list slice and not a window that follows you.
+`SILENT` is a THIRD answer, and the difference from `null` is load-bearing: `null` means "say nothing and FORGET what
+was last said" (the caller clears its suppression key), `SILENT` means "say nothing and LEAVE the memory alone".
+Collapsing them costs precisely what the suppression was for — log "Talking: X", raise a hand (suppressed), lower it,
+and the unchanged "Talking: X" counts as new and prints again, so every raise/lower cycle reprints it. Both halves
+are pinned by mutation tests, along with the case a reviewer caught in the TEST rather than the source: a fixture
+meant to prove "everything else is still narrated" left `waiting` empty, so the section was never actually up and a
+blanket silence would have passed it.
+
+**This is the one place the two clients deliberately differ.** The Java console client's `floorNarration` mirrors the
+browser's kind-for-kind and key-for-key everywhere else, but it has no section to read, so there those two lines ARE
+the queue display and both stay. Both sides say so in a comment; anything else that differs is drift.
 
 `check` also runs **`checkBrowserModuleDocs`** (`BrowserModuleDocCheck`, same directory), which keeps the
 browser-module list further down this file honest: every DOM-free module must be named here and must have a

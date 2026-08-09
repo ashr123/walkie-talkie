@@ -26,7 +26,6 @@ import {
 	isVoiceActive,
 	micTrackEnabled,
 	needsVoiceMeter,
-	QUEUE_ROWS_SHOWN,
 	queueView,
 	SILENT,
 	shouldAutoOpenMic,
@@ -810,25 +809,33 @@ test('the threshold sits between room tone and speech', () => {
 	assert.ok(!isVoiceActive(atThreshold, 1), 'exactly at the threshold is not yet speech (strict >)');
 });
 
-// --- the floor queue as two rendered surfaces (queueView) -------------------------------------------
+// --- the floor queue as a roster section (queueView) ------------------------------------------------
 //
-// The panel and the roster chips are drawn from ONE call, so these assert the derivation once and both surfaces
-// inherit it. The limit is read from QUEUE_ROWS_SHOWN rather than hard-coded, so re-tuning the constant does not
-// silently turn the truncation tests into assertions about nothing.
+// The queue is a SECTION of the roster: a queued member's row moves into it rather than being repeated there, so
+// there is nothing to truncate and no position field — order is the position, and the numbers people read come from
+// a CSS counter over document order. What is left to pin is the gate (three terms), the order, and `isOffered`.
 
 const QUEUE_VIEW = {selfId: SELF, holderId: HOLDER, waiting: [], floorQueueEnabled: true, mode: 'MULTI_CHANNEL_PTT'};
 
-test('queueView: an ordered queue numbers from 1 and marks us', () => {
+test('queueView: the queue comes back in order, with us marked', () => {
 	const view = queueView({...QUEUE_VIEW, waiting: [OTHER, SELF]});
 	assert.equal(view.shown, true);
 	assert.equal(view.size, 2);
-	assert.deepEqual(view.entries.map(entry => entry.position), [1, 2]);
+	// ORDER is the position — there is deliberately no position field to disagree with the CSS counter that draws
+	// the numbers, so what this pins is that `entries` is the queue in FIFO order, unaltered.
 	assert.deepEqual(view.entries.map(entry => entry.memberId), [OTHER, SELF]);
 	assert.deepEqual(view.entries.map(entry => entry.isSelf), [false, true]);
-	assert.deepEqual(view.visible, view.entries, 'a short queue is drawn whole');
-	// A queue shorter than the cut must report ZERO hidden, not a negative. "-6 were hidden" is nonsense, and a
-	// caller testing `hiddenCount !== 0` instead of `> 0` would render "+-6 more waiting" off the back of it.
-	assert.equal(view.hiddenCount, 0);
+});
+
+test('queueView: order and length survive a long queue — nothing truncates or re-sorts', () => {
+	// A queued member's row MOVES into the section rather than being repeated below it, so the section is as long as
+	// the queue and the two lists together are never longer than the roster alone. A reversal or a re-sort here
+	// would silently renumber everyone, since the numbers people read come from document order.
+	const waiting = Array.from({length: 30}, (_, i) => `m-${i}`);
+	const view = queueView({...QUEUE_VIEW, waiting});
+	assert.equal(view.size, 30);
+	assert.equal(view.entries.length, 30, 'no cut');
+	assert.deepEqual(view.entries.map(entry => entry.memberId), waiting);
 });
 
 test('queueView: nothing is drawn when the owner has the queue switched off', () => {
@@ -837,7 +844,7 @@ test('queueView: nothing is drawn when the owner has the queue switched off', ()
 	// state that must not be drawn.
 	const view = queueView({...QUEUE_VIEW, floorQueueEnabled: false, waiting: [OTHER, SELF]});
 	assert.equal(view.shown, false);
-	assert.deepEqual(view.entries, [], 'and no roster chips either — both surfaces go together');
+	assert.deepEqual(view.entries, [], 'so every row belongs in the plain roster');
 	assert.equal(view.size, 0);
 });
 
@@ -884,31 +891,8 @@ test('queueView: the offered mark agrees with floorStateFor for our own id', () 
 	});
 });
 
-test('queueView: a queue longer than the visible limit truncates and SAYS how many it cut', () => {
-	// Silent truncation would read as "that is the whole queue". The count is what makes the cut honest.
-	const waiting = Array.from({length: QUEUE_ROWS_SHOWN + 3}, (_, i) => `m-${i}`);
-	const view = queueView({...QUEUE_VIEW, waiting});
-	assert.equal(view.size, QUEUE_ROWS_SHOWN + 3, 'size is the WHOLE queue, for the heading');
-	assert.equal(view.visible.length, QUEUE_ROWS_SHOWN);
-	assert.equal(view.hiddenCount, 3);
-	assert.equal(view.entries.length, QUEUE_ROWS_SHOWN + 3,
-			'entries stays complete: a roster chip belongs on a member past the cut too');
-	assert.equal(view.entries.at(-1).position, QUEUE_ROWS_SHOWN + 3, 'and their position is still their real one');
-});
 
-test('queueView: a queue exactly at the limit is not reported as truncated', () => {
-	const waiting = Array.from({length: QUEUE_ROWS_SHOWN}, (_, i) => `m-${i}`);
-	const view = queueView({...QUEUE_VIEW, waiting});
-	assert.equal(view.visible.length, QUEUE_ROWS_SHOWN);
-	assert.equal(view.hiddenCount, 0, 'off by one here would print "+0 more waiting"');
-});
 
-test('queueView: visible is a prefix of entries, so the two surfaces cannot contradict each other', () => {
-	const waiting = Array.from({length: QUEUE_ROWS_SHOWN + 5}, (_, i) => `m-${i}`);
-	const view = queueView({...QUEUE_VIEW, waiting});
-	view.visible.forEach((entry, index) => assert.deepEqual(entry, view.entries[index],
-			'a row in the panel must be the same entry as the chip on that member'));
-});
 
 test('floorNarration: the two lines the panel duplicates fall silent while it is on screen', () => {
 	// The point of the panel. With five in line, every arrival and departure renumbered everyone and wrote a line
