@@ -18,6 +18,14 @@
             --muted: #8aa0b3;
             --ok: #3fb950;
             --bad: #f85149;
+            /* The edge of a BOX — panels and the boxes nested inside them. It was referenced by #ownerSettings
+               before it was ever declared, which is worse than it sounds: an unresolvable var() inside the `border`
+               shorthand makes the whole declaration invalid at computed-value time, so width/style/colour all fell
+               back to their initial values (`none`, `0px`) and that box simply had no border. Measured, not
+               guessed — it computed `border-top-style: none` while its siblings computed `solid 1px`.
+               Form controls (`input, select`) deliberately keep a LIGHTER edge of their own and are not this
+               token: an interactive field should read as more prominent than the box it sits in. */
+            --line: #28323d;
         }
 
         * {
@@ -50,7 +58,7 @@
 
         header {
             padding: 18px 24px;
-            border-bottom: 1px solid #28323d;
+            border-bottom: 1px solid var(--line);
         }
 
         header h1 {
@@ -87,7 +95,7 @@
 
         .panel {
             background: var(--panel);
-            border: 1px solid #28323d;
+            border: 1px solid var(--line);
             border-radius: 10px;
             padding: 16px;
         }
