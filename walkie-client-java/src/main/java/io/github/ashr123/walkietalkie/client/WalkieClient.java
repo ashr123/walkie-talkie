@@ -1570,10 +1570,16 @@ public final class WalkieClient implements AutoCloseable {
 				? WalkieClientLauncher.GLOBAL_CHANNEL
 				: target.channel();
 		CompletableFuture<WebSocket> handshake = httpClient.newWebSocketBuilder()
+				// The token goes in the HEADER, not in the URL. A URL is the least private part of a request: it lands
+				// in access logs, proxy logs and error reports, and every hop between here and the origin sees it even
+				// under TLS if anything terminates in between. `TokenAuthenticationFilter` reads this header first and
+				// keeps its `?token=` parameter only for the BROWSER client, which cannot set headers on a WebSocket
+				// handshake at all — a limitation of the browser API, not a choice, and no reason for a Java client
+				// that has the option to give up the safer one.
+				.header("Authorization", "Bearer " + token)
 				.buildAsync(
 						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio"
-								+ "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8)
-								+ "&channel=" + URLEncoder.encode(routingChannel, StandardCharsets.UTF_8)),
+								+ "?channel=" + URLEncoder.encode(routingChannel, StandardCharsets.UTF_8)),
 						new ClientListener()
 				);
 		try {

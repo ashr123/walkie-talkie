@@ -526,7 +526,9 @@ WebCrypto on the browser is serialized through `txChain`/`rxChain` so it can't r
 **Security / identity.** Stateless, **store-free** token auth. `POST /api/auth/login` takes **no input**
 and mints a self-contained **HMAC-SHA512-signed** token (`AuthService`, key from `walkie.auth-signing-key`
 / env `WALKIE_AUTH_SIGNING_KEY`, random per-process fallback for dev). `TokenAuthenticationFilter` reads
-`Authorization: Bearer` or a `?token=` query param (browsers can't set headers on a WS handshake) and
+`Authorization: Bearer` — which is what the Java client sends, so the credential stays out of URLs that land in
+access logs, proxy logs and error reports — or a `?token=` query param, which exists because a BROWSER cannot set
+headers on a WebSocket handshake at all. Both paths verify identically: the filter reads the header first, and
 **verifies the signature + expiry cryptographically — no lookup**; on success it sets a constant principal
 (`"ws-client"`). There is **no `/logout`**: the token is short-lived and self-expiring, so ending a session
 is just closing the WebSocket. `SecurityConfig` permits static assets, `/error`, health, and login, and

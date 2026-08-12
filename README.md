@@ -173,7 +173,9 @@ WALKIE_AUTH_SIGNING_KEY="$(openssl rand -base64 64)" java -jar walkie-server/bui
 ### Transport encryption (TLS / WSS)
 
 **TLS is on by default**, so the whole connection is encrypted in transit — control messages, the binary
-audio frames, the HTTPS login, and the `?token=` on the WebSocket handshake. (The audio passphrase
+audio frames, the HTTPS login, and the token on the WebSocket handshake — which the Java client sends as an
+`Authorization: Bearer` header, keeping the credential out of a URL that would otherwise reach access and proxy
+logs; the browser sends `?token=` because a browser cannot set headers on a WebSocket handshake. (The audio passphrase
 is a separate, end-to-end layer that protects only the audio *payload* between participants; it is **not** a
 substitute for transport TLS, and control messages are never passphrase-encrypted because the server has to
 read and act on them.)
