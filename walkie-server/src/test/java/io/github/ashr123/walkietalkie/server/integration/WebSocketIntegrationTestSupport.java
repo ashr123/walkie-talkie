@@ -115,7 +115,8 @@ abstract class WebSocketIntegrationTestSupport {
 	}
 
 	/// Opens an authenticated WebSocket to `path` ([#AUDIO] or [#SIGNAL]), passing the token as the `?token=`
-	/// query parameter exactly as the real clients do (the browser can't set headers on a WS handshake).
+	/// query parameter — the BROWSER's route, which exists because a browser cannot set headers on a WS handshake.
+	/// The Java desktop client uses the header instead; see [#connectWithHeaderAuth].
 	protected WebSocketSession connect(String path, WebSocketHandler handler, String token) throws Exception {
 		return connect(path, handler, token, null);
 	}
@@ -129,6 +130,18 @@ abstract class WebSocketIntegrationTestSupport {
 						headers,
 						URI.create("ws://localhost:" + port + path + "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8))
 				)
+				.get(5, TimeUnit.SECONDS);
+	}
+
+	/// Opens a WebSocket to `path` authenticated by the `Authorization: Bearer` HEADER, with NO credential anywhere in
+	/// the URI — the way the Java desktop client authenticates.
+	///
+	/// Both routes need a real handshake behind them because both are real, and nothing pinned this one: reverting that
+	/// client to a query parameter would have left the whole suite green.
+	protected WebSocketSession connectWithHeaderAuth(String path, WebSocketHandler handler, String token) throws Exception {
+		WebSocketHttpHeaders headers = new WebSocketHttpHeaders();
+		headers.set("Authorization", "Bearer " + token);
+		return wsClient.execute(handler, headers, URI.create("ws://localhost:" + port + path))
 				.get(5, TimeUnit.SECONDS);
 	}
 

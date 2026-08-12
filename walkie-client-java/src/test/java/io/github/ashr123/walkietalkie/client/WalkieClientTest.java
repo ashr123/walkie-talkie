@@ -5,6 +5,8 @@ import io.github.ashr123.walkietalkie.shared.protocol.ClientMessage;
 import io.github.ashr123.walkietalkie.shared.protocol.ErrorCode;
 import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
+
+import java.net.URI;
 import tools.jackson.databind.cfg.EnumFeature;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -24,6 +26,20 @@ import static org.junit.jupiter.api.Assertions.*;
 /// nothing. That matters more than it did, not less: with no legitimate way to reach a plaintext state, any
 /// announcement that would put us in one is a downgrade attempt, and this gate is what refuses it.
 class WalkieClientTest {
+
+	@Test
+	void theAudioSocketUriCarriesTheRoutingKeyAndNoCredential() {
+		// The token authenticates through an `Authorization: Bearer` header, so it must appear nowhere in this URI: a
+		// URL is what lands in access logs, proxy logs and error reports. Nothing but this test stops it drifting back.
+		URI uri = WalkieClient.audioSocketUri("https://walkie.example.com", "my room");
+
+		assertEquals("wss", uri.getScheme(), "the scheme follows the transport: http becomes ws, https becomes wss");
+		assertEquals("/ws/audio", uri.getPath());
+		assertEquals("channel=my+room", uri.getRawQuery(), "the routing key, form-encoded, and nothing else");
+		assertFalse(uri.toString().contains("token"), "no credential in the URI: " + uri);
+		assertEquals("ws://localhost:8080/ws/audio?channel=global",
+				WalkieClient.audioSocketUri("http://localhost:8080", "global").toString());
+	}
 
 	/// A captured `[codec tag][payload]` plaintext frame (contents are arbitrary for this test).
 	private static final byte[] FRAME = {1, 2, 3, 4, 5};

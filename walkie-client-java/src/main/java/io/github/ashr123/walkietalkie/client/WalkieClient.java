@@ -1554,6 +1554,17 @@ public final class WalkieClient implements AutoCloseable {
 				: "[entry] requesting to stop muting new members on entry...");
 	}
 
+	/// The audio socket's address: the server's base with its scheme swapped to `ws`/`wss`, and the channel ROUTING KEY
+	/// as its only parameter.
+	///
+	/// Static and named so a test can assert what is NOT in it. The bearer token travels as a header instead (see
+	/// [#connect]) because a URL is the least private part of a request — it reaches access logs, proxy logs and error
+	/// reports — and nothing but a test stops a credential drifting back into one.
+	static URI audioSocketUri(String server, String routingChannel) {
+		return URI.create(server.replaceFirst("^http", "ws") + "/ws/audio"
+				+ "?channel=" + URLEncoder.encode(routingChannel, StandardCharsets.UTF_8));
+	}
+
 	/// Opens the WebSocket, INTERRUPTIBLY.
 	///
 	/// `join()` would be shorter and was what this used, but it ignores an interrupt and keeps waiting — so a front end
@@ -1566,9 +1577,6 @@ public final class WalkieClient implements AutoCloseable {
 		// single-instance. Global forces the routing key to "global", matching the Join's effective channel. Reads
 		// the connect target (not options) so a reconnect routes to the channel we switched to, not the startup one.
 		ConnectTarget target = connectTarget;   // read the pair once — channel + mode consistent
-		String routingChannel = target.mode() == ChannelMode.GLOBAL_PTT
-				? WalkieClientLauncher.GLOBAL_CHANNEL
-				: target.channel();
 		CompletableFuture<WebSocket> handshake = httpClient.newWebSocketBuilder()
 				// The token goes in the HEADER, not in the URL. A URL is the least private part of a request: it lands
 				// in access logs, proxy logs and error reports, and every hop between here and the origin sees it even
@@ -1578,8 +1586,9 @@ public final class WalkieClient implements AutoCloseable {
 				// that has the option to give up the safer one.
 				.header("Authorization", "Bearer " + token)
 				.buildAsync(
-						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio"
-								+ "?channel=" + URLEncoder.encode(routingChannel, StandardCharsets.UTF_8)),
+						audioSocketUri(options.server(), target.mode() == ChannelMode.GLOBAL_PTT
+								? WalkieClientLauncher.GLOBAL_CHANNEL
+								: target.channel()),
 						new ClientListener()
 				);
 		try {
@@ -1659,7 +1668,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// reach it. [#switchTo] already applied the target's mode/key and advanced [#connectTarget], so
 	/// [ClientListener#onOpen]'s [#sendJoin] lands us straight in it.
 	///
-	/// Runs on its own virtual thread — never the listener callback thread (whose executor [#connect]'s `join()`
+	/// Runs on its own virtual thread — never the listener callback thread (whose executor [#connect]'s `get()`
 	/// blocks on) and never the console thread. A fresh token keeps it robust even if the original has expired
 	/// (login takes no input). The [#reconnecting] guard both collapses a burst of mismatches into one reconnect and
 	/// tells the old socket's `onClose` this drop is intentional, so it is not treated as a lost connection.

@@ -71,6 +71,22 @@ class AuthBoundaryIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
+	void aValidBearerHeaderOpensAUsableAudioSessionWithNothingInTheUri() throws Exception {
+		// The route the Java desktop client uses. Its mirror below pins the browser's ?token=; without this one,
+		// reverting that client to a query parameter would leave the entire suite green — which is exactly the state
+		// the change to a header was made in.
+		// What this can assert is the SERVER's half: a header alone authenticates and the session is fully usable. The
+		// client's half — that its URI carries no credential — is pinned by WalkieClientTest on the URI builder itself,
+		// because a client-side WebSocketSession reports getUri() as null here.
+		CollectingHandler handler = new CollectingHandler();
+		try (WebSocketSession session = connectWithHeaderAuth(AUDIO, handler, login())) {
+			send(session, new ClientMessage.Join("auth-header", ChannelMode.MULTI_CHANNEL_PTT, null, "Alice", TestKeyChecks.ENCRYPTED));
+			ServerMessage.Joined joined = awaitType(handler.messages, ServerMessage.Joined.class);
+			assertEquals("auth-header", joined.channel(), "a header-authenticated session is fully usable");
+		}
+	}
+
+	@Test
 	void aValidQueryTokenOpensAUsableAudioSession() throws Exception {
 		CollectingHandler handler = new CollectingHandler();
 		try (WebSocketSession session = connect(AUDIO, handler, login())) {
