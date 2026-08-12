@@ -58,12 +58,21 @@ Every other request — including the WS handshake — requires the token. Two t
 | `/ws/audio`  | binary = audio, text = control | WebSocket relay (server forwards audio)            |
 | `/ws/signal` | text only                      | WebRTC signaling relay (media flows peer-to-peer)  |
 
-Pass the token **either** as `Authorization: Bearer <token>` **or** as a `?token=<url-encoded token>` query
-parameter. Browsers cannot set headers on a WS handshake, so they (and the reference Java client) use the
-query parameter:
+Pass the token as an `Authorization: Bearer <token>` handshake header. **Prefer the header in any client that
+can send one** — a URL is the least private part of a request: it reaches access logs, proxy logs and error
+reports, and every hop that terminates TLS in between sees the whole of it. The reference Java client sends the
+header:
 
 ```
-wss://host/ws/audio?token=<URL-encoded token>
+GET wss://host/ws/audio?channel=<URL-encoded channel>
+Authorization: Bearer <token>
+```
+
+A `?token=<url-encoded token>` query parameter is accepted as well, and exists for **browsers**, which cannot set
+headers on a WebSocket handshake at all. The server reads the header first; both routes verify identically.
+
+```
+wss://host/ws/audio?token=<URL-encoded token>     # browser only
 ```
 
 A missing/garbage/expired token is rejected at the handshake (HTTP 4xx, never the WebSocket upgrade). Use
@@ -147,7 +156,7 @@ member — §3d).
 `MemberInfo`: a waiting session is not a member and has no stream index, and inventing one would alias a real
 member's audio lane (§4).
 
-Typical flow: `login` → open `/ws/audio?token=…` → send `join` → receive `joined` (snapshot) → exchange
+Typical flow: `login` → open `/ws/audio` with `Authorization: Bearer …` (browsers: `?token=…`) → send `join` → receive `joined` (snapshot) → exchange
 floor/audio → `leave`/close. (Re-send `join` any time to **switch** channels without reconnecting — §3c.)
 
 ---
