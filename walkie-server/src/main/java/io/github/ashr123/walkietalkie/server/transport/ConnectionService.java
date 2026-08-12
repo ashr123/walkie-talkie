@@ -567,11 +567,11 @@ public class ConnectionService {
 	/// be locked, so it never has waiting newcomers; its owner check refuses there anyway.
 	private Option<Channel> requireOwnedChannel(ClientSession session) {
 		if (!(requireChannel(session) instanceof Some(Channel channel))) {
-			return Option.of((Channel) null);
+			return None.instance();
 		}
 		if (!session.id().equals(channel.ownerId())) {
 			sendError(session, ErrorCode.NOT_OWNER, "Only the channel owner can resolve join requests");
-			return Option.of((Channel) null);
+			return None.instance();
 		}
 		return Option.of(channel);
 	}
