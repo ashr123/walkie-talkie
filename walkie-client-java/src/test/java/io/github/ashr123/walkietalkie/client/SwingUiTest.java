@@ -289,6 +289,18 @@ class SwingUiTest {
 	}
 
 	@Test
+	void theOneSessionButtonOffersToStopAnAttemptThatIsStillRunning() {
+		// It used to go DEAD for the whole attempt, so a slow login — measured against a tunnel as an HTTP 524 after
+		// minutes — left closing the window as the only way out. All three states are the same question: am I in a
+		// session? "Not yet, and you may stop waiting" is as much an answer as the other two.
+		assertEquals("Cancel", SwingUi.connectionLabel(true, false));
+		assertEquals("Connect", SwingUi.connectionLabel(false, false));
+		assertEquals("Disconnect", SwingUi.connectionLabel(false, true));
+		assertEquals("Cancel", SwingUi.connectionLabel(true, true),
+				"an attempt in flight wins: whatever it becomes, stopping it is the only thing worth offering");
+	}
+
+	@Test
 	void theQueueControlSaysWhetherItJoinsTheLineOrLeavesIt() {
 		// It is offered to a member who is ALREADY queued — that is where the tap that leaves the line lives — so a
 		// fixed "Raise hand" label described the opposite of what pressing it did, and pressing it lost your place.

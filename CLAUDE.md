@@ -766,6 +766,18 @@ holding anything, which for this application is the worst failure it has:
   thread too, and macOS's default `QuitStrategy.NORMAL_EXIT` calls `System.exit` straight from the app-event handler —
   so Cmd-Q never produced a `windowClosed` and NO session ever said goodbye until `setQuitStrategy(CLOSE_ALL_WINDOWS)`.
 
+**An attempt in flight must be STOPPABLE, which is the session button's third state.** It used to read "Connecting…"
+and go disabled for the whole attempt, so the only way out of a slow one was to close the window — measured in the
+wild against a Cloudflare tunnel as a login that ended in an HTTP 524 after minutes of silence. The button now reads
+`Cancel` and stays enabled (`connectionLabel`, pinned by a test), and the progress moved to the header, since a button
+that says what is happening cannot also offer to stop it. Cancelling frees the controls at once and interrupts the
+attempt, which reaches BOTH blocking stages: `HttpClient.send` throws `InterruptedException`, and the WebSocket
+handshake changed from `join()` to `get()` for exactly this reason — `join` ignores an interrupt and keeps waiting, so
+the socket would have opened into a session nobody was waiting for. A session built anyway, in the gap before the flag
+is read, is closed by the connect thread rather than handed to a window that has moved on; and a cancelled attempt is
+not logged as a failure, because the interrupt that stopped it is what threw. Measured: `Cancel` returns the window to
+`Connect` immediately against a black-holed address, where the login's own timeout would have taken minutes.
+
 **The gesture listener is EDGE-triggered, and that is not a detail.** A `ButtonModel` fires `stateChanged` for armed
 and rollover changes too, so reading the press LEVEL re-ran the press branch while the model was still pressed. For a
 hold that was invisible (`held` was already true), but a TAP leaves `held` false by definition — so in full duplex a

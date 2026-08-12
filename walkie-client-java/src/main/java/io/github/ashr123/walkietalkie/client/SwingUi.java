@@ -208,9 +208,12 @@ final class SwingUi implements WalkieUi {
 	private String renderedChannel;
 	private ChannelMode renderedMode;
 	private String renderedName;
-	/// True while a connection attempt is in flight, so the one button can say so instead of going dead and silent for
-	/// however long a login round trip and a WebSocket handshake take.
+	/// True while a connection attempt is in flight, so the one button can offer to CANCEL it instead of going dead and
+	/// silent for however long a login round trip and a WebSocket handshake take.
 	private boolean connecting;
+	/// Set when the user cancels an attempt, so a session that is built anyway — in the gap before the flag is read —
+	/// is closed by the connect thread instead of being handed to a window that has moved on.
+	private volatile boolean connectCancelled;
 
 	/// Shows the window, pre-filled from the command line, and connects straight away only if those options are
 	/// already complete. Returns at once; the caller waits on [#awaitClose].
@@ -609,7 +612,9 @@ final class SwingUi implements WalkieUi {
 
 	private JPanel buildControlColumn() {
 		connection.addActionListener(_ -> {
-			if (client == null) {
+			if (connecting) {
+				cancelConnect();
+			} else if (client == null) {
 				connect();
 			} else {
 				disconnect();
@@ -705,17 +710,19 @@ final class SwingUi implements WalkieUi {
 		}
 		ClientOptions options = formOptions();
 		connecting = true;
-		refreshButtons();
+		connectCancelled = false;
+		// refresh, not refreshButtons: the HEADER is what says an attempt is under way, and only a full render writes it.
+		refresh();
 		Thread attempt = Thread.ofVirtual().name("gui-connect").unstarted(() -> {
 			try {
 				WalkieClient built = new WalkieClient(options, this);
 				// BEFORE the hand-off, not inside it: the EDT may never run the block below — the window can be gone
 				// by now — and a session nobody can see is a session nobody closes. See [#session].
 				session.set(built);
-				if (closed.getCount() == 0) {
-					// The window went WHILE this was being built, so nobody will ever read the field the EDT is about
-					// to be handed. Close it here: awaitClose's wait is bounded, so on the slow path it has already
-					// given up, and this is a joined channel with an open capture device.
+				if (connectCancelled || closed.getCount() == 0) {
+					// Either the user cancelled or the window went WHILE this was being built, so nobody will ever read
+					// the field the EDT is about to be handed. Close it here: awaitClose's wait is bounded, so on the
+					// slow path it has already given up, and this is a joined channel with an open capture device.
 					session.compareAndSet(built, null);
 					built.close();
 					return;
@@ -728,8 +735,11 @@ final class SwingUi implements WalkieUi {
 			} catch (Exception failure) {
 				// Everything the constructor can throw — a refused login, a busy microphone, a bad passphrase, a
 				// closed port — reaches the user as a line in the log rather than a stack trace on a stream nobody
-				// is reading. A window has nowhere else to put it.
-				status("[connect failed] " + describe(failure));
+				// is reading. A window has nowhere else to put it. A CANCELLED attempt is not a failure, though: the
+				// interrupt that stopped it is what threw, and [#cancelConnect] has already said so.
+				if (!connectCancelled) {
+					status("[connect failed] " + describe(failure));
+				}
 				SwingUtilities.invokeLater(() -> {
 					connecting = false;
 					refresh();
@@ -738,6 +748,26 @@ final class SwingUi implements WalkieUi {
 		});
 		connectAttempt = attempt;   // published before the start, so awaitClose can never see a thread it cannot join
 		attempt.start();
+	}
+
+	/// Abandons an attempt that is still in flight — which was otherwise a wait with nothing at all to press.
+	///
+	/// The button used to go dead for the whole attempt, so the only way out of a slow one was to close the window:
+	/// measured in the wild against a Cloudflare tunnel, a login that ended in an HTTP 524 after minutes of silence.
+	///
+	/// The controls are freed at once and the attempt is interrupted, which reaches both blocking stages — the login
+	/// round trip (`HttpClient.send` throws `InterruptedException`) and the WebSocket handshake ([WalkieClient]'s own
+	/// `connect` uses `get()` rather than `join()` for exactly this reason). Should a session be built
+	/// anyway, in the gap before the flag is read, the connect thread closes it.
+	private void cancelConnect() {
+		connectCancelled = true;
+		Thread attempt = connectAttempt;
+		if (attempt != null) {
+			attempt.interrupt();
+		}
+		connecting = false;
+		status("[connect] cancelled.");
+		refresh();
 	}
 
 	/// A failure the user can act on. `getMessage()` is null for a good few of the things that go wrong here — an
@@ -957,7 +987,9 @@ final class SwingUi implements WalkieUi {
 	private void refresh() {
 		WalkieClient live = client;
 		if (live == null) {
-			header.setText("Not connected.");
+			// The progress moved here when the button became Cancel: something has to say an attempt is under way, and a
+			// button reading "Connecting…" cannot also offer to stop it.
+			header.setText(connecting ? "Connecting…" : "Not connected.");
 			// Forget what was rendered, so a reconnect writes the server's values into the form again rather than
 			// treating whatever is left in the fields as already current.
 			renderedChannel = null;
@@ -1063,8 +1095,10 @@ final class SwingUi implements WalkieUi {
 		WalkieClient live = client;
 		boolean connected = live != null;
 		serverField.setEnabled(!connected);   // the socket is already open; changing this would say nothing
-		connection.setText(connecting ? "Connecting…" : connected ? "Disconnect" : "Connect");
-		connection.setEnabled(!connecting);
+		connection.setText(connectionLabel(connecting, connected));
+		// Never disabled: while an attempt is in flight this button is the only way to stop it, which is precisely the
+		// state it used to be dead in.
+		connection.setEnabled(true);
 		if (!connected) {
 			rename.setEnabled(false);
 			apply.setEnabled(false);
@@ -1306,6 +1340,17 @@ final class SwingUi implements WalkieUi {
 	/// silently dropped the user's place. The browser has one Talk control that relabels itself for the same reason.
 	static String raiseHandLabel(ClientSnapshot view) {
 		return view.floor().waiting().contains(view.selfId()) ? "Leave the line ✋" : "Raise hand ✋";
+	}
+
+	/// What the one session button says, given the two states it has to distinguish.
+	///
+	/// Three meanings for one control, and it is the same question in each: am I in a session? "Not yet, and you may
+	/// stop waiting" is as much an answer as the other two.
+	static String connectionLabel(boolean connecting, boolean connected) {
+		if (connecting) {
+			return "Cancel";
+		}
+		return connected ? "Disconnect" : "Connect";
 	}
 
 	/// Whether a floor GRANT has outlived the hold that asked for it — an open microphone with nobody holding anything.

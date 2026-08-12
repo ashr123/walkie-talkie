@@ -22,8 +22,10 @@ import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
@@ -1552,7 +1554,13 @@ public final class WalkieClient implements AutoCloseable {
 				: "[entry] requesting to stop muting new members on entry...");
 	}
 
-	private WebSocket connect(String token) {
+	/// Opens the WebSocket, INTERRUPTIBLY.
+	///
+	/// `join()` would be shorter and was what this used, but it ignores an interrupt and keeps waiting — so a front end
+	/// offering to cancel a connection could free its own controls and still not stop the attempt, and the socket would
+	/// then open into a session nobody was waiting for. `get()` throws, and cancelling the future tears the half-open
+	/// attempt down with it.
+	private WebSocket connect(String token) throws IOException, InterruptedException {
 		// Carry the effective channel as the ?channel= routing key so a channel-affinity ingress can pin this
 		// socket to the instance that owns the channel (see the server's ChannelHandshakeInterceptor). Harmless
 		// single-instance. Global forces the routing key to "global", matching the Join's effective channel. Reads
@@ -1561,14 +1569,31 @@ public final class WalkieClient implements AutoCloseable {
 		String routingChannel = target.mode() == ChannelMode.GLOBAL_PTT
 				? WalkieClientLauncher.GLOBAL_CHANNEL
 				: target.channel();
-		return httpClient.newWebSocketBuilder()
+		CompletableFuture<WebSocket> handshake = httpClient.newWebSocketBuilder()
 				.buildAsync(
 						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio"
 								+ "?token=" + URLEncoder.encode(token, StandardCharsets.UTF_8)
 								+ "&channel=" + URLEncoder.encode(routingChannel, StandardCharsets.UTF_8)),
 						new ClientListener()
-				)
-				.join();
+				);
+		try {
+			return handshake.get();
+		} catch (InterruptedException interrupted) {
+			handshake.cancel(true);   // do not leave a socket opening for a caller that has gone
+			throw interrupted;
+		} catch (ExecutionException failure) {
+			// `join` wrapped failures in an unchecked CompletionException; `get` uses ExecutionException. Unwrapped so
+			// both callers keep seeing the IOException or RuntimeException they were already written to handle — and so
+			// a front end's error line names the real cause instead of the wrapper.
+			Throwable cause = failure.getCause();
+			if (cause instanceof IOException problem) {
+				throw problem;
+			}
+			if (cause instanceof RuntimeException problem) {
+				throw problem;
+			}
+			throw new IOException(cause == null ? failure.toString() : cause.toString(), cause);
+		}
 	}
 
 	private void enqueue(ClientMessage message) {
