@@ -14,9 +14,9 @@ final class BearerTokens {
 
 	static Option<String> extract(String authorizationHeader, String tokenParameter) {
 		return authorizationHeader != null && authorizationHeader.startsWith(BEARER_PREFIX)
-				? Option.of(authorizationHeader.substring(BEARER_PREFIX.length()).trim())
+				? Option.of(authorizationHeader.substring(BEARER_PREFIX.length()).strip())
 				: tokenParameter != null && !tokenParameter.isBlank()
-				  ? Option.of(tokenParameter.trim())
+				  ? Option.of(tokenParameter.strip())
 				  : None.instance();
 	}
 }
