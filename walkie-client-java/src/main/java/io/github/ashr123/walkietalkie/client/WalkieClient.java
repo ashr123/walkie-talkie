@@ -7,10 +7,8 @@ import tools.jackson.databind.cfg.EnumFeature;
 import tools.jackson.databind.json.JsonMapper;
 
 import javax.sound.sampled.LineUnavailableException;
-import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.text.Normalizer;
@@ -22,8 +20,6 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletionStage;
@@ -31,7 +27,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 /// Console walkie-talkie client over the WebSocket-relay transport (the only one available to a pure-Java
 /// client; WebRTC is browser-to-browser). It orchestrates login, the relay WebSocket connection, the
@@ -46,10 +41,6 @@ import java.util.stream.Collectors;
 /// (ideally via try-with-resources) to tear the session down.
 public final class WalkieClient implements AutoCloseable {
 
-	private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(
-			"yyyy-MM-dd HH:mm:ss,SSS",
-			Locale.getDefault(Locale.Category.FORMAT)
-	);
 	// Stateless, thread-safe infrastructure with no per-connection input — shared by every client instance.
 	// Unknown enum values (an ErrorCode minted by a NEWER server than this client) deserialize to the enum's
 	// @JsonEnumDefaultValue constant (ErrorCode.UNKNOWN) instead of failing the whole message — the forward-
@@ -106,7 +97,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// Letters, combining marks and digits from ANY script, plus `_` and `-`, 1-64 code points. Mirrors the
 	/// server's `ConnectionService.CHANNEL_NAME` and the browser's in `static/assets/names.js`.
 	///
-	/// No whitespace, and that restriction is load-bearing HERE specifically: [#switchChannel] parses
+	/// No whitespace, and that restriction is load-bearing HERE specifically: [ConsoleUi]'s `switchChannel` parses
 	/// `c <channel> [mode] [key]` by splitting on `\s+`, so a room name with a space in it could not be typed at
 	/// this prompt at all.
 	/// Collapsed whitespace: `\p{Zs}` (every Unicode space separator) plus the five ASCII control whitespace
@@ -117,7 +108,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// `static/assets/names.js`, and the parity vectors in `names.test.js` / `ConnectionServiceTest`.
 	private static final Pattern CHANNEL_WHITESPACE = Pattern.compile("[\\p{Zs}\\t\\n\\r\\x0B\\f]+");
 
-	private static final Pattern CHANNEL_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N} _-]{1,64}");
+	static final Pattern CHANNEL_NAME = Pattern.compile("[\\p{L}\\p{M}\\p{N} _-]{1,64}");
 	/// First byte of an end-to-end-encrypted frame (mirrors FrameCrypto's scheme marker); lets the receive path
 	/// distinguish encrypted audio from a plaintext peer's `[codec tag][payload]` when we hold no key.
 	private static final int E2EE_SCHEME = 0xE2;
@@ -129,45 +120,6 @@ public final class WalkieClient implements AutoCloseable {
 	/// it — to drain gracefully before forcing termination, so quitting can never hang on a slow or vanished
 	/// server. Two seconds is ample for a localhost/LAN close handshake while still feeling instant to a user.
 	private static final Duration HTTP_SHUTDOWN_GRACE = Duration.ofSeconds(2);
-	/// ASCII BEL (0x07): written to the terminal to audibly/visibly nudge an inattentive user the instant it is
-	/// their turn to talk (a console has no other way to grab attention). Mirrors the browser's "your turn" beep.
-	private static final char TERMINAL_BELL = '\u0007';
-	/// Fixed width of the help box's horizontal rule — a cosmetic frame (some command lines run longer than this).
-	private static final int HELP_RULE_WIDTH = 98;
-	private static final String HELP_RULE = "-".repeat(HELP_RULE_WIDTH);
-	/// The commands available to everyone, owner or not. A non-owner additionally sees [#MEMBER_PASSPHRASE_COMMAND];
-	/// the owner instead sees [#OWNER_COMMANDS]. (`p` is role-split: a member ADOPTS a shared passphrase, an owner
-	/// CHANGES it.)
-	private static final String COMMON_COMMANDS = """
-			Commands:  t = talk/stop — in push-to-talk it's state-driven: grab a free floor, claim your turn, or join/leave the queue when busy
-			           w = who's here
-			           c <channel> [mode] [key] = switch channel (quote a name with spaces)
-			           n <name> = rename
-			           f = hi-fi on/off
-			           cancel = stop waiting to be admitted to a locked channel
-			           q = quit
-			           h = help""";
-	/// The owner-only command block — shown in the help ONLY to the current channel owner, and announced verbatim
-	/// the instant a member is promoted (see the [ServerMessage.OwnerChanged] handler) so it learns the abilities it
-	/// just gained. One source of truth, so the help and the promotion notice can't drift; the server also rejects
-	/// these from a non-owner, so hiding them is UI honesty, not the security boundary.
-	private static final String OWNER_COMMANDS = """
-			Owner:     m <ptt|global|duplex> = change the mode for everyone ('m global' switches YOU to the global room)
-			           p <passphrase> = rotate the passphrase for everyone (members auto-adopt); it can't be turned off
-			           p! [passphrase] = change the passphrase WITHOUT auto-sharing (members must re-enter it)
-			           o <#id> = give ownership to another member
-			           mute <#id|all> / unmute <#id|all> = mute or unmute members
-			           lock / unlock = lock or unlock the channel to new members
-			           queue on / queue off = turn the push-to-talk floor queue on or off
-			           entry on / entry off = mute every member that JOINS from now on ('mute all' covers those already here)
-			           requests = list the newcomers waiting to be admitted (a locked channel parks them)
-			           admit <#id|all> / deny <#id|all> = let a waiting newcomer in, or turn it away""";
-	/// The one passphrase command a NON-owner has: adopt a rotation the owner announced but didn't auto-share (an
-	/// owner instead changes the passphrase with `p`/`p!` — see [#OWNER_COMMANDS]). The 11 leading spaces align its
-	/// `p` under the command column of [#COMMON_COMMANDS] / [#OWNER_COMMANDS] after their text-block indent is
-	/// stripped (their " Commands:" / " Owner:" label lines set that margin one space in from the frame).
-	private static final String MEMBER_PASSPHRASE_COMMAND =
-			"           p [passphrase] = adopt the owner's new passphrase (only needed if you weren't auto-updated)";
 	private final ClientOptions options;
 	// Per-instance: its SSLContext trusts the system CAs plus (on localhost) the server's dev cert or a
 	// --tls-truststore, so HTTPS + WSS verify against the target server — verification is never disabled.
@@ -185,6 +137,10 @@ public final class WalkieClient implements AutoCloseable {
 	// add-all) would expose an EMPTY set to the capture thread mid-swap, and that thread's per-frame read is the local
 	// stop for our own mute. A reader sees the whole old set or the whole new one, never a half-applied one.
 	private volatile Set<String> mutedMembers = Set.of();
+	/// Everything this client shows a person goes through here — see [WalkieUi]. Final, and the first thing the
+	/// constructor assigns, because construction itself reports progress ("Connecting to …", the audio description)
+	/// and `deriveCrypto` can warn before anything else exists.
+	private final WalkieUi ui;
 	private final AudioEngine audio;
 	// The live relay socket. Volatile (not final) because a CHANNEL_ROUTING_MISMATCH reconnect swaps it for a new
 	// socket bound to the target channel's instance; onOpen publishes each new socket here before it queues its Join.
@@ -206,6 +162,16 @@ public final class WalkieClient implements AutoCloseable {
 	private volatile ConnectTarget connectTarget;
 	private volatile String currentPassphrase;   // passphrase backing the current channel's key (for switch defaults)
 	private volatile String currentChannelKeyCheck;   // the channel's currently-announced key-check (null = unencrypted); the yardstick a member re-keys against
+	/// Whether the server has CONFIRMED the channel in [#currentChannel], which the constructor and [#switchTo] both
+	/// set optimistically (the reconnect target and the key derivation need it before any answer arrives).
+	///
+	/// The distinction is load-bearing in exactly one place, [#joinRefused], which used "do we have a channel?" to tell
+	/// a refused SWITCH (keep everything — the server never departed us) from a refused FIRST join (nothing to keep).
+	/// Because the constructor had already filled the field, an initial refusal took the wrong branch: it told the user
+	/// "You are still in \"team1\"" about a channel they had never entered, and kept the phantom. A window then had no
+	/// way back — its adaptive button saw the typed name as the channel it was already in, so a mistyped passphrase
+	/// could only be corrected by disconnecting.
+	private volatile boolean channelConfirmed;
 	private volatile boolean rekeyInFlight;      // true between sending our own ChangePassphrase (owner) and its echoed PassphraseChanged
 
 	// --- HTTP login + WebSocket -------------------------------------------------------------------
@@ -242,7 +208,8 @@ public final class WalkieClient implements AutoCloseable {
 	/// [FloorSnapshot] discipline: a reader never sees a half-built list) and read by the console thread.
 	private volatile List<JoinRequestInfo> joinRequests = List.of();
 
-	public WalkieClient(ClientOptions options) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
+	WalkieClient(ClientOptions options, WalkieUi ui) throws IOException, InterruptedException, GeneralSecurityException, LineUnavailableException, OpusException {
+		this.ui = ui;
 		this.options = options;
 		// Validate the startup identity/channel locally before opening audio or a socket — the same checks the `n`
 		// and `c` commands apply, and the browser client applies on connect. The server validates authoritatively
@@ -268,28 +235,93 @@ public final class WalkieClient implements AutoCloseable {
 		this.currentChannel = channel;
 		this.connectTarget = new ConnectTarget(channel, options.mode());
 		this.currentPassphrase = options.key();
-		this.audio = new AudioEngine(options, this::sendAudioFrame);
-		System.out.println("Connecting to " + options.server() + " as '" + options.display() + "' ...");
+		this.audio = new AudioEngine(options, this::sendAudioFrame, ui::note);
+		ui.note("Connecting to " + options.server() + " as '" + options.display() + "' ...");
 		String token = login();
 		crypto = deriveCrypto(options.key(), options.mode(), channel);
 		currentChannelKeyCheck = crypto == null ? null : crypto.keyCheck();   // baseline the channel's key-check from our own join key
 		audio.start();
-		System.out.println("Audio: " + audio.description()
-				+ (crypto == null ? "" : ", end-to-end encrypted (AES-256-GCM)"));
+		// From here on the CAPTURE DEVICE IS OPEN, so a failure below has something to release. Nobody holds a
+		// reference to a client whose constructor threw, so without this the microphone stayed open — with the OS
+		// in-use indicator lit — while the window said "Not connected", once per failed attempt. It only became
+		// visible with a front end that OUTLIVES a failed connect: a console launcher exits and the JVM cleans up.
+		boolean live = false;
+		try {
+			ui.note("Audio: " + audio.description()
+					+ (crypto == null ? "" : ", end-to-end encrypted (AES-256-GCM)"));
 
-		webSocket = connect(token);
-		// Start the sender only after webSocket is assigned, so it is published to the sender thread (Thread.start()
-		// happens-after the write, and the field is volatile). onOpen republishes each socket it opens — including a
-		// reconnect's — into webSocket before queueing that socket's Join, so a Join is never sent on a stale socket.
-		Thread.ofVirtual().name("ptt-sender").start(this::senderLoop);
-
-		// Blocks until the user quits or stdin closes; the caller then closes us (try-with-resources).
-		consoleLoop();
+			webSocket = connect(token);
+			// Start the sender only after webSocket is assigned, so it is published to the sender thread (Thread.start()
+			// happens-after the write, and the field is volatile). onOpen republishes each socket it opens — including a
+			// reconnect's — into webSocket before queueing that socket's Join, so a Join is never sent on a stale socket.
+			Thread.ofVirtual().name("ptt-sender").start(this::senderLoop);
+			live = true;
+		} finally {
+			// A flag and a `finally` rather than a catch: nothing here declares a checked exception, and this way an
+			// Error releases the device too. The throw itself is left alone — the caller still sees what failed.
+			if (!live) {
+				running.set(false);
+				audio.close();
+			}
+		}
 	}
 
-	/// Prints a status line prefixed with the local timestamp (`yyyy-MM-dd HH:mm:ss,SSS`).
-	private static void log(String message) {
-		System.out.println(LocalDateTime.now().format(DATE_TIME_FORMATTER) + " " + message);
+	// --- Console-shaped residue, deliberately still here. -----------------------------------------------------------
+	//
+	// The help text and the mode hint are terminal prose, so they belong with the terminal — except that the CLIENT is
+	// what invokes them: the welcome help is printed once from the first Joined handler (only there is our role known,
+	// so only there is a role-aware list correct), and the hint is concatenated INTO a status line by the mode-change
+	// handler. Moving them would need new hooks on WalkieUi for "you have joined" and "the mode changed", invented
+	// with no second front end to check them against — so they stay until there is one, and ConsoleUi calls printHelp
+	// for its own `h` command.
+
+	/// Fixed width of the help box's horizontal rule — a cosmetic frame (some command lines run longer than this).
+	private static final int HELP_RULE_WIDTH = 98;
+	private static final String HELP_RULE = "-".repeat(HELP_RULE_WIDTH);
+	/// The commands available to everyone, owner or not. A non-owner additionally sees [#MEMBER_PASSPHRASE_COMMAND];
+	/// the owner instead sees [#OWNER_COMMANDS]. (`p` is role-split: a member ADOPTS a shared passphrase, an owner
+	/// CHANGES it.)
+	private static final String COMMON_COMMANDS = """
+			Commands:  t = talk/stop — in push-to-talk it's state-driven: grab a free floor, claim your turn, or join/leave the queue when busy
+			           w = who's here
+			           c <channel> [mode] [key] = switch channel (quote a name with spaces)
+			           n <name> = rename
+			           f = hi-fi on/off
+			           cancel = stop waiting to be admitted to a locked channel
+			           q = quit
+			           h = help""";
+	/// The owner-only command block — shown in the help ONLY to the current channel owner, and announced verbatim
+	/// the instant a member is promoted (see the [ServerMessage.OwnerChanged] handler) so it learns the abilities it
+	/// just gained. One source of truth, so the help and the promotion notice can't drift; the server also rejects
+	/// these from a non-owner, so hiding them is UI honesty, not the security boundary.
+	private static final String OWNER_COMMANDS = """
+			Owner:     m <ptt|global|duplex> = change the mode for everyone ('m global' switches YOU to the global room)
+			           p <passphrase> = rotate the passphrase for everyone (members auto-adopt); it can't be turned off
+			           p! [passphrase] = change the passphrase WITHOUT auto-sharing (members must re-enter it)
+			           o <#id> = give ownership to another member
+			           mute <#id|all> / unmute <#id|all> = mute or unmute members
+			           lock / unlock = lock or unlock the channel to new members
+			           queue on / queue off = turn the push-to-talk floor queue on or off
+			           entry on / entry off = mute every member that JOINS from now on ('mute all' covers those already here)
+			           requests = list the newcomers waiting to be admitted (a locked channel parks them)
+			           admit <#id|all> / deny <#id|all> = let a waiting newcomer in, or turn it away""";
+	/// The one passphrase command a NON-owner has: adopt a rotation the owner announced but didn't auto-share (an
+	/// owner instead changes the passphrase with `p`/`p!` — see [#OWNER_COMMANDS]). The 11 leading spaces align its
+	/// `p` under the command column of [#COMMON_COMMANDS] / [#OWNER_COMMANDS] after their text-block indent is
+	/// stripped (their " Commands:" / " Owner:" label lines set that margin one space in from the frame).
+	private static final String MEMBER_PASSPHRASE_COMMAND =
+			"           p [passphrase] = adopt the owner's new passphrase (only needed if you weren't auto-updated)";
+
+	/// Prints the command help for the caller's CURRENT role: the [#COMMON_COMMANDS] everyone has, then either the
+	/// non-owner's [#MEMBER_PASSPHRASE_COMMAND] or — when our session id currently owns the channel — the full
+	/// [#OWNER_COMMANDS]. The role is read live (not cached at connect), so pressing `h` right after being promoted
+	/// shows the owner commands; the sentinel-owned `global` room has no participant owner, so no one there is shown
+	/// the owner set.
+	void printHelp() {
+		ui.hint(HELP_RULE + System.lineSeparator()
+				+ COMMON_COMMANDS + System.lineSeparator()
+				+ (selfId.equals(ownerId) ? OWNER_COMMANDS : MEMBER_PASSPHRASE_COMMAND) + System.lineSeparator()
+				+ HELP_RULE);
 	}
 
 	private static String modeHint(ChannelMode mode, boolean micLive) {
@@ -298,10 +330,17 @@ public final class WalkieClient implements AutoCloseable {
 				: "Push-to-talk: type 't' to grab a free floor (or to join/leave the queue when it's busy; claim with 't' when it's your turn).";
 	}
 
+	/// Reports a status line — the running commentary of the session. Kept as a short local name because 97 call
+	/// sites read better for it; all it does now is hand the line to [WalkieUi#status], which decides whether that
+	/// means a timestamped `System.out.println` or a row in a window.
+	private void log(String message) {
+		ui.status(message);
+	}
+
 	/// Builds the AES-256-GCM frame cipher from `--key` (or the WALKIE_KEY env var), or null to disable
 	/// E2EE. Salted with the effective channel (the server forces "global" for global mode), so every
 	/// client in the channel derives the same key.
-	private static FrameCrypto deriveCrypto(String passphrase, ChannelMode mode, String channel) throws GeneralSecurityException {
+	private FrameCrypto deriveCrypto(String passphrase, ChannelMode mode, String channel) throws GeneralSecurityException {
 		if (passphrase == null || passphrase.isBlank()) {
 			return null;
 		}
@@ -419,27 +458,6 @@ public final class WalkieClient implements AutoCloseable {
 	record SwitchRollback(FrameCrypto crypto, String passphrase, ConnectTarget target) {
 	}
 
-	private static ChannelMode parseMode(String arg, ChannelMode fallback) {
-		return switch (arg.toLowerCase(Locale.ROOT)) {
-			case "ptt", "multi" -> ChannelMode.MULTI_CHANNEL_PTT;
-			case "global" -> ChannelMode.GLOBAL_PTT;
-			case "duplex", "full" -> ChannelMode.FULL_DUPLEX;
-			default -> fallback;
-		};
-	}
-
-	/// Prints the command help for the caller's CURRENT role: the [#COMMON_COMMANDS] everyone has, then either the
-	/// non-owner's [#MEMBER_PASSPHRASE_COMMAND] or — when our session id currently owns the channel — the full
-	/// [#OWNER_COMMANDS]. The role is read live (not cached at connect), so pressing `h` right after being promoted
-	/// shows the owner commands; the sentinel-owned `global` room has no participant owner, so no one there is shown
-	/// the owner set.
-	private void printHelp() {
-		System.out.println(HELP_RULE + System.lineSeparator()
-				+ COMMON_COMMANDS + System.lineSeparator()
-				+ (selfId.equals(ownerId) ? OWNER_COMMANDS : MEMBER_PASSPHRASE_COMMAND) + System.lineSeparator()
-				+ HELP_RULE);
-	}
-
 	// --- Server messages --------------------------------------------------------------------------
 
 	private String login() throws IOException, InterruptedException {
@@ -505,6 +523,15 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	private void handleServerMessage(String json) {
+		applyServerMessage(json);
+		// Exactly one signal per inbound message, whether or not that message moved anything. Notifying
+		// unconditionally is cheaper to reason about than notifying per mutation: the handler below writes 15-odd
+		// fields across a 200-line switch, so "did anything change?" would be a second thing to keep in step with the
+		// first, and a view that pulls a whole snapshot loses nothing by being told to re-read once too often.
+		ui.stateChanged();
+	}
+
+	private void applyServerMessage(String json) {
 		switch (JSON_MAPPER.readValue(json, ServerMessage.class)) {
 			case ServerMessage.Joined(String selfId,
 									  String channel,
@@ -520,6 +547,7 @@ public final class WalkieClient implements AutoCloseable {
 				this.ownerId = ownerId;
 				this.currentMode = mode;
 				this.currentChannel = channel;
+				this.channelConfirmed = true;   // the server put us here; a later refusal now knows there is something to keep
 				this.channelLocked = locked;   // adopt the channel's lock state from the snapshot (covers an in-place re-join)
 				// The switch (or initial join) landed, so what it overwrote is now the truth — there is nothing to
 				// roll back. Leaving a stale rollback here would let a LATER refusal restore this channel's
@@ -572,7 +600,8 @@ public final class WalkieClient implements AutoCloseable {
 						: selfId.equals(ownerId)
 						  ? "you own this channel — 'm <ptt|global|duplex>' to change the mode for everyone"
 						  : "owner: " + name(ownerId))
-						+ System.lineSeparator() + modeHint(mode, audio.isTransmitting()));
+						);
+				ui.hint(modeHint(mode, audio.isTransmitting()));
 				// Report the channel's E2EE status on EVERY confirmed entry (initial join AND in-place switch), like
 				// the browser — so switching into/out of an encrypted channel says so. The global room already states
 				// "unencrypted" in its owner line, so skip the redundant line there. crypto reflects the key held for
@@ -612,7 +641,7 @@ public final class WalkieClient implements AutoCloseable {
 			case ServerMessage.FloorGranted _ -> {
 				awaitingClaim = false;   // we claimed — no longer waiting for our turn
 				audio.setTransmitting(true);
-				log("[floor granted] talking — type 't' to stop");
+				log("[floor granted] talking — " + ui.gesture(WalkieUi.Cue.STOP) + " to stop");
 			}
 			case ServerMessage.FloorStatus(String holderId, List<String> waiting) -> handleFloorStatus(holderId, waiting);
 			case ServerMessage.FloorReserved(long claimSeconds) -> handleFloorReserved(claimSeconds);
@@ -634,8 +663,8 @@ public final class WalkieClient implements AutoCloseable {
 				// mutes. The mute check keeps a muted member's mic closed (and its "mic is live" hint honest) across
 				// a mode change — otherwise setTransmitting would report live while onAudio/sendAudioFrame drop it.
 				audio.setTransmitting(shouldAutoOpenMic(mode));
-				log("[mode changed] now " + mode + System.lineSeparator()
-						+ modeHint(mode, audio.isTransmitting()));
+				log("[mode changed] now " + mode);
+				ui.hint(modeHint(mode, audio.isTransmitting()));
 			}
 			case ServerMessage.OwnerChanged(String ownerId) -> {
 				boolean becameOwner = selfId.equals(ownerId) && !selfId.equals(this.ownerId);
@@ -739,13 +768,15 @@ public final class WalkieClient implements AutoCloseable {
 				// offered the floor onward (grant-to-claim, miss → dropped). floorNarration reports this only while
 				// the queue is still ON — if the owner just disabled it, the FloorQueueChanged that arrives right
 				// before this snapshot already explained the drop.
-				case TURN_PASSED -> log("[your turn passed] you didn't claim in time — type 't' to rejoin the queue");
-				case RELEASED -> log("[released] the floor is no longer yours — type 't' to request it again");
+				case TURN_PASSED -> log("[your turn passed] you didn't claim in time — "
+						+ ui.gesture(WalkieUi.Cue.JOIN_QUEUE) + " to rejoin the queue");
+				case RELEASED -> log("[released] the floor is no longer yours — "
+						+ ui.gesture(WalkieUi.Cue.TALK) + " to request it again");
 				case IN_LINE -> log("[in line #" + narration.position() + " of " + narration.size()
-						+ "] — type 't' to leave the queue");
+						+ "] — " + ui.gesture(WalkieUi.Cue.LEAVE_QUEUE) + " to leave the queue");
 				case TALKING -> log("[talking] " + name(narration.memberId()));
 				case OFFERED -> log("[floor reserved] being offered to " + name(narration.memberId()));
-				case FREE -> log("[floor free] — type 't' to talk");
+				case FREE -> log("[floor free] — " + ui.gesture(WalkieUi.Cue.TALK) + " to talk");
 			}
 		}
 		// Remembered even when nothing was logged, so LIVE/MY_TURN (which narrate nothing) cannot let the next IDLE
@@ -810,16 +841,37 @@ public final class WalkieClient implements AutoCloseable {
 	/// drops us and [#handleFloorStatus] logs "[your turn passed]".
 	private void handleFloorReserved(long claimSeconds) {
 		awaitingClaim = true;
-		System.out.print(TERMINAL_BELL);
-		System.out.flush();
-		log("*** YOUR TURN — type 't' within " + claimSeconds + "s to talk ***");
+		ui.attention();
+		log("*** YOUR TURN — " + ui.gesture(WalkieUi.Cue.TALK) + " within " + claimSeconds + "s to talk ***");
+	}
+
+	/// This client's observable state as one immutable value — see [ClientSnapshot] for why a view needs one read
+	/// rather than a dozen. Every field it reads is `volatile` (or a concurrent collection), so this is safe from any
+	/// thread; what it is NOT is atomic across fields, and it deliberately does not pretend to be. Two members
+	/// arriving while the snapshot is being taken can land on either side of it — which is the same weak consistency
+	/// the console has always had, and self-corrects on the next [WalkieUi#stateChanged].
+	ClientSnapshot snapshot() {
+		return new ClientSnapshot(
+				selfId,
+				currentChannel,
+				currentMode,
+				ownerId,
+				channelLocked,
+				floorQueueEnabled,
+				muteNewMembers,
+				audio.isTransmitting(),
+				memberNames,
+				mutedMembers,
+				floorSnapshot,
+				joinRequests
+		);
 	}
 
 	/// Resolves a member's display name from its session id, always suffixed with a short session-id prefix (the
 	/// session id is the real identity — display names aren't unique). Every call site passes a current member's
 	/// id (membership precedes any floor/owner/mute reference, and delivery is ordered per recipient), so no
 	/// unknown-id fallback is needed — mirrors the browser client's memberLabel().
-	private String name(String id) {
+	String name(String id) {
 		return memberNames.get(id) + " (#" + shortId(id) + ")";
 	}
 
@@ -861,7 +913,7 @@ public final class WalkieClient implements AutoCloseable {
 			}
 			log("[muted] the channel owner muted you — you can't talk until unmuted.");
 		} else if (previous.contains(selfId) && !next.contains(selfId)) {
-			log("[unmuted] the channel owner unmuted you — type 't' to talk again.");
+			log("[unmuted] the channel owner unmuted you — " + ui.gesture(WalkieUi.Cue.TALK) + " to talk again.");
 		}
 		logMuteChange(next.stream().filter(id -> !previous.contains(id) && !id.equals(selfId)).toList(), "muted");
 		logMuteChange(previous.stream().filter(id -> !next.contains(id) && !id.equals(selfId)).toList(), "unmuted");
@@ -871,7 +923,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// would otherwise print one line per member on the listener thread — the very per-member fan-out the snapshot
 	/// exists to collapse — and bury the roster the user is reading.
 	///
-	/// Ordered HERE, by display name then id, matching [#listMembers]: `MuteStatus.muted` is a `Set` precisely
+	/// Ordered HERE, by display name then id, matching [ConsoleUi]'s `listMembers`: `MuteStatus.muted` is a `Set` precisely
 	/// because arranging ids is a display decision, and this is the display.
 	private void logMuteChange(List<String> ids, String verb) {
 		if (ids.isEmpty()) {
@@ -917,7 +969,7 @@ public final class WalkieClient implements AutoCloseable {
 	private void joinRefused(String reason) {
 		SwitchRollback rollback = switchRollback;
 		switchRollback = null;
-		if (currentChannel != null) {
+		if (channelConfirmed) {
 			// A refused SWITCH. The server departs our current channel only once a join succeeds, so we are still in
 			// it with our floor and roster intact — keep all of that, and just undo what switchTo applied ahead of
 			// the answer. Restoring the key matters: holding the target's key while in this channel makes the
@@ -938,10 +990,18 @@ public final class WalkieClient implements AutoCloseable {
 
 	/// Drops every piece of per-channel state, settling into the connected-but-channel-less state that both ways
 	/// out of a channel end in — a refused initial join ([#joinRefused]) and a deliberate departure
-	/// ([#leaveBecauseWebRtc]). The typed `--key` (`crypto`) is deliberately KEPT, since it is the user's own
+	/// ([#leaveBecauseWebRtc]) — so it clears [#currentChannel] too, which is what "channel-less" means to every
+	/// reader of a snapshot. The typed `--key` (`crypto`) is deliberately KEPT, since it is the user's own
 	/// passphrase and reusable for the next attempt; `currentChannelKeyCheck` is the CHANNEL's announced value and
 	/// describes a channel we are no longer in, so it goes.
 	private void forgetChannelState() {
+		channelConfirmed = false;
+		// The CHANNEL itself, which this method claimed to drop and did not. Both callers had already been told they
+		// are out of one, and leaving the name behind made every reader disagree with that: a window's header still
+		// announced the channel, and its adaptive button read the typed name as "the channel you are already in" — so
+		// a mistyped passphrase could only be corrected by disconnecting. Measured before the fix: after a refused
+		// join, header "team1 · MULTI_CHANNEL_PTT · no owner" over a log line saying to pick another channel.
+		currentChannel = null;
 		ownerId = null;
 		channelLocked = false;
 		muteNewMembers = false;
@@ -950,6 +1010,9 @@ public final class WalkieClient implements AutoCloseable {
 		mutedMembers = Set.of();
 		floorSnapshot = FloorSnapshot.IDLE;
 		awaitingClaim = false;
+		// The waiting list is sent ONLY to the channel's current owner, so it is not ours to keep once we are leaving
+		// this channel: a stale entry would have a front end offering to admit somebody into a room it no longer owns.
+		joinRequests = List.of();
 		audio.setTransmitting(false);
 	}
 
@@ -972,9 +1035,8 @@ public final class WalkieClient implements AutoCloseable {
 				+ "relay — join it from a browser instead. Still connected: use 'c <channel>' for another.");
 		// Drop the per-channel state ourselves rather than waiting for anything back: `leave` draws no reply, so
 		// this is the only place that can reconcile us to being out of it.
-		currentChannel = null;
 		switchRollback = null;
-		forgetChannelState();
+		forgetChannelState();   // clears currentChannel as well; see its doc
 		return true;
 	}
 
@@ -1016,89 +1078,12 @@ public final class WalkieClient implements AutoCloseable {
 				: "[name] " + previous + " is now " + name(memberId));
 	}
 
-	/// Prints the current roster on demand (the 'w' command), sorted lexicographically by display name (then by
-	/// id), each member shown via [#name] (display name + `#id` prefix) with `(you)` / `(owner)` markers.
-	private void listMembers() {
-		if (memberNames.isEmpty()) {
-			log("[members] (none yet — join a channel first)");
-			return;
-		}
-		// One read of the mute snapshot for the whole walk: a mid-walk republish would otherwise render some rows
-		// against the old set and some against the new (cosmetic, but this file's rule is one read per decision).
-		Set<String> muted = mutedMembers;
-		log(memberNames.entrySet().stream()
-				.sorted(Map.Entry.<String, String>comparingByValue(String.CASE_INSENSITIVE_ORDER)
-						.thenComparing(Map.Entry.comparingByKey()))   // lexicographic by name, then id
-				.map(entry -> {
-					String id = entry.getKey();
-					String role = id.equals(selfId)
-							? " (you)"
-							: id.equals(ownerId)
-							  ? " (owner)"
-							  : "";
-					return name(id) + role + (muted.contains(id) ? " [muted]" : "");
-				})
-				.collect(Collectors.joining(
-						System.lineSeparator() + "  - ",
-						"[members] " + memberNames.size() + " in this channel"
-								+ (channelLocked ? " 🔒 locked to new members" : "")
-								+ (muteNewMembers ? " 🔇 new members muted on entry" : "")
-								// A terminal has no badge to glance at, so the count rides the status line the user
-								// already types. Only the owner is sent the list, so it is silently 0 for anyone else.
-								+ (joinRequests.isEmpty() ? "" : " · " + joinRequests.size() + " waiting to join ('requests')")
-								+ ":" + System.lineSeparator() + "  - ",
-						""
-				)));
-	}
-
-	private void consoleLoop() {
-		// The command help is printed from the first Joined handler, not here: at this point we haven't received
-		// our role (selfId/ownerId are still ""/null), so a role-aware help printed now would always show the
-		// non-owner set even for a channel creator. Deferring it until Joined makes the very first help correct.
-		try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
-			String line;
-			while (running.get() && (line = reader.readLine()) != null) {
-				String[] parts = line.strip().split("\\s+", 2);
-				switch (parts[0].toLowerCase(Locale.ROOT)) {
-					case "t", "talk" -> toggleTalk();
-					case "m", "mode" -> changeMode(parts.length > 1 ? parts[1] : "");
-					case "c", "channel" -> switchChannel(parts.length > 1 ? parts[1] : "");
-					case "p", "passphrase" -> changePassphrase(parts.length > 1 ? parts[1] : "", true);
-					case "p!" -> changePassphrase(parts.length > 1 ? parts[1] : "", false);
-					case "o", "owner" -> transferOwnership(parts.length > 1 ? parts[1] : "");
-					case "mute" -> muteMember(parts.length > 1 ? parts[1] : "", true);
-					case "unmute" -> muteMember(parts.length > 1 ? parts[1] : "", false);
-					case "lock" -> setChannelLock(true);
-					case "unlock" -> setChannelLock(false);
-					case "queue" -> setFloorQueue(parts.length > 1 ? parts[1] : "");
-					case "entry" -> setMuteNewMembers(parts.length > 1 ? parts[1] : "");
-					case "requests" -> listJoinRequests();
-					case "admit" -> resolveJoinRequest(parts.length > 1 ? parts[1] : "", true);
-					case "deny" -> resolveJoinRequest(parts.length > 1 ? parts[1] : "", false);
-					case "cancel" -> cancelJoinRequest();
-					case "n", "name" -> rename(parts.length > 1 ? parts[1] : "");
-					case "f", "fidelity" -> toggleFidelity();
-					case "w", "who", "members" -> listMembers();
-					case "q", "quit", "exit" -> running.set(false);
-					case "h", "help" -> printHelp();
-					case "" -> { /* ignore blank lines */ }
-					// Point at the single, role-aware source of truth ('h' -> printHelp) rather than repeating the
-					// command list here — a third copy would drift and would advertise owner commands to non-owners.
-					default ->
-							System.out.println("Unrecognized command '" + parts[0] + "' — press 'h' for the list of commands.");
-				}
-			}
-		} catch (IOException _) {
-			// stdin closed; fall through to shutdown
-		}
-	}
-
 	/// The unified `t` control. In full-duplex `t` just toggles the local mic (there is no floor). In a push-to-talk
 	/// channel it is STATE-DRIVEN: its meaning (and the message it sends) is derived from the latest
 	/// [ServerMessage.FloorStatus] snapshot via [#floorStateFor] / [#floorActionFor] — release when we hold it or are
 	/// queued, claim when it's our turn, grab-or-enqueue otherwise. The owner-mute guard and the full-duplex behaviour
 	/// are unchanged.
-	private void toggleTalk() {
+	void toggleTalk() {
 		if (currentChannel == null) {
 			// Connected but in no channel — a refused join leaves us here (see joinRefused). Refuse locally rather
 			// than open the mic and emit frames/floor requests the server would only drop as NOT_IN_CHANNEL.
@@ -1125,6 +1110,11 @@ public final class WalkieClient implements AutoCloseable {
 				live = false;
 			}
 			log(live ? "[talking]" : "[stopped]");
+			// Tell the view. Every OTHER state change reaches a front end through handleServerMessage's stateChanged,
+			// but this one is purely local: full duplex has no floor, so no message goes out and none comes back. A
+			// window that missed it kept reading "Mic OFF — click to talk" over an open microphone, and in a quiet
+			// duplex channel (where the only traffic is binary audio) nothing would have contradicted it for minutes.
+			ui.stateChanged();
 			return;
 		}
 		// Push-to-talk: read the floor snapshot ONCE (the listener thread may replace it under us), derive our
@@ -1158,35 +1148,72 @@ public final class WalkieClient implements AutoCloseable {
 		enqueue(floorActionFor(state));
 	}
 
+	/// Hands back a floor whose grant arrived AFTER the hold that asked for it ended.
+	///
+	/// [#toggleTalk] cannot serve here, and that is the whole reason this exists: on the snapshot a quick tap leaves
+	/// behind — floor still free, our request unanswered — it derives `IDLE` and would send a SECOND
+	/// [ClientMessage.RequestFloor], re-claiming the floor instead of giving it up. So this releases outright.
+	///
+	/// The browser answers the same race one layer up, in `grantOpensMic(mode, talkHeld)`: it declines to open the mic
+	/// at all and sends a release. This client opens it in the [ServerMessage.FloorGranted] handler before any front
+	/// end is consulted, so here the correction has to come after the fact. Either way the rule is the browser's —
+	/// a grant nobody is holding must not leave a microphone open.
+	void releaseHeldFloor() {
+		// Not in full duplex: there is no floor to hand back there, so an open mic is a deliberate switch and this
+		// would read to the user as a silent, unexplained mute.
+		if (currentMode == ChannelMode.FULL_DUPLEX || !audio.isTransmitting()) {
+			return;
+		}
+		audio.setTransmitting(false);   // stop first, as the LIVE branch of toggleTalk does — feedback before I/O
+		log("[stopped] the floor was granted after you let go — handed straight back");
+		enqueue(new ClientMessage.ReleaseFloor());
+	}
+
 	/// Flips the hi-fi (Opus music vs voice) profile live; [AudioEngine] rebuilds the encoder on its next
 	/// transmitted frame, so the change applies without reconnecting.
-	private void toggleFidelity() {
+	void toggleFidelity() {
 		boolean hifi = audio.toggleHiFi();
 		log("[hi-fi " + (hifi ? "on — music profile" : "off — voice profile") + "] (applies on the next transmitted frame)");
 	}
 
-	/// `m <ptt|global|duplex>` — mirrors the browser's mode selector. `ptt`/`duplex` change the CURRENT channel's
-	/// mode for everyone (owner-only; the server enforces it, and the echoed [ServerMessage.ModeChanged] is what
-	/// updates the controls). `global` is different: global-ptt lives only in the server-managed "global" room and
-	/// can't be set on a regular channel (the server rejects ChangeMode(GLOBAL_PTT) with INVALID_MODE), so — exactly
-	/// like the browser, whose "global" mode pick performs a Join to the global room rather than a mode change — it
-	/// SWITCHES you there. That's a room change open to anyone (the same as `c global global`), so it is handled
-	/// before the owner gate that guards real mode changes.
-	private void changeMode(String arg) {
-		String mode = arg.toLowerCase(Locale.ROOT);
-		if ("global".equals(mode)) {
-			switchTo("global", ChannelMode.GLOBAL_PTT, null);
+	// --- The INTENT surface: what a front end can ask this client to DO. -------------------------------------------
+	//
+	// Package-private rather than private, and typed rather than parsed. Each of these takes the value it acts on — a
+	// ChannelMode, a boolean, a full session id — never the console's spelling of it, because the console's grammar is
+	// the console's business: a window holds a ChannelMode from a dropdown and a session id from a roster selection,
+	// and making it render those back to "duplex" and "#a1b2" so this class can parse them again would be a round
+	// trip through a format neither side wants.
+	//
+	// The GUARDS stay here, on the intent, not with the parsing. "Only the owner may do this" and "full-duplex has no
+	// floor" are facts about the action, and a checkbox in a window needs telling them exactly as much as a typed
+	// command does. What moved out is only which WORD means which value, and what to say about a word that means none.
+	//
+	// One deliberate behaviour change fell out of that division: a NON-owner typing a mistyped `m bogus` now gets
+	// "Usage: m <ptt|global|duplex>" where it used to get "[denied] only the channel owner can change the mode",
+	// because the parse layer rejects a word it cannot map without first asking whether the action would have been
+	// allowed — which it could only do by duplicating the ownership rule this split exists to keep in one place. The
+	// mistyped word is also the more useful of the two things to be told.
+
+	/// Sets the channel's mode for everyone. Owner-only; the server enforces that too, and the echoed
+	/// [ServerMessage.ModeChanged] is what actually updates the controls.
+	///
+	/// [ChannelMode#GLOBAL_PTT] is the exception, and not really a mode change at all: global push-to-talk exists only
+	/// in the server-managed "global" room and cannot be set on a regular channel (the server refuses
+	/// `ChangeMode(GLOBAL_PTT)` with `INVALID_MODE`), so — exactly like the browser, whose "global" pick performs a
+	/// Join rather than a mode change — it SWITCHES you there. That is a room change open to anyone (the same as
+	/// `c global global`), which is why it is handled BEFORE the owner gate that guards real mode changes. Keeping
+	/// that order is also what makes the browser's Mode selector safe to leave enabled in global: it is the only way
+	/// out of a room with no owner to ask.
+	void setMode(ChannelMode mode) {
+		if (mode == ChannelMode.GLOBAL_PTT) {
+			switchTo(WalkieClientLauncher.GLOBAL_CHANNEL, ChannelMode.GLOBAL_PTT, null);
 			return;
 		}
 		if (!selfId.equals(ownerId)) {
 			log("[denied] only the channel owner can change the mode");
 			return;
 		}
-		switch (mode) {
-			case "ptt", "multi" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.MULTI_CHANNEL_PTT));
-			case "duplex", "full" -> enqueue(new ClientMessage.ChangeMode(ChannelMode.FULL_DUPLEX));
-			default -> System.out.println("Usage: m <ptt|global|duplex>");
-		}
+		enqueue(new ClientMessage.ChangeMode(mode));
 	}
 
 	/// `p [passphrase]` / `p! [passphrase]` — change the channel's end-to-end-encryption passphrase. For the OWNER
@@ -1200,7 +1227,7 @@ public final class WalkieClient implements AutoCloseable {
 	/// already-announced rotation ([#memberRekeyPending]), applied LOCALLY (no server round-trip) and verified
 	/// against the channel's announced key-check. To use a different passphrase otherwise, a non-owner switches
 	/// channels with `c`. (Mirrors the web client's owner-only passphrase field + "share with members" box.)
-	private void changePassphrase(String arg, boolean share) {
+	void changePassphrase(String arg, boolean share) {
 		String passphrase = arg.strip();
 		if (currentMode == ChannelMode.GLOBAL_PTT) {
 			log("[passphrase] the global room is the server's unencrypted broadcast channel — encryption isn't available there.");
@@ -1243,7 +1270,11 @@ public final class WalkieClient implements AutoCloseable {
 	/// the owner rotated or enabled the passphrase and we still hold the wrong key (or none). Only then may a
 	/// member set the CURRENT channel's passphrase (to adopt the announced one); otherwise changing it is the
 	/// owner's prerogative.
-	private boolean memberRekeyPending() {
+	///
+	/// Package-private rather than private because a FRONT END has to ask it too: the window's adaptive Apply button
+	/// is the only way a member can adopt an announced rotation, and gating that button on ownership alone would
+	/// strand exactly the person the log has just told to enter a new passphrase.
+	boolean memberRekeyPending() {
 		// Read each volatile ONCE into a local: the listener thread can null both fields (a disable rotation)
 		// concurrently with this console-thread call, so re-reading `crypto`/`currentChannelKeyCheck` between the
 		// null-check and the deref would risk an NPE on `crypto.keyCheck()` / `currentChannelKeyCheck.equals(...)`.
@@ -1339,61 +1370,31 @@ public final class WalkieClient implements AutoCloseable {
 		}
 	}
 
-	/// Switches to a different channel WITHOUT dropping the session: the server treats a fresh Join as
-	/// "leave the old channel, join the new one" on the same socket, so the session id (and the audio loops)
-	/// survive. Mode and passphrase are optional and default to the current ones. Usage: `c <channel> [mode] [key]`.
-	/// Splits `c` command arguments into `{channel, rest}`, honouring double quotes around the channel name.
-	///
-	/// Needed because channel names may now contain spaces, so `split` on whitespace could no longer tell where the
-	/// name ends. Only the CHANNEL is quotable, and the rest is deliberately left as ONE string for the caller to
-	/// split again: the trailing passphrase may itself contain spaces (`c room ptt correct horse battery staple`
-	/// worked before this change and has to keep working), so it must stay a remainder rather than become tokens.
-	///
-	/// An unterminated quote takes the rest of the line as the name — forgiving on purpose, since the usage line the
-	/// caller then prints is about the name the user actually typed rather than a complaint about quoting.
-	static String[] splitChannelArgs(String args) {
-		String trimmed = args.strip();
-		if (trimmed.startsWith("\"")) {
-			int close = trimmed.indexOf('\"', 1);
-			return close < 0
-					? new String[]{trimmed.substring(1), ""}
-					: new String[]{trimmed.substring(1, close), trimmed.substring(close + 1).strip()};
-		}
-		String[] head = trimmed.split("\\s+", 2);
-		return new String[]{head[0], head.length > 1 ? head[1] : ""};
-	}
-
-	private void switchChannel(String args) {
-		String[] split = splitChannelArgs(args);
-		String channel = canonicalChannelName(split[0]);   // the salt's form; see [#canonicalChannelName]
-		String[] parts = split[1].isEmpty() ? new String[0] : split[1].split("\\s+", 2);
-		ChannelMode mode = parts.length > 0 ? parseMode(parts[0], currentMode) : currentMode;
-		// Validate the name locally before the round-trip (like the `n` command and the browser client). Global
-		// forces the channel to "global" server-side, so the name only matters — and is only checked — otherwise.
-		if (mode != ChannelMode.GLOBAL_PTT && !CHANNEL_NAME.matcher(channel).matches()) {
-			System.out.println("Usage: c <channel> [ptt|global|duplex] [passphrase]  (channel = 1-64 letters, "
-					+ "digits or spaces in any language, plus _ or -; quote a name with spaces: c \"my room\" ptt secret)");
-			return;
-		}
-		// Every channel but the global room is end-to-end encrypted, so a switch has to bring a passphrase — either
-		// given here or carried over from the channel we are in. Without one the server refuses the join with
-		// PASSPHRASE_REQUIRED, so say so here, where it can name the argument to add. Reachable in practice by
-		// switching out of the global room (whose passphrase is empty) into a named one.
-		String passphrase = parts.length > 1 ? parts[1] : currentPassphrase;
-		if (mode != ChannelMode.GLOBAL_PTT && (passphrase == null || passphrase.isBlank())) {
-			System.out.println("Usage: c <channel> [ptt|global|duplex] <passphrase>  — '" + channel + "' needs an "
-					+ "encryption passphrase (every channel except the global room is encrypted).");
-			return;
-		}
-		switchTo(channel, mode, passphrase);
-	}
-
 	/// Re-derives the E2EE key for the new channel (the key salts on the channel name) and sends the Join; the
 	/// resulting Joined snapshot resets the roster/mode like the initial join. A switch is all-or-nothing server-side:
 	/// if it is refused — wrong passphrase, full, or parked for a locked channel's owner to approve — we KEEP the
 	/// channel we are in, and [#joinRefused] puts back the key this optimistically applied.
-	private void switchTo(String channel, ChannelMode mode, String passphrase) {
-		String effective = mode == ChannelMode.GLOBAL_PTT ? "global" : channel;
+	/// The passphrase the key in force was derived from, for a front end that has to answer "is what the user typed a
+	/// DIFFERENT passphrase?" — which is what the browser reads its own `state.passphrase` for. Without it, "the box
+	/// is not empty" gets mistaken for "the user asked for a rotation", and a passphrase seeded from `--key` offers to
+	/// re-key a channel to the value it already has.
+	///
+	/// Deliberately NOT on [ClientSnapshot]: that record is copied and handed to whatever draws it, and this is key
+	/// material. It lives in memory only — nothing here writes it anywhere.
+	String currentPassphrase() {
+		return currentPassphrase;
+	}
+
+	/// Switches channel KEEPING the passphrase we already hold — what omitting one means, and a decision that belongs
+	/// to the client rather than to whoever asked: a window leaving its passphrase box untouched means the same thing
+	/// a typed `c other-room` does. Distinct from passing `null` to the three-argument form, which means "no
+	/// passphrase at all" and is what [#setMode] uses for the unencrypted global room.
+	void switchTo(String channel, ChannelMode mode) {
+		switchTo(channel, mode, currentPassphrase);
+	}
+
+	void switchTo(String channel, ChannelMode mode, String passphrase) {
+		String effective = mode == ChannelMode.GLOBAL_PTT ? WalkieClientLauncher.GLOBAL_CHANNEL : channel;
 		if (effective.equals(currentChannel)) {
 			log("[switch] already in \"" + effective + "\" — use 'p <passphrase>' to change the passphrase here, or pick a different channel to switch.");
 			return;
@@ -1425,176 +1426,84 @@ public final class WalkieClient implements AutoCloseable {
 	/// Asks the server to change our display name. Validated locally for a fast no, but the server validates
 	/// authoritatively and the resulting [ServerMessage.MemberRenamed] (broadcast back to us) is what actually
 	/// updates the roster — so a rejected name surfaces as an `[error]` line instead.
-	private void rename(String requestedName) {
+	void rename(String requestedName) {
 		// The console hands over the rest of the line (`split("\\s+", 2)`), so a name with spaces arrives whole; the
 		// canonical form is what is compared and sent, matching the server byte for byte.
 		String newName = canonicalDisplayName(requestedName);
 		if (!DISPLAY_NAME.matcher(newName).matches()) {
-			System.out.println("Usage: n <new-name>  (1-32 letters, digits or spaces in any language, '_', '.' or '-')");
+			ui.note("Usage: n <new-name>  (1-32 letters, digits or spaces in any language, '_', '.' or '-')");
 			return;
 		}
 		if (newName.equals(memberNames.get(selfId))) {
-			System.out.println("[name] that is already your display name.");   // a no-op the server would reject anyway
+			ui.note("[name] that is already your display name.");   // a no-op the server would reject anyway
 			return;
 		}
 		enqueue(new ClientMessage.Rename(newName));
 	}
 
-	/// `o <id-prefix>` — hand channel ownership to another member, identified by the start of its session id (the
-	/// `#`-prefix shown next to each member in the roster; a leading `#` is optional). Gated locally to the owner
-	/// (the server enforces it too); the resulting [ServerMessage.OwnerChanged] is what actually moves the
-	/// owner-only controls.
-	private void transferOwnership(String arg) {
-		if (!selfId.equals(ownerId)) {
-			log("[denied] only the channel owner can transfer ownership");
-			return;
-		}
-		String prefix = arg.strip();
-		if (prefix.startsWith("#")) {
-			prefix = prefix.substring(1);
-		}
-		if (prefix.isBlank()) {
-			System.out.println("Usage: o <id-prefix>  (the #id shown next to a member in 'w')");
-			return;
-		}
-		List<String> matches = otherMembersMatching(prefix);
-		switch (matches.size()) {
-			case 0 -> log("[transfer] no other member's id starts with \"" + prefix + "\" — use 'w' to list members.");
-			case 1 -> {
-				String target = matches.getFirst();
-				enqueue(new ClientMessage.TransferOwnership(target));
-				log("[transfer] handing ownership to " + name(target) + "...");
-			}
-			default ->
-					log("[transfer] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
-		}
-	}
-
-	/// The other members (never ourself) whose session id starts with `needle` — the shared resolution for the
-	/// id-prefix targeting used by `o` (transfer ownership) and `mute`/`unmute`. Ourself is excluded because none
-	/// of those actions apply to it (you can't transfer to, or mute, yourself).
-	/// `requests` — the newcomers waiting to be admitted to this locked channel, in arrival order. The server sends
-	/// this list only to the owner, so for anyone else it is simply empty (rather than a permission error): being
-	/// unable to see who is knocking is not a failed command.
-	private void listJoinRequests() {
-		List<JoinRequestInfo> waiting = joinRequests;
-		if (waiting.isEmpty()) {
-			log(selfId.equals(ownerId)
-					? "[requests] nobody is waiting to join."
-					: "[requests] only the channel owner sees who is waiting to join.");
-			return;
-		}
-		log(waiting.stream()
-				.map(request -> request.displayName() + " (#" + shortId(request.id()) + ")")
-				.collect(Collectors.joining(
-						System.lineSeparator() + "  - ",
-						"[requests] " + waiting.size() + " waiting to join — 'admit <#id>' or 'deny <#id>':"
-								+ System.lineSeparator() + "  - ",
-						"")));
-	}
-
-	/// `admit <#id|all>` / `deny <#id|all>` — the owner's decision on a waiting newcomer, resolved from the `#id`
-	/// prefix shown by `requests` exactly the way `mute` resolves a member's.
-	///
-	/// Admitting does not add the member here: the server records a one-shot approval and the newcomer's own client
-	/// completes the join, so nothing happens on this side until that lands as a MemberJoined.
-	private void resolveJoinRequest(String arg, boolean admit) {
-		String verb = admit ? "admit" : "deny";
-		if (!selfId.equals(ownerId)) {
-			log("[denied] only the channel owner can " + verb + " newcomers");
-			return;
-		}
-		String prefix = arg.strip();
-		if (prefix.equalsIgnoreCase("all")) {
-			enqueue(new ClientMessage.ResolveAllJoinRequests(admit));
-			log("[" + verb + "] " + verb + "-ing everyone waiting...");
-			return;
-		}
-		if (prefix.startsWith("#")) {
-			prefix = prefix.substring(1);
-		}
-		if (prefix.isBlank()) {
-			System.out.println("Usage: " + verb + " <#id|all>  (the #id shown by 'requests', or 'all')");
-			return;
-		}
-		String needle = prefix;
-		List<JoinRequestInfo> matches = joinRequests.stream()
-				.filter(request -> request.id().startsWith(needle))
-				.toList();
-		switch (matches.size()) {
-			case 0 -> log("[" + verb + "] nobody waiting has an id starting with \"" + needle
-					+ "\" — use 'requests' to list them.");
-			case 1 -> {
-				JoinRequestInfo target = matches.getFirst();
-				enqueue(new ClientMessage.ResolveJoinRequest(target.id(), admit));
-				log("[" + verb + "] " + verb + "-ing " + target.displayName() + " (#" + shortId(target.id()) + ")...");
-			}
-			default -> log("[" + verb + "] \"" + needle + "\" matches " + matches.size()
-					+ " waiting newcomers — use more of the id.");
-		}
-	}
-
 	/// `cancel` — stop waiting to be admitted somewhere. Harmless when we are not waiting: the server treats it as a
 	/// no-op, and saying so locally is friendlier than a silent nothing.
-	private void cancelJoinRequest() {
+	void cancelJoinRequest() {
 		enqueue(new ClientMessage.WithdrawJoinRequest());
 		log("[cancel] withdrawing any request to join a locked channel.");
 	}
 
 	/// The short `#id` prefix both clients show beside a name, so two people sharing a display name stay tellable
 	/// apart. Shared by the roster and the waiting list.
-	private static String shortId(String id) {
+	static String shortId(String id) {
 		return id.substring(0, Math.min(ID_PREFIX_LENGTH, id.length()));
 	}
 
-	private List<String> otherMembersMatching(String needle) {
-		return memberNames.keySet().stream()
-				.filter(id -> !id.equals(selfId) && id.startsWith(needle))
-				.toList();
+	/// Admits or denies ONE newcomer waiting at this locked channel's door, named by its full session id — the id a
+	/// request row already holds. `displayName` is passed in rather than looked up because a waiting newcomer is NOT a
+	/// member, so it is not in the roster: its name is only ever known from the request list itself.
+	void resolveJoinRequestFor(String requesterId, String displayName, boolean admit) {
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can " + (admit ? "admit" : "deny") + " newcomers");
+			return;
+		}
+		enqueue(new ClientMessage.ResolveJoinRequest(requesterId, admit));
+		log("[" + (admit ? "admit" : "deny") + "] " + (admit ? "admit" : "deny") + "-ing "
+				+ displayName + " (#" + shortId(requesterId) + ")...");
 	}
 
-	/// `mute <#id|all>` / `unmute <#id|all>` — owner-only moderation. `all` mutes (or unmutes) every OTHER member at
-	/// once; otherwise the target is identified by the start of its session id (the `#`-prefix shown in 'w', a
-	/// leading `#` optional). Gated locally to the owner (the server enforces it too, and never trusts the client);
-	/// the resulting [ServerMessage.MuteStatus] broadcast is what actually updates the roster and stops a muted
-	/// member's mic. Applies immediately — there is no staged apply for moderation.
-	private void muteMember(String arg, boolean muted) {
-		String verb = muted ? "mute" : "unmute";
+	/// Admits or denies everyone waiting, in one message.
+	void resolveAllJoinRequests(boolean admit) {
 		if (!selfId.equals(ownerId)) {
-			log("[denied] only the channel owner can " + verb + " members");
+			log("[denied] only the channel owner can " + (admit ? "admit" : "deny") + " newcomers");
 			return;
 		}
-		String prefix = arg.strip();
-		if (prefix.equalsIgnoreCase("all")) {
-			enqueue(new ClientMessage.MuteAll(muted));
-			log("[" + verb + "] " + verb + "-ing all other members...");
+		enqueue(new ClientMessage.ResolveAllJoinRequests(admit));
+		log("[" + (admit ? "admit" : "deny") + "] " + (admit ? "admit" : "deny") + "-ing everyone waiting...");
+	}
+
+	/// Mutes or unmutes ONE member, named by its full session id — the id a roster selection already holds, which is
+	/// why the `#prefix` matching above is console grammar and stops here. Owner-only; the server enforces the same
+	/// rule, so this refusal is courtesy rather than the boundary.
+	void setMemberMuted(String memberId, boolean muted) {
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can " + (muted ? "mute" : "unmute") + " members");
 			return;
 		}
-		if (prefix.startsWith("#")) {
-			prefix = prefix.substring(1);
-		}
-		if (prefix.isBlank()) {
-			System.out.println("Usage: " + verb + " <#id|all>  (the #id shown next to a member in 'w', or 'all')");
+		enqueue(new ClientMessage.MuteMember(memberId, muted));
+		log("[" + (muted ? "mute" : "unmute") + "] " + (muted ? "mute" : "unmute") + "-ing " + name(memberId) + "...");
+	}
+
+	/// Mutes or unmutes every member except us, in one message. A one-shot over who is PRESENT — the standing rule for
+	/// arrivals is [#setMuteNewMembers].
+	void setAllMuted(boolean muted) {
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can " + (muted ? "mute" : "unmute") + " members");
 			return;
 		}
-		List<String> matches = otherMembersMatching(prefix);
-		switch (matches.size()) {
-			case 0 ->
-					log("[" + verb + "] no other member's id starts with \"" + prefix + "\" — use 'w' to list members.");
-			case 1 -> {
-				String target = matches.getFirst();
-				enqueue(new ClientMessage.MuteMember(target, muted));
-				log("[" + verb + "] " + verb + "-ing " + name(target) + "...");
-			}
-			default ->
-					log("[" + verb + "] \"" + prefix + "\" matches " + matches.size() + " members — use more of the id.");
-		}
+		enqueue(new ClientMessage.MuteAll(muted));
+		log("[" + (muted ? "mute" : "unmute") + "] " + (muted ? "mute" : "unmute") + "-ing all other members...");
 	}
 
 	/// `lock` / `unlock` — owner-only: stop / allow NEW members joining this channel. Gated locally to the owner
 	/// (the server enforces it too and never trusts the client); the resulting [ServerMessage.ChannelLocked] is what
 	/// actually flips everyone's state. Existing members are never affected.
-	private void setChannelLock(boolean locked) {
+	void setChannelLock(boolean locked) {
 		if (!selfId.equals(ownerId)) {
 			log("[denied] only the channel owner can " + (locked ? "lock" : "unlock") + " the channel");
 			return;
@@ -1603,13 +1512,21 @@ public final class WalkieClient implements AutoCloseable {
 		log("[" + (locked ? "lock" : "unlock") + "] requesting to " + (locked ? "lock" : "unlock") + " the channel...");
 	}
 
-	/// `queue on` / `queue off` — owner-only: turn this channel's push-to-talk floor queue on or off. When on, a
-	/// member that requests a busy floor joins a FIFO line (and is offered the floor in turn) rather than being
-	/// refused; when off, the server clears any waiting queue. Full-duplex has no floor, so it's rejected locally.
-	/// Otherwise gated locally to the owner — the server also enforces `NOT_OWNER` (and refuses the sentinel-owned
-	/// `global` room and full-duplex) — and the echoed [ServerMessage.FloorQueueChanged] is what actually flips
-	/// everyone's state. Mirrors `lock`/`unlock`.
-	private void setFloorQueue(String arg) {
+	/// Hands the channel to another member, named by its full session id. Owner-only. The server validates that the
+	/// target is a current member (`UNKNOWN_TARGET`), so this does not re-check the roster it was given.
+	void transferOwnershipTo(String memberId) {
+		if (!selfId.equals(ownerId)) {
+			log("[denied] only the channel owner can transfer ownership");
+			return;
+		}
+		enqueue(new ClientMessage.TransferOwnership(memberId));
+		log("[transfer] handing ownership to " + name(memberId) + "...");
+	}
+
+	/// Turns the owner-toggleable push-to-talk floor queue on or off. Both guards belong here rather than to a caller:
+	/// full-duplex has no floor to queue for, and only the owner may toggle it — a checkbox in a window needs telling
+	/// the same two things a typed command does.
+	void setFloorQueue(boolean enabled) {
 		if (currentMode == ChannelMode.FULL_DUPLEX) {
 			log("[queue] full-duplex has no floor, so there's no queue to toggle.");
 			return;
@@ -1618,40 +1535,21 @@ public final class WalkieClient implements AutoCloseable {
 			log("[denied] only the channel owner can turn the floor queue on or off");
 			return;
 		}
-		switch (arg.strip().toLowerCase(Locale.ROOT)) {
-			case "on" -> {
-				enqueue(new ClientMessage.SetFloorQueue(true));
-				log("[queue] requesting to turn the floor queue on...");
-			}
-			case "off" -> {
-				enqueue(new ClientMessage.SetFloorQueue(false));
-				log("[queue] requesting to turn the floor queue off...");
-			}
-			default -> System.out.println("Usage: queue <on|off>");
-		}
+		enqueue(new ClientMessage.SetFloorQueue(enabled));
+		log("[queue] requesting to turn the floor queue " + (enabled ? "on" : "off") + "...");
 	}
 
-	/// `entry <on|off>` — owner-only: mute every member that JOINS from now on. The standing counterpart to
-	/// `mute all`, which is a one-shot over the members present, so an owner quieting a room and keeping it quiet
-	/// uses both; this one deliberately changes nobody who is already here. Gated locally to the owner (the server
-	/// enforces it too, and never trusts the client). No mode restriction: full-duplex has no floor, but that is
-	/// where mute matters most, since every mic is open.
-	private void setMuteNewMembers(String arg) {
+	/// Arms or disarms the standing "mute every arrival" rule. Owner-only. Changes nobody already present — that is
+	/// the server's rule, not this client's, and the one-shot over present members is [#setAllMuted].
+	void setMuteNewMembers(boolean enabled) {
 		if (!selfId.equals(ownerId)) {
 			log("[denied] only the channel owner can change who is muted on entry");
 			return;
 		}
-		switch (arg.strip().toLowerCase(Locale.ROOT)) {
-			case "on" -> {
-				enqueue(new ClientMessage.SetMuteNewMembers(true));
-				log("[entry] requesting to mute new members on entry...");
-			}
-			case "off" -> {
-				enqueue(new ClientMessage.SetMuteNewMembers(false));
-				log("[entry] requesting to stop muting new members on entry...");
-			}
-			default -> System.out.println("Usage: entry <on|off>");
-		}
+		enqueue(new ClientMessage.SetMuteNewMembers(enabled));
+		log(enabled
+				? "[entry] requesting to mute new members on entry..."
+				: "[entry] requesting to stop muting new members on entry...");
 	}
 
 	private WebSocket connect(String token) {
@@ -1660,7 +1558,9 @@ public final class WalkieClient implements AutoCloseable {
 		// single-instance. Global forces the routing key to "global", matching the Join's effective channel. Reads
 		// the connect target (not options) so a reconnect routes to the channel we switched to, not the startup one.
 		ConnectTarget target = connectTarget;   // read the pair once — channel + mode consistent
-		String routingChannel = target.mode() == ChannelMode.GLOBAL_PTT ? "global" : target.channel();
+		String routingChannel = target.mode() == ChannelMode.GLOBAL_PTT
+				? WalkieClientLauncher.GLOBAL_CHANNEL
+				: target.channel();
 		return httpClient.newWebSocketBuilder()
 				.buildAsync(
 						URI.create(options.server().replaceFirst("^http", "ws") + "/ws/audio"
@@ -1719,7 +1619,7 @@ public final class WalkieClient implements AutoCloseable {
 			httpClient.shutdownNow();
 			Thread.currentThread().interrupt();
 		}
-		System.out.println("Goodbye.");
+		ui.note("Goodbye.");
 	}
 
 	/// Rebuilds the relay socket against the current connect target and re-joins it. Triggered by
@@ -1757,11 +1657,17 @@ public final class WalkieClient implements AutoCloseable {
 	}
 
 	/// Ends the session with a CLEAN WebSocket close — a `NORMAL_CLOSURE` frame the server sees, instead of the
-	/// abrupt EOF an immediate `System.exit` leaves — then stops the process. Used by the fatal join rejections
-	/// (wrong passphrase, locked or full channel) and by a lost connection: the console loop is parked in a
-	/// non-interruptible `System.in` read and can't observe a flag, so stopping the process is the only way out.
-	/// The close runs on its OWN virtual thread, NOT the WebSocket listener callback thread these paths fire on
-	/// (whose executor [#close]'s bounded HttpClient shutdown must drain to flush the frame). Fires exactly once.
+	/// abrupt EOF an immediate `System.exit` leaves — and then hands over to the front end.
+	///
+	/// Used by a lost connection. The close runs on its OWN virtual thread, NOT the WebSocket listener callback
+	/// thread this path fires on (whose executor [#close]'s bounded HttpClient shutdown must drain to flush the
+	/// frame). Fires exactly once.
+	///
+	/// What happens NEXT is deliberately not decided here. This used to call `System.exit(0)`, which is a terminal
+	/// application's prerogative and no business of the client's: the console has nothing left to do once its
+	/// non-interruptible `System.in` read can no longer be satisfied, so stopping the process IS its answer — but a
+	/// window's answer is to show that the session ended and stay open. So the client reports and defers, and
+	/// [WalkieUi#sessionEnded] is where each front end says what that means for it.
 	private void exitGracefully(String reason) {
 		if (!running.getAndSet(false)) {
 			return;
@@ -1769,7 +1675,7 @@ public final class WalkieClient implements AutoCloseable {
 		log(reason);
 		Thread.ofVirtual().name("ptt-shutdown").start(() -> {
 			close();   // sends NORMAL_CLOSURE, then the bounded HttpClient shutdown flushes it before we halt
-			System.exit(0);
+			ui.sessionEnded();
 		});
 	}
 

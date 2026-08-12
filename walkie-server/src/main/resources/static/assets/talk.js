@@ -12,8 +12,10 @@
 // WalkieClient.floorStateFor / floorActionFor / shouldAutoOpenMic, pinned by WalkieClientTest — and the FLOOR_*
 // values are that client's FloorState enum names, so the two must stay in lock-step. They take the same positional
 // arguments as their Java counterparts for that reason; talkDecision takes a snapshot object instead only because
-// it reads a dozen fields. The hold-vs-tap axis in talkDecision is genuinely browser-only: the Java console
-// client's `t` is a single keystroke with no press/release edge to distinguish.
+// it reads a dozen fields. The hold-vs-tap axis in talkDecision was browser-only while the only Java front end was a
+// console, whose `t` is a single keystroke with no press/release edge — but SwingUi gave the Java client a real hold
+// gesture, so `grantOpensMic` now has a counterpart to stay in lock-step with: SwingUi.grantOutlivedHold, which ends a
+// grant that outlived its hold. Introducing the axis there WITHOUT that guard is what left a microphone open.
 
 export const FLOOR_LIVE = 'LIVE';       // we hold the floor and are transmitting
 export const FLOOR_MY_TURN = 'MY_TURN'; // reserved for us: the floor is free and we are the queue head — claim it

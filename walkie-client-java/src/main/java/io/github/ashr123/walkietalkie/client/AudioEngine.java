@@ -43,7 +43,12 @@ final class AudioEngine implements AutoCloseable {
 			"aggregate", "multi-output", "teams audio", "krisp", "ndi", "obs virtual", "background music");
 
 	private final ClientOptions options;
-	private final Consumer<byte[]> frameSink;            // captured [tag][opus] frames -> caller (encrypt + send)
+	private final Consumer<byte[]> frameSink;
+	/// Where the device-selection messages go — [WalkieUi#note], passed as a plain `Consumer` rather than the whole
+	/// port because that is all this class has to say, mirroring how `frameSink` takes only the callback it needs.
+	/// Without it these four lines would be the one part of the client still writing to `System.out` directly, which a
+	/// window would silently lose.
+	private final Consumer<String> notes;            // captured [tag][opus] frames -> caller (encrypt + send)
 	// get/set only (a stop flag and two toggles) — visibility is all that's needed, so a volatile boolean suffices.
 	private volatile boolean running = true;
 	private final AtomicBoolean closed = new AtomicBoolean();   // guards close() so it is idempotent (atomic test-and-set)
@@ -63,7 +68,8 @@ final class AudioEngine implements AutoCloseable {
 	private TargetDataLine mic;
 	private SourceDataLine speaker;
 
-	AudioEngine(ClientOptions options, Consumer<byte[]> frameSink) {
+	AudioEngine(ClientOptions options, Consumer<byte[]> frameSink, Consumer<String> notes) {
+		this.notes = notes;
 		this.options = options;
 		this.frameSink = frameSink;
 		this.highFidelity = options.highFidelity();
@@ -184,7 +190,7 @@ final class AudioEngine implements AutoCloseable {
 				continue;   // not a capture device
 			}
 			if (wantSpecific && info.getName().toLowerCase(Locale.ROOT).contains(wanted.toLowerCase(Locale.ROOT))) {
-				System.out.println("Capturing from input device: " + info.getName() + " (matched --input \"" + wanted + "\")");
+				notes.accept("Capturing from input device: " + info.getName() + " (matched --input \"" + wanted + "\")");
 				return info;
 			}
 			if (!isVirtualDevice(info.getName())) {
@@ -197,15 +203,15 @@ final class AudioEngine implements AutoCloseable {
 			}
 		}
 		if (wantSpecific) {
-			System.out.println("No input device matching '" + wanted + "'; auto-selecting a real mic instead.");
+			notes.accept("No input device matching '" + wanted + "'; auto-selecting a real mic instead.");
 		}
 		Mixer.Info auto = firstReal48k != null ? firstReal48k : firstRealAny;
 		if (auto != null) {
-			System.out.println("Capturing from input device: " + auto.getName()
+			notes.accept("Capturing from input device: " + auto.getName()
 					+ " (auto-selected, skipping virtual devices — pass --input to override; --help lists all devices)");
 			return auto;
 		}
-		System.out.println("No real capture device identified; using the system default (may be silent — --help lists all devices).");
+		notes.accept("No real capture device identified; using the system default (may be silent — --help lists all devices).");
 		return null;
 	}
 

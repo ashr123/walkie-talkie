@@ -27,6 +27,19 @@ application {
     mainClass.set("io.github.ashr123.walkietalkie.client.WalkieClientLauncher")
 }
 
+// The desktop window wears the SAME icon as the browser client, taken from the browser client's own asset rather
+// than copied into this module. One file, so the two faces of the same product cannot drift apart — the argument this
+// build makes everywhere else, applied to a picture.
+//
+// `apple-touch-icon.png` and not `favicon.svg`/`favicon.ico`: ImageIO reads PNG out of the box and neither of the
+// others (SVG would mean Batik, a whole rendering dependency for one 1.6 KB image). At 180x180 it is already the size
+// a macOS dock icon wants.
+tasks.processResources {
+	from(rootProject.layout.projectDirectory.file("walkie-server/src/main/resources/static/apple-touch-icon.png")) {
+		rename { "walkie-icon.png" }
+	}
+}
+
 val fatJar = tasks.register<Jar>("fatJar") {
     group = "build"
     description = "Builds an executable fat jar for the Java desktop client."

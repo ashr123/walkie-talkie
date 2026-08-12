@@ -279,30 +279,4 @@ class WalkieClientTest {
 						() -> "should stay invalid: " + name));
 	}
 
-	@Test
-	void theChannelCommandQuotesANameWithSpaces() {
-		// `c <channel> [mode] [passphrase]` used to split on whitespace, which stopped working once a name could
-		// contain one. Only the CHANNEL is quotable; the rest stays a single remainder because the passphrase may
-		// itself contain spaces.
-		assertArrayEquals(new String[]{"my room", "ptt secret"}, WalkieClient.splitChannelArgs("\"my room\" ptt secret"));
-		assertArrayEquals(new String[]{"team-1", "ptt secret"}, WalkieClient.splitChannelArgs("team-1 ptt secret"));
-		assertArrayEquals(new String[]{"team-1", ""}, WalkieClient.splitChannelArgs("  team-1  "));
-		assertArrayEquals(new String[]{"my room", ""}, WalkieClient.splitChannelArgs("\"my room\""));
-	}
-
-	@Test
-	void aPassphraseWithSpacesStillSurvivesTheChannelCommand() {
-		// The behaviour that must NOT regress: the trailing passphrase was always the remainder of the line, so a
-		// four-word passphrase worked. Splitting the whole line into tokens would have broken it silently.
-		String[] split = WalkieClient.splitChannelArgs("\"my room\" ptt correct horse battery staple");
-		assertEquals("my room", split[0]);
-		String[] rest = split[1].split("\\s+", 2);
-		assertEquals("ptt", rest[0]);
-		assertEquals("correct horse battery staple", rest[1]);
-	}
-
-	@Test
-	void anUnterminatedQuoteTakesTheRestOfTheLineAsTheName() {
-		assertArrayEquals(new String[]{"my room ptt", ""}, WalkieClient.splitChannelArgs("\"my room ptt"));
-	}
 }

@@ -58,13 +58,44 @@ Java task defaulted to 26, tripping the inconsistent-target warning).
 compile with, and `buildSrc/build.gradle.kts` pins that one compiler to Java 25). Both classes are in the **default
 package** on purpose: a class in a named package cannot import one from the default package, so giving the plugin a
 package would cut it off from this task type. It
-fails on a `///` Javadoc reference naming a type or member that doesn't exist (`[SomeType]`, `[Type#member]`,
-`[#member]`). The compiler treats those links as plain text, so a rename — or documenting something before writing
-it — otherwise leaves a silently broken reference. Each module scans its own sources while the type index spans the
+fails on a `///` Javadoc reference that **cannot be followed** (`[SomeType]`, `[Type#member]`, `[#member]`) — either
+because the type or member doesn't exist, or because it exists and is `private` to a different file. The compiler
+treats those links as plain text, so a rename — or documenting something before writing it — otherwise leaves a
+silently broken reference. Each module scans its own sources while the type index spans the
 whole build (references cross modules routinely). It is deliberately conservative: Markdown links, bracketed prose
 (`[tag][payload]`), `java.lang`, imported and fully-qualified third-party types are all skipped, as is a bare
 simple name in a file with a wildcard import — but NOT an `Outer.Nested` whose outer half is one of ours, since a
-wildcard import can't explain that away. Report: `<module>/build/reports/javadoc-references.txt`.
+wildcard import can't explain that away.
+
+**A `[#member]` resolves against UNQUALIFIED occurrences only**, and that qualifier is load-bearing. The patterns
+used to accept any identifier followed by `(`, so `client.setMode(...)` made `[#setMode]` resolve in a file that had
+merely CALLED it on something else — precisely the state a refactor leaves behind when it moves a member out and
+leaves the call sites. Measured: five such references survived the console front end moving out of `WalkieClient`
+into `ConsoleUi`, this task reported **0 problems**, and an IDE caught them. A lookbehind for `.` fixed it with no
+false positives anywhere in the build, and the fix is itself checked by breaking a reference on purpose and watching
+the task fail. Note the limit that remains: this is a text scan, not a parser, so a member DECLARED in a form the
+patterns miss would still resolve by being mentioned nearby — the check buys "you renamed something and forgot the
+prose", not full symbol resolution. Report: `<module>/build/reports/javadoc-references.txt`.
+
+**Existing is not the same as reachable**, which is the second thing this task had to learn. `[ConsoleUi#listMembers]`
+and `[ConsoleUi#switchChannel]` both name members that genuinely exist — and both are `private` to `ConsoleUi`, so
+Javadoc cannot link to them from `WalkieClient`. Existence-only checking passed those builds; an IDE rejected them.
+The question a link poses is not "is this member in that file" but "does it resolve for a reader who is OUTSIDE that
+file", so the index now records, per file, the names whose EVERY declaration is `private`, and a cross-file
+`[Type#member]` naming one fails. A link inside the member's own file still resolves, and a name with any
+non-private declaration (an overload, a same-named accessor) counts as reachable — the check would rather miss a
+private overload than fail a build over a working link.
+
+**The fix for such a link is prose, not a wider member.** Both were rewritten to `[ConsoleUi]`'s `listMembers` —
+the link points at the class, which is reachable, and the member is named in backticks. Widening two console
+internals so a doc comment could link to them would have leaked encapsulation for a caller that does not exist;
+documentation does not get to drive visibility.
+
+Neither this nor the check above covers **the reverse leak**: a `public` member whose signature mentions a
+package-private type (`public WalkieClient(ClientOptions, WalkieUi)` exposed the package-private `WalkieUi`). `javac`
+is silent; an IDE flags it. The constructor became package-private — the launcher and the window that call it are
+both in this package, so nothing outside it constructs a client. A codebase-wide sweep for both shapes found no
+other instance.
 
 **A channel is SINGLE-transport, and the channel — not the socket — is where that lives.** `Transport`
 (`shared/protocol/Transport.java`) rides on the wire now, and `Channel.transport` is the one authority: every
@@ -610,6 +641,213 @@ yet done: the `global` room hashes to one instance (doesn't scale); a single ove
 shared backplane.
 See README "Known constraints".
 
+**The Java client's console is now ONE implementation of a port, not the client's only face.** Everything a person
+sees goes through `WalkieUi` — `status` (the timestamped session log), `note` (banners, help, `Usage:` replies),
+`attention` ("your turn", the terminal BEL) and `stateChanged`. There are TWO implementations: `ConsoleUi` and the
+`SwingUi` window described below — which is what the port was extracted for, and what turned `stateChanged` from a
+signal nobody used into the one the window redraws from.
+`WalkieClient` names no stream at all; `AudioEngine` takes a `Consumer<String>` for its four device messages, which
+were otherwise the one part of the client still writing to `System.out` and would have been silently lost by a window.
+
+`log()` survives as a one-line forwarder to `status`, deliberately: 97 call sites read better for the short local
+name, and keeping it meant the ~940 lines of protocol and gate logic were not retyped to extract the port.
+
+**A view renders from `ClientSnapshot`, not from log text.** That division is the point of the port having a
+`stateChanged` with no payload. A single `println(String)` sink would have been a smaller change and a dead end —
+the parameters are already interpolated into prose by the time a line is emitted, so a window would have had to
+re-parse its own output to draw a roster. The record is a COPY (the roster is the client's live
+`ConcurrentHashMap`), pinned by `ClientSnapshotTest`; `listMembers` was moved onto it so the model has a real
+consumer from the start rather than being unused scaffolding, which also collapsed six separate volatile reads in
+that method into one.
+
+**`runConsole()` exists because construction used to BE the session.** `consoleLoop()` was the last statement of the
+constructor, so `new WalkieClient(…)` did not return until the user typed `q` — which is why the launcher had a
+try-with-resources with an empty body and a `//noinspection EmptyTryBlock`. Nothing that drives the client from its
+own event loop could exist while that was true. Construction and running are now separate acts, and the suppression
+is gone.
+
+**The INBOUND half is typed, and the console's grammar is not part of it.** Each command splits in two: a parse
+layer that decides which WORD means which value (and prints `Usage: …` for a word that means none), and a
+package-private INTENT the client owns — `setMode(ChannelMode)`, `setFloorQueue(boolean)`,
+`setMuteNewMembers(boolean)`, `setMemberMuted(String memberId, boolean)`, `setAllMuted(boolean)`,
+`transferOwnershipTo(String memberId)`, `resolveJoinRequestFor(...)`, `resolveAllJoinRequests(boolean)`, plus the
+seven that were already typed and only needed widening (`toggleTalk`, `setChannelLock`, `rename`, `toggleFidelity`,
+`cancelJoinRequest`, `switchTo`, `changePassphrase`). A window holds a `ChannelMode` from a dropdown and a full
+session id from a roster selection; making it render those back to `"duplex"` and `"#a1b2"` for us to parse again
+would be a round trip through a format neither side wants. The `#id-prefix` matching (strip the `#`, match against
+the roster, handle none/one/many) is therefore console grammar and stops at the parse layer.
+
+**The guards stay on the INTENT, not with the parsing.** "Only the owner may do this" and "full-duplex has no floor
+to queue for" are facts about the action — a checkbox needs telling them exactly as much as a typed command does.
+Verified with a second client joining as a plain member: every owner-gated intent still refuses with its own
+`[denied]` line.
+
+One deliberate behaviour change fell out of the division, measured rather than assumed: a NON-owner typing a
+mistyped `m bogus` now gets `Usage: m <ptt|global|duplex>` where it used to get `[denied] only the channel owner can
+change the mode`. The parse layer rejects a word it cannot map without first asking whether the action would have
+been permitted — it could only do that by duplicating the ownership rule this split exists to keep in one place —
+and the mistyped word is the more useful of the two things to be told. Everything else is byte-identical: the
+all-commands trace (every command plus every usage message, 104 lines) is unchanged.
+
+`listMembers` / `listJoinRequests` / `printHelp` are deliberately NOT in the intent surface. They are console VIEWS,
+rendering to the log; a window renders the same facts from `ClientSnapshot` instead.
+
+**Ending the session is the front end's decision, not the client's.** `exitGracefully` used to call
+`System.exit(0)`; stopping the PROCESS is a terminal application's prerogative and no business of the client's. It
+now closes cleanly (a `NORMAL_CLOSURE` frame, on its own virtual thread — not the WebSocket listener callback whose
+executor the bounded HttpClient shutdown must drain) and then calls [WalkieUi#sessionEnded]. `ConsoleUi` answers with
+`System.exit(0)`, which is the honest answer for a terminal: its reader is parked in a `System.in` read that cannot
+be interrupted and will never be satisfied again, so there is nothing to return to. A window's answer is to show that
+the call ended and stay open.
+
+Verified by killing the server under a connected client — and the first attempt at that test was worthless: with
+stdin on `/dev/null` the console hit EOF and quit normally, never reaching the path at all. Held open with a sleeping
+writer so the reader genuinely parks, the client reports `Server connection lost — exiting.`, closes, and exits.
+
+The bar for the whole extraction was measurement, not assertion. A scripted session driving EVERY command and every
+`Usage:` message (39 inputs, 104 lines) was captured before and after with timestamps and session ids normalised, and
+the traces are byte-identical apart from the one documented non-owner difference above. The harness was validated
+first by running it twice against unchanged code — and it needed fixing before it was worth anything, because piping
+the script straight in drained every command before the join round-trip landed, which reordered the output.
+
+**`ConsoleUi` is now the whole terminal front end**, not just its output half: the `System.in` command loop, the
+grammar (which word means which value, which `#id` prefix names which member), the `c` quoting rules, and the `w` /
+`requests` views all live there — 362 lines left `WalkieClient`, which went from 2064 to ~1700. It holds the client
+in a field rather than a constructor argument, because construction runs the other way (the client takes a
+`WalkieUi`), and `run(client)` closes the loop. The launcher builds the front end, hands it to the client, then calls
+`run`.
+
+Three things did NOT move, each for a reason:
+- **The help text and `modeHint` stayed.** They are terminal prose, but the CLIENT invokes them — the welcome help is
+  printed from the first `Joined` handler, because only there is our role known, and the hint is concatenated INTO a
+  status line by the mode-change handler. Moving them needs new `WalkieUi` hooks for "you joined" and "the mode
+  changed", invented with no second front end to check them against. `ConsoleUi` calls `client.printHelp()` for `h`.
+- **The console keeps its own owner predicate** (`ownedByUs()`, the same thing the browser front end calls
+  `ownsChannel()`). Every intent re-checks ownership and the server checks again, so this is not the authority — it
+  exists so the grammar layer can refuse EARLY. Without it a non-owner typing `mute #ab` would have `#ab` matched
+  against a roster it may not act on and be told "no other member's id starts with…" instead of that it may not mute.
+- **`q` no longer touches the client's `running` flag.** The loop owns a `quitRequested` boolean: "the user typed q"
+  is a front-end fact, and the client learns of it when the launcher closes it. Sharing the flag never bought
+  anything either — the loop is parked in a `System.in` read that cannot be interrupted, so a flag another thread
+  flipped could not have unparked it.
+
+`splitChannelArgs` and its three tests moved with the grammar into `ConsoleUiTest`, where they always belonged.
+`checkJavadocReferences` caught four broken references from the move — two in `WalkieClient` naming members that had
+left (`[#switchChannel]`, `[#listMembers]`) and two that the mechanical `client.` rewrite had mangled INSIDE doc
+comments (`[#client.setFloorQueue(boolean)]`). That is the check paying for itself: none of the four would have
+failed a compile. Worth recording honestly, though, that the first two were then repointed at `ConsoleUi` — where
+they are private — and the check passed them a second time; see the reachability note above for what that cost.
+
+**There is a second front end: `SwingUi`, behind `--gui`.** The window is what the port was extracted for, and it
+adds the one thing a console physically cannot — **hold-to-talk**. The press/release edges come from the button's
+`ButtonModel`, NOT from a `MouseListener`: a mouse listener never sees the SPACE key, so the first version depressed
+the button visibly and did nothing at all when Space was held. Swing activates a focused button through its model, so
+watching `isPressed` catches mouse, Space and Enter with one listener. The console's `t` is a single keystroke with no
+edges at all.
+
+**A hold has an up-edge, and three things can swallow it** — each of which left the microphone open with nobody
+holding anything, which for this application is the worst failure it has:
+- **The grant can outlive the hold.** A press and its release both complete inside one round trip, so `releaseTalk`
+  finds `transmitting()` still false, has no floor to hand back, and sends nothing — then the grant arrives and opens
+  the mic with `held` already cleared. `grantOutlivedHold` (static, tested) detects it where the grant LANDS, in
+  `refresh`, and calls the client's `releaseHeldFloor`. That intent exists because `toggleTalk` could NOT serve: on the
+  snapshot a quick tap leaves behind it derives `IDLE` and would send a second `RequestFloor`, re-claiming the floor
+  instead of giving it up. This is the browser's `grantOpensMic(mode, talkHeld)` rule, one layer later — Java opens the
+  mic in the `FloorGranted` handler before any front end is consulted, so the correction has to come after the fact.
+- **Focus can leave mid-hold.** The Space binding is `WHEN_IN_FOCUSED_WINDOW`, so Cmd-Tab or a click into another
+  application delivers the `KEY_RELEASED` elsewhere and the release action cannot fire. `windowDeactivated` clears the
+  button model, which routes through the same edge listener; the browser answers this with a `blur` handler.
+- **The window can close mid-connect.** `awaitClose` used to read the `client` field once and find the null it held
+  before the attempt started, so a session finishing a moment later was fully live — joined, capture device open — and
+  never closed. The connect thread now publishes into an `AtomicReference` BEFORE the EDT hand-off, and `awaitClose`
+  joins that thread for a bounded `CONNECT_HANDOVER_GRACE` (2s, bounded for the reason `close` bounds its HTTP
+  shutdown). Measured: closing 300ms into a connect against a black-holed address returns in 2341ms and exits. Two
+  more paths needed the same treatment: a Disconnect's close also runs off the EDT, so `awaitClose` waits for that
+  thread too, and macOS's default `QuitStrategy.NORMAL_EXIT` calls `System.exit` straight from the app-event handler —
+  so Cmd-Q never produced a `windowClosed` and NO session ever said goodbye until `setQuitStrategy(CLOSE_ALL_WINDOWS)`.
+
+**The gesture listener is EDGE-triggered, and that is not a detail.** A `ButtonModel` fires `stateChanged` for armed
+and rollover changes too, so reading the press LEVEL re-ran the press branch while the model was still pressed. For a
+hold that was invisible (`held` was already true), but a TAP leaves `held` false by definition — so in full duplex a
+second event ran the tap again and FLIPPED THE MIC, and the fix for interrupted holds became a way to open a
+microphone by switching windows. Measured on the real window: with the level read, deactivating while Space was down
+ended with the mic ON; with `pressedBefore` guarding the transition, one tap is one transition and deactivation is
+inert. The `talk-press` action also arms BEFORE it presses, the order the JDK's own button action uses — the reverse
+fires an extra `stateChanged` between the two writes. A local full-duplex flip now calls `ui.stateChanged()` as well,
+because that toggle has no server echo: the button read "Mic OFF — click to talk" over an open mic until some
+unrelated message arrived, which in a quiet duplex channel is minutes.
+
+**Two rules the corrective pass added, both about not blocking or lying:**
+- **A "what did I last render?" marker moves only where the write happened.** Assigning `renderedChannel` on the
+  branch where the write was SKIPPED (the widget held focus) poisoned it permanently — the widget kept the old value
+  while the marker claimed the new one, so the field never caught up again. Measured on a headless replay: fifty
+  repaints after focus was released, still stale.
+- **Nothing that derives a key runs on the EDT.** `connect` was moved off it from the start, but `switchTo` and
+  `changePassphrase` were called straight from the button listener, and both derive a key: 600,000 PBKDF2 iterations,
+  measured at 175-239ms here. That froze the window AND deferred every queued gesture edge, including a Space
+  up-edge — the way to keep an open mic open. Both now run on a `gui-apply` virtual thread, with every widget read on
+  the EDT first. The switch is also validated locally first, as `ConsoleUi` does, because `switchTo` applies the
+  target's key optimistically and only PASSPHRASE_MISMATCH / CHANNEL_LOCKED / CHANNEL_FULL are rolled back.
+
+It adds NO floor logic. Every action is one of the client's typed intents, and the only question the window answers
+for itself is about the GESTURE: `talkControl` decides hold-vs-tap and what the button says, delegating every ACTION
+to `toggleTalk`, which derives what to send from the same `floorStateFor` the console and server use. A press on a
+busy floor deliberately does NOTHING — joining a line is a TAP, on its own Raise-hand button — because a hold that
+enqueued you would put people in queues they never asked to join. Full-duplex is a tap for the opposite reason: there
+is no floor to hold, and a mic switch you must keep holding would be absurd.
+
+Every console command is a field or a button: rename, switch channel/mode/passphrase, hi-fi, the three owner
+checkboxes, mute-everyone, rotate-passphrase, and per-member Mute / Make-owner acting on the roster SELECTION — which
+is why the window needs no `#id-prefix` grammar at all. `rosterOrder` is the single source of both the rows and the
+ids behind them, so a selection can never name a different member than the row clicked; the two actions behind that
+selection are "mute this person" and "give them the channel". The owner checkboxes are written FROM the snapshot
+under a `settingFromModel` guard — the rule the browser's `flagDisplay` states, since a Swing checkbox fires its
+listener on a programmatic `setSelected` too and would otherwise echo the server's own state back at it.
+
+**Three rules the window learned the hard way**, all of them about a model being rebuilt or a form being overwritten:
+- **A rebuilt list model has no selection.** `refresh` runs on EVERY inbound message and clears both list models;
+  measured, `DefaultListModel.clear()` takes `JList.getSelectedIndex()` from 1 to -1 and refilling the identical rows
+  does not restore it. So the owner's Mute / Make-owner went dead between picking a row and reaching for the button —
+  worst exactly when the floor is busy and moderation is wanted. Both selections are now re-found across the rebuild
+  by ID, never by index, because `rosterOrder` moves a queued member to the head and the surviving row number is a
+  different person.
+- **An empty selection is not a wildcard.** Admit/Deny used to fall through to "resolve everyone waiting", and since
+  the selection dies on every message that was the state a click routinely landed in. Admitting is irreversible (there
+  is no kick), so bulk admission has its own `Admit all` / `Deny all` pair, as the console makes you type the literal
+  word `all`.
+- **Render a form field only when the SERVER moved it.** A focus check alone was not enough: name a channel to switch
+  to, then click into Passphrase to type its key, and the field is no longer the focus owner — so the next message put
+  the old name back AND silently changed what the adaptive button did, from a switch into a passphrase rotation.
+  `renderedChannel` / `renderedMode` / `renderedName` hold what was last written from a snapshot.
+
+**The adaptive Apply button is the window's second decision**, and every one of its four verdicts had a bug worth
+recording, because each was a button that lied about what pressing it would do:
+- The channel name is **canonicalised** (`WalkieClient.canonicalChannelName`) before it is used, because that name is
+  the PBKDF2 salt as well as the routing key. `switchTo` does not canonicalise — its console caller does it first, and
+  this window did not, so a trailing space derived a key for a room the server spelled differently: a
+  PASSPHRASE_MISMATCH for a passphrase typed correctly.
+- Rotation needs the passphrase to have **CHANGED**, compared against the client's `currentPassphrase()`. "The box is
+  not empty" was never evidence of intent, since `seedForm` fills it from `--key`.
+- A **non-owner may adopt** an announced rotation (`memberRekeyPending`), the one non-owner use `changePassphrase`
+  accepts. Gating the button on ownership alone left it disabled for exactly the person whose log line had just told
+  them to enter a new passphrase, with their transmit gate dropping every frame.
+- A **GLOBAL_PTT join is pinned** to `WalkieClientLauncher.GLOBAL_CHANNEL`, so the decision compares against the
+  channel the client would actually join. Otherwise typing another name in the global room lit up "Switch channel" for
+  a switch `switchTo` then refused as "already in global" — and that was the only offered way out of the room.
+
+`WalkieUi.hint(String)` exists because of this window: it is terminal-only coaching (the command list, "type 't' to
+grab a free floor"), printed by `ConsoleUi` exactly as it always was and DROPPED by `SwingUi`, where the advice is
+the controls and a list of single-letter commands has no prompt to be typed at. Splitting it off the status lines it
+used to be concatenated into left the console byte-identical, because the advice was already on its own line inside
+one `println`.
+
+Everything the window renders is a static function of one `ClientSnapshot` (`headerText`, `rosterOrder`, `rosterRows`,
+`talkControl`, `grantOutlivedHold`, `applyState`), which is the only reason a window is testable at all — an instance
+needs a display, since the class holds a `JFrame`. `SwingUiTest` pins the gesture and the text with no display.
+`applyState` was made static for precisely that reason after it went wrong unnoticed: it used to read three widgets
+directly, so nothing could reach it, and it was offering to re-key a channel to the passphrase already in use. `ClientSnapshot` gained `transmitting` for it: in full-duplex, with no floor, the mic state is the
+only thing the Talk control can report.
+
 ## Testing notes
 
 Server tests mix unit (`ConnectionServiceTest`, `ChannelTest`, `ChannelRegistryTest` via the `FakeClientSession`
@@ -688,7 +926,8 @@ six:
 - `static/assets/talk.js` — the floor rules (`floorStateFor`/`floorActionFor`/`floorIsFree`), `queueView` (the
   floor queue as something to DRAW — see the queue-display note below), the full-duplex
   mic auto-open policy (`shouldAutoOpenMic`, whose three terms are mode / "Connect muted" / owner-mute),
-  `grantOpensMic` (a grant that outlived its hold must NOT open the mic — see the hold-vs-tap note below),
+  `grantOpensMic` (a grant that outlived its hold must NOT open the mic — the Java window now enforces the same rule
+  through `grantOutlivedHold`; see the hold-vs-tap note below),
   `micTrackEnabled` (whether the local `MediaStreamTrack.enabled` should be on — exactly "am I transmitting?",
   with NO transport term and NO mode term, and the single rule for both writers: `enableLocalTracks` and
   `createPeer`. It replaced `transport === 'webrtc' ? on : true`, which forced a relay client's track ENABLED at
@@ -728,8 +967,16 @@ six:
   channel-less client is `'disabled'` — a **disabled button still dispatches `mouseleave`**, so a `'hold'` there
   made a cursor crossing the control release a floor it never held. Java mirrors: `WalkieClient.floorStateFor` /
   `floorActionFor` / `shouldAutoOpenMic` / `floorNarration` (pinned by `WalkieClientTest`), which the FLOOR_* names,
-  positional signatures, cases and — for the narration — the KEYS deliberately match, so the two clients fall silent
-  on exactly the same snapshots; the hold-vs-tap axis and the Space-ownership rule are browser-only.
+  positional signatures, cases and — for the narration — the KEYS deliberately match. They no longer fall silent on
+  exactly the same snapshots, and that is the ONE intended difference: the browser returns `SILENT` for `in-line` and
+  `offered` while its queue section is showing them, and the console — which has no section — keeps both lines (see
+  the queue-display note above). The hold-vs-tap axis and the Space-ownership rule were browser-only until `SwingUi`
+gave Java a hold gesture — and introducing the axis without porting its guards is exactly what left a mic open, so
+the pairs now to keep in step are `grantOpensMic` ↔ `grantOutlivedHold` and `spaceDrivesFloor` ↔ `SwingUi.typing`.
+Note the second pair is NOT a mirror: the browser allow-lists where Space may drive the floor, while the window
+deny-lists editable text components, and a deny-list is the shape the browser's own doc calls out as the one that
+rots. It rotted here too — the first version excluded every `JTextComponent`, so clicking the read-only Log killed
+Space push-to-talk silently.
 
 The `:walkie-server:jsTest` Gradle task (an `Exec` guarded by an `onlyIf` Node-on-PATH check, hooked into `check`)
 runs them as part of `build`, and picks up a new `*.test.js` with no build change. `walkie-server/package.json`

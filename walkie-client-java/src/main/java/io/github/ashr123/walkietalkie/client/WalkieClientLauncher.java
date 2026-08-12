@@ -40,7 +40,10 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 
 	/// The server-managed room every global-mode join is pinned to (`ConnectionService.GLOBAL_CHANNEL`). Sent
 	/// explicitly rather than left null so the wire carries the name the server will use anyway.
-	private static final String GLOBAL_CHANNEL = "global";
+	/// Package-private because the WINDOW needs the same constant: its adaptive Apply button has to know that a
+	/// GLOBAL_PTT join is pinned here regardless of what the channel field says, and a second copy of the name in
+	/// SwingUi could drift from this one.
+	static final String GLOBAL_CHANNEL = "global";
 
 	@Option(names = "--server", defaultValue = "https://localhost:8443",
 			description = "Base URL of the server (default: ${DEFAULT-VALUE}). Use http://... for a server run with walkie.tls.enabled=false.")
@@ -92,8 +95,42 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 			+ "unmute). By default the mic is live on connect; ignored in push-to-talk modes.")
 	private boolean startMuted;
 
+	@Option(names = "--gui",
+			description = "Open a window instead of running at the terminal prompt. The window adds hold-to-talk — "
+					+ "press and hold the Talk button — which a console cannot offer, since a keystroke has no "
+					+ "press/release edges.")
+	private boolean gui;
+
 	static void main(String... args) {
 		System.exit(new CommandLine(new WalkieClientLauncher()).execute(args));
+	}
+
+	/// The command line as a starting point for the window's form. Never used to connect on its own — [#connectable]
+	/// decides that — so a partly-filled command line is a convenience, not a half-open session.
+	private ClientOptions prefill() {
+		return new ClientOptions(
+				server,
+				mode == ChannelMode.GLOBAL_PTT ? GLOBAL_CHANNEL : channel == null ? "" : channel,
+				mode,
+				display == null ? "" : display,
+				highFidelity,
+				input,
+				key,
+				tlsTruststore,
+				startMuted
+		);
+	}
+
+	/// Whether the command line already says everything a connection needs, in which case the window connects on
+	/// startup exactly as the console does. Otherwise it opens disconnected and waits for the form.
+	private boolean connectable() {
+		if (display == null || display.isBlank()) {
+			return false;
+		}
+		if (mode == ChannelMode.GLOBAL_PTT) {
+			return true;   // the global room names itself and takes no passphrase
+		}
+		return channel != null && !channel.isBlank() && key != null && !key.isBlank();
 	}
 
 	/// The rules picocli's annotations cannot state, checked before anything is constructed.
@@ -104,8 +141,15 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 	/// fields null also keeps a missing flag a usage error: `WalkieClient`'s constructor would otherwise reach
 	/// `CHANNEL_NAME.matcher(null)` and die with a bare NullPointerException stack trace.
 	///
+	/// These are the options a CONSOLE session must have up front, because a terminal has nowhere to ask for them once
+	/// it is running. A window does: it has a Connect form, so with `--gui` they are pre-fill values rather than
+	/// requirements ([#prefill]), and the only thing that must be right is whatever the user finally types.
+	///
 	/// @return the message to print, or `null` when the options are usable
 	private String validate() {
+		if (gui) {
+			return null;
+		}
 		if (display == null || display.isBlank()) {
 			return "Missing required option: '--display=<display>' (the name others see).";
 		}
@@ -129,8 +173,18 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 			System.err.println(invalid);
 			return CommandLine.ExitCode.USAGE;
 		}
-		//noinspection EmptyTryBlock
-		try (WalkieClient _ = new WalkieClient(new ClientOptions(
+		// The two front ends differ in WHO owns the session. A console must be handed a live client — it has nowhere to
+		// ask for a server or a passphrase once it is running — so the client is built here and closed by this
+		// try-with-resources. A window has a Connect form, so it builds and closes its own client and simply outlives
+		// any one session; all this does is hand it the command line as pre-fill and wait for the window to close.
+		if (gui) {
+			SwingUi window = new SwingUi();
+			window.start(prefill(), connectable());
+			window.awaitClose();
+			return CommandLine.ExitCode.OK;
+		}
+		ConsoleUi console = new ConsoleUi();
+		try (WalkieClient client = new WalkieClient(new ClientOptions(
 				server,
 				// Global forces the room name server-side, and --channel is not asked for in that mode, so give the
 				// wire the name it will be pinned to instead of a null (mirrors ConnectionService.handleJoin).
@@ -142,7 +196,8 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 				key,
 				tlsTruststore,
 				startMuted
-		))) {
+		), console)) {
+			console.run(client);
 		} catch (IllegalArgumentException e) {
 			// Bad --display / --channel etc. — a usage error, so print the message cleanly (no stack trace) and
 			// return picocli's usage exit code rather than letting it surface as an uncaught exception.
