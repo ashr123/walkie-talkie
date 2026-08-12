@@ -24,13 +24,19 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-/// Fails the build on a `///` Javadoc reference that points at something which does not exist — `[SomeType]`,
-/// `[Type#member]` or `[#member]` naming a type or member that is not (or is no longer) in the source.
+/// Fails the build on a `///` Javadoc reference that cannot be followed: `[SomeType]`, `[Type#member]` or
+/// `[#member]` naming a type or member that is not (or is no longer) in the source, or one that exists but is
+/// `private` to a DIFFERENT file, which Javadoc cannot link to from here.
 ///
 /// Why this exists: the project's Markdown Javadoc links are plain text as far as the compiler is concerned, so a
 /// renamed or not-yet-written symbol leaves a silently broken reference. The build does not run `javadoc`, and
 /// `javadoc` would not catch the case that earned this check its place anyway — links to protocol records that a
 /// feature had *documented before implementing*.
+///
+/// The privacy half was added after existence-only checking passed a build twice in a row on references an IDE
+/// rejected: `[ConsoleUi#switchChannel]` and `[ConsoleUi#listMembers]`, both left behind when the console front end
+/// moved out and both private to it. "The member is somewhere in that file" is the wrong question — the reader
+/// clicking the link is outside the file, so the question is whether the link RESOLVES for them.
 ///
 /// It is deliberately conservative, because a false positive fails an innocent build and teaches people to distrust
 /// the check. Anything it cannot resolve with confidence is skipped:
@@ -61,10 +67,21 @@ public abstract class JavadocReferenceCheck extends DefaultTask {
 	private static final Pattern REFERENCE = Pattern.compile("\\[([^\\[\\]]+)]");
 	private static final Pattern IMPORT = Pattern.compile("import\\s+(?:static\\s+)?([\\w.]+);");
 	private static final Pattern WILDCARD_IMPORT = Pattern.compile("import\\s+[\\w.]+\\.\\*;");
-	/// Method declarations and calls — enough to see that a referenced method exists somewhere in its file.
-	private static final Pattern MEMBER_CALL = Pattern.compile("\\b(\\w+)\\s*\\(");
-	/// Fields, parameters and record components.
-	private static final Pattern MEMBER_NAME = Pattern.compile("\\b(\\w+)\\s*[;=,)]");
+	/// Method declarations and UNQUALIFIED calls — enough to see that a referenced method exists in its file.
+	///
+	/// The `(?<![.\w])` matters and was missing once. Without it, `client.setMode(...)` counted as this file owning a
+	/// `setMode`, so `[#setMode]` resolved in a file that had merely CALLED it on something else — which is exactly
+	/// what happens after a refactor moves a member out and leaves the calls behind. Five such references survived the
+	/// console front end moving into its own class and were caught by an IDE, not by this task. An unqualified call is
+	/// by definition to our own (or an inherited) member; a qualified one is somebody else's.
+	private static final Pattern MEMBER_CALL = Pattern.compile("(?<![.\\w])(\\w+)\\s*\\(");
+	/// Fields, parameters and record components — again only UNQUALIFIED, for the reason above.
+	private static final Pattern MEMBER_NAME = Pattern.compile("(?<![.\\w])(\\w+)\\s*[;=,)]");
+	/// A member DECLARATION, with group 1 saying whether it is `private`. Requiring at least one token before the name
+	/// (a return type, a modifier, `record`, …) is what separates `void listMembers() {` from a bare `listMembers();`
+	/// call — without it every call site would read as a non-private declaration and cancel out the real one.
+	private static final Pattern MEMBER_DECLARATION = Pattern.compile(
+			"^[ \t]*(private\\s+)?(?:[\\w.<>\\[\\],?]+\\s+)+(\\w+)\\s*[(;=]", Pattern.MULTILINE);
 	/// An enum constant on its own line — including the LAST one, which is followed by `}`, not a comma.
 	private static final Pattern ENUM_CONSTANT = Pattern.compile("^\\s*([A-Z][A-Z_0-9]*)\\s*[,;]?\\s*$", Pattern.MULTILINE);
 
@@ -94,17 +111,30 @@ public abstract class JavadocReferenceCheck extends DefaultTask {
 
 	/// The indexed source: which files declare each type name (recorded both as `Nested` and as `Outer.Nested`, since
 	/// the Javadoc here uses both forms), and which member names appear in each file.
-	private record Index(Map<String, Set<File>> types, Map<File, Set<String>> members) {
+	private record Index(Map<String, Set<File>> types,
+	                     Map<File, Set<String>> members,
+	                     Map<File, Set<String>> privateMembers) {
 
 		/// The member names of `file`, or an empty set for a file outside the index.
 		Set<String> membersOf(File file) {
 			return members.getOrDefault(file, Set.of());
 		}
+
+		/// Whether `member` is declared in `file` and EVERY declaration of that name there is `private`. An overload or
+		/// same-named accessor that is not private makes the name reachable, so the answer is no — the check would
+		/// rather miss a private overload than fail a build over a link that works.
+		boolean isPrivateIn(File file, String member) {
+			return privateMembers.getOrDefault(file, Set.of()).contains(member);
+		}
 	}
 
 	/// The per-file context a reference is resolved against: what that file imports (an imported name is external,
 	/// so unresolvable here), whether it imports a package wholesale, and its own members for a `[#member]` link.
-	private record FileContext(Set<String> imported, boolean hasWildcardImport, Set<String> ownMembers) {
+	private record FileContext(Set<String> imported,
+	                           boolean hasWildcardImport,
+	                           Set<String> ownMembers,
+	                           /// The file being scanned: a `private` member is reachable from a link inside its own file.
+	                           File scanned) {
 	}
 
 	@TaskAction
@@ -122,7 +152,7 @@ public abstract class JavadocReferenceCheck extends DefaultTask {
 					.map(Problem::describe)
 					.collect(Collectors.joining(
 							System.lineSeparator(),
-							"Javadoc references point at symbols that do not exist:" + System.lineSeparator(),
+							"Javadoc references cannot be followed:" + System.lineSeparator(),
 							""
 					)));
 		}
@@ -150,6 +180,7 @@ public abstract class JavadocReferenceCheck extends DefaultTask {
 	private Index index() {
 		Map<String, Set<File>> types = new HashMap<>();
 		Map<File, Set<String>> members = new HashMap<>();
+		Map<File, Set<String>> privateMembers = new HashMap<>();
 		getIndexSources().getFiles().stream().filter(File::isFile).forEach(file -> {
 			String text = read(file);
 			List<String> declared = matches(DECLARATION, text);
@@ -168,8 +199,19 @@ public abstract class JavadocReferenceCheck extends DefaultTask {
 			found.addAll(matches(MEMBER_NAME, text));
 			found.addAll(matches(ENUM_CONSTANT, text));
 			members.put(file, found);
+			privateMembers.put(file, privateOnly(text));
 		});
-		return new Index(types, members);
+		return new Index(types, members, privateMembers);
+	}
+
+	/// The names in `text` whose every declaration is `private`, so a link from another file cannot reach them.
+	private static Set<String> privateOnly(String text) {
+		Set<String> restricted = new HashSet<>();
+		Set<String> reachable = new HashSet<>();
+		MEMBER_DECLARATION.matcher(text).results().forEach(result ->
+				(result.group(1) == null ? reachable : restricted).add(result.group(2)));
+		restricted.removeAll(reachable);
+		return restricted;
 	}
 
 	private List<Problem> problemsIn(File file, Index index) {
@@ -177,7 +219,8 @@ public abstract class JavadocReferenceCheck extends DefaultTask {
 		FileContext context = new FileContext(
 				Set.copyOf(matches(IMPORT, text).stream().map(JavadocReferenceCheck::simpleName).toList()),
 				WILDCARD_IMPORT.matcher(text).find(),
-				index.membersOf(file)
+				index.membersOf(file),
+				file
 		);
 		List<Problem> problems = new ArrayList<>();
 		String[] lines = text.split("\n", -1);
@@ -246,9 +289,16 @@ public abstract class JavadocReferenceCheck extends DefaultTask {
 		}
 		// A simple name can be declared in more than one file (the same name in two modules), so the member counts as
 		// found if ANY declaring file has it.
-		return index.types().get(owner).stream().anyMatch(declaring -> index.membersOf(declaring).contains(member))
+		Set<File> declaringFiles = index.types().get(owner);
+		if (declaringFiles.stream().noneMatch(declaring -> index.membersOf(declaring).contains(member))) {
+			return "no member \"" + member + "\" on " + owner;
+		}
+		// It exists — but a link only resolves for a reader outside the file if the member is visible there.
+		return declaringFiles.stream().anyMatch(declaring ->
+				declaring.equals(context.scanned()) || !index.isPrivateIn(declaring, member))
 				? null
-				: "no member \"" + member + "\" on " + owner;
+				: "member \"" + member + "\" is private to " + owner + ", so a link from another file cannot reach it"
+				  + " (name it in prose instead, or widen it for a real caller)";
 	}
 
 	/// The name `type` is indexed under — as written, its simple name, or the `Outer.Nested` tail of a longer path —
