@@ -11,7 +11,8 @@ import org.springframework.web.socket.WebSocketHandler;
 import org.springframework.web.socket.server.HandshakeInterceptor;
 import org.springframework.web.util.UriComponentsBuilder;
 
-import java.text.Normalizer;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
 /// Captures the `channel` query param from the WebSocket handshake URL into the session attributes, so
@@ -35,11 +36,24 @@ public class ChannelHandshakeInterceptor implements HandshakeInterceptor {
 	@Override
 	public boolean beforeHandshake(@NonNull ServerHttpRequest request, @NonNull ServerHttpResponse response,
 	                               @NonNull WebSocketHandler wsHandler, @NonNull Map<String, Object> attributes) {
-		String raw = UriComponentsBuilder.fromUri(request.getURI()).build().getQueryParams().getFirst("channel");
-		// NFC, to the same form handleJoin canonicalises a Join's channel to. Otherwise a client whose ?channel=
-		// spelling differs from its Join's (or from another instance's idea of the name) fails the affinity
-		// comparison and is bounced with CHANNEL_ROUTING_MISMATCH forever, for a name that looks identical.
-		String channel = raw == null ? null : Normalizer.normalize(raw, Normalizer.Form.NFC).strip();
+		String encoded = UriComponentsBuilder.fromUri(request.getURI()).build().getQueryParams().getFirst("channel");
+		// DECODED first, and that was the bug. `UriComponentsBuilder...build()` is `build(false)`, which hands the
+		// query value back still percent-encoded — measured: a Hebrew channel arrives here as
+		// "%D7%94%D7%97%D7%93%D7%A8" — while a Join carries the name as text. So every channel whose name needs
+		// encoding (any non-ASCII name, or one containing a space) could never equal its own Join and was bounced with
+		// CHANNEL_ROUTING_MISMATCH for a name that looked identical, forever.
+		//
+		// URLDecoder, i.e. form decoding, is the exact inverse of what both clients send: `URLEncoder.encode` in the
+		// Java client writes a space as `+`, `encodeURIComponent` in the browser writes it as `%20`, and both reduce to
+		// a space here. The `+`-means-space ambiguity that makes form decoding wrong for a general URI cannot arise,
+		// because a channel name is `[\p{L}\p{M}\p{N} _-]{1,64}` and a literal `+` is not in it.
+		//
+		// Then canonicalised with ConnectionService's OWN function rather than a smaller copy of it: the affinity
+		// comparison is between this value and the canonicalised Join, so anything less than the same reduction —
+		// it also collapses whitespace runs — is the same class of bug one step further along.
+		String channel = encoded == null
+				? null
+				: ConnectionService.canonicalChannelName(URLDecoder.decode(encoded, StandardCharsets.UTF_8));
 		if (channel == null || channel.isBlank()) {
 			if (properties.channelAffinity()) {
 				response.setStatusCode(HttpStatus.BAD_REQUEST);

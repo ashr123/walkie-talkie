@@ -161,7 +161,11 @@ public class ConnectionService {
 	/// "same channel" matches the clients' idea of "same salt": either both agree, or the mismatch is a genuinely
 	/// different passphrase. (Measured: Hebrew `שׁלום` written with the precomposed presentation form U+FB2A and as
 	/// U+05E9 U+05C1 render identically and derive different keys before NFC, the same key after.)
-	private static String canonicalChannelName(String requested) {
+	/// Package-private, not private: [ChannelHandshakeInterceptor] must reduce the handshake's routing key with
+	/// EXACTLY this function. It used to apply its own smaller version — NFC and strip, without the whitespace
+	/// collapse — so the two disagreed about any name whose spelling reduced, and the affinity comparison in
+	/// [#handleJoin] compared a name against a differently-canonicalised copy of itself.
+	static String canonicalChannelName(String requested) {
 		if (requested == null) {
 			return null;
 		}
