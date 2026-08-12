@@ -65,11 +65,16 @@ abstract class WebSocketIntegrationTestSupport {
 	/// status — used to assert which endpoints are public vs. authenticated, and that bad tokens are rejected
 	/// at the boundary rather than surfacing as a 500.
 	protected int httpStatus(String path, String authorizationHeader) throws Exception {
+		return httpResponse(path, authorizationHeader).statusCode();
+	}
+
+	/// The whole response, for a test that needs a HEADER as well as the status — the `WWW-Authenticate` challenge.
+	protected HttpResponse<Void> httpResponse(String path, String authorizationHeader) throws Exception {
 		HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path)).GET();
 		if (authorizationHeader != null) {
 			builder.header("Authorization", authorizationHeader);
 		}
-		return httpClient.send(builder.build(), HttpResponse.BodyHandlers.discarding()).statusCode();
+		return httpClient.send(builder.build(), HttpResponse.BodyHandlers.discarding());
 	}
 
 	/// Sends a raw binary (audio) frame.

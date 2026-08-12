@@ -7,6 +7,8 @@ import io.github.ashr123.walkietalkie.shared.protocol.ServerMessage;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.WebSocketSession;
 
+import java.net.http.HttpResponse;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /// The authentication boundary: which endpoints are public, the two credential transports the filter
@@ -60,9 +62,24 @@ class AuthBoundaryIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
+	void anUnauthenticatedRequestIsChallengedWith401AndNotRefusedWith403() throws Exception {
+		// The distinction is the diagnosis. 403 says "your credential was accepted and does not permit this"; every way
+		// this API can refuse — no token, an expired one, a mistyped one — is "no credential was accepted", which is
+		// 401 plus a challenge naming the scheme (RFC 6750). Spring Security answers 403 unless an entry point is
+		// configured, and nothing configures one by default here: httpBasic and formLogin are both disabled.
+		for (String credential : new String[]{null, "Bearer not-a-real-token", "Bearer ", "Basic dXNlcjpwYXNz"}) {
+			HttpResponse<Void> response = httpResponse(AUDIO, credential);
+			assertEquals(401, response.statusCode(), "unauthenticated, so a challenge: credential=" + credential);
+			assertEquals("Bearer", response.headers().firstValue("WWW-Authenticate").orElse(null),
+					"the challenge must name the scheme — and must not be Basic, which makes a browser open a "
+							+ "login dialog for a credential nobody can type: credential=" + credential);
+		}
+	}
+
+	@Test
 	void aValidBearerHeaderIsAcceptedAtTheBoundary() throws Exception {
 		// Exercises the Authorization: Bearer branch of BearerTokens. A valid token authenticates the request,
-		// so the outcome differs from the unauthenticated 403 (the now-authenticated GET reaches the handshake
+		// so the outcome differs from the unauthenticated 401 (the now-authenticated GET reaches the handshake
 		// machinery, which rejects the non-upgrade request with a different status) — and is never a 500.
 		int missing = httpStatus(AUDIO, null);
 		int withValidHeader = httpStatus(AUDIO, "Bearer " + login());
