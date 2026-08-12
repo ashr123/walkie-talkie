@@ -104,7 +104,7 @@ once, for Bob.)
 |----------------------|-----------------------------------------------------------------------------------------------------------------------------------|
 | `walkie-shared`      | Wire protocol: `ChannelMode`, sealed `ClientMessage` / `ServerMessage` records (Jackson-3 polymorphic). Zero Spring dependencies. |
 | `walkie-server`      | Spring Boot app: both transports, channel/floor logic, token security, and the browser client under `resources/static`.           |
-| `walkie-client-java` | Console desktop client: `javax.sound.sampled` capture/playback over the relay transport, on virtual threads.                      |
+| `walkie-client-java` | Desktop client, console or window (`--gui`): `javax.sound.sampled` capture/playback over the relay transport, on virtual threads. |
 
 ## Build & run
 
