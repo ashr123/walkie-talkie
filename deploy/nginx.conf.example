@@ -15,6 +15,29 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/walkie.example.com/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;   # TLS 1.2+ only
 
+    # The BROWSER client has to carry its bearer token as ?token= — a browser cannot set headers on a WebSocket
+    # handshake — so the request LINE of an upgrade contains a live credential. nginx's default `combined` format
+    # logs "$request" verbatim, which would write that token into a plaintext file on the proxy host: the exact sink
+    # the Java client was moved off (it sends Authorization: Bearer instead). Tokens are short-lived and signed, but
+    # they are replayable while they last and there is no revocation list, so keep them out of the log.
+    #
+    # `off` is the blunt version and costs little here: an upgrade is one line per long-lived socket. To keep the
+    # access record, define a format at http level that omits the query string — e.g.
+    #   log_format no_query '$remote_addr - - [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent';
+    # — and use `access_log /var/log/nginx/access.log no_query;` here instead.
+    location /ws/ {
+        access_log off;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;   # keep long-lived audio sockets open
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
