@@ -94,7 +94,7 @@ final class FrameCrypto {
 	byte[] encrypt(byte[] plaintext) throws GeneralSecurityException {
 		byte[] iv = new byte[IV_BYTES];
 		random.nextBytes(iv);
-		byte[] out = new byte[1 + IV_BYTES + plaintext.length + TAG_BITS / Byte.SIZE];
+		byte[] out = new byte[1 + IV_BYTES + TAG_BITS / Byte.SIZE + plaintext.length];
 		out[0] = SCHEME;
 		System.arraycopy(iv, 0, out, 1, IV_BYTES);
 		// Write the GCM ciphertext+tag straight into the envelope — no throwaway ciphertext array + second copy.
@@ -113,7 +113,7 @@ final class FrameCrypto {
 		}
 		// Point the GCM spec at the IV in place (frame[1 .. 1+IV_BYTES]) — no Arrays.copyOfRange.
 		return cipher(Cipher.DECRYPT_MODE, frame, 1)
-				.doFinal(frame, 1 + IV_BYTES, frame.length - 1 - IV_BYTES);
+				.doFinal(frame, 1 + IV_BYTES, -1 - IV_BYTES + frame.length);
 	}
 
 	/// Deterministic encryption with a caller-supplied IV, returning just the raw GCM output (ciphertext+tag,
