@@ -31,6 +31,14 @@ final class FrameCrypto {
 	private static final int TAG_BITS = Byte.SIZE * 16;          // 16-byte GCM tag
 	private static final byte SCHEME = (byte) 0xE2;              // wire marker: frame is scheme(1) ‖ IV ‖ ct+tag; kept outside the codec-tag set {1,2}
 	private static final byte[] AAD = {SCHEME};                 // the scheme byte is authenticated (GCM AAD) but not encrypted, binding the envelope to the tag
+	/// Everything before the ciphertext: the scheme marker plus the IV. Also the offset the GCM output starts at, which
+	/// is why it earns a name instead of being spelled `1 + IV_BYTES` at each of its uses.
+	private static final int HEADER_BYTES = 1 + IV_BYTES;
+	/// The smallest an encrypted frame can be — header plus a bare tag, i.e. an empty plaintext. It is both the envelope
+	/// [#encrypt] allocates around a payload and the length [#decrypt] refuses to go below, and it was previously
+	/// written out twice with the tag size divided two different ways (`TAG_BITS / Byte.SIZE` in one, `TAG_BITS / 8` in
+	/// the other) for the same 29 bytes. As one constant it also folds at compile time, so each use costs one add.
+	private static final int ENVELOPE_BYTES = HEADER_BYTES + TAG_BITS / Byte.SIZE;
 	// PBKDF2 work factor: a deliberate slowdown so a low-entropy passphrase is expensive to brute-force
 	// offline. It's the cost knob every password KDF has, not an arbitrary value — 600k comfortably exceeds
 	// OWASP's PBKDF2-HMAC-SHA512 floor (210k). It must match the browser's WebCrypto iteration count exactly —
@@ -94,18 +102,18 @@ final class FrameCrypto {
 	byte[] encrypt(byte[] plaintext) throws GeneralSecurityException {
 		byte[] iv = new byte[IV_BYTES];
 		random.nextBytes(iv);
-		byte[] out = new byte[1 + IV_BYTES + TAG_BITS / Byte.SIZE + plaintext.length];
+		byte[] out = new byte[ENVELOPE_BYTES + plaintext.length];
 		out[0] = SCHEME;
 		System.arraycopy(iv, 0, out, 1, IV_BYTES);
 		// Write the GCM ciphertext+tag straight into the envelope — no throwaway ciphertext array + second copy.
-		cipher(Cipher.ENCRYPT_MODE, iv, 0).doFinal(plaintext, 0, plaintext.length, out, 1 + IV_BYTES);
+		cipher(Cipher.ENCRYPT_MODE, iv, 0).doFinal(plaintext, 0, plaintext.length, out, HEADER_BYTES);
 		return out;
 	}
 
 	/// Decrypts a `scheme(1) ‖ IV ‖ ciphertext+tag` frame; throws on a missing scheme byte (a plaintext
 	/// peer in an encrypted channel) or a bad tag (tampered, or wrong passphrase).
 	byte[] decrypt(byte[] frame) throws GeneralSecurityException {
-		if (frame.length < 1 + IV_BYTES + TAG_BITS / 8) {
+		if (frame.length < ENVELOPE_BYTES) {
 			throw new GeneralSecurityException("frame too short to be encrypted");
 		}
 		if (frame[0] != SCHEME) {
@@ -113,7 +121,7 @@ final class FrameCrypto {
 		}
 		// Point the GCM spec at the IV in place (frame[1 .. 1+IV_BYTES]) — no Arrays.copyOfRange.
 		return cipher(Cipher.DECRYPT_MODE, frame, 1)
-				.doFinal(frame, 1 + IV_BYTES, -1 - IV_BYTES + frame.length);
+				.doFinal(frame, HEADER_BYTES, frame.length - HEADER_BYTES);
 	}
 
 	/// Deterministic encryption with a caller-supplied IV, returning just the raw GCM output (ciphertext+tag,
