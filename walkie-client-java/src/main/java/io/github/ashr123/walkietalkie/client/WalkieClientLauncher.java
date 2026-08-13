@@ -10,6 +10,7 @@ import picocli.CommandLine.TypeConversionException;
 import javax.sound.sampled.AudioSystem;
 import javax.sound.sampled.Mixer;
 import javax.sound.sampled.TargetDataLine;
+import java.awt.GraphicsEnvironment;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Locale;
@@ -95,11 +96,25 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 			+ "unmute). By default the mic is live on connect; ignored in push-to-talk modes.")
 	private boolean startMuted;
 
-	@Option(names = "--gui",
-			description = "Open a window instead of running at the terminal prompt. The window adds hold-to-talk — "
-					+ "press and hold the Talk button — which a console cannot offer, since a keystroke has no "
-					+ "press/release edges.")
+	/// Two options rather than one `negatable = true`, and the reason is measured rather than stylistic: picocli 4.7.7
+	/// INVERTS both forms of a negatable flag whose default is true, so `--gui` yielded false and `--no-gui` yielded
+	/// TRUE — a flag that opens the window when you ask it not to. An optional-value option plus an explicit shorthand
+	/// behaves the way a reader expects for every spelling: bare `--gui` is the window (via `fallbackValue`),
+	/// `--gui=false` and `--no-gui` are the prompt.
+	@Option(names = "--gui", arity = "0..1", defaultValue = "true", fallbackValue = "true",
+			description = "Open a window — the DEFAULT. The window adds hold-to-talk — press and hold the Talk button, "
+					+ "or the space bar — which a console cannot offer, since a keystroke has no press/release edges, "
+					+ "and it has a Connect form, so it opens without --display/--channel/--key up front. Use "
+					+ "--gui=false or --no-gui for the terminal prompt. Where there is no display to open a window on, "
+					+ "the terminal prompt runs instead and says so.")
 	private boolean gui;
+
+	/// Shorthand for `--gui=false`, and DECISIVE: given both, the prompt wins. Two independent flags have no relative
+	/// order for picocli to honour, so rather than pretend "the last word wins" this states which one does.
+	@Option(names = "--no-gui",
+			description = "Run at the terminal prompt instead of opening a window; shorthand for --gui=false. Wins if "
+					+ "--gui is given as well.")
+	private boolean noGui;
 
 	static void main(String... args) {
 		System.exit(new CommandLine(new WalkieClientLauncher()).execute(args));
@@ -142,12 +157,23 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 	/// `CHANNEL_NAME.matcher(null)` and die with a bare NullPointerException stack trace.
 	///
 	/// These are the options a CONSOLE session must have up front, because a terminal has nowhere to ask for them once
-	/// it is running. A window does: it has a Connect form, so with `--gui` they are pre-fill values rather than
+	/// it is running. A window does: it has a Connect form, so for the window they are pre-fill values rather than
 	/// requirements ([#prefill]), and the only thing that must be right is whatever the user finally types.
 	///
 	/// @return the message to print, or `null` when the options are usable
-	private String validate() {
-		if (gui) {
+	/// Whether to open a window: `wanted` is what the command line asked for (the default is yes), and a headless run
+	/// overrides it.
+	///
+	/// Separate and static because making the window the DEFAULT put weight on it. A headless run (over `ssh` without
+	/// X11, in a container, in CI) would otherwise reach `new JFrame()` and die on a `HeadlessException` for a client
+	/// that used to work there, so the terminal is the fallback rather than an error — and this is the one place that
+	/// decides it, since [#validate] must agree: the console needs its options up front, and the window does not.
+	static boolean windowWanted(boolean wanted, boolean headless) {
+		return wanted && !headless;
+	}
+
+	private String validate(boolean window) {
+		if (window) {
 			return null;
 		}
 		if (display == null || display.isBlank()) {
@@ -168,7 +194,15 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 
 	@Override
 	public Integer call() throws Exception {
-		String invalid = validate();
+		// Decided ONCE, because three things follow from it: which validation applies (a console must have its options
+		// up front; a window asks for them), which front end runs, and what the user is told when the two disagree.
+		boolean headless = GraphicsEnvironment.isHeadless();
+		boolean window = windowWanted(gui && !noGui, headless);
+		if (gui && !noGui && headless) {
+			System.err.println("No display is available, so the window cannot open — running at the terminal prompt "
+					+ "instead. Pass --no-gui to ask for the prompt without this notice.");
+		}
+		String invalid = validate(window);
 		if (invalid != null) {
 			System.err.println(invalid);
 			return CommandLine.ExitCode.USAGE;
@@ -177,10 +211,10 @@ public final class WalkieClientLauncher implements Callable<Integer> {
 		// ask for a server or a passphrase once it is running — so the client is built here and closed by this
 		// try-with-resources. A window has a Connect form, so it builds and closes its own client and simply outlives
 		// any one session; all this does is hand it the command line as pre-fill and wait for the window to close.
-		if (gui) {
-			SwingUi window = new SwingUi();
-			window.start(prefill(), connectable());
-			window.awaitClose();
+		if (window) {
+			SwingUi ui = new SwingUi();
+			ui.start(prefill(), connectable());
+			ui.awaitClose();
 			return CommandLine.ExitCode.OK;
 		}
 		ConsoleUi console = new ConsoleUi();

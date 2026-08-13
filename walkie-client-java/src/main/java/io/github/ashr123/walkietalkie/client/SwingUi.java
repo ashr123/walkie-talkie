@@ -220,9 +220,19 @@ final class SwingUi implements WalkieUi {
 	void start(ClientOptions options, boolean connectNow) {
 		this.pending = options;
 		SwingUtilities.invokeLater(() -> {
-			build();
-			if (connectNow) {
-				connect();
+			try {
+				build();
+				if (connectNow) {
+					connect();
+				}
+			} catch (RuntimeException | Error failure) {
+				// Nothing can be shown, so release the caller instead of leaving it parked in awaitClose forever. This
+				// matters because the window is now the DEFAULT front end: a display that AWT accepted and then could
+				// not draw on (a broken X11 forward, a revoked session) used to be an exception logged on the EDT while
+				// the process hung with nothing on screen.
+				System.err.println("The window could not be opened (" + describe(failure) + ") — run with --no-gui "
+						+ "to use the terminal prompt instead.");
+				closed.countDown();
 			}
 		});
 	}
@@ -360,7 +370,7 @@ final class SwingUi implements WalkieUi {
 		refresh();
 	}
 
-	/// Fills the form from the command line, so `--gui` with the usual options behaves exactly as the console does:
+	/// Fills the form from the command line, so the window with the usual options behaves exactly as the console does:
 	/// the window opens already holding them and connects.
 	///
 	/// Load-bearing, not cosmetic. [#connect] builds its options from the FORM — that is what lets the user change

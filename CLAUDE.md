@@ -740,7 +740,12 @@ comments (`[#client.setFloorQueue(boolean)]`). That is the check paying for itse
 failed a compile. Worth recording honestly, though, that the first two were then repointed at `ConsoleUi` — where
 they are private — and the check passed them a second time; see the reachability note above for what that cost.
 
-**There is a second front end: `SwingUi`, behind `--gui`.** The window is what the port was extracted for, and it
+**There is a second front end, and it is now the DEFAULT one: `SwingUi`.** `--no-gui` (or `--gui=false`) asks for the
+terminal prompt instead, and a headless run falls back to it automatically — `windowWanted(wanted, headless)` is the one
+place that decides, because validation follows from the same answer: a console must have its options up front, a window
+has a Connect form. Note the flag is deliberately NOT picocli's `negatable = true`: measured on picocli 4.7.7, a
+negatable flag defaulting to true inverts BOTH forms, so `--gui` gave false and `--no-gui` gave true. The window is what
+the port was extracted for, and it
 adds the one thing a console physically cannot — **hold-to-talk**. The press/release edges come from the button's
 `ButtonModel`, NOT from a `MouseListener`: a mouse listener never sees the SPACE key, so the first version depressed
 the button visibly and did nothing at all when Space was held. Swing activates a focused button through its model, so
