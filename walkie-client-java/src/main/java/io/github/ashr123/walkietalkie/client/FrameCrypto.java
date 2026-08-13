@@ -1,16 +1,17 @@
 package io.github.ashr123.walkietalkie.client;
 
 import javax.crypto.Cipher;
-import javax.crypto.SecretKey;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
+import java.security.Key;
 import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.HexFormat;
+import java.util.random.RandomGenerator;
 
 /// End-to-end encryption for relay audio frames (AES-256-GCM).
 ///
@@ -48,16 +49,16 @@ final class FrameCrypto {
 	private static final int KCV_BITS = Byte.SIZE * 16;          // 16-byte key-check value, derived alongside the AES key
 	private static final String SALT_PREFIX = "walkie-talkie:e2ee:";
 
-	private final SecretKey key;
-	private final String keyCheck;
 	/// One CSPRNG for the process rather than one per key, and `static` for a reason rather than by habit: GCM requires
 	/// IV uniqueness per KEY, which a single shared generator gives as surely as a private one, and `SecureRandom` is
 	/// thread-safe. A [FrameCrypto] is derived afresh on every join, channel switch and passphrase rotation, so a
 	/// per-instance field meant constructing a generator each time for no benefit. Mirrors the server, which shares one
 	/// `SecureRandom` bean across its security infrastructure for the same reason.
-	private static final SecureRandom RANDOM = new SecureRandom();
+	private static final RandomGenerator RANDOM = new SecureRandom();
+	private final String keyCheck;
+	private final Key key;
 
-	private FrameCrypto(SecretKey key, String keyCheck) {
+	private FrameCrypto(Key key, String keyCheck) {
 		this.key = key;
 		this.keyCheck = keyCheck;
 	}
