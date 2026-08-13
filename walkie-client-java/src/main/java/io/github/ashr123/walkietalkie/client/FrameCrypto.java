@@ -50,7 +50,12 @@ final class FrameCrypto {
 
 	private final SecretKey key;
 	private final String keyCheck;
-	private final SecureRandom random = new SecureRandom();
+	/// One CSPRNG for the process rather than one per key, and `static` for a reason rather than by habit: GCM requires
+	/// IV uniqueness per KEY, which a single shared generator gives as surely as a private one, and `SecureRandom` is
+	/// thread-safe. A [FrameCrypto] is derived afresh on every join, channel switch and passphrase rotation, so a
+	/// per-instance field meant constructing a generator each time for no benefit. Mirrors the server, which shares one
+	/// `SecureRandom` bean across its security infrastructure for the same reason.
+	private static final SecureRandom RANDOM = new SecureRandom();
 
 	private FrameCrypto(SecretKey key, String keyCheck) {
 		this.key = key;
@@ -101,7 +106,7 @@ final class FrameCrypto {
 	/// Encrypts a plaintext frame, returning `scheme(1) ‖ IV ‖ ciphertext+tag`.
 	byte[] encrypt(byte[] plaintext) throws GeneralSecurityException {
 		byte[] iv = new byte[IV_BYTES];
-		random.nextBytes(iv);
+		RANDOM.nextBytes(iv);
 		byte[] out = new byte[ENVELOPE_BYTES + plaintext.length];
 		out[0] = SCHEME;
 		System.arraycopy(iv, 0, out, 1, IV_BYTES);
