@@ -1001,3 +1001,24 @@ The `:walkie-server:jsTest` Gradle task (an `Exec` guarded by an `onlyIf` Node-o
 runs them as part of `build`, and picks up a new `*.test.js` with no build change. `walkie-server/package.json`
 (`"type":"module"`, no deps) only tells Node these `.js` files are ES modules; it isn't served and Gradle ignores
 it.
+
+**The suite runs on a runtime that is AHEAD of every browser, and `webcrypto-baseline.test.js` exists because of it.**
+Node has had ML-KEM and ML-DSA in `crypto.subtle` since v24.7.0; as of August 2026 no shipping browser has any of it —
+it is a WICG draft, Chrome keeps it behind `about://flags#webcrypto-pqc`, Firefox's patch never landed, WebKit has no
+implementation, and Chrome/Edge/Firefox/Safari all pass 0 of the 468 ML-KEM `generateKey` web-platform-tests. So a
+well-meant post-quantum change to `e2ee.js` would pass `node --test` on the developer's machine and throw in every
+browser, with the Java parity vectors still green. That guard is a SOURCE scan, not a runtime one, for two reasons: a
+runtime check sees only the paths a test exercises, and it cannot see `app.js` at all (unimportable under Node, which
+is why the DOM-free modules exist). Its method deny-list is DERIVED from `SubtleCrypto.prototype` at run time, so
+whatever a future Node adds is forbidden until someone adds it to the baseline deliberately. Note the distinction the
+messages are careful about: `digest`/`sign`/`generateKey` are outside our four but present in browsers — using them
+breaks Java parity, not the browser; `encapsulate*`/`decapsulate*`/`getPublicKey` break the browser outright.
+
+For the record, since it is the question that produced the test: post-quantum cryptography cannot improve the audio
+E2EE. `FrameCrypto` and `e2ee.js` contain no public-key operation at all — the AES-256 key is a deterministic function
+of (passphrase, channel name) — so Shor has nothing to attach to, and Grover leaves AES-256 at 2^128 with PBKDF2's
+600k serial iterations pushing an oracle call past NIST's MAXDEPTH bound. The quantum-relevant leg is TLS, and that
+needs no code here: JEP 527 (delivered in JDK 27, backported to OpenJDK 25.0.5) puts `X25519MLKEM768` first in the
+default named-group list, so a runtime upgrade is the whole change. Do NOT set `jdk.tls.namedGroups` to get there
+early — on JDK 25 GA and 26 an ML-KEM name is silently dropped, and if it is the only value the JVM throws
+`IllegalArgumentException` at class-init, which on the Pi is a startup failure.
