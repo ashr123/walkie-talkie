@@ -11,7 +11,6 @@ import java.security.Key;
 import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.HexFormat;
-import java.util.random.RandomGenerator;
 
 /// End-to-end encryption for relay audio frames (AES-256-GCM).
 ///
@@ -54,7 +53,13 @@ final class FrameCrypto {
 	/// thread-safe. A [FrameCrypto] is derived afresh on every join, channel switch and passphrase rotation, so a
 	/// per-instance field meant constructing a generator each time for no benefit. Mirrors the server, which shares one
 	/// `SecureRandom` bean across its security infrastructure for the same reason.
-	private static final RandomGenerator RANDOM = new SecureRandom();
+	///
+	/// Declared as `SecureRandom` and NOT as the wider `RandomGenerator`, deliberately: this field's contract is
+	/// cryptographic strength, and the narrow type is what makes the compiler enforce it. Both types expose
+	/// `nextBytes(byte[])`, so widening buys nothing here — while it would let `RandomGenerator.getDefault()` or a
+	/// `new Random()` past review, and a predictable IV is not a degradation in AES-GCM but a break: nonce reuse or
+	/// prediction forfeits both confidentiality and the authentication tag.
+	private static final SecureRandom RANDOM = new SecureRandom();
 	private final String keyCheck;
 	private final Key key;
 
