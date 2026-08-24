@@ -4,7 +4,7 @@ import org.springframework.boot.gradle.tasks.run.BootRun
 
 plugins {
 	id("walkietalkie.java-conventions")
-	id("org.springframework.boot") version "4.1.0"
+	id("org.springframework.boot") version "4.1.1"
 	// GraalVM Native Build Tools. Version pinned to what Spring Boot 4.1.0 aligns with
 	// (`native-build-tools-plugin.version` in the spring-boot-dependencies BOM) — plugin versions aren't
 	// managed by the BOM's dependency constraints, so it is stated explicitly. Applying this also makes Spring
