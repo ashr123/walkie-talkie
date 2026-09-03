@@ -5,9 +5,16 @@ import org.springframework.boot.gradle.tasks.run.BootRun
 plugins {
 	id("walkietalkie.java-conventions")
 	id("org.springframework.boot") version "4.1.1"
-	// GraalVM Native Build Tools. Version pinned to what Spring Boot 4.1.0 aligns with
-	// (`native-build-tools-plugin.version` in the spring-boot-dependencies BOM) — plugin versions aren't
-	// managed by the BOM's dependency constraints, so it is stated explicitly. Applying this also makes Spring
+	// GraalVM Native Build Tools. Stated explicitly because plugin versions are NOT managed by the
+	// spring-boot-dependencies BOM's dependency constraints — the BOM only records an aligned version as the
+	// `native-build-tools-plugin.version` property.
+	//
+	// This pin currently RUNS AHEAD of that alignment, and the comment used to claim otherwise. Measured against the
+	// BOMs on Maven Central: Boot 4.1.0 aligns with 1.1.1 and Boot 4.1.1 with 1.1.8, while the version below is
+	// 1.1.11 — Dependabot bumps this plugin on its own schedule, which the BOM knows nothing about. Either is
+	// defensible (newer native-build-tools may well be fine), but the two are no longer the same number: decide
+	// deliberately whether to re-pin to the BOM's value and have Dependabot ignore it, or to keep tracking upstream.
+	// Applying this also makes Spring
 	// Boot register its AOT tasks (`processAot` / `processTestAot`), which run the AOT engine and fold in the
 	// hints from ProtocolRuntimeHints. `build`/`test` also generate and compile those AOT sources as a dependency
 	// (so a context that can't be AOT-processed fails the ordinary build — cheap native-readiness insurance). The

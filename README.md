@@ -1,7 +1,7 @@
 # 📻 Walkie-Talkie Server
 
 A real-time, push-to-talk voice server that passes **live audio streams** (not recordings) between
-users. Written in **Java 25** (no `var`) on **Spring Boot 4.1.0**, with two interchangeable transports,
+users. Written in **Java 25** (no `var`) on **Spring Boot 4.1**, with two interchangeable transports,
 two reference clients, and three channel modes.
 
 ## What it does
