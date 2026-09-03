@@ -16,7 +16,6 @@ import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 
-import java.security.Principal;
 import java.time.Duration;
 
 /// Shared connect/text/close plumbing for both transports. Subclasses only differ in their
@@ -140,8 +139,7 @@ public abstract class BaseWalkieHandler extends AbstractWebSocketHandler {
 
 	@Override
 	public void afterConnectionEstablished(WebSocketSession session) {
-		Principal principal = session.getPrincipal();
-		if (principal == null) {
+		if (session.getPrincipal() == null) {
 			closeUnauthenticated(session);
 			return;
 		}
