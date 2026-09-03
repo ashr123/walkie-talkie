@@ -188,19 +188,33 @@ set is not a list this task maintains: it is whatever `app.js` imports from `./`
 moment it is wired up and `audio-worklet.js` (loaded by URL, never imported) stays correctly out of scope. Report:
 `<module>/build/reports/browser-modules.txt`.
 
-**The header's version line is derived at RUNTIME, not written down.** `index.html` deliberately contains no version
-text — its `#stack` paragraph ships as just the description, and `app.js`'s `showRunningVersions()` prefixes what the
-server reports from `/actuator/info`: `java.version` from Boot's own Java contributor (enabled with
-`management.info.java.enabled`, which is off by default) and `springBoot.version` from `RuntimeInfoContributor`, since
-Boot ships no contributor for its own version. The endpoint is already public alongside `/actuator/health` in
-`SecurityConfig`, and it discloses a framework version and a JDK build string — nothing about a channel, a member or a
-credential. The fetch is best-effort: any failure leaves the shipped description alone, because a footer is not worth a
-broken page.
-This replaced a literal that had already drifted twice over — the page said "Java 25 · Spring Boot 4.1" while the
-build was on 4.1.1 and the deployed Pi on JDK 25.0.4 — and it is the more truthful shape anyway, since what a reader
-wants from that line is what is RUNNING, not what someone compiled. Note what it does NOT solve: prose elsewhere still
-states versions by hand (README's "Java 25", this file's "Spring Boot 4.1"), and only the minor version is quoted there
-so a patch release cannot stale it.
+**The header's version line is SUBSTITUTED BY THE BUILD, and the first attempt at it was a mistake worth recording.**
+`index.html` carries `{{javaVersion}}` and `{{springBootVersion}}` placeholders, never numbers; `processResources`
+replaces them with `compileJava`'s `--release` (where `JavaConventionsPlugin.JAVA_RELEASE` ends up — this project
+targets a release rather than pinning a toolchain, so `java.toolchain.languageVersion` has no value and asking for it
+fails the build) and with `SpringBootPlugin.BOM_COORDINATES`' version, i.e. whatever plugin is actually applied. A
+`doLast` guard fails the build if a placeholder survives, quoting the line, because the alternative is shipping braces
+to a user. Both values are resolved to Strings INSIDE the task block: an execution-time lambda that reads a
+script-level `val` carries a reference to the script object, which the configuration cache refuses — the same trap the
+`jsTest` task documents, and this block hit it on the first try.
+
+The rejected design was to fetch `/actuator/info` at page load. It cost an extra request on every first paint, before
+login, for every visitor and bot — and it published the exact JDK build, vendor and framework patch level to
+unauthenticated callers, which is precisely the fingerprint a vulnerability scanner wants. A footer is not worth
+either. Precise RUNNING versions still exist for an operator, on the management port.
+
+**The actuator is not on the application port.** `management.server` binds it to `127.0.0.1:9090`, so it is reachable
+from the host or an SSH tunnel and never through a reverse proxy or Cloudflare Tunnel, which forward only the
+application port. The reason is specific rather than hygienic: `/actuator/loggers` is a WRITE endpoint, and a bearer
+token is no barrier when `POST /api/auth/login` mints one for anybody with no input — measured before the change,
+`POST /actuator/loggers/io.github.ashr123` with a freshly minted token returned 204 and the level really changed,
+which on a Raspberry Pi is an SD-card-filling denial of service and widens what the MDC writes (session ids, display
+names, channel names). Be precise about what protects it now: `SecurityConfig`'s chain IS applied on the management
+port too — health and info stay public there, the rest answers 401 with the same `WWW-Authenticate: Bearer` challenge
+— but since anyone can mint a token, the loopback bind is the boundary and authentication is not. The consequence to
+know: an external load-balancer probe can no longer reach `/actuator/health`; expose a purpose-built endpoint rather
+than moving the actuator back. `AuthBoundaryIntegrationTest` pins it, and that test previously asserted the OPPOSITE
+— it is why the change could not be made silently.
 
 Four more `check` tasks apply that same idea to README.md and docs/CLIENT_PROTOCOL.md — derive the truth from
 source, fail when the prose has fallen behind. Each is registered on the module that OWNS the source (so an

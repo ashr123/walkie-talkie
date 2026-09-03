@@ -124,11 +124,35 @@ class AuthBoundaryIntegrationTest extends WebSocketIntegrationTestSupport {
 	}
 
 	@Test
-	void staticAssetsAndActuatorHealthArePublic() throws Exception {
+	void staticAssetsArePublic() throws Exception {
 		assertEquals(200, httpStatus("/", null), "the index page is public");
 		assertEquals(200, httpStatus("/index.html", null), "the index page is public");
 		assertEquals(200, httpStatus("/assets/app.js", null), "client assets are public");
-		assertEquals(200, httpStatus("/actuator/health", null), "the health check is public");
+	}
+
+	@Test
+	void theActuatorIsNotServedOnTheApplicationPortAtAll() throws Exception {
+		// This test used to assert the opposite — that /actuator/health was public here — and it is the reason the
+		// change that moved the actuator was not a silent one. `management.server` now binds the actuator to
+		// 127.0.0.1 on its own port, so nothing under /actuator is mapped on the port a reverse proxy or a Cloudflare
+		// tunnel forwards.
+		//
+		// Why it matters more than tidiness: /actuator/loggers is a WRITE endpoint, and a bearer token is no barrier
+		// when POST /api/auth/login mints one for anybody with no input. Before the split, an internet caller could
+		// set the running log level to TRACE — measured, 204 — which on a Raspberry Pi fills the SD card and widens
+		// what the MDC writes (session ids, display names, channel names).
+		//
+		// health and info are asserted as NOT-200 rather than as a specific code on purpose: unmapped-but-permitted
+		// paths answer 404 while token-gated ones answer 401, and pinning which is which would make this test about
+		// Spring's ordering rather than about the actuator being absent.
+		for (String path : new String[]{"/actuator/health", "/actuator/info", "/actuator/metrics", "/actuator/loggers"}) {
+			assertNotEquals(200, httpStatus(path, null), path + " must not be served on the application port");
+			assertNotEquals(200, httpStatus(path, "Bearer " + login()),
+					path + " must not be reachable here even with a token anyone can mint");
+		}
+		// And the write that used to succeed.
+		assertNotEquals(204, httpStatus("/actuator/loggers/io.github.ashr123", "Bearer " + login()),
+				"the log-level write must not be reachable from the application port");
 	}
 
 	@Test

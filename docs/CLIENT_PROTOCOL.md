@@ -38,7 +38,8 @@ WebRTC (§3a) is a separate transport for true peer-to-peer media and is indepen
 ### Login
 
 `POST /api/auth/login` — **no request body, no authentication required** (it is the only public application
-endpoint besides static assets, `/actuator/health`, `/actuator/info`, and `/error`). It returns:
+endpoint besides static assets and `/error`; the actuator is not on this port — see the deployment notes). It
+returns:
 
 ```json
 { "token": "<opaque signed bearer token>" }

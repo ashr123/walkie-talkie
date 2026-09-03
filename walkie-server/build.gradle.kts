@@ -1,3 +1,4 @@
+import org.gradle.api.tasks.compile.JavaCompile
 import org.springframework.boot.gradle.plugin.SpringBootPlugin
 import org.springframework.boot.gradle.tasks.bundling.BootJar
 import org.springframework.boot.gradle.tasks.run.BootRun
@@ -157,6 +158,50 @@ tasks.named<BootRun>("bootRun") {
 	// such switch: its bundled spring.properties wins over any -D (SpringProperties reads the file before the
 	// system property), so `java -jar` is always AOT.
 	systemProperty("spring.aot.enabled", providers.gradleProperty("aot").getOrElse("true"))
+}
+
+// The header's version line, filled in at build time from the versions this build ACTUALLY uses: the Java release
+// every module targets, and the Spring Boot plugin's own BOM coordinate. index.html carries placeholders, never
+// numbers.
+//
+// Substituting rather than fetching is deliberate, and the first attempt got it wrong: reading the versions from
+// /actuator/info at page load meant an extra request on every first paint and — worse — publishing the exact JDK
+// build, vendor and framework patch level to unauthenticated callers, which is the fingerprint a CVE scanner wants.
+// A footer is not worth either cost. Precise RUNNING versions remain available to an operator on the management
+// port, which is bound to loopback (see application.yml).
+tasks.processResources {
+	// Resolved to plain Strings INSIDE this block, so the execution-time lambdas below close over immutable values
+	// rather than the build script: a lambda that reads a script-level `val` carries a reference to the script object
+	// (its `this$0`), which the configuration cache cannot serialize. The jsTest task below documents the same trap —
+	// and this file earned the lesson twice, because the first version of this block hit exactly that error.
+	//
+	// The Java version comes from `compileJava`'s `--release`, which is where JavaConventionsPlugin's JAVA_RELEASE
+	// constant ends up: this project targets a release rather than pinning a toolchain (the host JDK is newer), so
+	// `java.toolchain.languageVersion` has no value at all — asking for it fails the build.
+	val javaVersion = tasks.named<JavaCompile>("compileJava").get().options.release.get().toString()
+	val bootVersion = SpringBootPlugin.BOM_COORDINATES.substringAfterLast(':')
+	val processedResources = destinationDir
+	inputs.property("headerJavaVersion", javaVersion)
+	inputs.property("headerBootVersion", bootVersion)
+	filesMatching("static/index.html") {
+		filter { line ->
+			line.replace("{{javaVersion}}", javaVersion).replace("{{springBootVersion}}", bootVersion)
+		}
+	}
+	// A placeholder that survives would ship braces to a user, so fail the build instead. Cheap, and it is the only
+	// thing standing between a renamed placeholder and a visibly broken header.
+	doLast {
+		val page = processedResources.resolve("static/index.html")
+		val unsubstituted = page.readLines().withIndex().filter { (_, line) -> line.contains("{{") }
+		if (unsubstituted.isNotEmpty()) {
+			throw GradleException(
+					"processResources left a placeholder unsubstituted in static/index.html — the page would ship it " +
+							"verbatim:" + unsubstituted.joinToString("") { (n, line) ->
+						System.lineSeparator() + "  line ${n + 1}: ${line.trim()}"
+					}
+			)
+		}
+	}
 }
 
 tasks.named<BootJar>("bootJar") {

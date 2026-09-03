@@ -631,9 +631,10 @@
 <body>
 <header>
 	<h1>📻 Walkie-Talkie</h1>
-	<!-- No version numbers here on purpose: app.js prefixes the running JDK and Spring Boot versions from
-	     /actuator/info. A literal would drift the moment either is upgraded, which it already had. -->
-	<p id="stack">live audio over WebSocket relay or WebRTC</p>
+	<!-- The two versions are SUBSTITUTED BY THE BUILD (see walkie-server/build.gradle.kts: processResources).
+	     Hand-written numbers drifted here before — the page claimed Spring Boot 4.1 while the build was on
+	     4.1.1 — and the build fails if either placeholder survives into the packaged resource. -->
+	<p>Java {{javaVersion}} · Spring Boot {{springBootVersion}} · live audio over WebSocket relay or WebRTC</p>
 </header>
 <main>
 	<section class="panel" id="setup">

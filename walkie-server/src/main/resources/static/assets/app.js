@@ -3040,38 +3040,7 @@ function closeCodec(codec) {
 
 // --- wiring ---------------------------------------------------------------------------------------
 
-/**
- * Prefixes the header's one-line description with the versions the SERVER is actually running, read from
- * /actuator/info (public, alongside /actuator/health — see SecurityConfig).
- *
- * index.html deliberately carries no version text, so there is nothing to drift: it had said "Java 25 · Spring Boot
- * 4.1" while the build was on 4.1.1 and the deployed JDK on 25.0.4. Everything here is best-effort — any failure
- * (actuator off, `info` not exposed, offline first paint) leaves the description exactly as the page shipped it,
- * because a footer is not worth a broken page.
- */
-async function showRunningVersions() {
-	try {
-		const res = await fetch('/actuator/info');
-		if (!res.ok) {
-			return;
-		}
-		const info = await res.json();
-		// Boot's own Java contributor supplies java.version; RuntimeInfoContributor adds springBoot.version.
-		const parts = [
-			info?.java?.version && `Java ${info.java.version}`,
-			info?.springBoot?.version && `Spring Boot ${info.springBoot.version}`,
-		].filter(Boolean);
-		const el = byId('stack');
-		if (parts.length > 0 && el) {
-			el.textContent = `${parts.join(' · ')} · ${el.textContent}`;
-		}
-	} catch {
-		// Offline, blocked, or malformed — the shipped description stands.
-	}
-}
-
 window.addEventListener('DOMContentLoaded', () => {
-	showRunningVersions();
 	byId('connectBtn').addEventListener('click', connect);
 	byId('disconnectBtn').addEventListener('click', disconnect);
 

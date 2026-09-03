@@ -72,16 +72,32 @@ walkie:
   keepalive-ping-interval: 30s
 
 management:
+  # The actuator moves OFF the application port and onto loopback. It is an operator interface, and it was reachable
+  # from the public edge: /actuator/loggers is a WRITE endpoint, and although it requires a token, POST /api/auth/login
+  # is public and takes no input — so anyone could mint one and set the log level to TRACE. Measured before this
+  # change: POST /actuator/loggers/io.github.ashr123 answered 204 and the level really changed. On a Raspberry Pi that
+  # is an SD-card-filling denial of service, and this app's MDC puts session ids, display names and channel names on
+  # every line, so it widens what gets written too. /actuator/info leaked the exact JDK build and framework patch
+  # level to unauthenticated callers, which is the fingerprint a vulnerability scanner wants.
+  #
+  # Bound to 127.0.0.1, so it is reachable from the host (or an SSH tunnel) and NOT through the Cloudflare tunnel or a
+  # reverse proxy, both of which forward only the application port.
+  #
+  # The loopback bind is the boundary, and be clear about why. SecurityConfig's chain IS applied on this port — health
+  # and info stay permitAll, everything else answers 401 with the same WWW-Authenticate: Bearer challenge (measured) —
+  # but that is not protection here, because /api/auth/login mints a token for anyone who asks. Verified: a token
+  # minted on the application port is accepted on this one, and POST /actuator/loggers/... with it still returns 204.
+  # Authentication gates who reaches the endpoints; loopback is what stops the internet reaching the port.
+  #
+  # Consequence to know about: a load balancer or uptime probe can no longer reach /actuator/health over the public
+  # port. If that is ever needed, expose a purpose-built public endpoint rather than moving the actuator back.
+  server:
+    port: 9090
+    address: 127.0.0.1
   endpoints:
     web:
       exposure:
         include: health,info,loggers,metrics
-  info:
-    # Boot's own Java contributor, off by default. It publishes java.version / java.vendor / java.runtime on
-    # /actuator/info, which the browser client's footer reads so the page states the JDK actually running rather than
-    # a number hard-coded in index.html (see RuntimeInfoContributor, which adds Boot's version the same way).
-    java:
-      enabled: true
 
 logging:
   level:

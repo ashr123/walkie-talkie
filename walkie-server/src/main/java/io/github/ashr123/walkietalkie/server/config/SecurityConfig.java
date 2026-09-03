@@ -54,6 +54,11 @@ public class SecurityConfig {
 						.requestMatchers("/", "/index.html", "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png", "/assets/**").permitAll()
 						// Permit the error dispatch so validation failures surface as 400, not as the deny status.
 						.requestMatchers("/error").permitAll()
+						// Not mapped on the APPLICATION port as configured — the actuator listens on its own
+						// loopback-only management port (see application.yml), where this same chain is applied, so
+						// these two stay public there and the rest answers 401. Kept rather than deleted so that
+						// removing the port split restores the previous behaviour instead of silently gating a health
+						// probe behind a token.
 						.requestMatchers("/actuator/health", "/actuator/info").permitAll()
 						.requestMatchers(HttpMethod.POST, "/api/auth/login").permitAll()
 						.requestMatchers("/ws/**").authenticated()

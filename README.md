@@ -216,8 +216,12 @@ The server therefore sends a WebSocket Ping to any connection idle for `walkie.k
 code is involved. Lower it if your proxy is stricter than 60 s; a value at or above the proxy's timeout is the
 same as having none.
 
-The health endpoints `/actuator/health` and `/actuator/info` are exposed unauthenticated for a load balancer to
-probe; everything else under `/actuator` is not.
+The actuator does not listen on the application port at all: `management.server` binds it to `127.0.0.1:9090`, so it
+is reachable from the host (or over an SSH tunnel) and never through a reverse proxy or Cloudflare Tunnel, which
+forward only the application port. `/actuator/health` and `/actuator/info` remain unauthenticated **there**;
+everything else answers 401. A load-balancer probe therefore cannot reach `/actuator/health` from outside — if you
+need one, expose a purpose-built endpoint rather than moving the actuator back, because `/actuator/loggers` is a
+write endpoint and a bearer token is not a meaningful barrier when `POST /api/auth/login` mints one for anybody.
 
 ### Browser client
 
