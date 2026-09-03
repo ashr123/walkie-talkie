@@ -76,6 +76,12 @@ management:
     web:
       exposure:
         include: health,info,loggers,metrics
+  info:
+    # Boot's own Java contributor, off by default. It publishes java.version / java.vendor / java.runtime on
+    # /actuator/info, which the browser client's footer reads so the page states the JDK actually running rather than
+    # a number hard-coded in index.html (see RuntimeInfoContributor, which adds Boot's version the same way).
+    java:
+      enabled: true
 
 logging:
   level:

@@ -188,6 +188,20 @@ set is not a list this task maintains: it is whatever `app.js` imports from `./`
 moment it is wired up and `audio-worklet.js` (loaded by URL, never imported) stays correctly out of scope. Report:
 `<module>/build/reports/browser-modules.txt`.
 
+**The header's version line is derived at RUNTIME, not written down.** `index.html` deliberately contains no version
+text — its `#stack` paragraph ships as just the description, and `app.js`'s `showRunningVersions()` prefixes what the
+server reports from `/actuator/info`: `java.version` from Boot's own Java contributor (enabled with
+`management.info.java.enabled`, which is off by default) and `springBoot.version` from `RuntimeInfoContributor`, since
+Boot ships no contributor for its own version. The endpoint is already public alongside `/actuator/health` in
+`SecurityConfig`, and it discloses a framework version and a JDK build string — nothing about a channel, a member or a
+credential. The fetch is best-effort: any failure leaves the shipped description alone, because a footer is not worth a
+broken page.
+This replaced a literal that had already drifted twice over — the page said "Java 25 · Spring Boot 4.1" while the
+build was on 4.1.1 and the deployed Pi on JDK 25.0.4 — and it is the more truthful shape anyway, since what a reader
+wants from that line is what is RUNNING, not what someone compiled. Note what it does NOT solve: prose elsewhere still
+states versions by hand (README's "Java 25", this file's "Spring Boot 4.1"), and only the minor version is quoted there
+so a patch release cannot stale it.
+
 Four more `check` tasks apply that same idea to README.md and docs/CLIENT_PROTOCOL.md — derive the truth from
 source, fail when the prose has fallen behind. Each is registered on the module that OWNS the source (so an
 empty source set is a hard "the file moved" failure rather than a silent pass, and the failure lands on whoever

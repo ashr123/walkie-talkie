@@ -631,7 +631,9 @@
 <body>
 <header>
 	<h1>📻 Walkie-Talkie</h1>
-	<p>Java 25 · Spring Boot 4.1 · live audio over WebSocket relay or WebRTC</p>
+	<!-- No version numbers here on purpose: app.js prefixes the running JDK and Spring Boot versions from
+	     /actuator/info. A literal would drift the moment either is upgraded, which it already had. -->
+	<p id="stack">live audio over WebSocket relay or WebRTC</p>
 </header>
 <main>
 	<section class="panel" id="setup">
